@@ -32545,6 +32545,11 @@ test("XERK-2896: personal blocks never take a capture; a late invite replaces a 
       await postMeeting2508(S, capture2896(id, at, 20, { participants: ["Cy Doe"] }));
       assert.equal(row2896(S, id).calendarEventId, undefined, id);
     }
+    // XERK-2898: each Outlook event serves the org the matcher counts it for, so a
+    // client relinks by the same rule: the pinned one counts for no org.
+    const served = (await view2896()).events.filter((e) => e.host === D);
+    assert.equal(served.find((e) => e.id === "pinned").matchOrg, "");
+    assert.equal(served.find((e) => e.id === "allhands").matchOrg, S);
     // An impromptu call inside the all-hands slot links to it (no better event yet)...
     await postMeeting2508(S, capture2896("ah", T2896 + 17 * H + 30 * MIN2896, 30, { title: "Customer call",
       participants: ["Dee Fox"] }));

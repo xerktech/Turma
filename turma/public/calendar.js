@@ -7,7 +7,11 @@
 // snapshot (update) and tells it when the hub's `calendar` / `holidaySettings`
 // SSE frames land (refetch). It reads the calendar routes itself — the events
 // are too big for the snapshot (contract-calendar.md). Read-only: no drag, no
-// create, no edit. Rules + the Teams decisions: .claude/rules/turma-meetings.md.
+// create, no edit. A click opens the event's detail panel (XERK-2898): Outlook's
+// details, and a linked Tenir capture's summary + proposals, reviewed in place by
+// meetings.js (TurmaMeetings.showPanel), which this module never forks; the one
+// write here is relinking a capture to another event.
+// Rules + the Teams decisions: .claude/rules/turma-meetings.md.
 // Loaded after org.js; in server.js's HASHED_ASSETS. Tests: tests/calendar.test.js.
 (() => {
 const DAY_MS = 86400000;
@@ -195,7 +199,15 @@ let anchor = dayStart(Date.now());
 let modes = loadStore(MODE_KEY, {});
 let narrow = false;
 let picker = null;                // the mini-month's shown month (ms of its 1st) when open
-let detail = null;                // the event whose placeholder detail is open
+let detail = null;                // the event whose detail panel is open
+let lastGot = null;               // collect() of the last paint: the relink candidates
+let $grid = null, $side = null, $info = null, $mt = null;
+let descOpen = false;             // the open event's description is expanded
+let panelHas = false;             // meetings.js painted the capture into the panel
+const linkBusy = new Set();       // capture keys with a relink POST in flight
+const linkErr = new Map();        // capture key -> the hub's refusal
+const linkPick = new Map();       // capture key -> the picked event's key
+let sidePress = false, sidePending = false;
 let shown = [];                   // the events of the last paint, indexed by data-ev
 let scrolled = false;             // the grid opened at working hours once
 const weeks = new Map();          // `${orgKey}|${weekMs}` -> {cal, hol, loading, again, err, retry}
@@ -437,6 +449,34 @@ function ariaOf(ev, day) {
   if (ev.source === "tenir") bits.push("captured by Tenir, not on Outlook");
   return bits.join(", ");
 }
+// A capture's review state on its event block (XERK-2898): proposals still
+// waiting, or the captions still being read. meetings.js reads the snapshot's
+// rows; a Tenir-only entry the snapshot no longer carries falls back to its own status.
+function capturesOf(ev) {
+  if (ev.source === "tenir") return typeof ev.site === "string" && typeof ev.meetingId === "string" ? [{ site: ev.site, meetingId: ev.meetingId }] : [];
+  return (Array.isArray(ev.meetings) ? ev.meetings : [])
+    .filter((c) => c && typeof c.site === "string" && typeof c.meetingId === "string");
+}
+function badgeOf(ev) {
+  const M = typeof TurmaMeetings !== "undefined" && TurmaMeetings.meetingState ? TurmaMeetings : null;
+  let pending = 0, reading = false;
+  for (const c of capturesOf(ev)) {
+    const st = M && data ? M.meetingState(data, c.site, c.meetingId) : null;
+    if (st) { pending += st.pending; reading = reading || st.reading; }
+    else if (ev.source === "tenir") reading = reading || ev.status === "queued" || ev.status === "running";
+  }
+  return { pending, reading };
+}
+const LIST_SVG = `<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M2 3h2v2H2zm4 .25h8v1.5H6zM2 7h2v2H2zm4 .25h8v1.5H6zM2 11h2v2H2zm4 .25h8v1.5H6z"/></svg>`;
+function badgeHtml(b) {
+  if (b.pending) return `<span class="cal-badge" aria-hidden="true">${LIST_SVG}${b.pending}</span>`;
+  if (b.reading) return `<span class="cal-badge reading" aria-hidden="true"><span class="cal-spin"></span></span>`;
+  return "";
+}
+function badgeAria(b) {
+  if (b.pending) return `${b.pending} proposal${b.pending === 1 ? "" : "s"} to review`;
+  return b.reading ? "the meeting is being read" : "";
+}
 function evIndex(ev) {
   let i = shown.indexOf(ev);
   if (i < 0) { i = shown.length; shown.push(ev); }
@@ -454,10 +494,11 @@ function timedHtml(seg, day, colors, now) {
   const short = h < 34;
   const meta = [fmtSpan(ev.startMs, ev.endMs), ev.location ? String(ev.location) : ""].filter(Boolean).join(" · ");
   const cls = ["cal-ev", ...styleOf(ev, now), short ? "short" : ""].filter(Boolean).join(" ");
+  const b = badgeOf(ev);
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
     + ` style="${evStyle(ev, colors)}top:${top}px;height:${h}px;left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
-    + ` aria-label="${esc(ariaOf(ev, day))}">`
-    + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}${esc(titleOf(ev))}</span>`
+    + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
+    + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
     + (short ? "" : `<span class="m">${esc(meta)}</span>`) + `</button>`;
 }
 function bandHtml(day, events, holidays, colors, now) {
@@ -470,9 +511,10 @@ function bandHtml(day, events, holidays, colors, now) {
   for (const ev of events) {
     if (!inBand(ev) || !onDay(ev, day)) continue;
     const cls = ["cal-ev", "allday", ...styleOf(ev, now)].join(" ");
+    const b = badgeOf(ev);
     bits.push(`<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="-1"`
-      + ` style="${evStyle(ev, colors)}" aria-label="${esc(ariaOf(ev, day))}">`
-      + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}${esc(titleOf(ev))}</span></button>`);
+      + ` style="${evStyle(ev, colors)}" aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
+      + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span></button>`);
   }
   return bits.join("");
 }
@@ -512,26 +554,154 @@ function pickerHtml(days, now) {
     + `<button type="button" class="cal-ic" data-pmonth="12" aria-label="Next year">»</button></div>`
     + `<div class="cal-picker-grid">${wd.map((w) => `<span class="cal-pw" aria-hidden="true">${esc(w)}</span>`).join("")}${cells}</div></div>`;
 }
-function detailHtml(ev, now) {
+// ---- the detail panel (XERK-2898) -----------------------------------------------
+const evKey = (ev) => `${ev.host}\u0000${ev.id}`;
+// The same key as it may ride an HTML attribute: the parser turns a NUL into U+FFFD (QA).
+const evDomKey = (ev) => [ev.host, ev.id].map((x) => encodeURIComponent(String(x ?? ""))).join("/");
+// The org a host is decided into (the served agent `org`), which the hub's matcher
+// counts an unassigned event under.
+function hostOrg(host) {
+  const a = data && Array.isArray(data.agents) ? data.agents.find((x) => x && x.key === host) : null;
+  return a && typeof a.org === "string" ? a.org : "";
+}
+// An event's org as the hub's capture matcher reads it: the served `matchOrg` (a series
+// pinned to no org is ""), else (an older hub) its assigned org, else its host's.
+const eventOrg = (ev) => (typeof ev.matchOrg === "string" ? ev.matchOrg
+  : ev.org || (ev.source === "tenir" ? "" : hostOrg(ev.host)));
+const capKey = (c) => [c.site, c.meetingId].map(encodeURIComponent).join("/");
+const RESPONSE = { organizer: "Organizer", accepted: "Accepted", tentative: "Tentative", declined: "Declined",
+  notResponded: "Not responded", none: "No response needed" };
+const MY_RESPONSE = { organizer: "You organized it", accepted: "Accepted", tentative: "Tentative",
+  declined: "Declined", notResponded: "Not responded yet" };
+const fmtWhenLong = (ms) => `${fmtLongDay(ms)}, ${fmtTime(ms)}`;
+// An Outlook occurrence's id is `<GlobalAppointmentID>:<original start ISO>`
+// (contract-calendar.md): a start that differs from it is a moved occurrence.
+function originalStart(ev) {
+  if (ev.source === "tenir" || typeof ev.id !== "string") return NaN;
+  const i = ev.id.indexOf(":");
+  if (i < 0 || !ev.seriesId) return NaN;
+  const t = Date.parse(ev.id.slice(i + 1));
+  return Number.isFinite(t) ? t : NaN;
+}
+function whenText(ev) {
+  return inBand(ev) ? `${fmtLongDay(ev.startMs)}, all day` : `${fmtLongDay(ev.startMs)}, ${fmtSpan(ev.startMs, ev.endMs)}`;
+}
+// Plain text as HTML: every line escaped, joined by <br>; "" for none.
+function linesHtml(t) {
+  return typeof t === "string" && t.trim() ? t.trim().split(/\r?\n/).map(esc).join("<br>") : "";
+}
+function attendeesHtml(list) {
+  const rows = list.filter((a) => a && typeof a === "object" && (a.name || a.email)).map((a) => {
+    const who = a.name ? String(a.name) : String(a.email);
+    const role = a.role === "optional" ? "optional" : a.role === "resource" ? "room" : "";
+    const resp = Object.prototype.hasOwnProperty.call(RESPONSE, a.response) ? RESPONSE[a.response] : "";
+    return `<li><span class="who"${a.email && a.name ? ` title="${esc(a.email)}"` : ""}>${esc(who)}</span>`
+      + (role ? `<span class="role">${esc(role)}</span>` : "")
+      + (resp ? `<span class="resp ${esc(a.response)}">${esc(resp)}</span>` : "") + `</li>`;
+  });
+  return rows.length ? `<ul class="cal-people">${rows.join("")}</ul>` : "";
+}
+// Outlook events a capture can move to: the same day, not canceled, of its org
+// (an unassigned event counts as its host's org, as the hub's matcher reads it),
+// nearest its start first.
+function linkCandidates(c, at, skip) {
+  const day = dayStart(at);
+  return ((lastGot && lastGot.events) || [])
+    .filter((e) => e.source !== "tenir" && e.canceled !== true && !inBand(e) && evKey(e) !== skip
+      && dayStart(e.startMs) === day && eventOrg(e) === c.site && typeof e.id === "string" && e.id)
+    .sort((x, y) => Math.abs(x.startMs - at) - Math.abs(y.startMs - at)).slice(0, 20);
+}
+function captureLinkHtml(ev, c) {
+  const k = capKey(c);
+  const M = typeof TurmaMeetings !== "undefined" && TurmaMeetings.meetingState ? TurmaMeetings : null;
+  const st = M && data ? M.meetingState(data, c.site, c.meetingId) : null;
+  const title = ev.source === "tenir" ? titleOf(ev) : String(c.title || (st && st.title) || "Tenir capture");
+  const linked = ev.source !== "tenir" || !!ev.calendarEventId;
+  const cands = linkCandidates(c, ev.startMs, ev.source === "tenir" ? "" : evKey(ev));
+  const pick = linkPick.get(k) || "";
+  const dis = linkBusy.has(k) ? ' aria-disabled="true"' : "";
+  const opts = `<option value="">${linked ? "Move it to another event…" : "Link it to an Outlook event…"}</option>`
+    + cands.map((e) => `<option value="${esc(evDomKey(e))}"${evDomKey(e) === pick ? " selected" : ""}>${esc(`${fmtTime(e.startMs)} · ${titleOf(e)}`)}</option>`).join("");
+  return `<div class="cal-link" data-cap="${esc(k)}">`
+    + `<div class="cal-link-what">${ev.source === "tenir" ? "This capture" : `Tenir capture: <b>${esc(title)}</b>`}</div>`
+    + `<div class="cal-link-row">`
+    + (cands.length ? `<select data-link-pick="${esc(k)}" aria-label="Link ${esc(title)} to an event">${opts}</select>`
+      + `<button type="button" class="btn-sm" data-link-go="${esc(k)}"${pick ? dis : ' aria-disabled="true"'}>${linkBusy.has(k) ? "Working…" : "Link"}</button>`
+      : `<span class="cal-dnote">No other Outlook event that day to link it to.</span>`)
+    + (linked ? `<button type="button" class="btn-sm" data-link-unlink="${esc(k)}"${dis}>Unlink</button>` : "")
+    + (st && st.calendarBy === "operator" ? `<button type="button" class="btn-sm" data-link-auto="${esc(k)}"${dis} title="Let Turma match it to the calendar again">Match automatically</button>` : "")
+    + `</div>` + (linkErr.has(k) ? `<div class="mt-err">${esc(linkErr.get(k))}</div>` : "") + `</div>`;
+}
+function detailHtml(ev, now, hasPanel = false) {
   const rows = [];
-  const row = (k, v) => { if (v) rows.push(`<div class="cal-drow"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`); };
-  row("When", inBand(ev) ? `${fmtLongDay(ev.startMs)}, all day` : `${fmtLongDay(ev.startMs)}, ${fmtSpan(ev.startMs, ev.endMs)}`);
+  const row = (k, v, html = false) => { if (v) rows.push(`<div class="cal-drow"><span class="k">${esc(k)}</span><span class="v">${html ? v : esc(v)}</span></div>`); };
+  const tenir = ev.source === "tenir";
+  const state = [];
+  if (ev.canceled === true) state.push("Canceled");
+  const orig = originalStart(ev);
+  const moved = Number.isFinite(orig) && Math.abs(orig - ev.startMs) >= 60000;
+  row("When", whenText(ev));
+  if (moved) row("Moved", `from ${fmtWhenLong(orig)}`);
+  if (tenir && ev.moved === true) row("Moved", "its Outlook event moved to another time");
   row("Org", orgLabel(ev.org));
+  if (ev.recurring === true) row("Repeats", "Part of a recurring series");
   row("Where", ev.location ? String(ev.location) : "");
-  row("Organizer", ev.organizer ? String(ev.organizer) : "");
-  row("Calendar", ev.source === "tenir" ? "Captured by Tenir — not on Outlook" : (ev.host ? (typeof TurmaBoard !== "undefined" && TurmaBoard.hostName ? TurmaBoard.hostName(ev.host) : String(ev.host)) : ""));
+  const org = ev.organizer ? String(ev.organizer) : "";
+  row("Organizer", org && ev.organizerEmail ? `${org} (${ev.organizerEmail})` : org);
+  row("You", Object.prototype.hasOwnProperty.call(MY_RESPONSE, ev.myResponse) ? MY_RESPONSE[ev.myResponse] : "");
+  if (ev.busy === "tentative" && ev.myResponse !== "tentative") state.push("Tentative");
+  if (ev.busy === "free") state.push("Free");
+  if (ev.busy === "outOfOffice") state.push("Out of office");
+  const host = ev.host ? (typeof TurmaBoard !== "undefined" && TurmaBoard.hostName ? TurmaBoard.hostName(ev.host) : String(ev.host)) : "";
+  row("Calendar", tenir ? "Captured by Tenir — not on Outlook" : host ? `Outlook on ${host}` : "");
+  const cats = (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string" && c);
+  if (cats.length) row("Categories", cats.map((c) => `<span class="cal-cat">${esc(c)}</span>`).join(""), true);
   const join = safeHttps(ev.joinUrl);
-  const state = styleOf(ev, now).filter((c) => ["canceled", "tentative", "free"].includes(c));
-  const notes = openNotes && notesTarget(ev, now)
+  const openNotesBtn = openNotes && notesTarget(ev, now)
     ? `<div class="cal-drow"><button type="button" class="btn-sm" data-open-notes>Open in notes review</button></div>` : "";
-  return `<aside class="cal-detail" role="dialog" aria-modal="false" aria-labelledby="calDetailTitle" tabindex="-1">`
-    + `<div class="cal-detail-head"><h2 id="calDetailTitle">${esc(titleOf(ev))}</h2>`
+  const att = Array.isArray(ev.attendees) ? attendeesHtml(ev.attendees) : "";
+  // The description as Outlook wrote it: escaped line by line, breaks kept.
+  const descHtml = linesHtml(ev.body);
+  const notes = [];
+  if (ev.private === true) notes.push("A private event: its details are withheld.");
+  if (tenir && ev.calendarEventMissing === true) notes.push("The Outlook event it was linked to is no longer on the calendar.");
+  if (tenir && ev.ambiguous === true) notes.push("More than one Outlook event fits this capture; link the right one below.");
+  // What the capture says when meetings.js has no row for it (older than the snapshot's tail).
+  let capture = "";
+  if (tenir && !hasPanel) {
+    const ppl = (Array.isArray(ev.participants) ? ev.participants : []).filter((x) => typeof x === "string" && x);
+    const url = typeof ev.tenirUrl === "string" && /^https?:\/\/[^\s"'<>`\\]+$/i.test(ev.tenirUrl) ? ev.tenirUrl : "";
+    capture = (ev.status === "queued" || ev.status === "running" ? `<div class="mt-status">Reading the captions…</div>` : "")
+      + (ppl.length ? `<div class="mt-people" aria-label="Participants">${ppl.map((x) => `<span>${esc(x)}</span>`).join("")}</div>` : "")
+      + (typeof ev.summary === "string" && ev.summary.trim()
+        ? `<div class="mt-summary" aria-label="Summary">${ev.summary.trim().split(/\n{2,}/).map((x) => `<p>${x.split(/\r?\n/).map(esc).join("<br>")}</p>`).join("")}</div>` : "")
+      + (url ? `<a class="mt-tenir" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Tenir ↗</a>` : "");
+  }
+  const caps = capturesOf(ev);
+  return `<div class="cal-detail-head"><h2 id="calDetailTitle">${esc(titleOf(ev))}</h2>`
     + `<button type="button" class="cal-ic" data-close-detail aria-label="Close">✕</button></div>`
     + (state.length ? `<div class="cal-dstate">${esc(state.join(" · "))}</div>` : "")
     + rows.join("")
     + (join ? `<div class="cal-drow"><a href="${esc(join)}" target="_blank" rel="noopener noreferrer">Join meeting</a></div>` : "")
-    + notes
-    + `<p class="cal-dnote">Meeting details, notes and proposals open here soon.</p></aside>`;
+    + openNotesBtn
+    + notes.map((n) => `<p class="cal-dnote">${esc(n)}</p>`).join("")
+    + (att ? `<div class="cal-dsec"><div class="cal-dlabel">Attendees</div>${att}</div>` : "")
+    + (descHtml ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-body-toggle aria-expanded="${descOpen}">`
+      // descHtml is linesHtml's output: every line esc()'d (Semgrep reads `ev.body` as an Express req.body).
+      // nosemgrep: javascript.express.security.injection.raw-html-format.raw-html-format
+      + `${descOpen ? "▾" : "▸"} Description</button>${descOpen ? `<div class="cal-dbody">${descHtml}</div>` : ""}</div>` : "")
+    + capture
+    + (caps.length ? caps.map((c) => captureLinkHtml(ev, c)).join("") : "")
+    + (!tenir && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "");
+}
+// What meetings.js shows below the details: the linked captures of ONE org (the
+// first's), and a daily meeting's brief when the event is that org's daily meeting.
+function panelSpec(ev) {
+  const caps = capturesOf(ev);
+  const site = caps.length ? caps[0].site : eventOrg(ev);
+  if (!site) return null;
+  return { site, meetingIds: caps.filter((c) => c.site === site).map((c) => c.meetingId),
+    dailyAt: ev.source === "tenir" ? 0 : ev.startMs };
 }
 function headerHtml(days) {
   const m = mode();
@@ -565,6 +735,18 @@ function calendarHtml() {
       revealing = null;
       revealFocus = true;
     } else if (got.have && !got.loading) revealing = null;    // read, and not there: stay on its week
+  }
+  lastGot = got;
+  // The open event, as the newest read has it (a sync changed it, a relink moved it).
+  if (detail) {
+    const k = evKey(detail);
+    let fresh = got.events.find((e) => evKey(e) === k);
+    // A Tenir-only entry that a (re)link merged into an event: follow it there.
+    if (!fresh && detail.source === "tenir" && got.have) {
+      fresh = got.events.find((e) => e.source !== "tenir" && capturesOf(e)
+        .some((c) => c.site === detail.site && c.meetingId === detail.meetingId));
+    }
+    if (fresh) detail = fresh;
   }
   const colors = colorMap();
   shown = [];
@@ -600,8 +782,7 @@ function calendarHtml() {
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
     + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${DAY_PX}px">`
-    + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`
-    + (detail ? detailHtml(detail, now) : "");
+    + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 
 // Focus survives a repaint by its event + day (the button is a new node).
@@ -627,19 +808,59 @@ let lastHtml = "";
 function paint(force = false) {
   if (!$root || !active) return;
   const html = calendarHtml();
-  if (!force && html === lastHtml) return;
-  lastHtml = html;
-  const sig = focusSig();
-  const T = typeof TurmaNav !== "undefined" && TurmaNav.preserveScroll ? TurmaNav : null;
-  const put = () => { $root.innerHTML = html; };
-  if (T) T.preserveScroll($root, put); else put();
-  restoreFocusSig(sig);
-  const sc = $root.querySelector && $root.querySelector("#calScroll");
-  if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
-  else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
-  scrollToMin = -1;
-  if (revealFocus) { revealFocus = false; focusQ(".cal-detail"); }
+  if (force || html !== lastHtml) {
+    lastHtml = html;
+    const sig = focusSig();
+    const T = typeof TurmaNav !== "undefined" && TurmaNav.preserveScroll ? TurmaNav : null;
+    const put = () => { $grid.innerHTML = html; };
+    if (T) T.preserveScroll($grid, put); else put();
+    restoreFocusSig(sig);
+    const sc = $grid.querySelector && $grid.querySelector("#calScroll");
+    if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
+    else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
+    scrollToMin = -1;
+  }
+  paintDetail(force);
+  if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
 }
+// The detail panel paints apart from the grid, into its own element: the grid's
+// repaints (a frame, the clock) never swap the controls under the operator.
+// meetings.js paints the capture part into `$mt` itself, with its own hold.
+const fieldFocused = (el) => {
+  const a = typeof document !== "undefined" ? document.activeElement : null;
+  return !!a && !!el && !!el.contains && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
+};
+let lastDetail = "";
+function paintDetail(force = false) {
+  if (!$side) return;
+  const M = typeof TurmaMeetings !== "undefined" && TurmaMeetings.showPanel ? TurmaMeetings : null;
+  if (!detail || !active) {
+    if (M) M.showPanel($mt, null);
+    if (lastDetail) { $info.innerHTML = ""; lastDetail = ""; }
+    $side.hidden = true;
+    panelHas = false;
+    return;
+  }
+  $side.hidden = false;
+  if (!force && (sidePress || fieldFocused($info))) { sidePending = true; return; }
+  sidePending = false;
+  if (M) {
+    panelHas = M.showPanel($mt, panelSpec(detail), { scroller: $side,
+      onPaint: (has) => { if (has !== panelHas) { panelHas = has; paintDetail(); } } });
+  }
+  const html = detailHtml(detail, nowFn(), panelHas);
+  if (html === lastDetail) return;
+  lastDetail = html;
+  const a = typeof document !== "undefined" ? document.activeElement : null;
+  const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "closeDetail"].find((x) => ds[x] !== undefined);
+  $info.innerHTML = html;
+  if (k && $info.querySelectorAll) {
+    const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
+    if (el && el.focus) el.focus({ preventScroll: true });
+  }
+}
+function flushSide() { setTimeout(() => { if (sidePending) paintDetail(); }, 0); }
 
 // Arrow keys walk between events: ↑/↓ within a day (all-day band first), ←/→ to
 // the nearest event of the neighbouring day. Esc closes the picker / detail.
@@ -672,6 +893,9 @@ function onKey(ev) {
     // The New-ticket panel stays in the DOM while hidden, so presence alone is no test.
     if (typeof document !== "undefined" && document.querySelector && document.querySelector(MODAL_OPEN)) return;
     if (picker !== null) { picker = null; paint(true); focusQ("[data-open-picker]"); ev.preventDefault(); return; }
+    // Esc in a field (an Edit draft, a relink pick) stays with the field.
+    const f = ev.target;
+    if (f && (/^(INPUT|TEXTAREA|SELECT)$/.test(f.tagName || "") || f.isContentEditable)) return;
     if (detail) { closeDetail(); ev.preventDefault(); return; }
     return;
   }
@@ -696,6 +920,47 @@ function closeDetail() {
   paint(true);
   if (back) restoreFocusSig(back);
 }
+function openDetail(e, from) {
+  detailFrom = from;
+  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; linkPick.clear(); linkErr.clear(); }
+  detail = e;
+  picker = null;
+  paint(true);
+  if ($side && $side.focus) $side.focus();
+}
+// Relink a capture (contract-calendar.md, `POST .../meetings/<mid>/calendar`):
+// `{eventId}` to another event, `{eventId: null}` never linked, `{auto: true}`
+// back to the matcher. The answer's row goes to meetings.js; the weeks re-read.
+async function relink(k, body, target) {
+  if (linkBusy.has(k)) return;
+  const [site, mid] = k.split("/").map(decodeURIComponent);
+  linkBusy.add(k);
+  linkErr.delete(k);
+  paintDetail(true);
+  let res = null, out = {};
+  try {
+    res = await fetch(`/api/orgs/${encodeURIComponent(site)}/meetings/${encodeURIComponent(mid)}/calendar`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  linkBusy.delete(k);
+  const T = typeof TurmaNav !== "undefined" ? TurmaNav : null;
+  const what = body.auto ? "Matching the capture" : body.eventId === null ? "Unlinking the capture" : "Linking the capture";
+  if (res && res.status === 401) { location.href = "/login"; return; }
+  if (!res || !res.ok) {
+    const text = res ? (T && T.refusalText ? T.refusalText(what, res.status, out)
+      : `${what} failed — ${(out && out.error) || `the hub answered HTTP ${res.status}`}`) : `${what} failed — the hub is unreachable`;
+    linkErr.set(k, text);
+    if (T && T.toast) T.toast(text);
+  } else {
+    linkPick.delete(k);
+    if (out && out.meeting && typeof TurmaMeetings !== "undefined" && TurmaMeetings.patch) TurmaMeetings.patch(site, out.meeting);
+    // A Tenir-only entry linked to an event becomes that event: follow it.
+    if (target && detail && detail.source === "tenir") detail = target;
+    refetch();
+  }
+  paintDetail(true);
+}
 function go(ms) { revealing = null; anchor = dayStart(ms); paint(true); }
 
 function mount(el, opts = {}) {
@@ -704,12 +969,40 @@ function mount(el, opts = {}) {
   if (opts && typeof opts.now === "function") nowFn = opts.now;
   if (opts && typeof opts.onData === "function") onData = opts.onData;
   if (opts && typeof opts.openNotes === "function") openNotes = opts.openNotes;
+  // The grid and the detail panel are separate children, painted apart; the
+  // panel's capture part ($mt) is meetings.js's (showPanel).
+  const mk = (tag, cls) => { const x = document.createElement(tag); if (cls) x.className = cls; return x; };
+  $grid = mk("div", "cal-main");
+  $side = mk("aside", "cal-detail");
+  $side.setAttribute("aria-labelledby", "calDetailTitle");
+  $side.tabIndex = -1;
+  $side.hidden = true;
+  $info = mk("div", "cal-dinfo");
+  $mt = mk("div", "cal-dmt");
+  $side.appendChild($info);
+  $side.appendChild($mt);
+  $root.appendChild($grid);
+  $root.appendChild($side);
+  $side.addEventListener("pointerdown", () => { sidePress = true; }, true);
+  $side.addEventListener("focusout", flushSide);
+  const release = () => { if (sidePress) { sidePress = false; flushSide(); } };
+  if (typeof addEventListener === "function") {
+    for (const n of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(n, release, true);
+    addEventListener("blur", (e) => { if (typeof window !== "undefined" && e.target === window) release(); });
+  }
+  $root.addEventListener("change", (ev) => {
+    const t = ev.target, d = t && t.dataset;
+    if (!d || d.linkPick === undefined) return;
+    if (t.value) linkPick.set(d.linkPick, t.value); else linkPick.delete(d.linkPick);
+    paintDetail(true);
+  });
   const mq = typeof window !== "undefined" && window.matchMedia ? window.matchMedia(`(max-width: ${NARROW_PX - 1}px)`) : null;
   narrow = !!(mq && mq.matches);
   if (mq && mq.addEventListener) mq.addEventListener("change", (e) => { narrow = !!e.matches; paint(true); });
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
-      ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],[data-open-notes]") : null;
+      ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
+        + "[data-open-notes],[data-body-toggle],[data-link-go],[data-link-unlink],[data-link-auto]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -717,18 +1010,23 @@ function mount(el, opts = {}) {
     const d = b.dataset;
     if (d.ev !== undefined) {
       const e = shown[Number(d.ev)];
-      if (!e) return;
-      detailFrom = { ev: `${e.host}\u0000${e.id}`, day: d.day };
-      detail = e;
-      picker = null;
-      paint(true);
-      focusQ(".cal-detail");
+      if (e) openDetail(e, { ev: evKey(e), day: d.day });
       return;
     }
     if (d.closeDetail !== undefined) return void closeDetail();
     if (d.openNotes !== undefined) {
       const t = notesTarget(detail, nowFn());
       if (t && openNotes) openNotes(t);
+      return;
+    }
+    if (d.bodyToggle !== undefined) { descOpen = !descOpen; return void paintDetail(true); }
+    if (d.linkGo !== undefined || d.linkUnlink !== undefined || d.linkAuto !== undefined) {
+      if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
+      if (d.linkUnlink !== undefined) return void relink(d.linkUnlink, { eventId: null });
+      if (d.linkAuto !== undefined) return void relink(d.linkAuto, { auto: true });
+      const want = linkPick.get(d.linkGo);
+      const target = ((lastGot && lastGot.events) || []).find((e) => evDomKey(e) === want);
+      if (target) relink(d.linkGo, { eventId: target.id }, target);
       return;
     }
     if (d.step !== undefined) return void go(stepAnchor(anchor, mode(), Number(d.step) < 0 ? -1 : 1));
@@ -770,7 +1068,7 @@ function mount(el, opts = {}) {
 function update(snapshot) { data = snapshot; if (active) paint(); }
 function setActive(on) {
   active = !!on;
-  if (!active) return;
+  if (!active) return void paintDetail();
   // Shown again: a failed week is asked at once, not when its back-off ends.
   for (const w of weeks.values()) if (w.err && w.retry) { clearTimeout(w.retry); w.retry = 0; }
   lastHtml = "";
@@ -783,7 +1081,9 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
+  detailHtml, panelSpec, badgeOf, originalStart, relink, evDomKey,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),
+  _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
 };

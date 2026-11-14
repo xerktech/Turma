@@ -160,8 +160,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     spanning bar; not worth the layout here).
   - Holidays sit in the all-day band; a day off for an org in view (`offFor` ∩ header pick) is
     hatched grey with "Day off · <org>".
-- **Read-only**: nothing drags, creates or edits. A click opens a placeholder side panel
-  (`detailHtml`) that the detail ticket (XERK-2898) replaces.
+- **Read-only grid**: nothing drags, creates or edits. A click opens the detail panel (XERK-2898).
 - Keyboard: events are buttons in day order; ↑/↓ within a day, ←/→ to the nearest event of the
   next day, Esc closes the picker / panel. Every event carries an aria-label sentence.
 - **Esc listens on the document** (so it works after a click elsewhere) and yields to a SHOWN
@@ -172,3 +171,46 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   as `var(--sN)` (`safeColor`).
 - Android: XERK-2900 (`android/PARITY.md`). Tests: `turma/tests/calendar.test.js`, the
   `XERK-2897` cases in `brief.test.js`.
+
+## The event detail panel (XERK-2898)
+
+- **The panel paints apart from the grid**: `calendar.js` mounts `.cal-main` + an `aside.cal-detail`
+  holding `.cal-dinfo` (its own) and `.cal-dmt` (meetings.js's). A grid repaint (frame, clock)
+  never swaps the panel's controls; the info part holds its paint while a field in it is focused
+  or a press is down, like meetings.js.
+- **A capture is reviewed with meetings.js's own controls, never a fork**: `TurmaMeetings.showPanel
+  (el, {site, meetingIds, dailyAt})` paints `meetingHtml` (+ the names, `people`) into `.cal-dmt`
+  and wires the same click/input/change handlers there. Busy, escaping, `edits`, refusals all
+  carry over; `showPanel(el, null)` when the panel closes or the calendar is hidden.
+  - **The keys follow the panel while it shows a meeting** (`panelOn`, `activeOrder`): A/S/E/R/J/K
+    walk its proposals (the hidden notes view's stay inert otherwise), and `followCursor` runs on
+    the panel's order — the SSE-frame-beats-POST rule holds there too.
+  - A review in the panel never moves the notes view's selection: `fromPanel` is decided at the
+    PRESS, never at the answer (the panel may have closed by then, QA). Its cursor is put aside
+    while a panel shows a meeting and restored after.
+  - The panel's aside is NOT `role=dialog`: meetings.js ignores keys from inside a dialog.
+- **An event counts for the org the hub's matcher reads** (`eventOrg` = the served `matchOrg`;
+  an older hub: assigned org, else the host's): for the daily brief and relink candidates (QA:
+  another org's unassigned event was offered; a series pinned to no org must not count).
+- `advanceFrom` resets the NOTES cursor: while a panel is open that is `panel.listCur`, never the
+  live `curItem` (QA: a notes answer landing mid-panel made the next R hit the wrong proposal).
+- One org's captures per panel (the first linked capture's site); a daily event (an Outlook event
+  within 20 min of an org's daily `meetingAt`) shows that entry's brief via `hooks.briefHtml`.
+  `brief.html` listens for the brief's buttons on `#calendarView` too.
+- "Moved from …" is read off the occurrence id (`<GlobalAppointmentID>:<original start>`,
+  `originalStart`), or a Tenir entry's `moved`; Canceled from `canceled`.
+- **Relink** posts `POST .../meetings/<mid>/calendar` (`relink`): candidates are same-day,
+  uncanceled, timed Outlook events of the capture's org or unassigned; Unlink = `{eventId:null}`;
+  "Match automatically" only when the row's `calendarBy` is `operator`. The answer's row goes to
+  `TurmaMeetings.patch`; a Tenir entry that a link (or "Match automatically") merged into an event
+  follows it there on the next read.
+  - **A key in an HTML attribute never carries a NUL** (`evDomKey`): the parser turns it into
+    U+FFFD, and the picker silently did nothing (QA). Test markup that went through a parser.
+- **Badges** (`badgeOf`): proposals still pending (`TurmaMeetings.meetingState`, archived = 0) or a
+  spinner while the captions are read; said in the event's aria-label too.
+- A Tenir entry the snapshot no longer carries shows the entry's own participants/summary/link.
+- The panel keeps XERK-2899's "Open in notes review" (`openNotes`, in `.cal-dinfo`) and paints no
+  "Open in calendar" in its own capture part (`inPanelPaint`): `calTargets` indexes the notes view's
+  paint and a panel push would collide with it.
+- Tests: the `XERK-2898` cases in `calendar.test.js` and `meetings.test.js` (incl. an end-to-end
+  calendar→panel→review run with both modules in one sandbox).

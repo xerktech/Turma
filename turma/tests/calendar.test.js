@@ -17,10 +17,12 @@ let replies = {};
 globalThis.TurmaOrg = { getKeys: () => orgKeys, orgColors: () => null };
 globalThis.TurmaBoard = require("../public/board.js");
 globalThis.location = { href: "" };
-globalThis.fetch = async (u) => {
+const posts = [];   // every non-GET fetch: {url, body}
+globalThis.fetch = async (u, init = {}) => {
   const url = String(u);
+  if (init.method && init.method !== "GET") posts.push({ url, body: init.body ? JSON.parse(init.body) : undefined });
   const key = Object.keys(replies).find((k) => url.startsWith(k));
-  const body = await (key ? replies[key](url) : (url.startsWith("/api/holidays") ? [] : { events: [], hosts: [] }));
+  const body = await (key ? replies[key](url, init) : (url.startsWith("/api/holidays") ? [] : { events: [], hosts: [] }));
   // A reply of {status, body} is a refusal.
   if (body && body.status) return { status: body.status, ok: false, json: async () => body.body || {} };
   return { status: 200, ok: true, json: async () => body };
@@ -109,14 +111,20 @@ test("XERK-2897: canceled, past, tentative, free and Tenir-only styling", () => 
 
 const tick = () => new Promise((r) => setImmediate(r));
 function el() {
-  const e = { _html: "", listeners: {}, addEventListener(n, f) { (this.listeners[n] ||= []).push(f); },
+  const e = { _html: "", listeners: {}, children: [], attrs: {}, addEventListener(n, f) { (this.listeners[n] ||= []).push(f); },
+    setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; },
+    appendChild(c) { this.children.push(c); return c; },
     querySelector() { return null; }, querySelectorAll() { return []; }, contains(t) { return !!t && t.inside === true; } };
-  Object.defineProperty(e, "innerHTML", { get() { return this._html; }, set(v) { this._html = String(v); } });
+  // A parent's markup is its children's (the grid, the detail panel), as a browser's would be.
+  Object.defineProperty(e, "innerHTML", { get() { return this._html + this.children.map((c) => c.innerHTML).join(""); },
+    set(v) { this._html = String(v); } });
   return e;
 }
 const root = el();
 let NOW = at(2026, 11, 11, 10, 30);
+globalThis.document = { createElement: () => el(), activeElement: null, querySelector: () => null };
 cal.mount(root, { now: () => NOW });
+delete globalThis.document;
 
 async function show(anchorMs) {
   cal.setActive(true);
@@ -151,7 +159,9 @@ test("XERK-2897: every served string is escaped; canceled + Tenir events render 
   // The placeholder detail escapes too.
   const btn = /data-ev="(\d+)" data-day="(\d+)"/.exec(html);
   for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { ev: btn[1], day: btn[2] } }) } });
-  assert.ok(root.innerHTML.includes('class="cal-detail"'));
+  const { side, info } = cal._els();
+  assert.equal(side.hidden, false);
+  assert.match(info.innerHTML, /id="calDetailTitle">Canceled: &lt;img/);
   assert.ok(!root.innerHTML.includes("<img"));
 });
 
@@ -374,6 +384,221 @@ test("XERK-2897: a read the frame dropped is not retried off screen", { timeout:
   assert.equal(asked.length, 1, "the dropped week's failure arms no retry");
 });
 
+// ---- XERK-2898: the event detail panel ------------------------------------------------
+const click = (dataset) => { for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset, getAttribute: () => null }) } }); };
+const change = (dataset, value) => { for (const f of root.listeners.change || []) f({ target: { dataset, value } }); };
+async function openEvent(anchorMs, match) {
+  const html = await show(anchorMs);
+  const re = new RegExp(`data-ev="(\\d+)" data-day="(\\d+)"[^>]*aria-label="${match}`);
+  const m = re.exec(html);
+  assert.ok(m, `an event button labelled ${match}`);
+  click({ ev: m[1], day: m[2] });
+  return cal._els().info.innerHTML;
+}
+
+test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurrence, people, responses — every field escaped", async () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  replies = { "/api/calendar": () => ({ hosts: [], events: [{
+    host: "h1", id: "G1:2027-03-09T09:00:00-05:00", seriesId: "G1", org: "", source: "outlook", meetings: [],
+    subject: `Plan ${evil}`, startMs: at(2027, 3, 10, 14), endMs: at(2027, 3, 10, 15), canceled: true, recurring: true,
+    location: evil, organizer: evil, organizerEmail: "o@x.example", myResponse: "accepted",
+    attendees: [{ name: evil, email: "a@x.example", role: "optional", response: "declined" },
+      { name: "", email: "b@x.example", role: "required", response: "accepted" }, "junk"],
+    joinUrl: "https://teams.example/j/1", body: `line one\n${evil}`, categories: [evil, "Blue", 7],
+  }] }) };
+  cal.refetch();
+  let h = await openEvent(at(2027, 3, 10), "Canceled: Plan");
+  assert.ok(!h.includes("<img"), "no raw markup from a served field");
+  assert.match(h, /id="calDetailTitle">Canceled: Plan &lt;img/);
+  assert.match(h, /cal-dstate">Canceled</);
+  assert.match(h, /<span class="k">Moved<\/span><span class="v">from Tuesday, March 9, 9:00\s?AM<\/span>/);
+  assert.match(h, /Part of a recurring series/);
+  assert.match(h, /&lt;img src=x onerror=alert\(1\)&gt; \(o@x\.example\)/);
+  assert.match(h, /<span class="k">You<\/span><span class="v">Accepted</);
+  assert.match(h, /<span class="who" title="a@x\.example">&lt;img[^<]*<\/span><span class="role">optional<\/span><span class="resp declined">Declined/);
+  assert.match(h, /<span class="who">b@x\.example<\/span><span class="resp accepted">Accepted/);
+  assert.match(h, /<span class="cal-cat">&lt;img[^<]*<\/span><span class="cal-cat">Blue<\/span><\/span>/);
+  assert.match(h, /href="https:\/\/teams\.example\/j\/1"[^>]*>Join meeting/);
+  assert.match(h, /data-body-toggle aria-expanded="false"/);
+  assert.doesNotMatch(h, /cal-dbody/, "the description starts collapsed");
+  assert.equal(cal._els().side.hidden, false);
+  click({ bodyToggle: "" });
+  h = cal._els().info.innerHTML;
+  assert.match(h, /<div class="cal-dbody">line one<br>&lt;img src=x onerror=alert\(1\)&gt;<\/div>/);
+  click({ closeDetail: "" });
+  assert.equal(cal._els().side.hidden, true);
+  // A join link is only ever an https URL.
+  assert.doesNotMatch(cal.detailHtml({ host: "h", id: "x", startMs: 1, endMs: 2, joinUrl: "javascript:alert(1)" }, 0), /Join meeting|javascript:/);
+  // An occurrence still at its original start says nothing about a move.
+  assert.equal(cal.originalStart({ id: "G1:2027-03-09T09:00:00-05:00", seriesId: "" }), NaN);
+  assert.doesNotMatch(cal.detailHtml({ host: "h", id: "G1:2027-03-09T09:00:00-05:00", seriesId: "G1",
+    startMs: Date.parse("2027-03-09T09:00:00-05:00"), endMs: Date.parse("2027-03-09T10:00:00-05:00") }, 0), /Moved/);
+});
+
+test("XERK-2898: a Tenir-only entry says it is not on Outlook and shows what the capture knows, escaped", () => {
+  const evil = "<script>x</script>";
+  const ev = { source: "tenir", host: "", org: "acme", id: "tenir:m9", site: "acme", meetingId: "m9", subject: `Hallway ${evil}`,
+    startMs: at(2027, 3, 10, 14), endMs: at(2027, 3, 10, 15), participants: [evil, "Bo", 3], summary: `We met.\n\n${evil}`,
+    tenirUrl: "https://tenir.example/c/9", status: "ok", moved: true, calendarEventMissing: true, ambiguous: true };
+  const h = cal.detailHtml(ev, at(2027, 3, 11));
+  assert.ok(!h.includes("<script>"));
+  assert.match(h, /Captured by Tenir — not on Outlook/);
+  assert.match(h, /its Outlook event moved to another time/);
+  assert.match(h, /no longer on the calendar/);
+  assert.match(h, /More than one Outlook event fits/);
+  assert.match(h, /<div class="mt-people" aria-label="Participants"><span>&lt;script&gt;x&lt;\/script&gt;<\/span><span>Bo<\/span><\/div>/);
+  assert.match(h, /<p>We met\.<\/p><p>&lt;script&gt;/);
+  assert.match(h, /href="https:\/\/tenir\.example\/c\/9"/);
+  assert.match(h, /This capture/);
+  // meetings.js painted the row itself: the entry's own copy is not repeated.
+  assert.doesNotMatch(cal.detailHtml(ev, 0, true), /mt-people|mt-summary|Open in Tenir/);
+  assert.doesNotMatch(cal.detailHtml({ ...ev, tenirUrl: "javascript:alert(1)" }, 0), /javascript:|Open in Tenir/);
+});
+
+test("XERK-2898: badges count proposals still needing review; a meeting being read shows a spinner", async () => {
+  const state = { "acme/m1": { pending: 3, reading: false }, "acme/m2": { pending: 0, reading: true }, "beta/m3": { pending: 1, reading: false } };
+  globalThis.TurmaMeetings = { meetingState: (_d, site, mid) => state[`${site}/${mid}`] || null, showPanel: () => false };
+  try {
+    cal.update({ agents: [] });
+    const o = (over) => ({ host: "h1", id: over.id, org: "", startMs: at(2027, 4, 7, 9), endMs: at(2027, 4, 7, 10), ...over });
+    assert.deepEqual(cal.badgeOf(o({ id: "a", meetings: [{ site: "acme", meetingId: "m1" }, { site: "beta", meetingId: "m3" }] })), { pending: 4, reading: false });
+    assert.deepEqual(cal.badgeOf(o({ id: "b", meetings: [{ site: "acme", meetingId: "m2" }] })), { pending: 0, reading: true });
+    // A Tenir entry the snapshot no longer carries falls back to its own status.
+    assert.deepEqual(cal.badgeOf(o({ id: "tenir:zz", source: "tenir", site: "acme", meetingId: "zz", status: "running" })), { pending: 0, reading: true });
+    assert.deepEqual(cal.badgeOf(o({ id: "c" })), { pending: 0, reading: false });
+    replies = { "/api/calendar": () => ({ hosts: [], events: [
+      o({ id: "a", subject: "Review me", meetings: [{ site: "acme", meetingId: "m1" }] }),
+      o({ id: "b", subject: "Reading", startMs: at(2027, 4, 7, 11), endMs: at(2027, 4, 7, 12), meetings: [{ site: "acme", meetingId: "m2" }] }),
+      o({ id: "d", subject: "Plain", startMs: at(2027, 4, 7, 13), endMs: at(2027, 4, 7, 14), meetings: [{ site: "acme", meetingId: "gone" }] }),
+    ] }) };
+    cal.refetch();
+    const html = await show(at(2027, 4, 7));
+    assert.match(html, /aria-label="Review me,[^"]*, 3 proposals to review"><span class="t"><span class="tx">Review me<\/span><span class="cal-badge" aria-hidden="true"><svg[^]*?<\/svg>3<\/span>/);
+    assert.match(html, /aria-label="Reading,[^"]*, the meeting is being read"><span class="t"><span class="tx">Reading<\/span><span class="cal-badge reading" aria-hidden="true"><span class="cal-spin">/);
+    assert.match(html, /aria-label="Plain,[^"]*"><span class="t"><span class="tx">Plain<\/span><\/span>/);
+  } finally { delete globalThis.TurmaMeetings; }
+});
+
+test("XERK-2898: the panel asks meetings.js for one org's captures and a daily meeting's brief", () => {
+  assert.deepEqual(cal.panelSpec({ source: "outlook", org: "x", startMs: 5, meetings: [
+    { site: "acme", meetingId: "m1" }, { site: "beta", meetingId: "m2" }, { site: "acme", meetingId: "m3" }] }),
+  { site: "acme", meetingIds: ["m1", "m3"], dailyAt: 5 });
+  assert.deepEqual(cal.panelSpec({ source: "outlook", org: "acme", startMs: 5, meetings: [] }), { site: "acme", meetingIds: [], dailyAt: 5 });
+  assert.equal(cal.panelSpec({ source: "outlook", org: "", startMs: 5 }), null);
+  assert.deepEqual(cal.panelSpec({ source: "tenir", site: "acme", meetingId: "m9", org: "acme", startMs: 5 }), { site: "acme", meetingIds: ["m9"], dailyAt: 0 });
+});
+
+test("XERK-2898: relink — link a Tenir capture to an event, unlink, back to automatic; a refusal shows the hub's words", async () => {
+  const patched = [];
+  globalThis.TurmaMeetings = { meetingState: () => ({ pending: 0, reading: false, title: "Sync", calendarBy: "operator" }),
+    showPanel: () => false, patch: (site, row) => patched.push([site, row]) };
+  let answer = { ok: true, meeting: { meetingId: "m9" } };
+  const day = at(2027, 5, 12);
+  const outlook = { host: "h1", id: "OUT1", org: "", source: "outlook", subject: "Design <review>", startMs: at(2027, 5, 12, 10), endMs: at(2027, 5, 12, 11), meetings: [] };
+  const tenir = { host: "", id: "tenir:m9", source: "tenir", site: "acme", meetingId: "m9", org: "acme", subject: "Captured chat",
+    startMs: at(2027, 5, 12, 10, 5), endMs: at(2027, 5, 12, 10, 50), status: "ok" };
+  replies = { "/api/calendar": () => ({ hosts: [], events: [outlook, tenir,
+    { ...outlook, id: "CANCEL", subject: "Gone", canceled: true }, { ...outlook, id: "OTHERDAY", subject: "Tomorrow", startMs: at(2027, 5, 13, 10), endMs: at(2027, 5, 13, 11) },
+    { ...outlook, id: "OTHERORG", subject: "Beta", org: "beta" },
+    // Unassigned, but on a host decided into another org: the hub's matcher counts it there.
+    { ...outlook, host: "h2", id: "H2UNASSIGNED", subject: "Elsewhere" }] }),
+  "/api/orgs/": () => answer };
+  try {
+    cal.update({ agents: [{ key: "h1", org: "acme" }, { key: "h2", org: "beta" }] });
+    cal.refetch();
+    posts.length = 0;
+    let h = await openEvent(day, "Captured chat");
+    assert.match(h, /data-link-pick="acme\/m9"/);
+    // The key rides the attribute with no NUL (a parser turns it into U+FFFD, QA).
+    assert.match(h, /<option value="h1\/OUT1">10:00\s?AM · Design &lt;review&gt;<\/option>/);
+    assert.ok(!h.includes("\u0000"));
+    assert.doesNotMatch(h, /Gone|Tomorrow|Beta|Elsewhere/, "only same-day, uncanceled events of its org (an unassigned one by its host's)");
+    assert.match(h, /data-link-go="acme\/m9" aria-disabled="true"/, "nothing picked yet");
+    assert.doesNotMatch(h, /data-link-unlink/, "an unlinked capture has nothing to unlink");
+    assert.match(h, /data-link-auto="acme\/m9"/);
+    change({ linkPick: "acme/m9" }, "h1/OUT1");
+    assert.match(cal._els().info.innerHTML, /<option value="h1\/OUT1" selected>/, "the pick survives the repaint");
+    click({ linkGo: "acme/m9" });
+    click({ linkGo: "acme/m9" });                                 // a second press while in flight
+    for (let i = 0; i < 6; i++) await tick();
+    assert.deepEqual(posts.filter((p) => p.url.includes("/calendar")), [{ url: "/api/orgs/acme/meetings/m9/calendar", body: { eventId: "OUT1" } }]);
+    assert.deepEqual(patched, [["acme", { meetingId: "m9" }]]);
+    assert.equal(cal._state().detail.id, "OUT1", "the panel follows the capture to its event");
+    // From the event: unlink, and back to the matcher.
+    posts.length = 0;
+    const capOnEvent = { ...outlook, meetings: [{ site: "acme", meetingId: "m9", title: "Captured <chat>" }] };
+    h = cal.detailHtml(capOnEvent, day);
+    assert.match(h, /Tenir capture: <b>Captured &lt;chat&gt;<\/b>/);
+    assert.match(h, /data-link-unlink="acme\/m9"/);
+    await cal.relink("acme/m9", { eventId: null });
+    await cal.relink("acme/m9", { auto: true });
+    assert.deepEqual(posts.map((p) => p.body), [{ eventId: null }, { auto: true }]);
+    // A refusal is the hub's words, escaped, inline (the next read carries the link).
+    replies["/api/calendar"] = () => ({ hosts: [], events: [capOnEvent] });
+    cal.refetch();
+    for (let i = 0; i < 6; i++) await tick();
+    answer = { status: 404, body: { error: "no calendar event of this tenant's hosts has <that> id" } };
+    await cal.relink("acme/m9", { eventId: null });
+    assert.match(cal._els().info.innerHTML, /Unlinking the capture failed — no calendar event of this tenant&#39;s hosts has &lt;that&gt; id/);
+  } finally { delete globalThis.TurmaMeetings; click({ closeDetail: "" }); }
+});
+
+test("XERK-2898: a Tenir entry that 'Match automatically' merges into an event follows it there", async () => {
+  globalThis.TurmaMeetings = { meetingState: () => ({ pending: 0, reading: false, title: "Chat", calendarBy: "operator" }),
+    showPanel: () => false, patch: () => {} };
+  const ev = { host: "h1", id: "STAND", org: "acme", source: "outlook", subject: "Standup", startMs: at(2027, 7, 14, 9), endMs: at(2027, 7, 14, 9, 30), meetings: [] };
+  const entry = { host: "", id: "tenir:c1", source: "tenir", site: "acme", meetingId: "c1", org: "acme", subject: "Chat",
+    startMs: at(2027, 7, 14, 9, 2), endMs: at(2027, 7, 14, 9, 25), status: "ok" };
+  let linked = false;
+  replies = { "/api/calendar": () => ({ hosts: [], events: linked ? [{ ...ev, meetings: [{ site: "acme", meetingId: "c1", title: "Chat" }] }] : [ev, entry] }),
+    "/api/orgs/": () => { linked = true; return { ok: true, meeting: { meetingId: "c1" } }; } };
+  try {
+    cal.update({ agents: [{ key: "h1", org: "acme" }] });
+    cal.refetch();
+    await openEvent(at(2027, 7, 14), "Chat");
+    await cal.relink("acme/c1", { auto: true });
+    for (let i = 0; i < 6; i++) await tick();
+    assert.equal(cal._state().detail.id, "STAND");
+    assert.match(cal._els().info.innerHTML, /Tenir capture: <b>Chat<\/b>[^]*data-link-unlink="acme\/c1"/);
+  } finally { delete globalThis.TurmaMeetings; click({ closeDetail: "" }); }
+});
+
+test("XERK-2898: an unassigned event asks for its host's org (the daily brief needs one)", () => {
+  cal.update({ agents: [{ key: "h1", org: "acme" }] });
+  assert.deepEqual(cal.panelSpec({ source: "outlook", host: "h1", org: "", startMs: 5, meetings: [] }), { site: "acme", meetingIds: [], dailyAt: 5 });
+  assert.equal(cal.panelSpec({ source: "outlook", host: "nobody", org: "", startMs: 5 }), null);
+  cal.update({ agents: [] });
+});
+
+test("XERK-2898 QA: the detail's repaint waits while its relink pick has focus", async () => {
+  replies = { "/api/calendar": () => ({ hosts: [], events: [{ host: "h1", id: "HOLD", org: "", source: "outlook", subject: "Hold me",
+    startMs: at(2027, 8, 11, 9), endMs: at(2027, 8, 11, 10), meetings: [] }] }) };
+  cal.refetch();
+  await openEvent(at(2027, 8, 11), "Hold me");
+  const before = cal._els().info.innerHTML;
+  globalThis.document = { activeElement: { inside: true, tagName: "SELECT", dataset: {} }, querySelector: () => null };
+  try {
+    replies = { "/api/calendar": () => ({ hosts: [], events: [{ host: "h1", id: "HOLD", org: "", source: "outlook", subject: "Hold me",
+      location: "Room 2", startMs: at(2027, 8, 11, 9), endMs: at(2027, 8, 11, 10), meetings: [] }] }) };
+    cal.refetch();
+    for (let i = 0; i < 6; i++) await tick();
+    assert.equal(cal._els().info.innerHTML, before, "held while the field has focus");
+  } finally { delete globalThis.document; }
+  for (const f of cal._els().side.listeners.focusout) f({});
+  await new Promise((r) => setTimeout(r, 5));
+  assert.match(cal._els().info.innerHTML, /Room 2/);
+  click({ closeDetail: "" });
+});
+
+test("XERK-2898 QA: the served matchOrg decides — a series pinned to no org is no candidate and opens no panel", () => {
+  cal.update({ agents: [{ key: "h1", org: "acme" }] });
+  // Unassigned on an acme host, but the hub says it counts for no org.
+  assert.equal(cal.panelSpec({ source: "outlook", host: "h1", org: "", matchOrg: "", startMs: 5 }), null);
+  assert.deepEqual(cal.panelSpec({ source: "outlook", host: "h1", org: "", matchOrg: "beta", startMs: 5, meetings: [] }),
+    { site: "beta", meetingIds: [], dailyAt: 5 });
+  cal.update({ agents: [] });
+});
+
 // ---- XERK-2899: the notes review's upcoming list and the two-way jump ----------------
 // Last in the file: once the notes review asks for upcoming meetings, the calendar
 // keeps reading those weeks while hidden (what the "hidden asks nothing" case pins
@@ -518,10 +743,12 @@ test("XERK-2914: a reveal scrolls the grid to the event and moves focus into its
   replies = { "/api/calendar": () => ({ hosts: [], events: [
     { host: "h1", id: "late", org: "acme", subject: "Late one", startMs: at(2027, 2, 3, 15), endMs: at(2027, 2, 3, 16) },
   ] }) };
+  const [grid, side] = root.children;            // mount's .cal-main and aside.cal-detail
   const scroller = { scrollTop: 0 };
-  const panel = { focused: 0, focus() { this.focused++; } };
-  const qs = root.querySelector;
-  root.querySelector = (sel) => (sel === "#calScroll" ? scroller : sel === ".cal-detail" ? panel : null);
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  let focused = 0;
+  side.focus = () => { focused++; };
   try {
     cal.refetch();
     cal.setActive(true);
@@ -530,15 +757,16 @@ test("XERK-2914: a reveal scrolls the grid to the event and moves focus into its
     assert.equal(cal._state().detail && cal._state().detail.id, "late");
     // 15:00 is row 30 of 24px; one hour of context sits above it.
     assert.equal(scroller.scrollTop, (900 / 30) * 24 - 48, "the grid scrolls to the event");
-    assert.equal(panel.focused, 1, "the panel takes focus");
+    assert.equal(focused, 1, "the panel takes focus");
     // A later repaint leaves the operator's scroll and focus alone.
     scroller.scrollTop = 5;
     cal.refetch();
     for (let i = 0; i < 4; i++) await tick();
     assert.equal(scroller.scrollTop, 5);
-    assert.equal(panel.focused, 1);
+    assert.equal(focused, 1);
   } finally {
-    root.querySelector = qs;
+    grid.querySelector = qs;
+    delete side.focus;
     cal.setActive(false);
   }
 });
