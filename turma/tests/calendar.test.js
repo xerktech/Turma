@@ -142,7 +142,9 @@ test("XERK-2897: canceled, past, tentative, free and Tenir-only styling", () => 
 
 const tick = () => new Promise((r) => setImmediate(r));
 function el() {
-  const e = { _html: "", listeners: {}, children: [], attrs: {}, addEventListener(n, f) { (this.listeners[n] ||= []).push(f); },
+  const e = { _html: "", listeners: {}, children: [], attrs: {},
+    style: { props: {}, setProperty(k, v) { this.props[k] = String(v); }, removeProperty(k) { delete this.props[k]; } },
+    addEventListener(n, f) { (this.listeners[n] ||= []).push(f); },
     setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; },
     appendChild(c) { this.children.push(c); return c; },
     querySelector() { return null; }, querySelectorAll() { return []; }, contains(t) { return !!t && t.inside === true; } };
@@ -1061,4 +1063,44 @@ test("XERK-2943: brief.html keeps the CSS that sizes short blocks and clears the
   assert.match(css, /\.cal-ev:not\(\.allday\) \{ container-type: size;/);
   assert.match(css, /@container \(height < 34px\) \{[^}]*\.cal-evb \{[^}]*\}\s*\.cal-evb \.m \{ display: none; \}/);
   assert.match(css, /\.cal:has\(> \.cal-detail:not\(\[hidden\]\)\) > \.cal-main \{\s*margin-right: max\(0px, 447px - max\(0px, \(100vw - var\(--tri-wrap\)\) \/ 2\)\);/);
+});
+
+test("XERK-2939: the detail panel wears its event's org color; an unassigned or forged one stays plain", async () => {
+  const board = globalThis.TurmaBoard;
+  globalThis.TurmaBoard = { ...board, orgColorMap: () => new Map([["acme", "var(--s3)"], ["evil", "red;x:url(y)"]]) };
+  replies = { "/api/calendar": () => ({ hosts: [], events: [
+    { host: "h1", id: "o1", org: "acme", source: "outlook", meetings: [], subject: "Acme sync",
+      startMs: at(2027, 4, 7, 9), endMs: at(2027, 4, 7, 10) },
+    { host: "h1", id: "o2", org: "", source: "outlook", meetings: [], subject: "Loose",
+      startMs: at(2027, 4, 7, 11), endMs: at(2027, 4, 7, 12) },
+    { host: "h1", id: "o3", org: "evil", source: "outlook", meetings: [], subject: "Forged",
+      startMs: at(2027, 4, 7, 13), endMs: at(2027, 4, 7, 14) },
+  ] }) };
+  try {
+    cal.refetch();
+    const { side } = cal._els();
+    await openEvent(at(2027, 4, 7), "Acme sync");
+    assert.equal(side.style.props["--org"], "var(--s3)");
+    await openEvent(at(2027, 4, 7), "Loose");
+    assert.equal(side.style.props["--org"], undefined, "an unassigned event clears the previous tint");
+    await openEvent(at(2027, 4, 7), "Acme sync");
+    await openEvent(at(2027, 4, 7), "Forged");
+    assert.equal(side.style.props["--org"], undefined, "only a var(--sN) slot is ever inlined");
+  } finally {
+    globalThis.TurmaBoard = board;
+  }
+});
+
+test("XERK-2939: the detail panel's tint is exactly the session card's mix", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const read = (f) => fs.readFileSync(path.join(__dirname, "..", "public", f), "utf8");
+  const mix = (css, sel) => {
+    const rule = new RegExp(`${sel}\\s*\\{[^}]*?background:\\s*color-mix\\(in srgb, var\\(--org[^)]*\\)\\)?\\s*(\\d+)%, var\\(--surface\\)\\)`).exec(css);
+    assert.ok(rule, `${sel} has an org color-mix background`);
+    return rule[1];
+  };
+  const card = mix(read("sessions.html"), "\\.s-card");
+  assert.equal(mix(read("app.css"), "\\.kanban-card"), card);
+  assert.equal(mix(read("brief.html"), "\\.cal-detail"), card, "the panel matches the session card (operator's rule)");
 });

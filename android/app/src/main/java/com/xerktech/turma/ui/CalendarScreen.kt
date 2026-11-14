@@ -66,6 +66,7 @@ import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
@@ -345,8 +346,10 @@ private fun CalendarBody(
     }
     val panel: @Composable (Modifier, CalendarEvent) -> Unit = { m, ev ->
         key(ev.key) {
+            val series = TurmaColors.series()
             CalendarDetail(
-                m, ev, side, now, zone, locale, fleet, names, range.events, range.hostRows[ev.host], cvm, bvm, mvm,
+                m, ev, colors[ev.org]?.let { series[it % series.size] },
+                side, now, zone, locale, fleet, names, range.events, range.hostRows[ev.host], cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
             )
         }
@@ -780,6 +783,12 @@ private fun CalBadgeView(b: com.xerktech.turma.core.CalBadge) {
     }
 }
 
+/** The detail panel's background: exactly a session card's org tint ([orgCardColor], XERK-2939). */
+internal fun calPanelTint(orgColor: Color?, surface: Color): Color = orgCardColor(orgColor, surface)
+
+/** A text color on that panel: half [c], half [ink] in sRGB, the web's `color-mix(… 50%, var(--ink))`. */
+internal fun calOnTint(c: Color, ink: Color): Color = c.copy(alpha = 0.5f).compositeOver(ink)
+
 /**
  * The event's detail (XERK-2898): Outlook's details, Join, Open in notes review,
  * attendees and the description, then a linked capture's summary + proposals
@@ -792,6 +801,7 @@ private fun CalBadgeView(b: com.xerktech.turma.core.CalBadge) {
 private fun CalendarDetail(
     modifier: Modifier,
     ev: CalendarEvent,
+    orgColor: Color?,
     wide: Boolean,
     now: Long,
     zone: ZoneId,
@@ -808,12 +818,18 @@ private fun CalendarDetail(
     dailyFor: (String, Long) -> TriageEntry?,
 ) {
     val uri = LocalUriHandler.current
-    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    // The panel wears its event's org tint, as its grid block does (XERK-2939); no org = plain.
+    // Its text colors are pulled toward ink so they stay ≥4.5:1 on every tint (web `.cal-detail`).
+    val cs = MaterialTheme.colorScheme
+    val tint = calPanelTint(orgColor, cs.surface)
+    val onTint: (Color) -> Color = { calOnTint(it, cs.onSurface) }
+    val muted = onTint(cs.onSurfaceVariant)
     val hostOrg: (String) -> String = { h -> fleet.agents.firstOrNull { it.key == h }?.org.orEmpty() }
     val orgLabel: (String) -> String = { s -> if (s.isEmpty()) "No org" else com.xerktech.turma.core.orgName(s, names[s].orEmpty()) }
     var descOpen by rememberSaveable { mutableStateOf(false) }
     var attOpen by rememberSaveable { mutableStateOf(false) }   // collapsed by default (XERK-2942)
-    Column(modifier.fillMaxSize().testTag("cal-detail")) {
+    MaterialTheme(colorScheme = cs.copy(primary = onTint(cs.primary), onSurfaceVariant = muted)) {
+    Column(modifier.fillMaxSize().background(tint).testTag("cal-detail")) {
         Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(
                 calTitle(ev), Modifier.weight(1f).semantics { heading() },
@@ -834,7 +850,7 @@ private fun CalendarDetail(
                 if (ev.busy == "free") add("Free")
                 if (ev.busy == "outOfOffice") add("Out of office")
             }
-            if (state.isNotEmpty()) Text(state.joinToString(" · "), color = TurmaColors.warning, fontWeight = FontWeight.SemiBold)
+            if (state.isNotEmpty()) Text(state.joinToString(" · "), color = onTint(TurmaColors.waitingText()), fontWeight = FontWeight.SemiBold)
             DetailRow("When", calWhenText(ev, zone, locale))
             calMovedFrom(ev)?.let { o ->
                 DetailRow("Moved", "from ${calLongDay(calDay(o, zone), locale)}, ${calTime(o, zone, locale)}")
@@ -880,9 +896,9 @@ private fun CalendarDetail(
                         val resp = calAttendeeResponse(a.response)
                         if (resp.isNotEmpty()) {
                             Text(resp, style = MaterialTheme.typography.bodySmall, color = when (a.response) {
-                                "accepted", "organizer" -> TurmaColors.good
-                                "declined" -> TurmaColors.critical
-                                "tentative" -> TurmaColors.warning
+                                "accepted", "organizer" -> onTint(TurmaColors.workingText())
+                                "declined" -> onTint(TurmaColors.criticalText())
+                                "tentative" -> onTint(TurmaColors.waitingText())
                                 else -> muted
                             })
                         }
@@ -914,7 +930,7 @@ private fun CalendarDetail(
             for (m in caps) {
                 HorizontalDivider()
                 Text(meetingTitle(m), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                MeetingPart(spec!!.site, m, mvm)
+                MeetingPart(spec!!.site, m, mvm, textOn = onTint)
             }
             // What a Tenir entry says when the snapshot no longer carries its row.
             if (ev.tenir && caps.isEmpty()) {
@@ -938,6 +954,7 @@ private fun CalendarDetail(
             }
             Spacer(Modifier.height(12.dp))
         }
+    }
     }
 }
 

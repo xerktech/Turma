@@ -339,8 +339,22 @@
      The grid ends 33px (wrap 20 + .cal 12 + border 1) plus the centred wrap's side gap from the edge. */
   @media (min-width: 1100px) { .cal:has(> .cal-detail:not([hidden])) > .cal-main {
     margin-right: max(0px, 447px - max(0px, (100vw - var(--tri-wrap)) / 2)); } }
+  .cal { --cal-muted: var(--muted); --cal-accent-text: var(--accent-text); --cal-good-text: var(--good-text);
+    --cal-critical-text: var(--critical-text); --cal-warning-text: var(--warning-text); }
   .cal-detail { position: fixed; top: 0; right: 0; bottom: 0; z-index: 40; width: min(480px, 100vw); box-sizing: border-box;
-    overflow-y: auto; padding: 18px 20px 32px; background: var(--surface); border-left: 1px solid var(--border);
+    overflow-y: auto; padding: 18px 20px 32px; border-left: 1px solid var(--border);
+    /* The event's org tint, exactly the session/board card's (XERK-2939, app.css .kanban-card,
+       sessions.html); no org = plain surface. */
+    --org: var(--surface); background: color-mix(in srgb, var(--org) 12%, var(--surface));
+    /* Every text color the panel shows is pulled halfway to ink, so it clears 4.5:1 on all eight
+       org tints in both themes, chip backgrounds included (on the light tint --muted fell to 2.4:1,
+       --critical-text to 3.2:1, the decision chip to 2.8:1). They read the page's values captured
+       on .cal, since a token can't mix itself. */
+    --muted: color-mix(in srgb, var(--cal-muted) 50%, var(--ink));
+    --accent-text: color-mix(in srgb, var(--cal-accent-text) 50%, var(--ink));
+    --good-text: color-mix(in srgb, var(--cal-good-text) 50%, var(--ink));
+    --critical-text: color-mix(in srgb, var(--cal-critical-text) 50%, var(--ink));
+    --warning-text: color-mix(in srgb, var(--cal-warning-text) 50%, var(--ink));
     box-shadow: -12px 0 32px rgba(0, 0, 0, 0.25); }
   .cal-detail-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
   .cal-detail h2 { flex: 1 1 auto; font-family: var(--font-display); font-size: 18px; margin: 0; overflow-wrap: anywhere; }
