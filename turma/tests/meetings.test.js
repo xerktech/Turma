@@ -150,11 +150,21 @@ test("XERK-2885: a failed types load is not re-asked on repaint, only on the ope
   // (it used to re-ask the tracker every few seconds while the page was open).
   for (let i = 0; i < 5; i++) { P.renderMeetings(data(), true); await P.settle(); }
   assert.equal(typeFetches().length, 1, "no repaint-driven refetch");
+  // Edit and a project pick are acts too: each asks again with retry=1.
+  P.startEdit(P.itemKey(SITE, "m1", "p1"));
+  await P.settle();
+  assert.equal(typeFetches().length, 2);
+  assert.match(typeFetches()[1].url, /project=ACME&retry=1$/);
+  P.edits.clear();
+  for (const fn of P.els.meetingList.listeners.change) fn({ target: { value: "ACME", dataset: { project: SITE } } });
+  await P.settle();
+  assert.equal(typeFetches().length, 3);
+  assert.match(typeFetches()[2].url, /project=ACME&retry=1$/);
   // Approve is an act: it asks again, telling the hub to skip its cached failure.
   typesOk = true;
   await P.review(P.itemKey(SITE, "m1", "p1"), "approve");
-  assert.equal(typeFetches().length, 2);
-  assert.match(typeFetches()[1].url, /project=ACME&retry=1$/);
+  assert.equal(typeFetches().length, 4);
+  assert.match(typeFetches()[3].url, /project=ACME&retry=1$/);
   assert.equal(P.fetches.filter((f) => f.method === "POST").length, 1);
 });
 
