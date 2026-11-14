@@ -25759,7 +25759,7 @@ def normalize_meeting_transcript(doc, run_id, site_key):
 
 
 # Whose work to propose (XERK-2514): the operator's names as captions show them
-# and their role, set per org on the Brief page and sent on `extractMeeting` as
+# and their role, set per org on the Meetings page and sent on `extractMeeting` as
 # `focus`. A standup is everyone's status; without it every speaker's work
 # became a proposal. The model is told to keep only the operator's work, and
 # meeting_focus_filter drops any item it still assigns to someone else.

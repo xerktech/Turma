@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Turma — Brief</title>
+<title>Turma — Meetings</title>
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="32x32">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -12,10 +12,10 @@
 <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
 <link rel="stylesheet" href="/app.css">
 <style>
-  /* The Brief page (XERK-2396, XERK-2857): one two-pane triage of every org's
+  /* The Meetings page (/meetings; was /brief, XERK-2893; XERK-2396, XERK-2857): one two-pane triage of every org's
      meetings and daily briefs, painted by meetings.js; the brief block and the
      schedule editor are this page's (mount hooks). Tokens/base/nav live in app.css.
-     Android's Brief tab is its counterpart (android/PARITY.md). */
+     Android's Meetings tab is its counterpart (android/PARITY.md). */
   .wrap.tri-wrap { max-width: 1280px; padding-top: 16px; }
   .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
     opacity: 0.5; cursor: default; border-color: var(--border); }
@@ -225,7 +225,7 @@
 </style>
 </head>
 <body class="app-shell">
-<header class="site-header" id="siteHeader" data-page="brief"></header>
+<header class="site-header" id="siteHeader" data-page="meetings"></header>
 <div class="page-scroll">
 <div class="wrap tri-wrap">
   <div id="meetingList" class="mt-list"></div>
@@ -518,7 +518,7 @@ function render(data) {
   renderBriefs(data, Date.now());
 }
 
-// `#brief`, `#meetings` and the old /meetings URL all land on the one pane.
+// `#brief`, `#meetings` and the old /brief URL all land on the one pane.
 TurmaMeetings.mount($briefs, {
   now: () => paintAt || Date.now(),
   nextOf: (site) => {

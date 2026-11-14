@@ -18,7 +18,7 @@ const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html", "
 
 test("nav: every page's tab is in the list, once", () => {
   const ids = PAGES.map(p => p.id);
-  assert.deepEqual(ids, ["dashboard", "sessions", "board", "brief", "usage", "insights"]);
+  assert.deepEqual(ids, ["dashboard", "sessions", "board", "meetings", "usage", "insights"]);
   assert.equal(new Set(ids).size, ids.length);
 });
 

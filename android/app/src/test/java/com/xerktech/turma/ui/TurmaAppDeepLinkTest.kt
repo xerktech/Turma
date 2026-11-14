@@ -60,25 +60,31 @@ class TurmaAppDeepLinkTest {
 
     /**
      * A "N proposals from <meeting>" push carries only a click path (rollup
-     * XERK-2602): tapping it must land on the Brief tab (XERK-2858).
+     * XERK-2602): tapping it must land on the Meetings tab (XERK-2858, XERK-2893),
+     * from the new `/meetings` path and an older hub's `/brief…#meetings` alike.
      * `deepLinkBrief` is pinned alone in `BottomNavTabTest`; this pins the
      * effect that acts on it. It asserts the selected tab, not the screen's content:
      * the screen's default `viewModel()` can hold an earlier test's fleet.
      */
-    @Test fun aMeetingsPushOpensTheMeetingsTab() {
+    @Test fun aMeetingsPushOpensTheMeetingsTab() = pushOpensMeetings("/meetings?site=o.atlassian.net")
+
+    @Test fun anOlderHubsBriefPushOpensTheMeetingsTab() =
+        pushOpensMeetings("/brief?site=o.atlassian.net#meetings")
+
+    private fun pushOpensMeetings(click: String) {
         container.config.save("http://localhost:1/", "op", "pw")
         var consumed = false
         compose.setContent {
             TurmaApp(
                 container = container,
                 wide = false,
-                pendingDeepLink = MainActivity.DeepLink(null, null, "/brief?site=o.atlassian.net#meetings"),
+                pendingDeepLink = MainActivity.DeepLink(null, null, click),
                 onDeepLinkConsumed = { consumed = true },
             )
         }
         compose.waitForIdle()
         assertTrue("the meetings link must be consumed", consumed)
-        compose.onAllNodes(hasText("Brief") and isSelected()).assertCountEquals(1)
+        compose.onAllNodes(hasText("Meetings") and isSelected()).assertCountEquals(1)
     }
 
     /** A click path naming no tab is consumed but moves nothing: the app stays on the Dashboard. */

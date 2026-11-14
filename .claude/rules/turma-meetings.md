@@ -6,7 +6,7 @@ paths:
   - "turma/tests/brief.test.js"
 ---
 
-# The meetings triage (Brief page, XERK-2510, XERK-2623, XERK-2857)
+# The meetings triage (Meetings page, XERK-2510, XERK-2623, XERK-2857, XERK-2893)
 
 The web surface of the Meetings epic (XERK-2503). The wire, the review/archive routes and the
 `daily` pairing are in `contract-meetings.md`; this file is the triage's own rules.
@@ -15,8 +15,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 
 - **One pane, not tabs** (XERK-2857, operator's pick from mockups): `brief.html` mounts
   `meetings.js` once on `#meetingList`; it paints a rail + main pane + per-org settings drawer.
-  - `#brief`, `#meetings` and `/meetings` (302 → `/brief<query>#meetings`) all land on it.
-  - Nav label stays "Brief".
+  - Served at `/meetings`; `#brief`, `#meetings` and `/brief` (302 → `/meetings<query>`) all land
+    on it.
+  - Nav label is "Meetings" (XERK-2893); the Daily Brief inside it keeps its own name.
 - Rail: one group per org (the header org pick scopes it), collapsible; the collapsed set is per
   viewer in `localStorage` (`turma-meetings-collapsed`), every access guarded.
   - Entries bucketed Upcoming / Today / Yesterday / This week / Earlier, newest first.

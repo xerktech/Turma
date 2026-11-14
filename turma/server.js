@@ -5692,8 +5692,8 @@ function resolveMeetingOrg(urlSite, t) {
   }
   noteMeetingLabelMiss(label, t, hits.length > 1);
   return { error: hits.length
-    ? `more than one org has the meeting label "${label}" — give one of them its own label on the Brief page`
-    : `no org has the meeting label "${label}" — set it on the Brief page` };
+    ? `more than one org has the meeting label "${label}" — give one of them its own label on the Meetings page`
+    : `no org has the meeting label "${label}" — set it on the Meetings page` };
 }
 // The operator sets (or, with null, resets) an org's label: {status, body}.
 function setMeetingLabel(siteKey, raw) {
@@ -9192,7 +9192,7 @@ function buildAgentsCache() {
     meetingProposals: meetingProposalsWire(),
     // Each org's meeting label (XERK-2638): siteKey -> {label, custom}, and the
     // labels Tenir sent that no single org answers to: "<label>[@tenant]" ->
-    // {at, shared?}. Hub-owned; the Brief page's Meetings pane maps them.
+    // {at, shared?}. Hub-owned; the Meetings page maps them.
     meetingLabels: meetingLabelsWire(),
     meetingLabelMisses,
     // Whose work each org's meetings propose (XERK-2514): siteKey -> {names, role}.
@@ -21357,10 +21357,10 @@ function notifyMeetingProposals(host, siteKey, row) {
   const n = Array.isArray(row.items) ? row.items.length : 0;
   if (!n) return;
   notify(`${n} proposal${n === 1 ? "" : "s"} from ${row.title || "a meeting"}`,
-    "Review them under Brief → Meetings — nothing reaches the board until you approve.", {
+    "Review them on the Meetings page — nothing reaches the board until you approve.", {
       tags: "meetings", route: { host },
       notifKey: `meeting:${siteKey}:${row.meetingId}`,
-      click: `/brief?site=${encodeURIComponent(siteKey)}#meetings`,
+      click: `/meetings?site=${encodeURIComponent(siteKey)}`,
     });
 }
 
@@ -23993,15 +23993,16 @@ const server = http.createServer(async (req, res) => {
       return sendPage(req, res, INSIGHTS);
     }
 
-    // The Daily Brief page (XERK-2396). The URL was the retired org brief's
-    // (XERK-2386), so an old bookmark lands on its meeting-scheduled successor.
-    if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
+    // The Meetings page (XERK-2893): the meetings triage with the Daily Brief
+    // folded in, still served from brief.html.
+    if (req.method === "GET" && (url.pathname === "/meetings" || url.pathname === "/meetings.html")) {
       return sendPage(req, res, BRIEF);
     }
-    // Meetings live on the Brief page's Meetings pane (XERK-2623); the old URL —
-    // bookmarks, a notification already on a phone — lands there, query kept.
-    if (req.method === "GET" && (url.pathname === "/meetings" || url.pathname === "/meetings.html")) {
-      res.writeHead(302, { Location: `/brief${url.search}#meetings` });
+    // The page was /brief (XERK-2396; before that the retired org brief's URL,
+    // XERK-2386). Bookmarks and a push already on a phone (`/brief?site=…#meetings`)
+    // still land, query kept; the browser carries the fragment across the redirect.
+    if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
+      res.writeHead(302, { Location: `/meetings${url.search}` });
       return res.end();
     }
 

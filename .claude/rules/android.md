@@ -34,7 +34,7 @@ A pure-core/adapter-shell split:
 | `sessions.html` + `chat.js` | `ui/SessionsScreen.kt` + `ui/ChatScreen.kt` + `vm/ChatViewModel.kt` |
 | `board.js` + `board.html` | `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt` |
 | `usage.html` | `ui/UsageScreen.kt` |
-| Brief page (triage, `meetings.js`) | `ui/BriefScreen.kt` + `core/MeetingsTriage.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
+| Meetings page (`brief.html` triage, `meetings.js`) | `ui/BriefScreen.kt` + `core/MeetingsTriage.kt` + `core/DailyBrief.kt` + `vm/BriefViewModel.kt` |
 | Meetings review pieces | `ui/MeetingsScreen.kt` (`ItemRow`) + `core/Meetings.kt` + `vm/MeetingsViewModel.kt` |
 | `nav.js` | `ui/MainScaffold.kt` + `ui/TurmaApp.kt` |
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
@@ -95,13 +95,14 @@ A pure-core/adapter-shell split:
   same create. A poll begun before a `meetingProposals` SSE frame or a review answer keeps the
   newer map (`meetingsClock`, the web's XERK-444 merge). Tests: `core/MeetingsTest`,
   `vm/MeetingsWiringTest`, `ui/MeetingsScreenTest`, `BottomNavTabTest`.
-- **The Brief tab is ONE triage list, the Daily brief folded into each org's daily-meeting entry**
-  (XERK-2858, web XERK-2857). `core/MeetingsTriage.kt` `triageEntries` ports the web's `entriesOf`:
+- **The Meetings tab is ONE triage list, the Daily brief folded into each org's daily-meeting
+  entry** (XERK-2858, web XERK-2857). It was the Brief tab until XERK-2893 (calendar icon now). `core/MeetingsTriage.kt` `triageEntries` ports the web's `entriesOf`:
   ONE entry per scheduled `meetingAt` holding EVERY capture tagged `daily` for it and its briefs.
   - The hub serves meetings newest first, so "first capture wins" pairs the rejoin, not the
     standup (QA). Test fixtures must be in hub order (`MeetingsTriageTest`).
   - Needs review always lists the org's `current` daily entry (today's or later, else the newest).
-  - A meetings push (`deepLinkBrief`) opens Brief with its org unfolded (`TurmaApp.briefOpenSite`).
+  - A meetings push (`deepLinkBrief`) opens Meetings with its org unfolded (`TurmaApp.briefOpenSite`).
+  - `deepLinkBrief` accepts `/meetings` and an older hub's `/brief…#meetings`; keep both.
   - The open entry is looked up in the UNFILTERED entries: one reviewed to zero must not vanish
     from under the operator because Needs review no longer lists it.
   - Settings saves toast only a refusal; success reads "Saved" by its button (one failure surface).

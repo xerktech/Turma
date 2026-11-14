@@ -17,7 +17,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
-| Brief page (triage + brief)   | `ui/BriefScreen.kt`, `core/MeetingsTriage.kt`, `core/DailyBrief.kt` |
+| Meetings page (triage + brief) | `ui/BriefScreen.kt`, `core/MeetingsTriage.kt`, `core/DailyBrief.kt` |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
 | `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
@@ -711,7 +711,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   absent fields, refused load blocks Save, org-less board has no button — Robolectric over
   MockWebServer), `vm/PermissionPolicyResultTest.kt` (the response reading).
 
-## Brief tab — meetings triage with the Daily brief folded in (XERK-2858)
+## Meetings tab — meetings triage with the Daily brief folded in (XERK-2858)
 
 - **At parity with the web's two-pane triage (XERK-2857)**: one list of every org's meetings,
   orgs collapsible (remembered per phone), bucketed Upcoming / Today / Yesterday / This week /
@@ -1025,7 +1025,7 @@ those are marked `[MODEL]`.
   as the cache split above, and for the same reason (no table view yet).
 - P2 Per-day tooltip; the web's texture channel for series 9+ (Android reuses hues past 8).
 
-### Meetings review (Brief tab, XERK-2510 / XERK-2858)
+### Meetings review (Meetings tab, XERK-2510 / XERK-2858)
 - **At parity (XERK-2511, XERK-2858)**: Approve / Approve + start / Edit / Reject / Log decision /
   Reopen, the same review states and refusal words. `meetingProposals` decodes PER MEETING.
 - A proposal whose ticket may exist (`review.maybeCreated`, XERK-2865) reads "Maybe created — …"
@@ -1033,7 +1033,7 @@ those are marked `[MODEL]`.
 - Platform differences: a created ticket's key and a "May duplicate" key are text, not board
   links; quote/Tenir links open the system browser.
 - Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens
-  the Brief tab with that org unfolded on Needs review.
+  the Meetings tab with that org unfolded on Needs review.
 
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in

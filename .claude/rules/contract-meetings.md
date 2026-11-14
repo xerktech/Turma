@@ -35,7 +35,7 @@ ticket builds to this file; change it here first.
   - No org, or two (colliding defaults), answering a label = 404 in words naming it, and the label
     is noted in `meetingLabelMisses` (`<label>[@tenant]` → `{at, shared?}`, ≤20 per tenant, 200
     in all trimmed by `trimByTenant`, a repeat re-written at most every 10 min) for
-    the Brief page to map. Tenir keeps retrying a 404, so mapping it delivers the meeting.
+    the Meetings page to map. Tenir keeps retrying a 404, so mapping it delivers the meeting.
   - Tests: the `XERK-2638:` cases in `server.test.js` (tenant isolation pinned by mutation).
   - Why in Turma: the capture PC should hold no tracker hosts. Tenir needs no version gate: the
     label rides the same URL slot the site key did.
@@ -221,8 +221,8 @@ ticket builds to this file; change it here first.
   - **The running → ok edge pushes "N proposals from <title>"** (XERK-2511,
     `notifyMeetingProposals`): once per meeting, since only that edge sends it; none for an empty
     list or a failure. Routed by the reporting host (its tenant's devices), `tags:"meetings"`,
-    `notifKey: meeting:<site>:<id>`, `click: /brief?site=…#meetings` (Android opens Brief's
-    Meetings pane; an older hub's `/meetings?site=…` lands there too, XERK-2623).
+    `notifKey: meeting:<site>:<id>`, `click: /meetings?site=…` (XERK-2893; Android opens its
+    Meetings tab, and an older hub's `/brief?site=…#meetings` lands there too).
   - `ok` with `items: []` is a real answer ("nothing to propose"); `ok` with no `items` array fails.
 - An item (XERK-2509's schema, re-whitelisted by the hub, ≤`MEETING_ITEMS_MAX` (30) per meeting):
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee

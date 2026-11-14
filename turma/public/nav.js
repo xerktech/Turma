@@ -47,7 +47,7 @@
       icon: `<rect x="3" y="3" width="5" height="18" rx="1"/><rect x="9.5" y="3" width="5" height="12" rx="1"/><rect x="16" y="3" width="5" height="15" rx="1"/>`,
     },
     {
-      id: "brief", href: "/brief", label: "Brief",
+      id: "meetings", href: "/meetings", label: "Meetings",
       icon: `<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6"/><path d="M9 16h6"/>`,
       join: `stroke-linejoin="round"`,
     },
