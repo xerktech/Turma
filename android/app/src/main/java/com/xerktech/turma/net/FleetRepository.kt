@@ -350,7 +350,16 @@ class FleetRepository(
     internal fun onSseEvent(type: String?, data: String) {
         if (type == "calendar" || type == "holidaySettings" || type == "meetingProposals") _calendarFrames.value++
         when (type) {
-            "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let { upsert(it) }
+            "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let {
+                // A host going offline (or back) sends no calendar frame, only its agent
+                // record, so the calendar's "<host> is offline" notice would wait for the
+                // next read (XERK-2921, web brief.html). Count only an online FLIP: agent
+                // frames arrive every beat, and re-reading on each would cost a read per beat.
+                val was = synchronized(byKey) { byKey[it.key]?.online }
+                upsert(it)
+                val now = synchronized(byKey) { byKey[it.key]?.online }
+                if (was != null && now != null && was != now) _calendarFrames.value++
+            }
             "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
                 .getOrNull()?.get("key")?.jsonPrimitive?.content?.let { remove(it) }
             // A ticket->agent pin changed somewhere; the event carries

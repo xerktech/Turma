@@ -1,0 +1,45 @@
+package com.xerktech.turma.net
+
+import com.xerktech.turma.harness.HubHarness
+import com.xerktech.turma.harness.MainDispatcherRule
+import org.junit.Assert.assertEquals
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+
+/**
+ * A host going offline sends no calendar frame, only its agent record (XERK-2921,
+ * web brief.html): the calendar re-reads on an `agent` frame that FLIPS `online`,
+ * never on an ordinary beat.
+ */
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [35])
+class FleetCalendarFlipTest {
+
+    @get:Rule(order = 0)
+    val main = MainDispatcherRule()
+
+    @get:Rule(order = 1)
+    val hub = HubHarness()
+
+    private fun agent(online: Boolean, lastSeen: Long = 100) =
+        """{"key":"h1","device":"h1","online":$online,"lastSeen":$lastSeen}"""
+
+    @Test
+    fun `only an online flip in an agent frame re-reads the calendar`() {
+        val fleet = hub.container.fleet
+        val start = fleet.calendarFrames.value
+        fleet.onSseEvent("agent", agent(true))               // first sight: nothing to compare
+        fleet.onSseEvent("agent", agent(true, lastSeen = 120)) // a beat
+        assertEquals(start, fleet.calendarFrames.value)
+        fleet.onSseEvent("agent", agent(false, lastSeen = 120)) // the offline sweep's frame
+        assertEquals(start + 1, fleet.calendarFrames.value)
+        fleet.onSseEvent("agent", agent(true, lastSeen = 140))
+        assertEquals(start + 2, fleet.calendarFrames.value)
+        fleet.onSseEvent("agent", agent(false, lastSeen = 10)) // stale: dropped, not a flip
+        fleet.onSseEvent("agent", "{not json")
+        assertEquals(start + 2, fleet.calendarFrames.value)
+    }
+}
