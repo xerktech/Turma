@@ -765,8 +765,8 @@ private fun OrgSettings(
             Text("$org settings", Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold)
 
-            SectionLabel("New tickets")
-            ProjectTarget(meta[site], project, { mvm.setProject(site, it) }, { mvm.retryMeta(site) })
+            SectionLabel("New tickets go to")
+            ProjectTarget(meta[site], project, { mvm.setProject(site, it) }, { mvm.retryMeta(site) }, showLabel = false)
 
             // Whose work (XERK-2514): one name per line, since a name may hold a comma.
             SectionLabel("Whose work")

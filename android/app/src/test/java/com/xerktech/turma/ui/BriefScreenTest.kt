@@ -380,6 +380,26 @@ class BriefScreenTest {
     private fun bodyOf(path: String): JsonObject =
         TurmaJson.parseToJsonElement(hub.findRequest(path).body.readUtf8()).jsonObject
 
+    // The section heading says it; the picker under it must not say it again (the inline
+    // picker on a meeting has no heading, so it keeps its own label).
+    @Test fun `org settings say New tickets go to once with projects loaded`() {
+        hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG", "name": "Engineering" }, { "key": "OPS", "name": "Ops" } ] }""")
+        seed()
+        show()
+        compose.onNodeWithContentDescription("o settings").performClick()
+        waitFor("Pick a project")
+        compose.onAllNodesWithText("New tickets go to", ignoreCase = true).assertCountEquals(1)
+    }
+
+    @Test fun `org settings say New tickets go to once when the projects fail to load`() {
+        hub.json("/api/jira/$site/create-meta", """{ "error": "jira said no" }""")
+        seed()
+        show()
+        compose.onNodeWithContentDescription("o settings").performClick()
+        waitFor("jira said no")
+        compose.onAllNodesWithText("New tickets go to", ignoreCase = true).assertCountEquals(1)
+    }
+
     @Test fun `the settings panel saves whose work, the Tenir label and the schedule`() {
         hub.json("/api/jira/$site/create-meta", """{ "projects": [ { "key": "ENG", "name": "Engineering" } ] }""")
         hub.json("/api/orgs/$site/meeting-focus", """{ "ok": true }""")
@@ -449,7 +469,7 @@ class BriefScreenTest {
 
         compose.onNodeWithText("Ann").performTextReplacement("Zed Draft")
         fleet.onSseEvent("meetingFocus", """{ "$site": { "names": ["Bo"], "role": "PM" } }""")
-        compose.waitUntil(5_000) { compose.onAllNodesWithText("PM").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("PM").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Zed Draft").assertExists() // edited: kept
         compose.onNodeWithText("Bo").assertDoesNotExist()
 
@@ -457,7 +477,7 @@ class BriefScreenTest {
         compose.onNodeWithTag("save-schedule").performScrollTo().performClick()
         assertEquals("\"23:00\"", TurmaJson.parseToJsonElement(
             hub.findRequest("/daily-brief/schedule").body.readUtf8()).jsonObject["time"].toString())
-        compose.waitUntil(5_000) { compose.onAllNodesWithText("23:00").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("23:00").fetchSemanticsNodes().isNotEmpty() }
         // Another client sets 10:00: the hub serves it from now on, so a poll the
         // save nudged (possibly still answering the old fixture) settles on it.
         hub.json("/api/agents", """

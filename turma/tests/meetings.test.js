@@ -309,6 +309,37 @@ test("XERK-2638: the Tenir labels list and an unmapped label's banner, escaped, 
   assert.match(Q.list(), /<option value="dev\.azure\.com\/Bolt">/);
 });
 
+// A visible "New tickets go to" is text right after a tag; the select's aria-label is not.
+const visibleTarget = (h) => (h.match(/>New tickets go to/g) || []).length;
+const drawerOf = (P) => P.list().slice(P.list().indexOf('<aside class="tri-drawer"'));
+
+test("the settings drawer says \"New tickets go to\" once; the inline picker keeps its own label", async () => {
+  const P = loadPage(META);
+  P.update(data());
+  await P.settle();
+  P.update(data(), true);
+  assert.match(P.list(), /<label class="mt-target">New tickets go to <select/, "inline picker keeps its words");
+  P.click({ orgSettings: SITE });
+  const drawer = drawerOf(P);
+  assert.equal(visibleTarget(drawer), 1, "only the section heading shows it");
+  assert.match(drawer, /<label class="mt-target"><select data-project="acme\.atlassian\.net" aria-label="New tickets go to">/);
+});
+
+test("the settings drawer says \"New tickets go to\" once while the projects load and when they fail", async () => {
+  const loading = loadPage(() => new Promise(() => {}));
+  loading.update(data());
+  loading.click({ orgSettings: SITE });
+  assert.match(drawerOf(loading), /loading projects/);
+  assert.equal(visibleTarget(drawerOf(loading)), 1);
+
+  const failed = loadPage((u) => (/create-meta/.test(u) ? { error: "Jira said 403 Forbidden" } : {}));
+  failed.update(data());
+  await failed.settle();
+  failed.click({ orgSettings: SITE });
+  assert.match(drawerOf(failed), /Jira said 403 Forbidden/);
+  assert.equal(visibleTarget(drawerOf(failed)), 1);
+});
+
 test("XERK-2514: the Whose work rows, escaped, post names and role; Clear posts empty", async () => {
   const d = { ...data(), meetingLabels: { [SITE]: { label: "acme", custom: false } },
     meetingFocus: { [SITE]: { names: ["Ann <b>Lee</b>", "Lee, Ann"], role: "QA \"lead\"" } } };
