@@ -569,6 +569,15 @@ test("XERK-2857: the search matches meeting and proposal titles, case-blind, and
   assert.match(P.list(), /data-entry="globex[^"]*"/, "both meetings carry that proposal");
   typed("globex");
   assert.doesNotMatch(P.list(), /data-entry="acme/);
+  // XERK-2894: an inferred title is searchable too.
+  const d = two();
+  d.meetingProposals[SITE][0].inferredTitle = "Login bug triage";
+  P.update(d);
+  typed("login BUG");
+  assert.match(P.list(), /data-entry="acme[^"]*"/);
+  assert.doesNotMatch(P.list(), /data-entry="globex/);
+  P.update(two());
+  typed("globex");
   assert.doesNotMatch(P.list(), /data-org-toggle="acme/, "an org with no match is hidden while searching");
   typed(`"><img src=x>`);
   assert.doesNotMatch(P.list(), /<img/);

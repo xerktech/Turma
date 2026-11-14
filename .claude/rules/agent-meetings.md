@@ -34,6 +34,8 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
     `summary` 1..`MEETING_SUMMARY_MAX` chars, always written; `title` a one-line inferred title
     ONLY when `meeting_title_generic` (empty, "Meeting"/"Untitled"…, a call id) put
     `"titleNeeded": true` in the input, else it must be null. Eval: ADR "Summary and inferred title".
+  - Both are judged on what the hub keeps (`_meeting_visible`: control/format chars dropped,
+    whitespace collapsed), so a reply the hub would blank is retried, not shipped empty.
 - **The model never writes `duplicateKeys`**: a model-named key is a guess. The agent fills it
   from a READ-ONLY search (`meeting_duplicate_keys`: a Jira JQL `summary ~` / an ADO WIQL
   `CONTAINS` over OPEN issues of the org's projects, any assignee), ranked client-side by shared

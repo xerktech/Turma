@@ -89,6 +89,10 @@ ticket builds to this file; change it here first.
     JSON ≤`MEETING_SUMMARY_BYTES_MAX` (16 KiB), measured apart from the items' budget; the title
     one line ≤120. Empty or wrong-typed = absent. `inferredTitle` never replaces `title`: clients
     show `inferredTitle || title`. Both are plain text, rendered ESCAPED.
+  - **The hub keeps `inferredTitle` only for a GENERIC title** (`meetingTitleGeneric`, the mirror
+    of the agent's `meeting_title_generic`; both pass `agent/tests/meeting_title_vectors.json` —
+    add a vector there, never to one side), so an agent cannot rename a meeting Tenir named.
+  - The push ("N proposals from …") and a logged decision's `label` use `meetingDisplayTitle`.
   - `segments` are kept ONLY while `queued`/`running` and dropped once settled; a running row also
     keeps `cmdId, sentAt, attempt, tried`. None of those four, nor `segments`, is ever served.
   - **Eviction drops settled rows first** — archived ones before the rest — oldest first; a

@@ -25932,20 +25932,34 @@ _MEETING_GENERIC_TITLES = frozenset((
     "teams meeting", "microsoft teams meeting", "teams call", "zoom meeting",
     "google meet", "meet", "meeting now", "instant meeting", "personal meeting room",
     "recording", "capture"))
-_MEETING_CALL_ID_RE = re.compile(r"(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?\Z"
-                                 r"|[A-Za-z0-9:_@.=-]{20,}\Z")
+_MEETING_CALL_ID_RE = re.compile(
+    r"(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?\Z"
+    r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+_MEETING_OPAQUE_RE = re.compile(r"[A-Za-z0-9:_@.=]{20,}\Z")
 
 
 def meeting_title_generic(title):
     """True when a meeting's own title says nothing about it, so a title is
-    inferred. A long opaque token counts only when it holds a digit (a call id),
-    so a long hyphenated real name never does."""
+    inferred. Mirrored by the hub's `meetingTitleGeneric` (it keeps an inferred
+    title only then); both pass agent/tests/meeting_title_vectors.json. An
+    opaque token needs no hyphen and 4+ digits, so "Q4-2026-roadmap-sync" stays
+    a real title."""
     t = " ".join(str(title or "").split())
     if not t:
         return True
-    if t.casefold().strip(" .:-") in _MEETING_GENERIC_TITLES:
+    if t.lower().strip(" .:-") in _MEETING_GENERIC_TITLES:
         return True
-    return " " not in t and bool(_MEETING_CALL_ID_RE.match(t)) and any(c.isdigit() for c in t)
+    if " " in t:
+        return False
+    return bool(_MEETING_CALL_ID_RE.match(t)) or (
+        bool(_MEETING_OPAQUE_RE.match(t)) and sum(c.isdigit() for c in t) >= 4)
+
+
+def _meeting_visible(s):
+    """`s` without control/format characters, whitespace collapsed: what the
+    hub's `meetingText` keeps, so a reply the hub would blank is rejected here."""
+    return " ".join("".join(c for c in s if c in "\n\t"
+                            or unicodedata.category(c) not in ("Cc", "Cf")).split())
 
 
 def meeting_repo_options(cands):
@@ -25996,13 +26010,13 @@ def meeting_items_problems(obj, transcript, repos):
         return ["items is not a list"]
     problems = []
     summary = obj["summary"]
-    if not (isinstance(summary, str) and summary.strip()
-            and len(summary) <= MEETING_SUMMARY_MAX):
+    if not (isinstance(summary, str) and _meeting_visible(summary)
+            and len(summary.strip()) <= MEETING_SUMMARY_MAX):
         problems.append(f"summary is not text of 1-{MEETING_SUMMARY_MAX} chars")
     title = obj["title"]
     if meeting_title_generic(transcript["title"]):
-        if not (isinstance(title, str) and title.strip() and "\n" not in title
-                and len(title) <= MEETING_INFERRED_TITLE_MAX):
+        if not (isinstance(title, str) and _meeting_visible(title) and "\n" not in title
+                and len(" ".join(title.split())) <= MEETING_INFERRED_TITLE_MAX):
             problems.append(f"title is not one line of 1-{MEETING_INFERRED_TITLE_MAX} chars")
     elif title is not None:
         problems.append("title given though the meeting has one")

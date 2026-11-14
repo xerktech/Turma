@@ -56990,12 +56990,22 @@ class TestMeetingItems(unittest.TestCase):
         self.assertFalse(json.loads(ha.meeting_input(self.t, self.repos))["titleNeeded"])
 
     def test_xerk2894_generic_titles(self):
-        for t in ("", "  ", "Meeting", "untitled meeting", "Microsoft Teams Meeting",
-                  "19:meeting_ZmFkNjA1@thread.v2", "meeting_ZmFkNjA1ZT", "8f3e2a9c-1b7d-4e2f-9a3b"):
+        # The hub's meetingTitleGeneric reads the same vectors (server.test.js).
+        with open(os.path.join(os.path.dirname(__file__), "meeting_title_vectors.json")) as f:
+            vec = json.load(f)
+        for t in vec["generic"]:
             self.assertTrue(ha.meeting_title_generic(t), t)
-        for t in ("Sprint planning", "Weekly bug triage", "infra-sync-with-the-platform-team",
-                  "Meeting with Acme about billing"):
+        for t in vec["real"]:
             self.assertFalse(ha.meeting_title_generic(t), t)
+
+    def test_xerk2894_a_reply_the_hub_would_blank_is_rejected(self):
+        generic = dict(self.t, title="Meeting")
+        for summary in ("\u0000", "\u200b\u202e", " \u2060 \n "):
+            self.assertIsNone(ha.parse_meeting_reply(self.reply(summary=summary), self.t, self.repos))
+        self.assertIsNone(ha.parse_meeting_reply(self.reply(title="\u200b"), generic, self.repos))
+        # Padding is not length: 119 visible chars inside spaces is fine.
+        r = ha.parse_meeting_reply(self.reply(title="  " + "t" * 119 + "   "), generic, self.repos)
+        self.assertEqual(r["inferredTitle"], "t" * 119)
 
     def test_a_good_reply_parses_to_the_wire_shape(self):
         decision = self.item(kind="decision", title="Drop the legacy PDF export",
