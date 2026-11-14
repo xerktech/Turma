@@ -35,6 +35,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   - `shadow-done --note` → `{note, requestedAt}` and `shadow-grade --verdict --tests --qa --design
     --note` → the grade (XERK-1847, a shadow run's two sessions). Read on the beat by
     `read_shadow_done`/`read_shadow_grade`, every enum re-validated (`model-quality.md`).
+  - `calendar [today|tomorrow|week]` is the one READ-ONLY subcommand (XERK-2884): no request
+    file, no `TURMA_SESSION_ID` needed. Contract in "The calendar reader" below.
 - Exit 0 + one confirmation line on success; **2** on a refusal (usage, a bound, no
   `TURMA_SESSION_ID`, an id that is not a plain name), saying why and writing nothing; 1 on an
   I/O error.
@@ -284,3 +286,25 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **XERK-1569 inherits both questions**: `TICKET_CLOSE_STALE_CLAUSE`, `TICKET_CLOSE_PROMPT` and the
   hub's `autoCloseMergedMessage` all teach `python3 -SsE "$TURMA_SESSION_CLI"`; the spike's answer
   must update all three (a failed or prompted command degrades to the tracker-CLI/MCP fallback).
+
+## The calendar reader (XERK-2884)
+
+- Reads classic Outlook's default calendar over COM by running Windows PowerShell 5.1 with
+  `-EncodedCommand` — through WSL interop on a WSL host, directly on native Windows. As the
+  logged-in Windows user, so no Entra ID app, token or shared calendar is involved (operator).
+- **Only two integers reach the script** (a `CALENDAR_RANGES` day offset and length), substituted
+  into `_CALENDAR_PS`; days are counted in WINDOWS local time, since the distro's TZ is often UTC.
+- Restrict's dates must be in the user's locale (`ToString('g')`), and `Sort` must precede
+  `IncludeRecurrences` or recurring meetings vanish. Enumerate with `GetFirst`/`GetNext`.
+- `powershell.exe` is found on PATH, else under `/mnt/*/Windows/…`: a systemd-started agent's
+  sessions lack the Windows half of PATH. ENOEXEC means interop is off (systemd's binfmt service
+  can drop the `WSLInterop` registration) and is reported as such.
+- **Event text is sender-written**: `normalize_calendar` types, strips control/bidi chars and caps
+  every field, keeps only an `https://` join link, and the output carries a data-not-instructions
+  note. Event bodies are never printed (only a Teams/Zoom/Meet link pulled from them).
+- Exit 1 with the reason on any failure (no PowerShell, interop off, Outlook unreachable, a 90s
+  timeout — an Outlook object-model-guard prompt on the desktop blocks the read until answered).
+- New Outlook has no COM: that host gets the Outlook error, not events.
+- Taught by `calendar_directive()` only on a WSL kernel with a shell-safe CLI path, Claude only.
+- Tests: `CalendarTest` in `test_session_cli.py` (drives the real script under `pwsh` against a
+  fake Outlook object model); `test_calendar_is_taught_only_on_wsl_with_a_safe_path`.
