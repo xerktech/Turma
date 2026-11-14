@@ -426,3 +426,33 @@ test("newticket: a gone opener falls back to a page modal still open underneath 
   assert.equal(doc.activeElement, detail);
   assert.equal(attrs.tabindex, "-1");
 });
+
+// ---- attachments (XERK-2935) --------------------------------------------------
+
+test("XERK-2935: picked files make the form dirty and gate Create while uploading", () => {
+  const B = global.window.TurmaBoard;
+  assert.equal(NT.createDirty({ values: {}, files: [{ name: "a.png", status: "ready" }] }), true);
+  const base = { sites: [{ siteKey: "s", source: "jira" }], siteKey: "s", source: "jira",
+    meta: { projects: [{ key: "ENG", name: "Eng" }], labels: [] },
+    types: { types: [{ id: "1", name: "Task" }] },
+    values: { project: "ENG", issueType: "1", summary: "Hi" } };
+  const busy = B.createFormHtml({ ...base, files: [{ name: "big.zip", status: "uploading" }] });
+  assert.match(busy, /data-cf-submit="1" disabled/);
+  assert.match(busy, /big\.zip/);
+  assert.match(busy, /uploading…/);
+  const ready = B.createFormHtml({ ...base, files: [{ name: "<x>.png", status: "ready", uploadId: "u" }] });
+  assert.doesNotMatch(ready, /data-cf-submit="1" disabled/);
+  assert.match(ready, /&lt;x&gt;\.png/);            // escaped
+  assert.match(ready, /data-cf-file-remove="0"/);
+  // A failed file holds Create until it is removed or re-attached (QA).
+  const failed = B.createFormHtml({ ...base, files: [{ name: "a", status: "error", error: "too large" }] });
+  assert.match(failed, /data-cf-submit="1" disabled/);
+  assert.match(failed, /Remove the files that failed/);
+  assert.match(B.createFilesHtml([], "At most 10 files per ticket."), /At most 10 files/);
+  const err = B.createFilesHtml([{ name: "a", status: "error", error: "file too large" }]);
+  assert.match(err, /cf-file-err/);
+  assert.match(err, /file too large/);
+  // At the cap the picker button is disabled.
+  const full = B.createFilesHtml(Array.from({ length: B.CREATE_FILES_MAX }, () => ({ name: "f", status: "ready" })));
+  assert.match(full, /data-cf-attach="1" disabled/);
+});

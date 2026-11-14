@@ -1114,6 +1114,18 @@ body.td-open { overflow: hidden; }
 /* The dirty-close confirmation row (XERK-218): the question fills the space the
    right-aligned buttons leave. */
 .cf-discard-q { margin-right: auto; align-self: center; }
+.cf-files { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.cf-file {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  padding: 2px 4px 2px 8px; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 12px; color: var(--ink);
+}
+.cf-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 220px; }
+.cf-file.cf-file-err { border-color: var(--warning); color: var(--warning-text); }
+.cf-file-x {
+  border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 11px; padding: 2px 4px;
+}
+.cf-file-x:hover { color: var(--ink); }
 .cf-btn.cf-danger { color: #fff; background: var(--critical); border-color: var(--critical); }
 .cf-btn.cf-danger:hover:not(:disabled) { filter: brightness(1.06); color: #fff; }
 .cf-done { font-size: 14px; color: var(--ink); padding: 14px 0; line-height: 1.5; }

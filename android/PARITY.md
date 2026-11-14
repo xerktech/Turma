@@ -966,6 +966,12 @@ those are marked `[MODEL]`.
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 
 ### Board (`board.js` → `BoardScreen`/`core/Board`)
+
+- P1 **New-ticket attachments (XERK-2935) — web only.** The web form uploads each picked file to
+  `POST /api/jira/<site>/uploads?name=` (raw body, answers `{uploadId, name, size}`) and sends the
+  ids as `uploadIds` on the create; the poll waits up to 5 min when files ride. Android's
+  `CreateTicketSheet` creates without files. A port adds a file picker + those two calls; no new
+  `/api/agents` key (the `ticketAttachments` capability is untyped and skipped).
 - Azure DevOps org support (XERK-43) is at parity for free: the agent reports Azure work items in the
   SAME `jira` heartbeat block, ticket shape and detail shape as Jira (with `source:"azure"`), so the
   board renders them unchanged. The only client-side change was `orgName` — now takes the last path

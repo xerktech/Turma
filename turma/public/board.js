@@ -2812,6 +2812,29 @@
   //   { sites, siteKey, source, meta, types, values, busy, error, created,
   //     confirmDiscard }
   // where meta = {loading|error|projects,labels}, types = {loading|error|types}.
+  // The New-ticket form's attachments row (XERK-2935): one chip per picked
+  // file, uploaded to the hub as soon as it is picked, plus the picker button.
+  function createFilesHtml(files, note) {
+    const list = files || [];
+    const chips = list.map((f, i) => {
+      const state = f.status === "uploading" ? " · uploading…"
+        : f.status === "error" ? ` · ${f.error || "failed"}` : "";
+      return `<span class="cf-file${f.status === "error" ? " cf-file-err" : ""}">
+          <span class="cf-file-name" title="${esc(f.name)}">${esc(f.name)}</span>${esc(state)}
+          <button type="button" class="cf-file-x" data-cf-file-remove="${i}"
+            aria-label="Remove ${esc(f.name)}">✕</button></span>`;
+    }).join("");
+    const full = list.length >= CREATE_FILES_MAX;
+    return `<div class="cf-field"><span>Attachments</span>
+        <div class="cf-files">${chips}
+          <button type="button" class="cf-btn cf-attach" data-cf-attach="1"${full ? " disabled" : ""}>📎 Attach files</button>
+          <input type="file" multiple hidden data-cf-file-input="1">
+        </div>${list.some((f) => f.status === "error")
+          ? `<div class="cf-note cf-err">Remove the files that failed, or attach them again.</div>` : ""}${
+          note ? `<div class="cf-note">${esc(note)}</div>` : ""}</div>`;
+  }
+  const CREATE_FILES_MAX = 10;
+
   function createFormHtml(st) {
     const s = st || {};
     const v = s.values || {};
@@ -2871,7 +2894,11 @@
 
     const suggestions = (meta.labels || []).slice(0, 200)
       .map((l) => `<option value="${esc(l)}"></option>`).join("");
-    const canSubmit = !!(v.project && v.issueType && (v.summary || "").trim()) && !s.busy;
+    const files = s.files || [];
+    // A file still uploading, or one that failed, holds Create: sending without
+    // it would make a ticket silently missing a file (XERK-2935).
+    const uploading = files.some((f) => f.status !== "ready");
+    const canSubmit = !!(v.project && v.issueType && (v.summary || "").trim()) && !s.busy && !uploading;
     return `<div class="cf-head">
         <h2>New ticket</h2>
         <button class="td-close" type="button" data-cf-close="1" aria-label="Close">✕</button>
@@ -2889,6 +2916,7 @@
           <input type="text" data-cf-labels="1" list="cf-label-suggestions"
             placeholder="comma-separated ${esc(labelWord)}s" value="${esc(v.labels || "")}">
           <datalist id="cf-label-suggestions">${suggestions}</datalist></label>
+        ${createFilesHtml(files, s.filesNote)}
       </div>
       ${s.error ? `<div class="cf-note cf-err">Couldn't create — ${esc(s.error)}</div>` : ""}
       ${s.confirmDiscard
@@ -3042,7 +3070,7 @@
   const api = {
     focusKeyIn, restoreFocusIn, boardFocusKey, restoreBoardFocus, isTabStop, trapTabTarget, trapModalTab,
     CATEGORIES, SLOTS, mergeSites, categoryOf, isReviewStatus, ticketSort, orgColor, orgColorMap, orgSlotPin, orgName, hostName, autoStartOn, ageStr,
-    createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
+    createFormHtml, createFilesHtml, CREATE_FILES_MAX, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
     bareKey, prioClass, cardHtml, boardHtml, detailHtml, textHtml, linkify, fmtDate, esc,
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     dedupeChipHtml, dedupeTwinUrl,

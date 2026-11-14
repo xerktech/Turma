@@ -83,7 +83,16 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   in-memory, so one left queued re-runs on return; `deliveredAt` decides only the wording). A retry
   rejoins an unresolved identical create (`createInFlight`, whole body); creates round-robin past
   gapped hosts.
-- Tests: `server.test.js`; `createFormHtml` in `board.test.js`.
+- **Files ride a new ticket** (XERK-2935): each picked file uploads AT ONCE to
+  `POST /api/jira/<site>/uploads?name=` — the chat relay (`stageUpload`, sessionId `#ticket`),
+  staged for the host chosen THEN (`pickTicketAttachHost`: online, reports
+  `ticketAttachments.available`), since the agent's blob GET is host-scoped.
+  - The create names them (`uploadIds`) and goes to that host, never another; a stale/foreign
+    id is 404, an offline holder 409 — re-attach, never a ticket silently missing its files.
+  - A create with files is waited on as `createTicketFiles` (`ASYNC_RESULT_KINDS`): the agent
+    attaches on a worker, so its result lands beats after the ack. The client polls 5 min.
+  - A file that fails to attach is a WARNING on the created ticket, never a failed create.
+- Tests: `server.test.js` (`XERK-2935:`); `createFormHtml` in `board.test.js`, `newticket.test.js`.
 
 ### Repo chips
 
