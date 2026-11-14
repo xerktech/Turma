@@ -5157,10 +5157,9 @@ function meetingTitleGeneric(title) {
   const t = String(title || "").split(/\s+/).filter(Boolean).join(" ");
   if (!t) return true;
   if (MEETING_GENERIC_TITLES.has(t.toLowerCase().replace(/^[ .:-]+|[ .:-]+$/g, ""))) return true;
-  if (t.includes(" ")) return false;
-  if (/^(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?$/.test(t)
-    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t)) return true;
-  return /^[A-Za-z0-9:_@.=]{20,}$/.test(t) && (t.match(/\d/g) || []).length >= 4;
+  if (/^[0-9][0-9 -]{7,}[0-9]$/.test(t) && t.replace(/\D/g, "").length >= 9) return true;
+  return !t.includes(" ") && (/^(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?$/.test(t)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t));
 }
 // What a meeting is called on every operator surface (push, decisions log, pages).
 const meetingDisplayTitle = (m) => m.inferredTitle || m.title;

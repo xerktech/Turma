@@ -83,7 +83,7 @@ segment (a lone "okay" accepting a task). Word-boundary matching stops a fragmen
 
 The same model run now also writes `summary` (two to four short paragraphs, then a "Decisions:"
 and an "Actions:" line, ≤4000 chars) and, when the capture's own title is generic ("Meeting",
-"Untitled", a Teams call id; `meeting_title_generic`), an inferred `title` (≤120 chars, one line).
+"Untitled", a Teams call id, a UUID or a bare Zoom-style numeric id; `meeting_title_generic`), an inferred `title` (≤120 chars, one line).
 The input says which with `"titleNeeded"`. The parser is still reject-never-repair: all three
 keys are required, an empty or over-long summary fails, and a title given when not asked fails.
 

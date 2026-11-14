@@ -57000,7 +57000,7 @@ class TestMeetingItems(unittest.TestCase):
 
     def test_xerk2894_a_reply_the_hub_would_blank_is_rejected(self):
         generic = dict(self.t, title="Meeting")
-        for summary in ("\u0000", "\u200b\u202e", " \u2060 \n "):
+        for summary in ("\u0000", "\u200b\u202e", " \u2060 \n ", "\u2065"):
             self.assertIsNone(ha.parse_meeting_reply(self.reply(summary=summary), self.t, self.repos))
         self.assertIsNone(ha.parse_meeting_reply(self.reply(title="\u200b"), generic, self.repos))
         # Padding is not length: 119 visible chars inside spaces is fine.

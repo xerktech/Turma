@@ -25935,31 +25935,35 @@ _MEETING_GENERIC_TITLES = frozenset((
 _MEETING_CALL_ID_RE = re.compile(
     r"(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?\Z"
     r"|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
-_MEETING_OPAQUE_RE = re.compile(r"[A-Za-z0-9:_@.=]{20,}\Z")
+_MEETING_NUMERIC_ID_RE = re.compile(r"[0-9][0-9 -]{7,}[0-9]\Z")   # a Zoom id, "834 1234 5678"
 
 
 def meeting_title_generic(title):
     """True when a meeting's own title says nothing about it, so a title is
     inferred. Mirrored by the hub's `meetingTitleGeneric` (it keeps an inferred
-    title only then); both pass agent/tests/meeting_title_vectors.json. An
-    opaque token needs no hyphen and 4+ digits, so "Q4-2026-roadmap-sync" stays
-    a real title."""
+    title only then); both pass agent/tests/meeting_title_vectors.json. Only
+    named SHAPES count (a placeholder word, a Teams call id, a UUID, a bare
+    numeric id): any title with a word in it is a real one ("weekly_sync_2026")."""
     t = " ".join(str(title or "").split())
     if not t:
         return True
     if t.lower().strip(" .:-") in _MEETING_GENERIC_TITLES:
         return True
-    if " " in t:
-        return False
-    return bool(_MEETING_CALL_ID_RE.match(t)) or (
-        bool(_MEETING_OPAQUE_RE.match(t)) and sum(c.isdigit() for c in t) >= 4)
+    if _MEETING_NUMERIC_ID_RE.match(t) and sum(c.isdigit() for c in t) >= 9:
+        return True
+    return " " not in t and bool(_MEETING_CALL_ID_RE.match(t))
+
+
+# The hub's meetingText strip set, which also covers unassigned U+2065.
+_MEETING_HUB_STRIPPED = re.compile(
+    "[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
 
 
 def _meeting_visible(s):
     """`s` without control/format characters, whitespace collapsed: what the
     hub's `meetingText` keeps, so a reply the hub would blank is rejected here."""
-    return " ".join("".join(c for c in s if c in "\n\t"
-                            or unicodedata.category(c) not in ("Cc", "Cf")).split())
+    return " ".join("".join(c for c in s if c in "\n\t" or (
+        unicodedata.category(c) not in ("Cc", "Cf") and not _MEETING_HUB_STRIPPED.match(c))).split())
 
 
 def meeting_repo_options(cands):
