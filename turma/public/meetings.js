@@ -403,12 +403,16 @@ function needsProject(list) {
 }
 function targetHtml(site) {
   const m = meta.get(site);
-  if (!m || m.loading) return `<div class="mt-target">New tickets go to … <span class="mt-meta">loading projects</span></div>`;
-  if (m.error) return `<div class="mt-target">New tickets go to … <span class="err">${esc(m.error)}</span> <button class="btn-sm" data-meta-retry="${esc(site)}">Retry</button></div>`;
+  // `data-meta-focus` marks the one control that stands for this org's project
+  // target in each state (loading → error/Retry → picker), so focus taken by
+  // Retry follows the swap instead of dropping to <body> (XERK-2885).
+  const mf = `data-meta-focus="${esc(site)}"`;
+  if (!m || m.loading) return `<div class="mt-target">New tickets go to … <span class="mt-meta" tabindex="-1" ${mf}>loading projects</span></div>`;
+  if (m.error) return `<div class="mt-target">New tickets go to … <span class="err">${esc(m.error)}</span> <button class="btn-sm" data-meta-retry="${esc(site)}" ${mf}>Retry</button></div>`;
   const cur = projectOf(site);
   const opts = (cur ? "" : `<option value="">Pick a project</option>`)
     + m.projects.map((p) => `<option value="${esc(p.key)}"${p.key === cur ? " selected" : ""}>${esc(p.name ? `${p.name} (${p.key})` : p.key)}</option>`).join("");
-  return `<label class="mt-target">New tickets go to <select data-project="${esc(site)}">${opts}</select></label>`;
+  return `<label class="mt-target">New tickets go to <select data-project="${esc(site)}" ${mf}>${opts}</select></label>`;
 }
 function archiveButton(site, m) {
   // A meeting still being read can't be archived (the hub's 409); no button then.
@@ -738,7 +742,7 @@ function editing() {
 // What has focus, as keys that survive the swap: the page's own (hooks) first,
 // else one of this pane's controls by its data attribute.
 const FOCUS_ATTRS = ["search", "filter", "orgToggle", "orgSettings", "entry", "showReviewed", "archive",
-  "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaRetry"];
+  "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus"];
 function focusKey() {
   if (hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
   const a = document.activeElement;
@@ -754,7 +758,7 @@ function focusKey() {
 function restoreFocus(key) {
   if (!key) return;
   if (key.page) return void (hooks.restoreFocus && hooks.restoreFocus(key.page));
-  const el = [...$list.querySelectorAll("button,input")].find((x) => x.dataset && x.dataset[key.attr] === key.v
+  const el = [...$list.querySelectorAll("button,input,select,[data-meta-focus]")].find((x) => x.dataset && x.dataset[key.attr] === key.v
     && (key.act === undefined || x.dataset.act === key.act));
   if (!el || !el.focus) return;
   el.focus();
@@ -786,12 +790,15 @@ const repaint = (force = false) => { if (cache) { painted = null; renderMeetings
 
 // ---- the org's projects / types (the New-ticket modal's routes, XERK-137) ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function fetchMeta(site, project) {
+// `retry` asks the hub to drop a cached failure and fetch again (XERK-2885); only
+// the first request carries it, so the 202-polls read the new answer.
+async function fetchMeta(site, project, retry = false) {
   const q = project ? `?project=${encodeURIComponent(project)}` : "";
   const url = `/api/jira/${encodeURIComponent(site)}/create-meta${q}`;
   for (let i = 0; i < 25; i++) {
     let r;
-    try { r = await fetch(url); } catch { return { error: "the hub is unreachable" }; }
+    const u = retry && i === 0 ? `${url}${q ? "&" : "?"}retry=1` : url;
+    try { r = await fetch(u); } catch { return { error: "the hub is unreachable" }; }
     if (r.status === 401) { location.href = "/login"; return { error: "signed out" }; }
     if (r.status === 202) { await sleep(1500); continue; }
     let d = {};
@@ -801,10 +808,10 @@ async function fetchMeta(site, project) {
   }
   return { error: "the host didn't answer in time" };
 }
-function ensureMeta(site) {
+function ensureMeta(site, retry = false) {
   if (meta.has(site)) return void ensureTypes(site);
   meta.set(site, { loading: true });
-  fetchMeta(site, "").then((d) => {
+  fetchMeta(site, "", retry).then((d) => {
     meta.set(site, d.error ? { error: d.error } : { projects: Array.isArray(d.projects) ? d.projects : [] });
     ensureTypes(site);
     repaint();
@@ -815,7 +822,7 @@ function ensureTypes(site) {
   if (!p) return null;
   const k = `${site}\u0000${p}`;
   if (types.has(k) && !types.get(k).error) return types.get(k).promise || Promise.resolve();
-  const promise = fetchMeta(site, p).then((d) => {
+  const promise = fetchMeta(site, p, types.has(k)).then((d) => {
     types.set(k, d.error ? { error: d.error } : { types: Array.isArray(d.types) ? d.types : [] });
     repaint();
   });
@@ -1058,7 +1065,7 @@ function mount(el, pageHooks = {}) {
       const v = labelDrafts.has(site) ? labelDrafts.get(site) : (own(cache && cache.meetingLabels, site) || {}).label;
       return void saveLabel(site, String(v || "").trim().toLowerCase());
     }
-    if (d.metaRetry !== undefined) { meta.delete(d.metaRetry); ensureMeta(d.metaRetry); return repaint(true); }
+    if (d.metaRetry !== undefined) { meta.delete(d.metaRetry); ensureMeta(d.metaRetry, true); return repaint(true); }
     if (d.act === undefined || b.getAttribute("aria-disabled") === "true") return;
     const k = d.k, act = d.act;
     if (k !== undefined && act !== "cancel") curItem = k;

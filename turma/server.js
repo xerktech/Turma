@@ -26803,9 +26803,21 @@ const server = http.createServer(async (req, res) => {
           : json(res, 404, { error: "no host reports that org" });
       }
       const a = agents[key];
-      const cached = project
+      let cached = project
         ? (a.createTypes || {})[project]
         : a.createMeta;
+      // `?retry=1` (XERK-2885): the operator's Retry, or a fresh open of the
+      // New-ticket form, must ask the tracker again rather than replay a cached
+      // FAILURE for the rest of CREATE_META_FRESH_MS — the cause (a 403, a bad
+      // token) may be fixed by now. Only an error is evicted: a good cached
+      // answer is still served, so a retry can't be used to hammer the tracker.
+      // The client sends it on its FIRST request only; its 202-polls go without
+      // it and read the new answer from this same cache slot once it lands.
+      if (cached && cached.error && url.searchParams.get("retry") === "1") {
+        if (project) delete a.createTypes[project];
+        else a.createMeta = null;
+        cached = null;
+      }
       if (cached && Date.now() - cached.fetchedAt < CREATE_META_FRESH_MS) {
         if (cached.error) return json(res, 200, { error: cached.error });
         return json(res, 200, project

@@ -132,6 +132,34 @@ class MeetingsWiringTest {
         assertNull(body("/api/orgs/").edited)
     }
 
+    @Test fun `Retry on a failed project list asks the hub to skip its cached failure`() {
+        // XERK-2885: the hub caches a create-meta failure; a Retry sends ?retry=1 on its
+        // first request only, so the hub re-asks the tracker instead of replaying it.
+        seed()
+        val paths = java.util.concurrent.CopyOnWriteArrayList<String>()
+        hub.route("/api/jira/$site/create-meta") { r ->
+            val p = r.path.orEmpty()
+            paths += p
+            val body = if (p.contains("project=")) """{ "types": [] }"""
+                else if (paths.none { it.contains("retry=1") }) """{ "error": "Jira said 403 Forbidden" }"""
+                else """{ "projects": [ { "key": "ENG" } ] }"""
+            MockResponse().setHeader("Content-Type", "application/json").setBody(body)
+        }
+        val vm = main.track(MeetingsViewModel(hub.app))
+        fun waitFor(ok: (MetaState?) -> Boolean) {
+            val end = System.currentTimeMillis() + 10_000
+            while (!ok(vm.meta.value[site]) && System.currentTimeMillis() < end) Thread.sleep(20)
+            assertTrue("meta was ${vm.meta.value[site]}", ok(vm.meta.value[site]))
+        }
+        vm.ensureMeta(site)
+        waitFor { it is MetaState.Error }
+        assertTrue("a first load serves the cache", paths.none { it.contains("retry=1") })
+        vm.retryMeta(site)
+        waitFor { it is MetaState.Projects }
+        assertEquals(1, paths.count { it.contains("retry=1") })
+        assertTrue(paths.last { !it.contains("project=") }.endsWith("/create-meta?retry=1"))
+    }
+
     @Test fun `a second press while an Approve awaits its types posts nothing`() {
         seed()
         val release = java.util.concurrent.CountDownLatch(1)

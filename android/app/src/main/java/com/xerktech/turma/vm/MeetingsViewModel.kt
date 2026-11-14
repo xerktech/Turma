@@ -115,12 +115,13 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
             ensureTypes(siteKey)
             return
         }
-        load(siteKey, null) { ensureTypes(siteKey) }
+        load(siteKey, null, retry = cur is MetaState.Error) { ensureTypes(siteKey) }
     }
 
+    /** Retry: the hub drops its cached failure and asks the tracker again (XERK-2885). */
     fun retryMeta(siteKey: String) {
         _meta.value = _meta.value - siteKey
-        ensureMeta(siteKey)
+        load(siteKey, null, retry = true) { ensureTypes(siteKey) }
     }
 
     /** Load the picked project's issue types once; the returned job finishes when they are in. */
@@ -130,15 +131,15 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
         val k = typesKey(siteKey, p)
         val cur = meta.value[k]
         if (cur != null && cur !is MetaState.Error) return inflight[k]
-        return load(k, p) {}
+        return load(k, p, retry = cur is MetaState.Error) {}
     }
 
-    private fun load(key: String, project: String?, then: () -> Unit): Job {
+    private fun load(key: String, project: String?, retry: Boolean = false, then: () -> Unit): Job {
         inflight[key]?.let { return it }
         _meta.value = _meta.value + (key to MetaState.Loading)
         val site = if (project == null) key else key.substringBefore('\u0000')
         val job = viewModelScope.launch {
-            val out = when (val r = fetchCreateMetaFrom(container.client.api, site, project)) {
+            val out = when (val r = fetchCreateMetaFrom(container.client.api, site, project, retry)) {
                 is CreateMetaFetch.Projects -> MetaState.Projects(r.projects)
                 is CreateMetaFetch.Types -> MetaState.Types(r.types)
                 is CreateMetaFetch.Error -> MetaState.Error(r.message)
