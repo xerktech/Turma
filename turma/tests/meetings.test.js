@@ -177,7 +177,42 @@ test("XERK-2941: Show full transcript reads the hub once, groups speaker turns, 
   P.click({ entry: "acme.atlassian.net/m%3Am2" });
   P.click({ transcript: P.meetingKey("acme.atlassian.net", "m2") });
   await P.settle();
-  assert.match(P.list(), /<div class="mt-status">No transcript was kept for this meeting/);
+  assert.match(P.list(), /<div class="mt-status">No transcript is kept for this meeting/);
+});
+
+test("XERK-2941 QA: a failed transcript read retries on the next open, and a read landing mid-edit waits for focusout", async () => {
+  let fail = true;
+  let release = null;
+  const P = loadPage((u) => {
+    if (!/\/transcript$/.test(u)) return META(u);
+    if (fail) return { status: 503, body: { error: "the transcript store is unreachable — try again shortly" } };
+    return new Promise((r) => { release = () => r({ meetingId: "m1", segments: [{ speaker: "Ann", text: "Hi.", startMs: 0 }] }); });
+  });
+  const d = data();
+  P.setCache(d);
+  P.renderMeetings(d);
+  const mk = P.meetingKey(SITE, "m1");
+  P.click({ transcript: mk });
+  await P.settle();
+  assert.match(P.list(), /<div class="mt-status failed">Loading the transcript failed — the transcript store is unreachable/);
+  // Closed and reopened: read again, and this time it answers while a field is being typed in.
+  fail = false;
+  P.click({ transcript: mk });
+  P.click({ transcript: mk });
+  await P.settle();
+  assert.equal(P.fetches.filter((f) => /\/transcript$/.test(f.url)).length, 2);
+  const list = P.els.meetingList;
+  const field = { tagName: "TEXTAREA", dataset: {} };
+  list.contains = (a) => a === field;
+  P.document.activeElement = field;
+  const before = P.list();
+  release();
+  await P.settle();
+  assert.equal(P.list(), before, "held while the field has focus (QA D1)");
+  P.document.activeElement = null;
+  for (const fn of list.listeners.focusout || []) fn({});
+  P.renderMeetings(d);
+  assert.match(P.list(), /<b>Ann:<\/b> Hi\./);
 });
 
 test("XERK-2885: Retry on a failed project list asks the hub to skip its cached failure", async () => {

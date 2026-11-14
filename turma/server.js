@@ -22436,15 +22436,21 @@ function saveMeetingTranscript(m) {
 // arrived before this build, or on a replica whose disk is gone), then drop every
 // document no stored row names. Postgres is swept every MEETING_TRANSCRIPT_SWEEP_MS.
 const MEETING_TRANSCRIPT_SWEEP_MS = 10 * 60e3;
+// The store's byte budget (XERK-2941 QA D3): the rows alone bound it only at
+// orgs x MEETINGS_KEEP x 1 MiB (~3 GiB). Sized from the container like every
+// /data ceiling, clamped 256 MiB..1 GiB; the biggest tenant's oldest go first.
+const MEETING_TRANSCRIPTS_MAX_BYTES = positiveEnv("MEETING_TRANSCRIPTS_MAX_BYTES",
+  Math.min(1024 ** 3, Math.max(256 * 1024 ** 2, MEMORY_LIMIT)));
 let meetingTranscriptRemoteSweptAt = 0;
 let meetingTranscriptSweeping = false;
 function sweepMeetingTranscripts(now = Date.now()) {
   if (meetingTranscriptSweeping) return;
-  const live = new Set();
-  for (const list of Object.values(meetingProposals)) {
+  const live = new Map(); // key -> {tenant, at}, for the per-tenant byte budget
+  for (const [site, list] of Object.entries(meetingProposals)) {
     for (const m of list || []) {
       if (!m || !m.meetingId || !m.receivedAt) continue;
-      live.add(meetingTranscripts.keyOf(m.meetingId, m.receivedAt));
+      live.set(meetingTranscripts.keyOf(m.meetingId, m.receivedAt),
+        { tenant: tenantOfSite(site) || "", at: m.receivedAt });
       if (MEETING_PENDING.has(m.status) && !meetingTranscripts.has(m.meetingId, m.receivedAt)) {
         saveMeetingTranscript(m);
       }
@@ -22453,7 +22459,7 @@ function sweepMeetingTranscripts(now = Date.now()) {
   const withRemote = now - meetingTranscriptRemoteSweptAt >= MEETING_TRANSCRIPT_SWEEP_MS;
   if (withRemote) meetingTranscriptRemoteSweptAt = now;
   meetingTranscriptSweeping = true;
-  meetingTranscripts.sweep(live, { withRemote })
+  meetingTranscripts.sweep(live, { withRemote, maxBytes: MEETING_TRANSCRIPTS_MAX_BYTES, now })
     .catch((e) => console.error(`meetings: transcript sweep failed: ${e && e.message}`))
     .finally(() => { meetingTranscriptSweeping = false; });
 }

@@ -591,13 +591,14 @@ async function loadTranscript(mk) {
   if (res && res.ok && out && Array.isArray(out.segments)) {
     transcripts.set(mk, transcriptBodyHtml(m, out.segments));
   } else if (res && res.status === 404 && out && out.missing) {
-    transcripts.set(mk, { error: "No transcript was kept for this meeting — it was read before Turma kept transcripts.", missing: true });
+    transcripts.set(mk, { error: "No transcript is kept for this meeting — it was read before Turma kept transcripts, or aged out of the store.", missing: true });
   } else {
     const text = res ? TurmaNav.refusalText("Loading the transcript", res.status, out)
       : "Loading the transcript failed — the hub is unreachable";
     transcripts.set(mk, { error: text });
   }
-  repaint(true);
+  // Never forced: a field being typed in keeps focus; the paint waits for focusout (QA D1).
+  repaint();
 }
 
 // `primary`: the entry IS this meeting (its title heads the pane, with the back

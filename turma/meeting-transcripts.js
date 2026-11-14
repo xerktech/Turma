@@ -31,6 +31,7 @@ function keyOf(meetingId, receivedAt) {
 
 function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
   const fileOf = (key) => path.join(dir, `${key}.json`);
+  const SAVE_GRACE_MS = 5 * 60e3;
   // Keys saved locally whose Postgres write has not landed yet (HA only).
   const unsynced = new Set();
   let schemaReady = null;
@@ -104,34 +105,73 @@ function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
     }
   }
 
-  // Drop every document no live row names (`liveKeys`: a Set of keyOf values).
-  // Local files every call; Postgres rows when `withRemote` (the caller spaces it).
-  async function sweep(liveKeys, { withRemote = false } = {}) {
+  // Plain text params only (no array encoding), a bounded batch per statement.
+  async function deleteRows(keys) {
+    let n = 0;
+    for (let i = 0; i < keys.length; i += 500) {
+      const batch = keys.slice(i, i + 500);
+      await pool.query(`DELETE FROM ${TABLE} WHERE key IN (${batch.map((_, j) => `$${j + 1}`).join(", ")})`, batch);
+      n += batch.length;
+    }
+    return n;
+  }
+
+  // Drop every document no live row names, then hold the store to `maxBytes`.
+  // `live`: Map keyOf -> {tenant, at} (the row's tenant and receivedAt).
+  // - A document saved within SAVE_GRACE_MS is never deleted: one saved between
+  //   the caller building `live` and the delete would otherwise go (QA D2).
+  // - Over the budget the tenant holding the most bytes loses its OLDEST
+  //   transcript first, so one tenant never evicts another's (the XERK-2621 rule);
+  //   its row stays and reads "no transcript kept".
+  // Local files every call; Postgres rows (sized there too: a promoted leader's
+  // disk starts empty) when `withRemote`.
+  async function sweep(live, { withRemote = false, maxBytes = Infinity, now = Date.now() } = {}) {
     let removed = 0;
+    const sizes = new Map(); // live key -> bytes
     let names = [];
     try { names = fs.readdirSync(dir); } catch { names = []; }
     for (const name of names) {
       const m = /^([0-9a-f]{40})\.json$/.exec(name);
-      // A stray temp file from a killed write is swept too.
       if (!m && !/\.tmp$/.test(name)) continue;
-      if (m && liveKeys.has(m[1])) continue;
-      try { fs.unlinkSync(path.join(dir, name)); removed++; } catch { /* gone */ }
+      const full = path.join(dir, name);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (m && live.has(m[1])) { sizes.set(m[1], st.size); continue; }
+      if (now - st.mtimeMs <= SAVE_GRACE_MS) continue;
+      try { fs.unlinkSync(full); removed++; } catch { /* gone */ }
       if (m) unsynced.delete(m[1]);
     }
+    let remote = null;
     if (pool) {
       for (const key of [...unsynced]) await pushRow(key);
       if (withRemote) {
         try {
           await ensureSchema();
-          const rows = await pool.query(`SELECT key FROM ${TABLE}`);
-          const dead = (rows || []).map((r) => r.key).filter((k) => !liveKeys.has(k));
-          // Plain text params only (no array encoding), a bounded batch per statement.
-          for (let i = 0; i < dead.length; i += 500) {
-            const batch = dead.slice(i, i + 500);
-            await pool.query(`DELETE FROM ${TABLE} WHERE key IN (${batch.map((_, j) => `$${j + 1}`).join(", ")})`, batch);
-            removed += batch.length;
+          remote = await pool.query(`SELECT key, octet_length(doc) AS bytes FROM ${TABLE} WHERE saved_at < $1`,
+            [now - SAVE_GRACE_MS]);
+          for (const r of remote || []) {
+            if (live.has(r.key) && !sizes.has(r.key)) sizes.set(r.key, Number(r.bytes) || 0);
           }
         } catch (e) {
+          remote = null;
+          log.error(`meeting transcripts: postgres sweep failed: ${e && e.message}`);
+        }
+      }
+    }
+    const evicted = overBudget(live, sizes, maxBytes);
+    for (const key of evicted) {
+      try { fs.unlinkSync(fileOf(key)); removed++; } catch { /* only in postgres */ }
+      unsynced.delete(key);
+    }
+    if (evicted.length) {
+      log.error(`meeting transcripts: over the ${maxBytes}-byte budget, dropped the ${evicted.length} oldest`);
+    }
+    if (pool) {
+      // Only rows the SELECT saw (older than the grace), plus what the budget evicted.
+      const dead = new Set(evicted);
+      for (const r of remote || []) if (!live.has(r.key)) dead.add(r.key);
+      if (dead.size) {
+        try { removed += await deleteRows([...dead]); } catch (e) {
           log.error(`meeting transcripts: postgres sweep failed: ${e && e.message}`);
         }
       }
@@ -139,7 +179,34 @@ function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
     return removed;
   }
 
-  return { save, has, load, sweep, keyOf, _unsynced: unsynced };
+  // The keys to drop to fit `maxBytes`: the biggest tenant's oldest first.
+  function overBudget(live, sizes, maxBytes) {
+    let total = 0;
+    for (const b of sizes.values()) total += b;
+    if (total <= maxBytes) return [];
+    const byTenant = new Map();
+    for (const [key, bytes] of sizes) {
+      const { tenant = "", at = 0 } = live.get(key) || {};
+      if (!byTenant.has(tenant)) byTenant.set(tenant, { bytes: 0, keys: [] });
+      const t = byTenant.get(tenant);
+      t.bytes += bytes;
+      t.keys.push({ key, at, bytes });
+    }
+    for (const t of byTenant.values()) t.keys.sort((a, b) => b.at - a.at); // pop() = oldest
+    const out = [];
+    while (total > maxBytes) {
+      let big = null;
+      for (const t of byTenant.values()) if (t.keys.length && (!big || t.bytes > big.bytes)) big = t;
+      if (!big) break;
+      const k = big.keys.pop();
+      big.bytes -= k.bytes;
+      total -= k.bytes;
+      out.push(k.key);
+    }
+    return out;
+  }
+
+  return { save, has, load, sweep, keyOf, overBudget, SAVE_GRACE_MS, _unsynced: unsynced };
 }
 
 module.exports = { makeTranscriptStore, keyOf, TABLE };

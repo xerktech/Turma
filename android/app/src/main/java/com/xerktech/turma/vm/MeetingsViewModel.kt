@@ -516,7 +516,7 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         /** The web's words for a meeting read before transcripts were kept. */
         const val TRANSCRIPT_MISSING =
-            "No transcript was kept for this meeting — it was read before Turma kept transcripts."
+            "No transcript is kept for this meeting — it was read before Turma kept transcripts, or aged out of the store."
         private const val PREFS = "turma-meetings-project"
         private const val COLLAPSED_PREFS = "turma-meetings-collapsed"
         private const val COLLAPSED_KEY = "orgs"

@@ -180,6 +180,24 @@ class MeetingsScreenTest {
         org.junit.Assert.assertNull(hub.findRequestOrNull("/m2/transcript"))
     }
 
+    @Test fun `XERK-2941 a meeting with no kept transcript says so and is never read again`() {
+        seed()
+        hub.json("/api/orgs/$site/meetings/m2/transcript",
+            """{ "error": "no transcript was kept for this meeting", "missing": true }""", code = 404)
+        val vm = main.track(MeetingsViewModel(hub.app))
+        show(vm)
+        open("Sprint sync")
+        compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText(MeetingsViewModel.TRANSCRIPT_MISSING).fetchSemanticsNodes().isNotEmpty()
+        }
+        hub.findRequest("/m2/transcript")
+        compose.onNodeWithText("▾ Full transcript").performScrollTo().performClick()
+        compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
+        compose.onNodeWithText(MeetingsViewModel.TRANSCRIPT_MISSING).assertExists()
+        org.junit.Assert.assertNull(hub.findRequestOrNull("/m2/transcript"))
+    }
+
     @Test fun `Reopen sends the reopen action and Archive the archive route`() {
         seed()
         hub.json("/api/orgs/$site/meetings/m2/items/p4", """{ "ok": true }""")

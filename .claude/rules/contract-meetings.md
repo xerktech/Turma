@@ -107,8 +107,13 @@ ticket builds to this file; change it here first.
       Never the archive bucket: its hydrate lists and pulls every key in it.
     - Dropped with its row: `sweepMeetingTranscripts` on the leader's `meetingsTick` (files every
       tick, Postgres every 10 min) deletes what no stored row names; it also back-fills a pending
-      row's document from its `segments`. Bounded by the rows themselves (≤`MEETINGS_KEEP` per org,
-      ≤1 MiB each).
+      row's document from its `segments`.
+    - **Nothing saved within `SAVE_GRACE_MS` (5 min) is deleted** — a save landing between the
+      sweep's live set and its DELETE was lost from Postgres (QA). Never drop the grace.
+    - **A byte budget, `MEETING_TRANSCRIPTS_MAX_BYTES`** (the container limit, clamped
+      256 MiB..1 GiB): the rows alone allow ~3 GiB. Over it the tenant holding the most bytes
+      loses its OLDEST transcript first (the XERK-2621 rule); the row stays and reads "no
+      transcript is kept".
     - `GET /api/orgs/<site>/meetings/<mid>/transcript` (OPERATOR-authed, `org` class) answers
       `{meetingId, startedAt, segments}`, read only through the org's stored row; 404 unknown org /
       meeting, 404 `{missing:true}` for a meeting settled before this build, 503 store unreachable.

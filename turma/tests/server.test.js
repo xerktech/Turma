@@ -29729,15 +29729,48 @@ test("XERK-2941: a settled meeting's full transcript is kept, served to its org 
     startedAt: 1, endedAt: 2, receivedAt: 3, status: "ok", items: [] }));
   const old = await request("GET", url(S, "old1"), { headers: userHeaders });
   assert.deepEqual([old.status, old.body.missing], [404, true]);
-  // Dropped with its row.
+  // Dropped with its row — but never inside the save grace (QA D2: a save racing the sweep).
   const file = path.join(hub.MEETING_TRANSCRIPTS_DIR, `${hub.meetingTranscripts.keyOf("tr1", row.receivedAt)}.json`);
   assert.ok(fs.existsSync(file));
   hub.getMeetings()[S].splice(0, 1);
   hub.sweepMeetingTranscripts();
   await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fs.existsSync(file), "a fresh save survives a sweep that does not know its row");
+  hub.sweepMeetingTranscripts(Date.now() + hub.meetingTranscripts.SAVE_GRACE_MS + 1000);
+  await new Promise((r) => setTimeout(r, 20));
   assert.equal(fs.existsSync(file), false);
+  // A pending row whose document is missing (posted before this build) is back-filled.
+  const pend = hub.sanitizeMeeting({ ...meeting2508("bf2"), status: "queued", receivedAt: 7 });
+  hub.getMeetings()[S].push(pend);
+  assert.equal(hub.meetingTranscripts.has("bf2", 7), false);
+  hub.sweepMeetingTranscripts();
+  assert.equal(hub.meetingTranscripts.has("bf2", 7), true);
+  hub.getMeetings()[S].pop();
   cleanup2508(S, ["mtTr2941"]);
   cleanup2508(O, ["mtTrO2941"]);
+});
+
+test("XERK-2941 QA: the transcript store holds its byte budget by the biggest tenant's oldest, and ignores a colliding id", async () => {
+  const { makeTranscriptStore } = require("../meeting-transcripts.js");
+  const dir = fs.mkdtempSync(path.join(scratchDir(), "mtr2941-"));
+  const st = makeTranscriptStore({ dir, log: { error() {} } });
+  const big = (n) => ({ segments: [{ speaker: "A", text: "x".repeat(n) }] });
+  const live = new Map();
+  // Tenant A: three of ~1000 bytes; tenant B: one.
+  for (const [id, at, t] of [["a1", 1, "A"], ["a2", 2, "A"], ["a3", 3, "A"], ["b1", 1, "B"]]) {
+    st.save(id, at, big(1000));
+    live.set(st.keyOf(id, at), { tenant: t, at });
+  }
+  await st.sweep(live, { maxBytes: 3300, now: Date.now() + st.SAVE_GRACE_MS + 1 });
+  // Only A's oldest goes, never B's (B is the smaller tenant).
+  assert.deepEqual(["a1", "a2", "a3", "b1"].map((id, i) => st.has(id, [1, 2, 3, 1][i])), [false, true, true, true]);
+  // A document that names another meeting reads as absent.
+  fs.writeFileSync(path.join(dir, `${st.keyOf("zz", 9)}.json`), JSON.stringify({ meetingId: "other", receivedAt: 9, segments: [] }));
+  assert.equal(await st.load("zz", 9), null);
+  // The pure picker: biggest tenant first, oldest first.
+  assert.deepEqual(st.overBudget(new Map([["k1", { tenant: "A", at: 1 }], ["k2", { tenant: "A", at: 2 }], ["k3", { tenant: "B", at: 0 }]]),
+    new Map([["k1", 10], ["k2", 10], ["k3", 10]]), 20), ["k1"]);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("XERK-2508: the tick waits for a host, retries a silent or departed one, and expires the queue", async () => {
