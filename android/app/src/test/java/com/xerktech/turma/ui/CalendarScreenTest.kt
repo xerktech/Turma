@@ -91,7 +91,8 @@ class CalendarScreenTest {
                 { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "E2", "source": "outlook", "subject": "Overlap",
                   "startMs": ${t(today, 10, 30)}, "endMs": ${t(today, 11, 30)}, "busy": "tentative", "myResponse": "tentative" },
                 { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "E3", "source": "outlook", "subject": "Planning",
-                  "startMs": ${t(tomorrow, 14)}, "endMs": ${t(tomorrow, 15)}, "busy": "busy", "myResponse": "accepted" }""")
+                  "startMs": ${t(tomorrow, 14)}, "endMs": ${t(tomorrow, 15)}, "busy": "busy", "myResponse": "accepted",
+                  "joinUrl": "https://teams.microsoft.com/l/plan" }""")
         hub.json("/api/holidays", """[ { "id": "us-test", "date": "$today", "name": "Test Day", "offFor": ["$site"] } ]""")
     }
 

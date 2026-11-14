@@ -159,7 +159,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     opens a mini-month (month ‹ ›, year « »). Narrow (<760px): Day / 3 days, arrows + swipe.
   - 30-min rows (24px), working hours 8–17 shaded white, the grid opens scrolled to 8:00, a red
     now-line with a dot on today, today's header in the accent with a top bar.
-  - Events: a 22% tint of the org color with a 4px solid left bar (unassigned = neutral);
+  - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event an
+    org (XERK-2936, its host's when no rule decides); neutral only for a host in no org;
     overlaps share the width and widen into free columns to the right (`layoutDay`).
   - Tentative / not responded = hatched; free / declined = outlined; canceled = "Canceled: " +
     strikethrough (kept, as Teams keeps them); past = dimmed; Tenir-only (`source:"tenir"`) = a
@@ -198,7 +199,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   - The panel's aside is NOT `role=dialog`: meetings.js ignores keys from inside a dialog.
 - **An event counts for the org the hub's matcher reads** (`eventOrg` = the served `matchOrg`;
   an older hub: assigned org, else the host's): for the daily brief and relink candidates (QA:
-  another org's unassigned event was offered; a series pinned to no org must not count).
+  another org's unassigned event was offered).
 - `advanceFrom` resets the NOTES cursor: while a panel is open that is `panel.listCur`, never the
   live `curItem` (QA: a notes answer landing mid-panel made the next R hit the wrong proposal).
 - One org's captures per panel (the first linked capture's site); a daily event (an Outlook event
@@ -207,7 +208,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - "Moved from …" is read off the occurrence id (`<GlobalAppointmentID>:<original start>`,
   `originalStart`), or a Tenir entry's `moved`; Canceled from `canceled`.
 - **Relink** posts `POST .../meetings/<mid>/calendar` (`relink`): candidates are same-day,
-  uncanceled, timed Outlook events of the capture's org or unassigned; Unlink = `{eventId:null}`;
+  uncanceled, timed Outlook events of the capture's org; Unlink = `{eventId:null}`;
   "Match automatically" only when the row's `calendarBy` is `operator`. The answer's row goes to
   `TurmaMeetings.patch`; a Tenir entry that a link (or "Match automatically") merged into an event
   follows it there on the next read.

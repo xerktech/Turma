@@ -2,6 +2,7 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentsResponse
 import com.xerktech.turma.model.CalendarAnswer
+import com.xerktech.turma.model.CalendarAttendee
 import com.xerktech.turma.model.CalendarCapture
 import com.xerktech.turma.model.CalendarEvent
 import com.xerktech.turma.model.CalendarHost
@@ -41,6 +42,7 @@ class CalendarTest {
     ) = CalendarEvent(
         host = host, org = org, id = id, source = "outlook", subject = "S $id", startMs = s, endMs = e,
         busy = busy, myResponse = resp, allDay = allDay, canceled = canceled, meetings = meetings,
+        joinUrl = "https://teams.microsoft.com/l/$id",
     )
 
     // ---- week math ----
@@ -262,6 +264,15 @@ class CalendarTest {
     @Test fun `an upcoming meeting is a live timed Outlook meeting of an org within a week`() {
         val now = at(2026, 11, 10, 8)
         val ok = ev("a", now + 3_600_000, now + 7_200_000)
+        // XERK-2936: a personal block (no one else invited, no join link) is no meeting.
+        val block = ok.copy(joinUrl = "")
+        assertFalse(calIsUpcomingMeeting(block, now))
+        assertFalse(calIsUpcomingMeeting(block.copy(attendees = listOf(CalendarAttendee(role = "resource"))), now))
+        assertTrue(calIsUpcomingMeeting(block.copy(attendees = listOf(CalendarAttendee(role = "required"))), now))
+        assertTrue(calIsUpcomingMeeting(block.copy(isOnlineMeeting = true), now))
+        // The hub's verdict wins: a private meeting is served with no attendees or link.
+        assertTrue(calIsUpcomingMeeting(block.copy(meeting = true), now))
+        assertFalse(calIsUpcomingMeeting(ok.copy(meeting = false), now))
         assertTrue(calIsUpcomingMeeting(ok, now))
         assertFalse(calIsUpcomingMeeting(ok.copy(org = ""), now))
         assertFalse(calIsUpcomingMeeting(ok.copy(canceled = true), now))

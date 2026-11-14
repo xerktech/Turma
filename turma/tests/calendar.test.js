@@ -637,7 +637,7 @@ test("XERK-2899: upcoming() reads the coming week while hidden and lists only li
     asked.push(url);
     if (url.includes(`from=${cal.weekStart(at(2026, 11, 16))}&`)) {
       return { hosts: [], events: [{ host: "h1", id: "next-mon", org: "acme", subject: "Planning",
-        startMs: at(2026, 11, 16, 9), endMs: at(2026, 11, 16, 10) },
+        attendees: [{ name: "Bo", role: "required" }], startMs: at(2026, 11, 16, 9), endMs: at(2026, 11, 16, 10) },
       { host: "h1", id: "far", org: "acme", subject: "Too far", startMs: at(2026, 11, 20, 9), endMs: at(2026, 11, 20, 10) }] };
     }
     return { hosts: [], events: [
@@ -645,6 +645,12 @@ test("XERK-2899: upcoming() reads the coming week while hidden and lists only li
       { ...m("live", 11), host: "h2" },                              // the same meeting on a second host
       m("past", 8), m("canceled", 13, { canceled: true }), m("declined", 13, { myResponse: "declined" }),
       m("focus", 14, { busy: "free" }), m("wfh", 14, { busy: "workingElsewhere" }),
+      // XERK-2936: a busy personal block (no one else invited, no join link) is no meeting.
+      m("lunch", 12, { joinUrl: "", attendees: [{ name: "Me", role: "organizer" }, { name: "Room", role: "resource" }] }),
+      m("hub-no", 12, { meeting: false }),                           // the hub's verdict wins over a link
+      // A private meeting is served with no attendees or link: the hub's flag keeps it.
+      m("private", 12, { joinUrl: "", attendees: [], meeting: true }),
+      m("online", 12, { joinUrl: "", isOnlineMeeting: true }),
       m("allday", 0, { allDay: true, endMs: at(2026, 11, 13) }), m("other", 15, { org: "rival" }),
       m("captured", 15, { meetings: [{ site: "acme", meetingId: "c1", title: "x" }] }),
       { host: "", id: "tenir:t1", source: "tenir", org: "acme", site: "acme", meetingId: "t1", subject: "Adhoc",
@@ -658,7 +664,7 @@ test("XERK-2899: upcoming() reads the coming week while hidden and lists only li
   assert.deepEqual(cal.upcoming("acme"), [], "nothing read yet");
   for (let i = 0; i < 6; i++) await tick();
   assert.ok(landed >= 2, "the page hears each read land");
-  assert.deepEqual(cal.upcoming("acme").map((e) => e.id), ["now", "live", "next-mon"]);
+  assert.deepEqual(cal.upcoming("acme").map((e) => e.id), ["now", "live", "private", "online", "next-mon"]);
   assert.deepEqual(cal.upcoming("rival").map((e) => e.id), ["other"]);
   // A frame while hidden re-reads exactly those weeks.
   asked.length = 0;
@@ -693,7 +699,7 @@ test("XERK-2899: reveal() opens the week and the event carrying a capture; the p
   for (let i = 0; i < 4; i++) await tick();
   assert.equal(cal._state().detail.id, "tenir:cap-2");
   assert.deepEqual(cal.notesTarget(cal._state().detail, NOW), { site: "acme", meetingId: "cap-2" });
-  assert.deepEqual(cal.notesTarget({ id: "u", org: "acme", startMs: NOW + 3600000, endMs: NOW + 7200000 }, NOW),
+  assert.deepEqual(cal.notesTarget({ id: "u", org: "acme", joinUrl: "https://zoom.us/j/1", startMs: NOW + 3600000, endMs: NOW + 7200000 }, NOW),
     { site: "acme", eventId: "u" }, "an upcoming meeting opens its notes-review entry");
   assert.equal(cal.notesTarget({ id: "p", org: "acme", startMs: NOW - 7200000, endMs: NOW - 3600000 }, NOW), null);
   // An id this week does not hold leaves the panel shut, on that week.
