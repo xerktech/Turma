@@ -8,6 +8,7 @@ end-to-end cases run the script exactly as a session does (a subprocess under
 `-SsE`, HOME pointed at a temp dir); the rest drive main() in-process.
 """
 
+import base64
 import importlib.util
 import io
 import json
@@ -273,11 +274,15 @@ _FAKE_OUTLOOK = r"""
   $script:found | Add-Member ScriptMethod GetNext {
     if ($this.i -lt $script:appts.Count) { $this.i++; $script:appts[$this.i - 1] } else { $null } }
   $script:items = [pscustomobject]@{ IncludeRecurrences = $false }
-  $script:items | Add-Member ScriptMethod Sort { param($k) }
+  $script:items | Add-Member ScriptMethod Sort {
+    param($k) [Console]::Error.WriteLine("SORT recur=$($this.IncludeRecurrences)") }
   $script:items | Add-Member ScriptMethod Restrict {
     param($f) [Console]::Error.WriteLine("FILTER=$f recur=$($this.IncludeRecurrences)"); $script:found }
   $ol = [pscustomobject]@{ Session = [pscustomobject]@{} }
   $ol.Session | Add-Member ScriptMethod GetDefaultFolder { param($n) [pscustomobject]@{ Items = $script:items } }"""
+
+
+ISO = r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d\d:\d\d$"
 
 
 class CalendarTest(unittest.TestCase):
@@ -306,7 +311,7 @@ class CalendarTest(unittest.TestCase):
         self.assertEqual([e["subject"] for e in data["events"]], ["Standup", "Focus"])
         standup, focus = data["events"]
         self.assertTrue(standup["start"].startswith("20"), standup["start"])
-        self.assertRegex(standup["start"], r"[+-]\d\d:\d\d$")
+        self.assertRegex(standup["start"], ISO)
         self.assertEqual(standup["busy"], "busy")
         self.assertEqual(standup["myResponse"], "accepted")
         self.assertTrue(standup["recurring"])
@@ -329,15 +334,57 @@ class CalendarTest(unittest.TestCase):
             self.skipTest("pwsh not installed")
         script = cli._CALENDAR_PS.replace(_COM_LINES, _FAKE_OUTLOOK).replace(
             "__START__", "1").replace("__DAYS__", "1").replace("__MAX__", "5")
-        import base64
         enc = base64.b64encode(script.encode("utf-16-le")).decode()
         r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
                            capture_output=True, text=True, timeout=120)
         self.assertIn("FILTER=[Start] < '", r.stderr)
         self.assertIn("' AND [End] > '", r.stderr)
         self.assertIn("recur=True", r.stderr)
+        # Sort must run BEFORE IncludeRecurrences is set, or Outlook drops
+        # recurring meetings.
+        self.assertIn("SORT recur=False", r.stderr)
         doc = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertTrue(doc["ok"])
+
+    def run_fake(self, prelude="", epilogue="", max_events="5"):
+        """The script against the fake Outlook: `prelude` runs before it is
+        built, `epilogue` after (to break part of it). Returns the raw JSON."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        script = cli._CALENDAR_PS.replace(_COM_LINES, prelude + _FAKE_OUTLOOK + "\n" + epilogue)
+        script = script.replace("__START__", "0").replace("__DAYS__", "7").replace(
+            "__MAX__", max_events)
+        enc = base64.b64encode(script.encode("utf-16-le")).decode()
+        r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                           capture_output=True, text=True, timeout=120)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_iso_stamps_ignore_the_users_culture(self):
+        """fi-FI writes '.' for ':', th-TH a Buddhist year, ar-SA a Hijri one."""
+        for culture in ("fi-FI", "th-TH", "ar-SA"):
+            doc = self.run_fake(
+                prelude=f"  [Threading.Thread]::CurrentThread.CurrentCulture = '{culture}'\n")
+            self.assertTrue(doc["ok"], (culture, doc))
+            ev = doc["events"][0]
+            for v in (doc["from"], doc["until"], ev["start"], ev["end"]):
+                self.assertRegex(v, ISO, culture)
+
+    def test_the_script_caps_its_own_loop(self):
+        self.assertEqual(len(self.run_fake(max_events="1")["events"]), 1)
+
+    def test_one_unreadable_item_is_skipped_not_fatal(self):
+        doc = self.run_fake(epilogue=(
+            "  $script:appts[1].StartUTC = 'not a date'"))      # Iso's SpecifyKind throws
+        self.assertTrue(doc["ok"], doc)
+        self.assertEqual([e["subject"] for e in doc["events"]], ["Standup"])
+        self.assertEqual(doc["skipped"], 1)
+        self.assertEqual(cli.normalize_calendar(doc)["unreadable"], 1)
+
+    def test_a_lookalike_zoom_domain_is_not_a_join_link(self):
+        doc = self.run_fake(epilogue=(
+            "  $script:appts[1].Body = 'https://evilzoom.us/j/1 or https://acme.zoom.us/j/2'"))
+        self.assertEqual(doc["events"][1]["joinUrl"], "https://acme.zoom.us/j/2")
 
     def test_an_outlook_error_is_reported_not_printed_as_events(self):
         ps = self.fake_ps("echo '{\"ok\":false,\"error\":\"Class not registered\"}'\n")
@@ -368,7 +415,6 @@ class CalendarTest(unittest.TestCase):
     def test_the_range_is_only_ever_two_integers(self):
         ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"events":[]}\'\n')
         cli.read_calendar("tomorrow", powershell=ps)
-        import base64
         with open(os.path.join(self.tmp, "enc")) as fh:
             script = base64.b64decode(fh.read().strip()).decode("utf-16-le")
         self.assertIn("[DateTime]::Today.AddDays(1)", script)
@@ -391,7 +437,13 @@ class CalendarTest(unittest.TestCase):
         self.assertEqual(len(e["attendees"]), cli.CALENDAR_ATTENDEES_MAX)
         self.assertEqual(e["attendees"][0], {"name": "", "email": "", "role": "unknown",
                                              "response": "unknown"})
-        for bad in (None, [], {"ok": "true"}):
+        for line in ("a\u2028b", "a\u2029b", "a\u061cb", "a\xadb", "a\u2060b", "a\nb"):
+            got = cli.normalize_calendar({"ok": True, "events": [
+                {"subject": line, "attendees": []}]})["events"][0]["subject"]
+            self.assertEqual(got, "a b", repr(line))
+        for bad in (None, [], {"ok": "true"}, {"ok": True},
+                    {"ok": True, "events": {"value": [{"subject": "x"}], "Count": 1}},
+                    {"ok": True, "events": [{"subject": "x", "attendees": {"name": "a"}}]}):
             with self.assertRaises(cli.Refused):
                 cli.normalize_calendar(bad)
 

@@ -296,6 +296,11 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   into `_CALENDAR_PS`; days are counted in WINDOWS local time, since the distro's TZ is often UTC.
 - Restrict's dates must be in the user's locale (`ToString('g')`), and `Sort` must precede
   `IncludeRecurrences` or recurring meetings vanish. Enumerate with `GetFirst`/`GetNext`.
+- **Printed stamps use the INVARIANT culture**; only Restrict's literals use the user's. A
+  culture's own `ToString` writes `T09.00.00` (fi-FI) or a Buddhist/Hijri year (th-TH, ar-SA).
+- One item that throws is skipped and counted (`unreadable`), never failing the whole read.
+- A non-list `events`/`attendees` is REFUSED, not read as "no meetings": PS 5.1 can wrap an
+  array as `{value, Count}`, and an empty calendar would hide that.
 - `powershell.exe` is found on PATH, else under `/mnt/*/Windows/…`: a systemd-started agent's
   sessions lack the Windows half of PATH. ENOEXEC means interop is off (systemd's binfmt service
   can drop the `WSLInterop` registration) and is reported as such.
