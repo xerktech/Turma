@@ -1230,6 +1230,23 @@ test("XERK-2899 QA: an org color is only a palette slot; a week-out meeting carr
   assert.ok(h.includes(`<span class="w">${day} `), `dated: ${day}`);
 });
 
+test("XERK-2914: every paint numbers its Open in calendar buttons afresh, so an index never outlives its paint", () => {
+  const opened = [];
+  const soon = Date.now() + 2 * 864e5;
+  const P = calPage([calEv("soon", soon)], opened);
+  const d = data([]);
+  P.setCache(d);
+  P.setFilter("all");
+  P.select(P.entryKey(SITE, "c:soon"));
+  for (let i = 0; i < 3; i++) P.renderMeetings(d);
+  assert.deepEqual([...P.list().matchAll(/data-open-cal="(\d+)"/g)].map((m) => m[1]), ["0"]);
+  P.click({ openCal: "0" });
+  assert.deepEqual(opened, [{ site: SITE, eventId: "soon", startMs: soon }]);
+  // An index from an earlier paint that this one did not hand out opens nothing.
+  P.click({ openCal: "1" });
+  assert.equal(opened.length, 1);
+});
+
 test("XERK-2898: the calendar's own panel offers no 'Open in calendar'; the notes view still does", async () => {
   const P = loadPage(META, [], {}, { hooks: { openCalendar: () => {} } });
   P.update(data());
@@ -1239,4 +1256,20 @@ test("XERK-2898: the calendar's own panel offers no 'Open in calendar'; the note
   P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
   assert.match(el.innerHTML, /data-act="approve"/);
   assert.doesNotMatch(el.innerHTML, /data-open-cal/);
+});
+
+test("XERK-2914: archiving from the calendar panel leaves the notes view's selection to its own fallback, not the archive's advance", async () => {
+  const P = loadPage((u) => (/\/archive$/.test(u) ? { ok: true, meeting: meeting({ archivedAt: 1.7e12 + 9e6 }) } : META(u)));
+  const three = [meeting({ meetingId: "m0", title: "Newest", startedAt: 1.7e12 + 1e6 }), meeting(),
+    meeting({ meetingId: "m2", title: "Oldest", startedAt: 1.7e12 - 1e6 })];
+  P.update(data(three));
+  await P.settle();
+  P.select(P.entryKey(SITE, "m:m1"));
+  const el = P.document.createElement();
+  P.showPanel(el, { site: SITE, meetingIds: ["m1"] });
+  await P.archive(P.meetingKey(SITE, "m1"), true);
+  await P.settle();
+  // The guard skips the archive's advance (which would pick m2, the next entry): the view's
+  // own fallback for a selection that left Needs review picks the first entry.
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:m0"));
 });
