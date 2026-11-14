@@ -189,7 +189,7 @@ test("XERK-2897: every served string is escaped; canceled + Tenir events render 
   assert.match(html, /cal-dh today"[^>]*aria-current="date"/);
   // The placeholder detail escapes too.
   const btn = /data-ev="(\d+)" data-day="(\d+)"/.exec(html);
-  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { ev: btn[1], day: btn[2] } }) } });
+  click({ ev: btn[1], day: btn[2] });
   const { side, info } = cal._els();
   assert.equal(side.hidden, false);
   assert.match(info.innerHTML, /id="calDetailTitle">Canceled: &lt;img/);
@@ -392,7 +392,7 @@ test("XERK-2897: Esc closes the detail from anywhere, never under a shown modal 
   cal.refetch();
   const html = await show(at(2027, 9, 8));
   const btn = /data-ev="(\d+)" data-day="(\d+)"/.exec(html);
-  const open = () => { for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { ev: btn[1], day: btn[2] } }) } }); };
+  const open = () => { click({ ev: btn[1], day: btn[2] }); };
   const esc = (extra = {}) => { for (const f of root.listeners.keydown) f({ key: "Escape", target: {}, preventDefault() {}, ...extra }); };
   let shown = null;
   // Only a SHOWN modal counts: the New-ticket panel is always in the DOM, hidden.
@@ -433,7 +433,24 @@ test("XERK-2897: a read the frame dropped is not retried off screen", { timeout:
 });
 
 // ---- XERK-2898: the event detail panel ------------------------------------------------
-const click = (dataset) => { for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset, getAttribute: () => null }) } }); };
+// A click as a browser bubbles it to the root: the target's closest(sel) finds the control only
+// when the root listener's own selector names one of its data-* attributes (XERK-2949), so a
+// control dropped from that list does nothing here either.
+const dataAttr = (k) => `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]`;
+function control(dataset) {
+  const t = { dataset, inside: true, getAttribute: () => null };
+  t.closest = (sel) => (Object.keys(dataset).some((k) => sel.split(",").includes(dataAttr(k))) ? t : null);
+  return t;
+}
+const click = (dataset) => { for (const f of root.listeners.click) f({ target: control(dataset) }); };
+// The detail's buttons and selects as fresh nodes parsed from its markup, as a repaint makes them.
+function detailControls(html) {
+  return [...html.matchAll(/<(?:button|select)\b([^>]*)>/g)].map(([, attrs]) => {
+    const ds = {};
+    for (const [, k, v] of attrs.matchAll(/\bdata-([a-z-]+)(?:="([^"]*)")?/g)) ds[k.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = v ?? "";
+    return control(ds);
+  });
+}
 const change = (dataset, value) => { for (const f of root.listeners.change || []) f({ target: { dataset, value } }); };
 async function openEvent(anchorMs, match) {
   const html = await show(anchorMs);
@@ -492,6 +509,32 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.equal(cal.originalStart({ id: "G1:2027-03-09T09:00:00-05:00", seriesId: "" }), NaN);
   assert.doesNotMatch(cal.detailHtml({ host: "h", id: "G1:2027-03-09T09:00:00-05:00", seriesId: "G1",
     startMs: Date.parse("2027-03-09T09:00:00-05:00"), endMs: Date.parse("2027-03-09T10:00:00-05:00") }, 0), /Moved/);
+});
+
+test("XERK-2949: the attendee toggle clicks through the root listener and keeps focus across its repaint", async () => {
+  replies = { "/api/calendar": () => ({ hosts: [], events: [{ host: "h1", id: "ATT", org: "", source: "outlook", meetings: [],
+    subject: "Crowd", startMs: at(2027, 4, 14, 9), endMs: at(2027, 4, 14, 10),
+    attendees: [{ name: "Ann", email: "a@x.example" }, { name: "Bo", email: "b@x.example" }] }] }) };
+  cal.refetch();
+  const h = await openEvent(at(2027, 4, 14), "Crowd");
+  assert.match(h, /data-att-toggle aria-expanded="false"/);
+  const info = cal._els().info;
+  const qsa = info.querySelectorAll;
+  let focused = null;
+  info.querySelectorAll = () => detailControls(info.innerHTML).map((c) => Object.assign(c, { focus() { focused = c; } }));
+  // Enter on the focused toggle: a click on it, then the repaint swaps the node under focus.
+  globalThis.document = { activeElement: control({ attToggle: "" }), querySelector: () => null };
+  try {
+    click({ attToggle: "" });
+    assert.match(info.innerHTML, /data-att-toggle aria-expanded="true"/, "the root listener handles the toggle");
+    assert.ok(focused && focused.dataset.attToggle !== undefined, "focus moves to the repainted toggle");
+    // The next Space is a click on the node that now holds focus: it collapses again.
+    globalThis.document.activeElement = focused;
+    focused = null;
+    for (const f of root.listeners.click) f({ target: globalThis.document.activeElement });
+    assert.match(info.innerHTML, /data-att-toggle aria-expanded="false"/);
+    assert.ok(focused && focused.dataset.attToggle !== undefined);
+  } finally { delete globalThis.document; info.querySelectorAll = qsa; click({ closeDetail: "" }); }
 });
 
 test("XERK-2898: a Tenir-only entry says it is not on Outlook and shows what the capture knows, escaped", () => {
@@ -720,7 +763,7 @@ test("XERK-2899: reveal() opens the week and the event carrying a capture; the p
   assert.equal(cal.dayKey(cal._state().anchor), "2026-12-02");
   assert.equal(cal._state().detail && cal._state().detail.id, "ev-1");
   assert.match(root.innerHTML, /data-open-notes>Open in notes review</);
-  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { openNotes: "" } }) } });
+  click({ openNotes: "" });
   assert.deepEqual(jumps, [{ site: "acme", meetingId: "cap-1" }]);
   // A Tenir-only capture is found by its meeting id; a past, unlinked event has no way back.
   cal.reveal({ site: "acme", meetingId: "cap-2", startMs: at(2026, 12, 4, 11) });
@@ -775,7 +818,7 @@ test("XERK-2899 QA: a weekend reveal shows Week (unsaved); navigation drops a re
   cal.reveal({ eventId: "x", startMs: at(2027, 2, 8, 10) });
   assert.equal(cal._state().mode, "work");
   cal.reveal({ eventId: "sat", startMs: at(2027, 2, 6, 10) });
-  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { mode: "work" } }) } });
+  click({ mode: "work" });
   assert.equal(cal._state().mode, "work");
   cal.setActive(false);
 });
@@ -873,7 +916,7 @@ test("XERK-2940: a Sunday starts its week — reveal, holiday read and the date 
   // Holidays are read for that Sunday through Saturday, so a Sunday holiday is not dropped.
   assert.ok(asked.some((u) => u.startsWith("/api/holidays?from=2028-05-14&until=2028-05-20")), asked.join("\n"));
   // The mini-month opens on a Sunday: May 2028's first cell is Sunday, April 30.
-  for (const f of root.listeners.click) f({ target: { closest: () => ({ dataset: { openPicker: "" } }) } });
+  click({ openPicker: "" });
   const first = /data-pick="(\d+)"/.exec(cal.calendarHtml());
   assert.ok(first, "the picker is open");
   assert.equal(cal.dayKey(Number(first[1])), "2028-04-30");
