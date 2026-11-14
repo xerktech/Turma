@@ -782,3 +782,17 @@ test("XERK-2933: a cross-midnight event's label and When name the end's date", (
   assert.equal(same.match(/November/g).length, 1);
   assert.match(cal.fmtLongSpan(at(2026, 11, 9, 9), at(2026, 11, 9, 9)), /^Monday, November 9, 9:00\s?AM$/);
 });
+
+test("XERK-2933: a cross-midnight event's button aria-label names the end's date on both days", async () => {
+  replies = {
+    "/api/calendar": (url) => (url.includes(`from=${cal.weekStart(at(2026, 11, 11))}`) ? {
+      hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+      events: [{ host: "h1", id: "late", org: "", subject: "Night shift", startMs: at(2026, 11, 10, 22), endMs: at(2026, 11, 11, 3) }],
+    } : { events: [], hosts: [] }),
+  };
+  cal.refetch();
+  const html = await show(at(2026, 11, 11));
+  const labels = [...html.matchAll(/aria-label="(Night shift,[^"]*)"/g)].map((m) => m[1]);
+  assert.equal(labels.length, 2, "one button on each day");
+  for (const l of labels) assert.match(l, /Tuesday, November 10, 10:00\s?PM – Wednesday, November 11, 3:00\s?AM/);
+});
