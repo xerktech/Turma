@@ -292,6 +292,18 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - Reads classic Outlook's default calendar over COM by running Windows PowerShell 5.1 with
   `-EncodedCommand` — through WSL interop on a WSL host, directly on native Windows. As the
   logged-in Windows user, so no Entra ID app, token or shared calendar is involved (operator).
+- **An ENOEXEC from powershell.exe is WSL interop, and the error names the fix** (XERK-2938):
+  `wsl_interop_hint` reads `/proc/sys/fs/binfmt_misc/WSLInterop` — missing (systemd on WSL can
+  drop it after boot) → re-run the installer, which persists + re-registers it
+  (`ensure_wsl_interop`); `disabled` → the `echo 1` fix. It rides the calendar notice, so it
+  stays under `CALENDAR_ERROR_MAX`. Tests: `test_interop_*` (`test_session_cli.py`),
+  `test_install_wsl_interop.sh`.
+- **The wsl.conf reader is mirrored** — `wsl_conf_interop_off` (py) ⇄ `_wsl_interop_disabled`
+  (install.sh), both as WSL's own parser reads it (`false`/`0`, `#` outside `"` quotes, `"` toggling anywhere,
+  an unterminated one voiding the line, quoted/inner spaces kept, the FIRST `enabled` wins even if
+  invalid; backslash escapes NOT handled); an
+  interop-off host is told so, never sent to the installer that refuses it. `WSLInterop-late`
+  (older WSL 2.x) counts as registered on both sides.
 - **It only ATTACHES to a running classic Outlook (`GetActiveObject`), never starts one.** A COM
   start launches whichever Outlook is registered for automation — on a PC with an old Office
   beside Microsoft 365, that one — and opens its account-setup wizard (operator, live). The

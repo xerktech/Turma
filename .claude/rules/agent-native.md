@@ -68,6 +68,10 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     `$PREFIX/.dsh` (the updater's "wants dsh" marker), seeds `TURMA_DSH=1`. CLI updates at every
     agent restart like Claude Code, never on the timer. **A built `dist/` is non-negotiable** —
     `_ensure_dsh_profile` refuses every dsh spawn without it. Tests: `test_install_dsh.sh`.
+  - **On WSL it persists the `WSLInterop` binfmt entry** (`/etc/binfmt.d/WSLInterop.conf`) and
+    re-registers a lost one (XERK-2938): systemd-binfmt can drop WSL init's registration, and every
+    Windows program (the calendar's powershell.exe) then fails ENOEXEC. Never against an
+    `[interop] enabled=false` in `/etc/wsl.conf`. Tests: `test_install_wsl_interop.sh`.
   - **Never `curl | sudo bash`** — install belongs to the invoking user, only prereqs need root.
     Tests: `test_install_sudo.sh`.
 - `bootstrap.sh` — `curl | bash` front door: resolves newest tarball, verifies sha256, unpacks to

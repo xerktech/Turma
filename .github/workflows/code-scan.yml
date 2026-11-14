@@ -385,6 +385,10 @@ jobs:
       # unattended no-hang, NOPASSWD, and a declined password. Shell + sudo stubs.
       - name: Native installer sudo-probe tests (agent/native/install.sh)
         run: ./agent/tests/test_install_sudo.sh
+      # XERK-2938: on WSL the installer persists + re-registers the WSLInterop
+      # binfmt entry the calendar sync needs (fake /proc and /etc trees).
+      - name: Native installer WSL interop tests (agent/native/install.sh)
+        run: ./agent/tests/test_install_wsl_interop.sh
       # bootstrap.sh is the README's curl|bash front door, so it runs off main
       # on hosts with no checkout — a bug there has no deployed copy to fix.
       # Covers its resolution decision (carried assets, newest build) and its
