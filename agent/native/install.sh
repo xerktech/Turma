@@ -294,7 +294,8 @@ _wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL r
   # comment, only `"` quotes (toggling anywhere in the value; an unterminated
   # one voids the line), inner spaces are kept, case is ignored, and the
   # FIRST `enabled` wins (a later one is a "duplicated" warning) even when it
-  # is not a valid bool — which leaves interop at its default, on.
+  # is not a valid bool — which leaves interop at its default, on. Backslash
+  # escapes are not handled (WSL's are; no real interop value uses one).
   # Mirrors session_cli.py's wsl_conf_interop_off.
   [ -r "$WSL_CONF" ] && awk '
     { t = $0; sub(/\r$/, "", t); sub(/^[ \t]+/, "", t) }
@@ -303,13 +304,16 @@ _wsl_interop_disabled() {  # [interop] enabled reads false in wsl.conf, as WSL r
     sec == "[interop]" && !seen {
       i = index(t, "="); if (!i) next
       k = tolower(substr(t, 1, i - 1)); sub(/[ \t]+$/, "", k); if (k != "enabled") next
-      raw = substr(t, i + 1); sub(/^[ \t]+/, "", raw); v = ""; q = 0
+      raw = substr(t, i + 1); sub(/^[ \t]+/, "", raw); v = ""; q = 0; keep = 0
       for (n = 1; n <= length(raw); n++) {  # `"` toggles quoting anywhere
         c = substr(raw, n, 1)
-        if (c == "\"") q = !q; else if (c == "#" && !q) break; else v = v c
+        if (c == "\"") { q = !q; keep = length(v) }
+        else if (c == "#" && !q) break
+        else { v = v c; if (q) keep = length(v) }
       }
       if (q) next  # unterminated quote: an invalid line, it claims nothing
-      sub(/[ \t]+$/, "", v)
+      tail = substr(v, keep + 1); sub(/[ \t]+$/, "", tail)  # quoted spaces stay
+      v = substr(v, 1, keep) tail
       seen = 1; v = tolower(v); off = (v == "false" || v == "0")
     }
     END { exit !off }' "$WSL_CONF"

@@ -68,7 +68,7 @@ if [ -f "$CONF" ]; then ok "enabled=false in another section does not count"; el
 i=0
 for conf in $'[interop]\nenabled=0' $'[interop]\nenabled="false"' $'[interop]\nenabled = false # no' \
             $'[interop] # x\nenabled=false' $'[interop]\r\nenabled=false\r' $'[interop]\nenabled=false\nenabled=true' \
-            $'[interop]\nenabled=false\n[interop]\nenabled=true' $'[interop]\nenabled="false\nenabled=false' \
+            $'[interop]\nenabled=false\n[interop]\nenabled=true' $'[interop]\nenabled="false\nenabled=false' $'[interop]\nenabled="true\nenabled=false' \
             $'[interop]\nenabled="fal"se' $'[interop]\nenabled=fa"lse"'; do
   i=$((i + 1)); run_case "off$i" "$WSL" "$conf" no
   if [ ! -e "$CONF" ] && [ ! -s "$REG" ]; then ok "honours off spelling $i"
@@ -76,7 +76,7 @@ for conf in $'[interop]\nenabled=0' $'[interop]\nenabled="false"' $'[interop]\ne
 done
 for conf in $'[interop]\nenabled=true\nenabled=false' $'[interop]\nenabled=off\nenabled=false' \
             $'[interop]\n# enabled=false' $'[interop]\nenabled=\'false\'' $'[interop]\nenabled="false#x"' \
-            $'[interop]\nenabled = fal se'; do
+            $'[interop]\nenabled = fal se' $'[interop]\nenabled="false' $'[interop]\nenabled="false "'; do
   i=$((i + 1)); run_case "on$i" "$WSL" "$conf" no
   if [ -f "$CONF" ]; then ok "an on/commented spelling still installs ($i)"; else fail "misread on spelling $i"; fi
 done

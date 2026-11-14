@@ -563,6 +563,7 @@ class CalendarTest(unittest.TestCase):
                      "[boot]\nsystemd=true\r\n[interop]\r\nenabled=false\r\nenabled=true\r\n",
                      "[interop]\nenabled=false\n[interop]\nenabled=true\n",
                      '[interop]\nenabled="false\nenabled=false\n',
+                     '[interop]\nenabled="true\nenabled=false\n',
                      '[interop]\nenabled="fal"se\n', '[interop]\nenabled=fa"lse"\n',
                      "#\n" * 40000 + "[interop]\nenabled=false\n"):
             with self.subTest(conf=conf[-60:]):
@@ -574,7 +575,8 @@ class CalendarTest(unittest.TestCase):
         for conf in ("[automount]\nenabled=false\n", "[interop]\nenabled=true\nenabled=false\n",
                      "[interop]\nenabled=off\nenabled=false\n", "[interop]\n#enabled=false\n",
                      "[interop]\nenabled='false'\n", '[interop]\nenabled="false#x"\n',
-                     "[interop]\nenabled = fal se\n"):
+                     "[interop]\nenabled = fal se\n",
+                     '[interop]\nenabled="false\n', '[interop]\nenabled="false "\n'):
             with self.subTest(conf=conf):
                 self.assertIn("not registered", self._interop_off(None, conf=conf))
 
