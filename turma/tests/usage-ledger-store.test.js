@@ -786,6 +786,30 @@ test("XERK-2870: every caller waiting on an early scan sees the model loaded", a
   ledger._internals.reset();
 });
 
+test("XERK-2870: concurrent reloads during an outage share one read", async () => {
+  ledger._internals.reset();
+  let selects = 0;
+  class DownPool extends FakePgPool {
+    constructor() { super(); this.down = false; }
+    query(text, params) {
+      if (/^\s*SELECT/i.test(String(text)) && this.down) {
+        selects++;
+        return new Promise((_r, rej) => setTimeout(() => rej(new Error("down")), 5));
+      }
+      return super.query(text, params);
+    }
+  }
+  const pool = new DownPool();
+  pool.down = true; // never loaded: every boot read fails
+  await ledger.configure({ ha: true }, pool, () => {});
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(ledger.isLoaded(), false);
+  selects = 0;
+  await Promise.all(Array.from({ length: 10 }, () => ledger.rehydrate()));
+  assert.ok(selects <= 2, `${selects} reads for 10 concurrent reloads`);
+  ledger._internals.reset();
+});
+
 test("XERK-2554: rekeyHost writes the tenant key to Postgres and deletes the old host's rows", async () => {
   ledger._internals.reset();
   const pool = new FakePgPool();

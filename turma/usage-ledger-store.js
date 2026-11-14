@@ -136,6 +136,7 @@ class LedgerStore {
     // seeded or not — and a re-key would move only its new beats.
     this._loaded = false;
     this._scanP = null;   // the in-flight scan, so an overlapping caller can wait on it
+    this._lastScanSeedLanded = false;
     this._seedWarnAt = 0;
   }
 
@@ -312,7 +313,9 @@ class LedgerStore {
       // scan may have started before the seed landed) scans again once it ends;
       // every waiter waits out a re-scan another waiter started, too.
       while (this._scanP) await this._scanP;
-      if (!this._loaded && !this._seed) return this._scan();
+      // Only when that scan began before the seed landed: one that simply failed
+      // is the next caller's to retry, or N waiters mean N reads during an outage.
+      if (!this._loaded && !this._seed && !this._lastScanSeedLanded) return this._scan();
       return;
     }
     this._scanP = this._scanOnce();
@@ -322,6 +325,7 @@ class LedgerStore {
   async _scanOnce() {
     // Only a scan that starts with the seed landed reads its rows back (XERK-2870).
     const seedLanded = !this._seed;
+    this._lastScanSeedLanded = seedLanded;
     let rawByHost;
     try {
       rawByHost = await this._readAll();
