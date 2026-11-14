@@ -32100,7 +32100,11 @@ test("XERK-2891: each tenant reads only its own hosts' calendars, settings and f
 // D's decided org). Times are in the past: Tenir refuses an endedAt a day ahead.
 const T2896 = Math.floor((Date.now() - 3 * 864e5) / 3.6e6) * 3.6e6;  // on the hour, 3 days ago
 const MIN2896 = 60e3;
-const ev2896 = (id, startMs, mins, extra = {}) => ({ ...ev2891(id, startMs), end: iso2891(startMs + mins * MIN2896), ...extra });
+// A real meeting has someone invited (a personal block does not, XERK-2896 QA).
+const BO2896 = { name: "Bo Ray", email: "bo@x.com", role: "required", response: "accepted" };
+const ev2896 = (id, startMs, mins, extra = {}) => ({ ...ev2891(id, startMs), end: iso2891(startMs + mins * MIN2896),
+  attendees: [BO2896], ...extra });
+hub.__setCalendarRelinkMinMs(0);   // relink on every sync here; the throttle has its own test
 const calHost2896 = (device, site, events, headers) => (headers
   ? beat2533(headers, device, { jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`,
     fetchedAt: new Date().toISOString(), tickets: [] }, calendar: { available: true },
@@ -32292,7 +32296,7 @@ test("XERK-2896: the operator's unlink sticks, auto hands it back; refusals in t
     await postMeeting2508(S, capture2896("u2", T2896 + 5 * 60 * MIN2896, 10, { calendarEventId: "plan", calendarBy: "operator" }));
     assert.deepEqual([row2896(S, "u2").calendarEventId, row2896(S, "u2").calendarBy], [undefined, undefined]);
     for (const [body, status] of [[null, 400], [{}, 400], [{ eventId: 5 }, 400], [{ eventId: "a\u0007" }, 400],
-      [{ auto: false }, 400]]) {
+      [{ auto: false }, 400], [{ auto: true, eventId: "plan" }, 400], [{ auto: false, eventId: "plan" }, 400]]) {
       assert.equal((await link2896(S, "u1", body)).status, status, JSON.stringify(body));
     }
     assert.equal((await link2896("nobody2896.atlassian.net", "u1", { eventId: null })).status, 404);
@@ -32348,5 +32352,123 @@ test("XERK-2896: tenant isolation — a capture never links to, or shows on, ano
     forget2891(ka, kb);
     forget2533("lkT2896", ka, kb);
     T.restore();
+  }
+});
+
+test("XERK-2896: personal blocks never take a capture; a late invite replaces a weaker auto link", async () => {
+  const S = "lkG2896.atlassian.net", D = "lkG2896";
+  cleanup2896(S, [D]);
+  try {
+    const H = 60 * MIN2896;
+    await calHost2896(D, S, [
+      ev2896("focus", T2896, 90, { subject: "Focus time", attendees: [] }),
+      ev2896("wfh", T2896 + 2 * H, 8 * 60, { subject: "WFH", busy: "workingElsewhere" }),
+      ev2896("gym", T2896 + 11 * H, 60, { subject: "Gym", busy: "free" }),
+      ev2896("nope", T2896 + 13 * H, 60, { myResponse: "declined" }),
+      ev2896("pinned", T2896 + 15 * H, 60),
+      ev2896("allhands", T2896 + 17 * H, 120, { subject: "All hands" }),
+    ]);
+    // The pinned event is unassigned on purpose: it must not fall back to the host's org.
+    assert.equal((await request("POST", `/api/agents/${D}/calendar/settings`, { headers: { ...userHeaders,
+      "content-type": "application/json" }, body: { series: { id: "pinned", org: "" } } })).status, 200);
+    for (const [id, at] of [["f", T2896 + 20 * MIN2896], ["w", T2896 + 3 * H], ["g", T2896 + 11 * H + 10 * MIN2896],
+      ["d", T2896 + 13 * H], ["p", T2896 + 15 * H]]) {
+      await postMeeting2508(S, capture2896(id, at, 20, { participants: ["Cy Doe"] }));
+      assert.equal(row2896(S, id).calendarEventId, undefined, id);
+    }
+    // An impromptu call inside the all-hands slot links to it (no better event yet)...
+    await postMeeting2508(S, capture2896("ah", T2896 + 17 * H + 30 * MIN2896, 30, { title: "Customer call",
+      participants: ["Dee Fox"] }));
+    assert.equal(row2896(S, "ah").calendarEventId, "allhands");
+    // ...until the real invite arrives: it scores clearly higher, so the link moves.
+    await calHost2896(D, S, [
+      ev2896("allhands", T2896 + 17 * H, 120, { subject: "All hands" }),
+      ev2896("cust", T2896 + 17 * H + 30 * MIN2896, 30, { subject: "Customer call",
+        attendees: [{ name: "Dee Fox", email: "dee@y.com", role: "required", response: "accepted" }] }),
+    ]);
+    assert.deepEqual([row2896(S, "ah").calendarEventId, row2896(S, "ah").calendarBy], ["cust", "auto"]);
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: a linked capture whose event is not served still shows on its own time", async () => {
+  const S = "lkH2896.atlassian.net", D = "lkH2896";
+  cleanup2896(S, [D]);
+  try {
+    await calHost2896(D, S, [ev2896("mv", T2896, 30)]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    assert.equal(row2896(S, "c").calendarEventId, "mv");
+    const hour = async (q = "") => (await calGet2891(T2896 - MIN2896, T2896 + 60 * MIN2896, userHeaders, q)).body.events;
+    // Served with its event: one Outlook entry carrying it, no Turma-only copy.
+    assert.deepEqual((await hour()).filter((e) => e.id === "mv" || e.id === "tenir:c").map((e) => e.id), ["mv"]);
+    // The org filter: the unassigned event serves as org "" — the capture still shows under its org.
+    const byOrg = (await hour(`&org=${encodeURIComponent(S)}`)).filter((e) => e.id === "tenir:c");
+    assert.deepEqual(byOrg.map((e) => [e.calendarEventId, e.moved]), [["mv", undefined]]);
+    // Moved 20 h later: the capture's own hour still has it, marked moved.
+    await calHost2896(D, S, [ev2896("mv", T2896 + 20 * 60 * MIN2896, 30)]);
+    const moved = (await hour()).filter((e) => e.id === "tenir:c");
+    assert.deepEqual(moved.map((e) => [e.calendarEventId, e.moved]), [["mv", true]]);
+    // The wire names the org the link was matched under, not "".
+    const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
+    assert.equal(fleet.find((m) => m.meetingId === "c").calendarEvent.org, S);
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: a private event stays withheld beside its capture", async () => {
+  const S = "lkI2896.atlassian.net", D = "lkI2896";
+  cleanup2896(S, [D]);
+  try {
+    await calHost2896(D, S, [ev2896("pv", T2896, 30, { subject: "Medical", sensitivity: "private",
+      location: "Clinic" })]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
+    const ev = fleet.find((m) => m.meetingId === "c").calendarEvent;
+    assert.deepEqual([ev.subject, ev.private], ["Private event", true]);
+    assert.ok(!JSON.stringify(fleet).includes("Medical") && !JSON.stringify(fleet).includes("Clinic"));
+    const r = await link2896(S, "c", { eventId: "pv" });
+    assert.equal(r.body.meeting.calendarEvent.subject, "Private event");
+  } finally {
+    cleanup2896(S, [D]);
+  }
+});
+
+test("XERK-2896: relinks are throttled per tenant and skip error-only syncs; an expired host's links rematch", async () => {
+  const S = "lkJ2896.atlassian.net", D = "lkJ2896";
+  cleanup2896(S, [D]);
+  const t = hub.tenantOfSite(S);
+  const clear = () => {
+    if (hub.calendarRelinkTimers.has(t)) { clearTimeout(hub.calendarRelinkTimers.get(t)); hub.calendarRelinkTimers.delete(t); }
+  };
+  try {
+    await calHost2896(D, S, [ev2896("a", T2896, 30)]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    hub.__setCalendarRelinkMinMs(60e3);
+    hub.calendarRelinkAt.set(t, Date.now());
+    // An error row (sent every beat, say) changes no event: no relink is even scheduled.
+    await beat1574(D, S, { calendar: { available: true }, calendarSync: [{}] });
+    await beat1574(D, S, { calendar: { available: true }, calendarSync: [{ windowFrom: T2896 - 864e5,
+      windowUntil: T2896 + 864e5, syncedAt: Date.now(), error: "Outlook is not open" }] });
+    assert.equal(hub.calendarRelinkTimers.has(t), false);
+    // Events changing inside the gap: deferred to one trailing relink, not run inline.
+    await calHost2896(D, S, []);
+    assert.equal(hub.calendarRelinkTimers.has(t), true);
+    assert.equal(row2896(S, "c").calendarEventId, "a", "not yet relinked");
+    clear();
+    hub.__setCalendarRelinkMinMs(0);
+    hub.relinkTenantMeetings(t);
+    assert.equal(row2896(S, "c").calendarEventId, undefined, "its event is gone: rematched (none)");
+    // calendarTick dropping a gone host's calendar rematches the links it held.
+    await calHost2896(D, S, [ev2896("a", T2896, 30)]);
+    assert.equal(row2896(S, "c").calendarEventId, "a");
+    delete agents[D];
+    assert.equal(hub.calendarTick(Date.now() + 31 * 864e5), 1);
+    assert.equal(row2896(S, "c").calendarEventId, undefined);
+  } finally {
+    clear();
+    hub.__setCalendarRelinkMinMs(0);
+    cleanup2896(S, [D]);
   }
 });

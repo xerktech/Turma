@@ -5540,11 +5540,11 @@ function meetingTenirWire(m) {
 const MEETINGS_WIRE_TAIL = 20;
 function meetingProposalsWire() {
   const out = Object.create(null);
-  const indexes = new Map(); // tenant -> its calendar candidate index, built once
+  const indexes = new Map(); // tenant -> its calendar event lookup, built once
   for (const [site, list] of Object.entries(meetingProposals)) {
     const rows = list.slice(0, MEETINGS_WIRE_TAIL);
     const t = tenantOfSite(site);
-    if (rows.some((m) => m.calendarEventId) && !indexes.has(t)) indexes.set(t, calendarCandidateIndex(t));
+    if (rows.some((m) => m.calendarEventId) && !indexes.has(t)) indexes.set(t, calendarEventLookup(t));
     out[site] = rows.map((m) => meetingWire(m, site, indexes.get(t)));
   }
   return out;
@@ -6033,19 +6033,24 @@ function applyCalendarSync(key, row, now) {
   calendarTrimHost(h, now);
   calendarEvents[key] = sanitizeCalendarHost(h);
   calendarEnforceTenant(tenantOfKey(key), now);
-  return true;
+  // "events" when the stored events differ: only that can change a capture's link.
+  return !prev || JSON.stringify(prev.events) !== JSON.stringify(calendarEvents[key].events) ? "events" : true;
 }
 function ingestCalendarSync(key, rows, now = Date.now()) {
   if (!Array.isArray(rows) || !rows.length) return false;
   let changed = false;
+  let eventsChanged = false;
   for (const row of rows.slice(0, CALENDAR_SYNC_ROWS_MAX)) {
-    if (row && typeof row === "object" && !Array.isArray(row)) changed = applyCalendarSync(key, row, now) || changed;
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const r = applyCalendarSync(key, row, now);
+    changed = changed || !!r;
+    eventsChanged = eventsChanged || r === "events";
   }
   if (changed) {
     persistCalendarEvents();
     broadcastCalendarSoon(key);
-    relinkTenantMeetings(tenantOfKey(key));
   }
+  if (eventsChanged) scheduleCalendarRelink(tenantOfKey(key), now);
   return changed;
 }
 
@@ -6149,11 +6154,13 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       if (ev.startMs >= until || ev.endMs < from || (ev.endMs === from && ev.endMs !== ev.startMs)) continue;
       const w = calendarEventWire(key, ev, orgs, hs);
       if (orgFilter && !orgFilter.has(w.org)) continue;
-      w.meetings = tenir.links.get(`${tenantOfKey(key)}\u0000${ev.id}`) || [];
+      const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
+      w.meetings = tenir.links.get(lk) || [];
+      tenir.linked.delete(lk);   // served: its captures ride on it
       events.push({ source: "outlook", ...w });
     }
   }
-  events = events.concat(tenir.entries);
+  events = events.concat(tenir.entries, ...tenir.linked.values());
   events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const truncated = events.length > CALENDAR_SERVE_MAX;
@@ -6194,7 +6201,7 @@ function setCalendarOrgRules(siteKey, body) {
   else delete calendarOrgRules[siteKey];
   persistCalendarOrgRules();
   for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
-  relinkTenantMeetings(tenantOfSite(siteKey));
+  scheduleCalendarRelink(tenantOfSite(siteKey));
   return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
 }
 function setCalendarHostSettings(key, body) {
@@ -6226,7 +6233,7 @@ function setCalendarHostSettings(key, body) {
   calendarHostSettings[key] = sanitizeCalendarHostSettings(cur);
   persistCalendarHostSettings();
   broadcastCalendarSoon(key);
-  relinkTenantMeetings(tenantOfKey(key));
+  scheduleCalendarRelink(tenantOfKey(key));
   return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
 }
 
@@ -6234,15 +6241,19 @@ function setCalendarHostSettings(key, body) {
 // its last sync (served offline meanwhile), then loses it.
 function calendarTick(now = Date.now()) {
   let n = 0;
+  const tenants = new Set();
   for (const [k, h] of Object.entries(calendarEvents)) {
     if (Object.hasOwn(agents, k)) continue;
     if (now - Math.max(h.syncedAt, h.lastErrorAt || 0) > CALENDAR_HOST_RETAIN_MS) {
       delete calendarEvents[k];
       delete calendarHostSettings[k];
+      tenants.add(tenantOfKey(k));
       n++;
     }
   }
   if (n) { persistCalendarEvents(); persistCalendarHostSettings(); }
+  // An auto link to an event that just went has nothing to hold (XERK-2896).
+  for (const t of tenants) scheduleCalendarRelink(t);
   return n;
 }
 
@@ -6258,32 +6269,59 @@ const CALENDAR_LINK_TOLERANCE_MS = 15 * 60e3;
 const CALENDAR_LINK_EVENT_MAX_MS = 12 * 3600e3;  // a longer block is not a meeting
 const CALENDAR_LINK_MIN_SCORE = 0.35;
 const CALENDAR_LINK_MARGIN = 0.05;
+const CALENDAR_LINK_SCAN_MAX = 200;              // candidates scored per capture
+const CALENDAR_RELINK_MIN_MS = 10e3;             // per tenant, between relinks
+const CAL_NOT_MEETING_BUSY = new Set(["free", "outOfOffice", "workingElsewhere"]);
 const CAL_PLATFORM_HOSTS = [["teams", /(^|\.)teams\.(microsoft|live)\.com$/], ["zoom", /(^|\.)zoom(gov)?\.us$/],
   ["meet", /(^|\.)meet\.google\.com$/], ["webex", /(^|\.)webex\.com$/]];
 
-// Every event a capture of the tenant `t` could link to: not all-day, at most
-// CALENDAR_LINK_EVENT_MAX_MS long, with its assigned org (or, unassigned, its
-// host's decided org). Sorted by start, plus id -> entries for link lookups. An
+// The org an event counts for when matching: its assigned org, else (unassigned,
+// and not PINNED unassigned by a series override) its host's decided org.
+function calendarMatchOrg(key, ev, orgs, hs) {
+  const org = calendarEventOrg(ev, orgs, hs);
+  if (org) return org;
+  const so = hs && hs.seriesOrgs;
+  if (so && Object.hasOwn(so, ev.seriesId || ev.id)) return "";
+  return agents[key] ? decidedOrgOf(agents[key]) : "";
+}
+// id -> {key, ev, syncedAt} for tenant `t`'s stored events: what a link resolves
+// against. Cheap (no org decision), so the wire and the view build it freely. An
 // id held by two hosts (two people's Outlooks invited to one meeting) is one
 // meeting; the newest-synced host's copy is served.
+function calendarEventLookup(t) {
+  const byId = new Map();
+  for (const [key, h] of Object.entries(calendarEvents)) {
+    if (tenantOfKey(key) !== t) continue;
+    for (const ev of h.events) {
+      const prev = byId.get(ev.id);
+      if (!prev || h.syncedAt > prev.syncedAt) byId.set(ev.id, { key, ev, syncedAt: h.syncedAt });
+    }
+  }
+  return { t, byId };
+}
+// A real meeting, not a personal block (Focus time, Lunch, Gym, WFH): someone
+// else is invited or it has a join link; shown busy/tentative; not declined; not
+// all-day; at most CALENDAR_LINK_EVENT_MAX_MS. (XERK-2896 QA: a capture inside
+// such a block linked to it and never left.)
+function calendarLinkCandidate(ev) {
+  if (ev.allDay || ev.endMs - ev.startMs > CALENDAR_LINK_EVENT_MAX_MS) return false;
+  if (ev.myResponse === "declined" || CAL_NOT_MEETING_BUSY.has(ev.busy)) return false;
+  return ev.attendees.length > 0 || !!ev.joinUrl || ev.isOnlineMeeting;
+}
+// Every event a capture of tenant `t` could link to, with the org it counts for,
+// sorted by start, plus the lookup.
 function calendarCandidateIndex(t) {
   const list = [];
-  const byId = new Map();
   const orgs = calendarOrgsOfTenant(t);
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t) continue;
     const hs = calendarHostSettings[key];
-    const hostOrg = agents[key] ? decidedOrgOf(agents[key]) : "";
     for (const ev of h.events) {
-      const org = calendarEventOrg(ev, orgs, hs);
-      const c = { key, ev, org: org || hostOrg, syncedAt: h.syncedAt };
-      const prev = byId.get(ev.id);
-      if (!prev || c.syncedAt > prev.syncedAt) byId.set(ev.id, c);
-      if (!ev.allDay && ev.endMs - ev.startMs <= CALENDAR_LINK_EVENT_MAX_MS) list.push(c);
+      if (calendarLinkCandidate(ev)) list.push({ key, ev, org: calendarMatchOrg(key, ev, orgs, hs) });
     }
   }
   list.sort((a, b) => a.ev.startMs - b.ev.startMs);
-  return { t, list, byId };
+  return { ...calendarEventLookup(t), list };
 }
 const calWords = (s) => new Set(String(s || "").toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) || []);
 function calJaccard(a, b) {
@@ -6337,30 +6375,62 @@ function calendarBestMatch(siteKey, m, index) {
   let a = 0, b = index.list.length;
   while (a < b) { const mid = (a + b) >> 1; if (index.list[mid].ev.startMs < lo) a = mid + 1; else b = mid; }
   const best = new Map(); // eventId -> score (one id on two hosts is one meeting)
-  for (let i = a; i < index.list.length && index.list[i].ev.startMs < hi; i++) {
+  for (let i = a, n = 0; i < index.list.length && index.list[i].ev.startMs < hi && n < CALENDAR_LINK_SCAN_MAX; i++) {
     const c = index.list[i];
     if (c.org !== siteKey || c.ev.canceled) continue;
+    n++;
     const sc = calendarLinkScore(m, c.ev);
     if (sc > (best.get(c.ev.id) || 0)) best.set(c.ev.id, sc);
   }
   const ranked = [...best.entries()].sort((x, y) => y[1] - x[1]);
   if (!ranked.length || ranked[0][1] < CALENDAR_LINK_MIN_SCORE) return null;
   if (ranked.length > 1 && ranked[1][1] >= ranked[0][1] - CALENDAR_LINK_MARGIN) return { ambiguous: true };
-  return { eventId: ranked[0][0] };
+  return { eventId: ranked[0][0], score: ranked[0][1] };
 }
+const calOverlapsCapture = (m, ev) => m.startedAt < ev.endMs + CALENDAR_LINK_TOLERANCE_MS &&
+  Math.max(m.endedAt, m.startedAt) > ev.startMs - CALENDAR_LINK_TOLERANCE_MS;
 // The link fields an auto-matched row should carry now. An operator's choice is
-// kept; so is an auto link whose event is still stored, even canceled or moved
-// (the capture is what happened). Else the matcher decides.
+// kept. An auto link whose event is still stored holds when that event was
+// canceled or moved (the capture is what happened); otherwise it yields only to a
+// different event scoring clearly higher (a late invite). Else the matcher decides.
 function meetingCalendarLinkFields(siteKey, m, index) {
   if (m.calendarBy === "operator") {
     return { calendarEventId: m.calendarEventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
-  if (m.calendarEventId && index.byId.has(m.calendarEventId)) {
-    return { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
+  const keep = { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
+  const cur = m.calendarEventId && index.byId.get(m.calendarEventId);
+  if (cur) {
+    if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
+    const hit = calendarBestMatch(siteKey, m, index);
+    const curScore = calendarLinkCandidate(cur.ev) ? calendarLinkScore(m, cur.ev) : 0;
+    return hit && hit.eventId && hit.eventId !== m.calendarEventId && hit.score > curScore + CALENDAR_LINK_MARGIN
+      ? { ...keep, calendarEventId: hit.eventId } : keep;
   }
   const hit = calendarBestMatch(siteKey, m, index);
   return { calendarEventId: hit && hit.eventId, calendarBy: hit && hit.eventId ? "auto" : undefined,
     calendarAmbiguous: hit && hit.ambiguous ? true : undefined };
+}
+// Relinks run at most once per CALENDAR_RELINK_MIN_MS per tenant (a trailing
+// timer catches what a throttled call skipped): one host re-sending syncs every
+// beat must not block the shared event loop (XERK-2896 QA: ~0.55 s a beat).
+const calendarRelinkAt = new Map();     // tenant -> last relink ms
+const calendarRelinkTimers = new Map(); // tenant -> pending timer
+let calendarRelinkMinMs = CALENDAR_RELINK_MIN_MS;
+function scheduleCalendarRelink(t, now = Date.now()) {
+  if (calendarRelinkTimers.has(t)) return false;
+  const wait = (calendarRelinkAt.get(t) || 0) + calendarRelinkMinMs - now;
+  if (wait <= 0) {
+    calendarRelinkAt.set(t, now);
+    return relinkTenantMeetings(t);
+  }
+  const timer = setTimeout(() => {
+    calendarRelinkTimers.delete(t);
+    calendarRelinkAt.set(t, Date.now());
+    try { relinkTenantMeetings(t); } catch (e) { console.error(`calendar relink failed: ${e && e.message}`); }
+  }, wait);
+  if (timer.unref) timer.unref();
+  calendarRelinkTimers.set(t, timer);
+  return false;
 }
 // Re-run the matcher over every meeting of tenant `t` (a calendar sync, or an org
 // rule / host setting that can move an event's org). One write for all changes.
@@ -6389,14 +6459,15 @@ function relinkTenantMeetings(t) {
 // A linked row's event as clients show it beside the capture: withheld like the
 // calendar withholds it (private), `moved` when it no longer overlaps the capture.
 function meetingCalendarEventWire(siteKey, m, index) {
-  const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarCandidateIndex(tenantOfSite(siteKey));
+  const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
   const c = ix.byId.get(m.calendarEventId);
   if (!c) return null;
-  const w = calendarEventWire(c.key, c.ev, calendarOrgsOfTenant(ix.t), calendarHostSettings[c.key]);
-  const s = m.startedAt, e = Math.max(m.endedAt, m.startedAt);
-  const out = { host: c.key, org: w.org, subject: w.subject, start: w.start, end: w.end,
-    startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
-    moved: !(s < w.endMs + CALENDAR_LINK_TOLERANCE_MS && e > w.startMs - CALENDAR_LINK_TOLERANCE_MS) };
+  const orgs = calendarOrgsOfTenant(ix.t);
+  const hs = calendarHostSettings[c.key];
+  const w = calendarEventWire(c.key, c.ev, orgs, hs);
+  const out = { host: c.key, org: calendarMatchOrg(c.key, c.ev, orgs, hs), subject: w.subject,
+    start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
+    moved: !calOverlapsCapture(m, w) };
   if (w.private) out.private = true;
   return out;
 }
@@ -6407,8 +6478,8 @@ function meetingCalendarEventWire(siteKey, m, index) {
 function setMeetingCalendarLink(siteKey, meetingId, body) {
   const refuse = (status, error) => ({ status, body: { error } });
   const ok = body && typeof body === "object" && !Array.isArray(body);
-  const auto = ok && body.auto === true && !("eventId" in body);
-  if (!ok || (!auto && !("eventId" in body)) ||
+  const auto = ok && body.auto === true;
+  if (!ok || auto === ("eventId" in body) || ("auto" in body && !auto) ||
       (!auto && body.eventId !== null && !meetingCalendarId(body.eventId))) {
     return refuse(400, "the body must be {eventId: \"<calendar event id>\"}, {eventId: null} or {auto: true}");
   }
@@ -6433,25 +6504,32 @@ function setMeetingCalendarLink(siteKey, meetingId, body) {
 // The captures beside a calendar range: each served Outlook event's linked
 // captures (`id -> [{site, meetingId, title}]`, per tenant) and the Turma-only
 // entries of captures with no link — never written to Outlook.
+// A linked capture whose event this answer does not serve (moved out of the
+// range, filtered out by org) is served on its own time too, with
+// `calendarEventId`, so a capture never vanishes from its own day: `linked` holds
+// those entries per event key for calendarView to keep or drop.
 function calendarTenirView(p, from, until, orgFilter) {
   const links = new Map(); // `${tenant}\u0000${eventId}` -> [capture]
+  const linked = new Map(); // same key -> [entry served only if the event is not]
   const entries = [];
-  const indexes = new Map();
+  const lookups = new Map();
   for (const [site, list] of Object.entries(meetingProposals)) {
     if (!principalMaySite(p, site)) continue;
     const t = tenantOfSite(site);
-    if (!indexes.has(t)) indexes.set(t, calendarCandidateIndex(t));
-    const index = indexes.get(t);
+    if (!lookups.has(t)) lookups.set(t, calendarEventLookup(t));
+    const lookup = lookups.get(t);
     for (const m of list) {
       const title = meetingDisplayTitle(m);
-      if (m.calendarEventId && index.byId.has(m.calendarEventId)) {
-        const k = `${t}\u0000${m.calendarEventId}`;
+      const endMs = Math.max(m.endedAt, m.startedAt);
+      const inRange = !(m.startedAt >= until || endMs < from || (orgFilter && !orgFilter.has(site)));
+      const c = m.calendarEventId && lookup.byId.get(m.calendarEventId);
+      let k = "";
+      if (c) {
+        k = `${t}\u0000${m.calendarEventId}`;
         if (!links.has(k)) links.set(k, []);
         links.get(k).push({ site, meetingId: m.meetingId, title });
-        continue;
       }
-      const endMs = Math.max(m.endedAt, m.startedAt);
-      if (m.startedAt >= until || endMs < from || (orgFilter && !orgFilter.has(site))) continue;
+      if (!inRange) continue;
       const e = { source: "tenir", host: "", org: site, id: `tenir:${m.meetingId}`, site,
         meetingId: m.meetingId, subject: title, start: new Date(m.startedAt).toISOString(),
         end: new Date(endMs).toISOString(), startMs: m.startedAt, endMs, allDay: false,
@@ -6459,11 +6537,18 @@ function calendarTenirView(p, from, until, orgFilter) {
       if (m.summary) e.summary = m.summary;
       if (m.tenirUrl) e.tenirUrl = m.tenirUrl;
       if (m.calendarAmbiguous) e.ambiguous = true;
-      if (m.calendarEventId) e.calendarEventMissing = true;
-      entries.push(e);
+      if (m.calendarEventId) e.calendarEventId = m.calendarEventId;
+      if (!c) {
+        if (m.calendarEventId) e.calendarEventMissing = true;
+        entries.push(e);
+        continue;
+      }
+      if (!calOverlapsCapture(m, c.ev)) e.moved = true;
+      if (!linked.has(k)) linked.set(k, []);
+      linked.get(k).push(e);
     }
   }
-  return { links, entries };
+  return { links, linked, entries };
 }
 
 // "Acme Corp" -> "acme-corp". "" when nothing label-shaped is left.
@@ -29718,6 +29803,8 @@ if (process.env.TURMA_TEST) {
     calendarEventOrg, calendarOnDemandAt,
     // XERK-2896: linking captures to calendar events.
     calendarLinkScore, calendarBestMatch, calendarCandidateIndex, relinkTenantMeetings, setMeetingCalendarLink,
+    scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,
+    __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     getCalendarOrgRules: () => calendarOrgRules,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
