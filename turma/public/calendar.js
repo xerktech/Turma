@@ -17,7 +17,11 @@
 const DAY_MS = 86400000;
 const SLOT_PX = 24;                 // one 30-minute row
 const HOUR_PX = SLOT_PX * 2;
-const DAY_PX = HOUR_PX * 24;
+// A length of `n` 30-minute rows. The grid stretches its rows to fill a pane
+// taller than the day (XERK-2937): `--slot` is SLOT_PX until the day fits, then
+// grows (brief.html, .cal-body). Scroll math stays in SLOT_PX: a stretched day
+// never scrolls.
+const slots = (n, minus = 0) => `calc(var(--slot, ${SLOT_PX}px) * ${n}${minus ? ` - ${minus}px` : ""})`;
 const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid opens at 8:00
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
@@ -513,7 +517,6 @@ function evStyle(ev, colors) {
 }
 function timedHtml(seg, day, colors, now) {
   const ev = seg.ev;
-  const top = (seg.top / 30) * SLOT_PX;
   const h = ((seg.bottom - seg.top) / 30) * SLOT_PX - 2;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
   const short = h < 34;
@@ -521,7 +524,7 @@ function timedHtml(seg, day, colors, now) {
   const cls = ["cal-ev", ...styleOf(ev, now), short ? "short" : ""].filter(Boolean).join(" ");
   const b = badgeOf(ev);
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
-    + ` style="${evStyle(ev, colors)}top:${top}px;height:${h}px;left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
+    + ` style="${evStyle(ev, colors)}top:${slots(seg.top / 30)};height:${slots((seg.bottom - seg.top) / 30, 2)};left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
     + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
     + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
     + (short ? "" : `<span class="m">${esc(meta)}</span>`) + `</button>`;
@@ -796,11 +799,11 @@ function calendarHtml() {
       + `</div>`;
   }).join("");
   const band = days.map((d) => `<div class="cal-band-day${offOrgs(d, got.holidays).length ? " off" : ""}">${bandHtml(d, got.events, got.holidays, colors, now)}</div>`).join("");
-  const hours = Array.from({ length: 24 }, (_, h) => `<div class="cal-hr" style="top:${h * HOUR_PX}px">${h ? esc(new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: "numeric" })) : ""}</div>`).join("");
+  const hours = Array.from({ length: 24 }, (_, h) => `<div class="cal-hr" style="top:${slots(h * 2)}">${h ? esc(new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: "numeric" })) : ""}</div>`).join("");
   const body = days.map((d) => {
     const isToday = dayKey(d) === today;
     const segs = daySegments(got.events, d);
-    const nowLine = isToday ? `<div class="cal-now" style="top:${(wallMinutes(now, d) / 30) * SLOT_PX}px" aria-hidden="true"></div>` : "";
+    const nowLine = isToday ? `<div class="cal-now" style="top:${slots(wallMinutes(now, d) / 30)}" aria-hidden="true"></div>` : "";
     return `<div class="cal-col${isToday ? " today" : ""}${offOrgs(d, got.holidays).length ? " off" : ""}" data-col="${d}">`
       + segs.map((s) => timedHtml(s, d, colors, now)).join("") + nowLine + `</div>`;
   }).join("");
@@ -810,7 +813,7 @@ function calendarHtml() {
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
-    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${DAY_PX}px">`
+    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${slots(48)}">`
     + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 

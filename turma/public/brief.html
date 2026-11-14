@@ -227,6 +227,19 @@
   .mt-views { display: flex; gap: 6px; margin: 0 0 12px; }
   button.tri-chip[aria-pressed="true"] { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
   .cal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 10px 12px 12px; min-width: 0; }
+  /* The shown calendar fills the page's height, and widens to the board's
+     --wrap-board column (operator's pick) (XERK-2937): a flex chain from the
+     scroll pane down to .cal-scroll, which takes whatever the bar and notices leave.
+     A fixed `100vh - N` guess capped at 900px left a tall window half empty and
+     overflowed when a notice wrapped. Below the 360px floor the page scrolls. */
+  .page-scroll:has(> .tri-wrap > .cal:not([hidden])) { display: flex; flex-direction: column; }
+  .wrap.tri-wrap:has(> .cal:not([hidden])) { max-width: var(--wrap-board); flex: 1 0 auto; width: 100%; padding-bottom: 16px; display: flex; flex-direction: column; }
+  .cal:not([hidden]) { flex: 1 0 auto; display: flex; flex-direction: column; }
+  .cal-main { flex: 1 0 auto; display: flex; flex-direction: column; }
+  .cal-main > * { flex: none; }
+  .cal-main > .cal-grid { flex: 1 0 auto; display: flex; flex-direction: column; }
+  .cal-grid > * { flex: none; }
+  .cal-grid > .cal-scroll { flex: 1 1 0; }
   .cal-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
   .cal-bar .sp { flex: 1 1 auto; }
   .cal-modes { display: inline-flex; gap: 6px; }
@@ -263,19 +276,20 @@
   .cal-band-day { padding: 2px; display: flex; flex-direction: column; gap: 2px; }
   .cal-hol { font-size: 11.5px; padding: 2px 6px; border-radius: 3px; background: var(--hairline); color: var(--ink-2);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cal-scroll { height: clamp(360px, calc(100vh - 290px), 900px); overflow-y: auto; overscroll-behavior: contain; }
-  .cal-body { position: relative; }
+  .cal-scroll { min-height: 360px; container-type: size; overflow-y: auto; overscroll-behavior: contain; }
+  /* 48 rows fill the pane once it is taller than 48 x 24px (XERK-2937). */
+  .cal-body { position: relative; --slot: max(24px, 100cqh / 48); }
   .cal-gutter { position: relative; }
   .cal-hr { position: absolute; right: 6px; transform: translateY(-50%); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
   .cal-col { position: relative; border-left: 1px solid var(--hairline);
     /* hour lines solid, half-hour dashed-light; non-working hours shaded (Teams) */
     background:
-      repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px 48px),
-      repeating-linear-gradient(to bottom, transparent 0 24px, color-mix(in srgb, var(--hairline) 45%, transparent) 24px 25px, transparent 25px 48px),
-      linear-gradient(to bottom, var(--page) 0 384px, transparent 384px 816px, var(--page) 816px); }
+      repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px calc(var(--slot) * 2)),
+      repeating-linear-gradient(to bottom, transparent 0 var(--slot), color-mix(in srgb, var(--hairline) 45%, transparent) var(--slot) calc(var(--slot) + 1px), transparent calc(var(--slot) + 1px) calc(var(--slot) * 2)),
+      linear-gradient(to bottom, var(--page) 0 calc(var(--slot) * 16), transparent calc(var(--slot) * 16) calc(var(--slot) * 34), var(--page) calc(var(--slot) * 34)); }
   .cal-col.off, .cal-band-day.off, .cal-dh.off { background-color: color-mix(in srgb, var(--muted) 10%, transparent); }
   .cal-col.off { background-image:
-      repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px 48px),
+      repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px calc(var(--slot) * 2)),
       repeating-linear-gradient(135deg, color-mix(in srgb, var(--muted) 9%, transparent) 0 6px, transparent 6px 12px); }
   .cal-now { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid #d13438; z-index: 3; pointer-events: none; }
   .cal-now::before { content: ""; position: absolute; left: -5px; top: -6px; width: 10px; height: 10px; border-radius: 50%; background: #d13438; }

@@ -157,6 +157,11 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   docs; recorded so a later change doesn't drift):
   - Work week (Mon–Fri) is the default; Week is Mon–Sun; ‹ › move a week; Today; the range label
     opens a mini-month (month ‹ ›, year « »). Narrow (<760px): Day / 3 days, arrows + swipe.
+  - **The calendar fills the page** (XERK-2937): a flex chain down to `.cal-scroll`, never a
+    `100vh - N` guess (a wrapped notice broke it). The Calendar view alone widens to `--wrap-board`.
+    Rows stretch past 24px only when the pane is taller than the day (`--slot`, `100cqh / 48` on
+    the `container-type: size` pane), so every top/height goes through `slots()`, never px.
+    Scroll math stays in `SLOT_PX`: a stretched day never scrolls.
   - 30-min rows (24px), working hours 8–17 shaded white, the grid opens scrolled to 8:00, a red
     now-line with a dot on today, today's header in the accent with a top bar.
   - Events: a 22% tint of the org color with a 4px solid left bar (unassigned = neutral);
