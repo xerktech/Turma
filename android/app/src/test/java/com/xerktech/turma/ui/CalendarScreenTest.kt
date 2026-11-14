@@ -205,9 +205,9 @@ class CalendarScreenTest {
         compose.onNodeWithTag("cal-today").performClick()
         compose.onNodeWithTag("cal-dh-$today").assertExists()
         // The day strip jumps to a day of the week.
-        val monday = com.xerktech.turma.core.calWeekStart(today)
-        compose.onNodeWithTag("cal-strip-$monday").performClick()
-        compose.onNodeWithTag("cal-dh-$monday").assertExists()
+        val first = com.xerktech.turma.core.calWeekStart(today)
+        compose.onNodeWithTag("cal-strip-$first").performClick()
+        compose.onNodeWithTag("cal-dh-$first").assertExists()
         // Kept on this phone: a fresh ViewModel reads it back.
         assertEquals(com.xerktech.turma.core.CalMode.THREE, calendarVm().modes.value[false])
     }

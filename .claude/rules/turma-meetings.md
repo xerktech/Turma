@@ -129,7 +129,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **Two views, one page**: `brief.html` shows a Calendar / Notes review switch; the pick is per
   viewer in `localStorage` (`turma-meetings-view`, guarded), Calendar by default. A `?site=` link
   (the proposals push) opens Notes review. The hidden view's keys are inert (`offsetParent`).
-- **`calendar.js` reads its own routes** (`/api/calendar` per Monday–Sunday week, prefetching the
+- **`calendar.js` reads its own routes** (`/api/calendar` per Sunday–Saturday week, prefetching the
   weeks either side; `/api/holidays` for the same days). The org pick is part of the cache key
   (`<orgs>|<week>`); a read keeps the pick it started with.
 - **What re-reads it** (each a QA finding): `calendar`, `holidaySettings` AND `meetingProposals`
