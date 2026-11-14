@@ -196,6 +196,23 @@ test("XERK-2897: every served string is escaped; canceled + Tenir events render 
   assert.ok(!root.innerHTML.includes("<img"));
 });
 
+test("XERK-2937: grid geometry is in --slot rows, so a tall pane stretches the day", async () => {
+  replies = {
+    "/api/calendar": (url) => (url.includes(`from=${cal.weekStart(at(2026, 11, 11))}`) ? {
+      hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+      events: [{ host: "h1", id: "g1", org: "", subject: "Sync", startMs: at(2026, 11, 11, 9, 30), endMs: at(2026, 11, 11, 11) }],
+    } : { events: [], hosts: [] }),
+  };
+  cal.refetch();
+  const html = await show(at(2026, 11, 11));
+  const slot = (n) => `calc(var(--slot, 24px) * ${n})`;
+  // 9:30 is row 19; 90 minutes is 3 rows less the 2px gap.
+  assert.ok(html.includes(`top:${slot(19)};height:calc(var(--slot, 24px) * 3 - 2px);`), "event placed in rows");
+  assert.ok(html.includes(`class="cal-hr" style="top:${slot(20)}"`), "10 AM label on row 20");
+  assert.ok(html.includes(`;height:${slot(48)}">`), "the day is 48 rows tall");
+  assert.ok(!/top:\d+px/.test(html), "no fixed-px row geometry left");
+});
+
 test("XERK-2897: holidays fill the all-day band; a day off shades only for the orgs in view", async () => {
   replies = {
     "/api/holidays": () => [{ id: "us-veterans-day", date: "2026-11-11", name: "Veterans Day", country: "US", offFor: ["acme"] }],
