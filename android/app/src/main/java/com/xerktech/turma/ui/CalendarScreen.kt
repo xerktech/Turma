@@ -143,6 +143,7 @@ import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -956,6 +957,7 @@ private fun RelinkControls(
     val linked = !ev.tenir || ev.calendarEventId.isNotEmpty()
     val cands = calLinkCandidates(c.site, ev.startMs ?: 0, if (ev.tenir) "" else ev.key, events, zone, hostOrg)
     val picks = remember { mutableStateMapOf<String, String>() }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     val pick = cands.firstOrNull { it.key == picks[k] }
     val inFlight = k in busy
     TurmaCard(Modifier.fillMaxWidth().testTag("cal-link")) {
@@ -976,8 +978,9 @@ private fun RelinkControls(
                 if (cands.isNotEmpty()) {
                     GhostButton(if (inFlight) "Working…" else "Link", {
                         val t = pick ?: return@GhostButton
-                        cvm.relink(c.site, c.meetingId, buildJsonObject { put("eventId", t.id) }, "Linking the capture")
-                        picks.remove(k)
+                        val job = cvm.relink(c.site, c.meetingId, buildJsonObject { put("eventId", t.id) }, "Linking the capture")
+                        // The pick is cleared only once the link held (the web keeps it on a refusal).
+                        scope.launch { job?.join(); if (k !in cvm.linkErr.value) picks.remove(k) }
                     }, Modifier.testTag("cal-link-go"), enabled = pick != null && !inFlight)
                 }
                 if (linked) {

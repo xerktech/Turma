@@ -20,7 +20,6 @@ import com.xerktech.turma.net.hubErrorMessage
 import java.time.LocalDate
 import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
@@ -29,7 +28,6 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -100,10 +98,14 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
     val modes: StateFlow<Map<Boolean, CalMode>> = _modes
 
     init {
-        @OptIn(FlowPreview::class)
         viewModelScope.launch {
-            // The first value is the current count, not a frame.
-            container.fleet.calendarFrames.drop(1).debounce(FRAME_COALESCE_MS).collect { refetch() }
+            // The first value is the current count, not a frame. Throttled like the
+            // web's `calendarSoon`: the first frame re-reads 1s later and the frames
+            // meanwhile ride along — a debounce would wait out a steady stream for good.
+            var soon: Job? = null
+            container.fleet.calendarFrames.drop(1).collect {
+                if (soon?.isActive != true) soon = launch { delay(FRAME_COALESCE_MS); refetch() }
+            }
         }
         viewModelScope.launch {
             while (true) {
@@ -115,10 +117,14 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
 
     fun start() = container.fleet.start()
 
-    fun setView(v: String) {
+    /**
+     * Show [v]. [remember] false (a push's Notes review, the web's `?site=`)
+     * shows it without replacing the view this phone keeps.
+     */
+    fun setView(v: String, remember: Boolean = true) {
         if (v != VIEW_CALENDAR && v != VIEW_NOTES) return
         _view.value = v
-        runCatching { prefs.edit().putString(VIEW_KEY, v).apply() }
+        if (remember) runCatching { prefs.edit().putString(VIEW_KEY, v).apply() }
     }
 
     fun setMode(wide: Boolean, m: CalMode) {
@@ -213,8 +219,8 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
             var hol: List<com.xerktech.turma.model.Holiday>? = null
             val err = try {
                 coroutineScope {
-                    val c = async { container.client.api.calendar(from, until, org.ifEmpty { null }) }
-                    val h = async { container.client.api.holidays(ws.toString(), ws.plusDays(6).toString()) }
+                    val c = async { container.client.calendarApi.calendar(from, until, org.ifEmpty { null }) }
+                    val h = async { container.client.calendarApi.holidays(ws.toString(), ws.plusDays(6).toString()) }
                     val cr = c.await()
                     val hr = h.await()
                     when {
@@ -229,6 +235,11 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (_: kotlinx.serialization.SerializationException) {
+                // A 200 that is not the hub's answer (a proxy's or portal's page): not "unreachable".
+                "Loading the calendar failed — the hub's answer could not be read"
+            } catch (_: IllegalArgumentException) {
+                "Loading the calendar failed — the hub's answer could not be read"
             } catch (_: Exception) {
                 "Loading the calendar failed — the hub is unreachable"
             }

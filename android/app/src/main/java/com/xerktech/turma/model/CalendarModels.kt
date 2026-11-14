@@ -3,6 +3,7 @@ package com.xerktech.turma.model
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
@@ -62,6 +63,7 @@ data class CalendarEvent(
     val joinUrl: String = "",
     val seriesId: String = "",
     val body: String = "",
+    @Serializable(with = LenientStringsSerializer::class)
     val categories: List<String> = emptyList(),
     val sensitivity: String = "",
     val isOnlineMeeting: Boolean = false,
@@ -74,6 +76,7 @@ data class CalendarEvent(
     val site: String = "",
     val meetingId: String = "",
     val platform: String = "",
+    @Serializable(with = LenientStringsSerializer::class)
     val participants: List<String> = emptyList(),
     val status: String = "",
     val summary: String = "",
@@ -168,6 +171,8 @@ object LenientCalendarEventsSerializer : LenientListSerializer<CalendarEvent>(Ca
 object LenientCalendarHostsSerializer : LenientListSerializer<CalendarHost>(CalendarHost.serializer())
 object LenientAttendeesSerializer : LenientListSerializer<CalendarAttendee>(CalendarAttendee.serializer())
 object LenientCapturesSerializer : LenientListSerializer<CalendarCapture>(CalendarCapture.serializer())
+/** A list of strings where one wrong-typed field must not drop the whole event (the web keeps it). */
+object LenientStringsSerializer : LenientListSerializer<String>(String.serializer())
 object LenientHolidaysSerializer : LenientListSerializer<Holiday>(Holiday.serializer())
 
 /**

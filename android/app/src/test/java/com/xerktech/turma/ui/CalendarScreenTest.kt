@@ -228,6 +228,8 @@ class CalendarScreenTest {
         show(cvm, push = site)
         compose.waitUntil(5_000) { cvm.view.value == CalendarViewModel.VIEW_NOTES }
         compose.onNodeWithTag("view-notes").assertIsSelected()
+        // Shown, not kept: the next visit still opens the operator's Calendar (web `?site=`).
+        assertEquals(CalendarViewModel.VIEW_CALENDAR, calendarVm().view.value)
     }
 
     @Test fun `the notes review lists an upcoming meeting and Open in calendar opens it`() {

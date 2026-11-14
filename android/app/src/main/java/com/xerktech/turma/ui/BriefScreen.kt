@@ -235,7 +235,8 @@ fun BriefScreen(
     LaunchedEffect(openSite) {
         val s = openSite ?: return@LaunchedEffect
         // A push is about proposals: it opens the notes review (the web's `?site=`).
-        calendarVm.setView(CalendarViewModel.VIEW_NOTES)
+        // Not remembered: the kept view stays the operator's pick (web `showView(v, false)`).
+        calendarVm.setView(CalendarViewModel.VIEW_NOTES, remember = false)
         filter = TriageFilter.REVIEW
         query = ""
         settingsFor = ""

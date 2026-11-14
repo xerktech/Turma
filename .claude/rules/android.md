@@ -131,6 +131,11 @@ A pure-core/adapter-shell split:
     (Expanded ≥840dp): week modes from 600dp (`CAL_WEEK_MIN_WIDTH`), so a portrait tablet or an
     unfolded foldable (Medium) never shows Day / 3 days; the detail sits beside the grid only from
     840dp, below that it is full screen. Operator's requirement (XERK-2900).
+  - Calendar reads go through `HubClient.calendarApi` (its own OkHttp dispatcher + 20s call timeout),
+    never the shared `api`: three weeks × (calendar + holidays) per step filled the shared 5-per-host
+    slots, and a stalled `/api/calendar` froze the `/api/agents` poll for 60s+ (QA). Tests:
+    `vm/CalendarViewModelTest`.
+  - A push shows Notes review WITHOUT saving it (`setView(.., remember = false)`, web `?site=`).
   - The detail reviews a capture with the notes review's own `MeetingPart`/`DailyPart`, never a fork.
   - A block's `testTag` goes BEFORE its `clearAndSetSemantics`: after it, the tag is cleared too.
   - The view switch and mode picks are `FilterChip`s: `SegmentedButton` taps never reached
