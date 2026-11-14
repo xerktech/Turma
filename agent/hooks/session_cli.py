@@ -331,12 +331,12 @@ WSL_CONF = "/etc/wsl.conf"
 def wsl_conf_interop_off(path=None) -> bool:
     """True when wsl.conf's `[interop] enabled` reads false, as WSL's own
     parser reads it (configfile.cpp + ParseBool): `#` outside quotes starts a
-    comment, only `"` quotes, inner spaces are kept, case is ignored, and the
+    comment, only `"` quotes (toggling anywhere; unterminated voids the line), inner spaces are kept, case is ignored, and the
     FIRST `enabled` wins even when it is no valid bool (interop then stays on).
     Mirrors install.sh's `_wsl_interop_disabled`."""
     try:
         with open(path or WSL_CONF, encoding="utf-8", errors="replace") as fh:
-            lines = fh.read(1 << 16).splitlines()
+            lines = fh.read(1 << 22).splitlines()
     except OSError:
         return False
     sec = ""
@@ -352,13 +352,17 @@ def wsl_conf_interop_off(path=None) -> bool:
         key, v = t.split("=", 1)
         if key.rstrip(" \t").lower() != "enabled":
             continue
-        v = v.lstrip(" \t")
-        if v.startswith('"'):
-            end = v.find('"', 1)
-            v = v[1:end] if end > 0 else "\x01"
-        else:
-            v = v.split("#", 1)[0].rstrip(" \t")
-        return v.lower() in ("false", "0")
+        out, quoted = [], False
+        for c in v.lstrip(" \t"):          # `"` toggles quoting anywhere
+            if c == '"':
+                quoted = not quoted
+            elif c == "#" and not quoted:
+                break
+            else:
+                out.append(c)
+        if quoted:                         # unterminated: invalid, claims nothing
+            continue
+        return "".join(out).rstrip(" \t").lower() in ("false", "0")
     return False
 
 
