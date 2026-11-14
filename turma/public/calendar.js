@@ -89,6 +89,11 @@ function fmtSpan(s, e) {
   return e > s ? `${fmtTime(s)} – ${fmtTime(e)}` : fmtTime(s);
 }
 const fmtLongDay = (ms) => new Date(ms).toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+// "Monday, November 9, 9:00 – 9:30 AM"; an end on another day names its date (XERK-2933).
+function fmtLongSpan(s, e) {
+  if (e > s && dayStart(s) !== dayStart(e)) return `${fmtLongDay(s)}, ${fmtTime(s)} – ${fmtLongDay(e)}, ${fmtTime(e)}`;
+  return `${fmtLongDay(s)}, ${fmtSpan(s, e)}`;
+}
 function ago(ms, now) {
   if (!num(ms) || ms <= 0) return "";
   const s = Math.max(0, Math.round((now - ms) / 1000));
@@ -439,7 +444,7 @@ function noticeText(n, now) {
 const TENIR_SVG = `<svg class="cal-tenir" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6A1.5 1.5 0 0 1 12.5 11H7l-3 3v-3h-.5A1.5 1.5 0 0 1 2 9.5z"/><path fill="var(--surface)" d="M5 5h1v3H5zm2-1h1v5H7zm2 1.5h1v2H9zm2-.5h1v3h-1z"/></svg>`;
 function ariaOf(ev, day) {
   const bits = [titleOf(ev)];
-  bits.push(inBand(ev) ? `${fmtLongDay(day)}, all day` : `${fmtLongDay(ev.startMs)}, ${fmtSpan(ev.startMs, ev.endMs)}`);
+  bits.push(inBand(ev) ? `${fmtLongDay(day)}, all day` : fmtLongSpan(ev.startMs, ev.endMs));
   if (ev.location) bits.push(String(ev.location));
   bits.push(orgLabel(ev.org));
   if (ev.busy === "tentative" || ev.myResponse === "tentative") bits.push("tentative");
@@ -584,7 +589,7 @@ function originalStart(ev) {
   return Number.isFinite(t) ? t : NaN;
 }
 function whenText(ev) {
-  return inBand(ev) ? `${fmtLongDay(ev.startMs)}, all day` : `${fmtLongDay(ev.startMs)}, ${fmtSpan(ev.startMs, ev.endMs)}`;
+  return inBand(ev) ? `${fmtLongDay(ev.startMs)}, all day` : fmtLongSpan(ev.startMs, ev.endMs);
 }
 // Plain text as HTML: every line escaped, joined by <br>; "" for none.
 function linesHtml(t) {
@@ -1081,7 +1086,7 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
-  detailHtml, panelSpec, badgeOf, originalStart, relink, evDomKey,
+  detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,

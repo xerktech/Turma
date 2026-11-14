@@ -445,4 +445,15 @@ class CalendarTest {
         assertEquals("h\u200b1", b.events.single().host)
         assertEquals("s\u2060", b.events.single().seriesId)
     }
+
+    @Test fun `a cross-midnight event names the end's date in its label and When text (XERK-2933)`() {
+        val l = Locale.US
+        val e = ev("late", at(2026, 10, 31, 22), at(2026, 11, 1, 3))
+        val want = "Saturday, October 31, 10:00 PM – Sunday, November 1, 3:00 AM"
+        assertEquals(want, calWhenText(e, ny, l))
+        assertTrue(calAria(e, calDay(e.startMs!!, ny), "Acme", CalBadge(0, false), ny, l).contains(want))
+        // Same day: one date, the short time span.
+        assertEquals("Monday, November 9, 9:00 AM – 9:30 AM",
+            calLongSpan(at(2026, 11, 9, 9), at(2026, 11, 9, 9, 30), ny, l))
+    }
 }

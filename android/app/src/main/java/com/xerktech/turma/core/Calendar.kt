@@ -347,11 +347,18 @@ fun calSpan(s: Long, e: Long, zone: ZoneId, locale: Locale): String =
 fun calLongDay(d: LocalDate, locale: Locale): String =
     DateTimeFormatter.ofPattern("EEEE, MMMM d", locale).format(d)
 
-/** "Monday, November 9, 9:00 AM – 9:30 AM" or "…, all day". */
-fun calWhenText(ev: CalendarEvent, zone: ZoneId, locale: Locale): String {
-    val day = calLongDay(calDay(ev.s(), zone), locale)
-    return if (calInBand(ev)) "$day, all day" else "$day, ${calSpan(ev.s(), ev.e(), zone, locale)}"
+/** "Monday, November 9, 9:00 AM – 9:30 AM"; an end on another day names its date (XERK-2933, the web's fmtLongSpan). */
+fun calLongSpan(s: Long, e: Long, zone: ZoneId, locale: Locale): String {
+    val start = calLongDay(calDay(s, zone), locale)
+    if (e > s && calDay(s, zone) != calDay(e, zone)) {
+        return "$start, ${calTime(s, zone, locale)} – ${calLongDay(calDay(e, zone), locale)}, ${calTime(e, zone, locale)}"
+    }
+    return "$start, ${calSpan(s, e, zone, locale)}"
 }
+
+/** "Monday, November 9, 9:00 AM – 9:30 AM" or "…, all day". */
+fun calWhenText(ev: CalendarEvent, zone: ZoneId, locale: Locale): String =
+    if (calInBand(ev)) "${calLongDay(calDay(ev.s(), zone), locale)}, all day" else calLongSpan(ev.s(), ev.e(), zone, locale)
 
 /** The range label: "November 9 – 13, 2026", across a month or year boundary too. */
 fun calRangeLabel(days: List<LocalDate>, locale: Locale): String {
@@ -373,7 +380,7 @@ fun calWeekdayLabel(d: LocalDate, short: Boolean, locale: Locale): String =
 fun calAria(ev: CalendarEvent, day: LocalDate, orgLabel: String, badge: CalBadge, zone: ZoneId, locale: Locale): String {
     val bits = mutableListOf(calTitle(ev))
     bits += if (calInBand(ev)) "${calLongDay(day, locale)}, all day"
-    else "${calLongDay(calDay(ev.s(), zone), locale)}, ${calSpan(ev.s(), ev.e(), zone, locale)}"
+    else calLongSpan(ev.s(), ev.e(), zone, locale)
     if (ev.location.isNotEmpty()) bits += ev.location
     bits += orgLabel
     when {
