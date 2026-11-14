@@ -57,7 +57,8 @@ function loadPage(reply = () => ({}), orgKeys = [], preset = {}) {
     TurmaNav: { preserveScroll: (el, paint) => paint(), toast: (m) => toasts.push(m),
       refusalText: (what, status, body) => `${what} failed — ${(body && body.error) || `the hub answered HTTP ${status}`}` },
     TurmaOrg: { getKeys: () => orgKeys, update: noop, subscribe: noop, sse: noop },
-    TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
+    TurmaBoard: { bareKey: require("../public/board.js").bareKey, orgName: (k, o) => o || k, mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean),
+      orgColorMap: (keys) => new Map(keys.map((k, i) => [k, i ? "url(x)" : `var(--s${i + 3})`])) },
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
@@ -790,4 +791,145 @@ test("XERK-2857: a selected entry re-keyed under the viewer stays selected as th
   // Gone with nothing carrying it: the nearest entry of the same org, not the first org's.
   P.update(base([meeting({ meetingId: "x2", title: "Other", startedAt: S + 3600e3 })]));
   assert.equal(P.state().selected.startsWith(encodeURIComponent(SITE)), true);
+});
+
+// ---- XERK-2899: the calendar in the notes review --------------------------------------
+const HOUR = 3600000;
+const calEv = (id, startMs, over = {}) => ({ host: "h1", id, org: SITE, source: "outlook", subject: id,
+  startMs, endMs: startMs + HOUR, joinUrl: "https://zoom.us/j/9", attendees: [], ...over });
+function calPage(events, opened = []) {
+  const P = loadPage(META);
+  P.setHooks({ upcomingOf: (site) => events.filter((e) => e.org === site), openCalendar: (t) => opened.push(t) });
+  return P;
+}
+
+test("XERK-2899: upcoming calendar meetings list under Upcoming, org-colored with time and join link — never as needing review", () => {
+  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1); tomorrow.setHours(14, 0, 0, 0);
+  const opened = [];
+  const evs = [calEv("plan", tomorrow.getTime(), { subject: "Planning <b>Q1</b>", location: "Room <1>", organizer: "Ann",
+    attendees: [{ name: "Ann", role: "organizer" }, { name: "Bo", role: "required" }, { name: "Room 1", role: "resource" }] }),
+  calEv("bad-link", tomorrow.getTime() + 2 * HOUR, { joinUrl: "javascript:alert(1)" }),
+  calEv("taken", tomorrow.getTime() + 3 * HOUR)];
+  const P = calPage(evs, opened);
+  const d = data([meeting({ calendarEventId: "taken" })]);    // already this capture's: not listed again
+  P.setCache(d);
+  // Needs review (the default): the event alone needs nothing reviewed.
+  P.renderMeetings(d);
+  assert.doesNotMatch(P.list(), /Planning/);
+  assert.equal(P.pendingCount(d), 2, "the capture's two proposals, nothing for the event");
+  P.setFilter("all");
+  const h = P.list();
+  assert.match(h, /<div class="tri-sec">Upcoming<\/div>(?:(?!tri-sec).)*<div class="tri-entry-row"><button type="button" class="tri-entry cal" data-entry="[^"]*c%3Aplan" style="--org:var\(--s3\)">/);
+  assert.match(h, /<span class="t">Planning &lt;b&gt;Q1&lt;\/b&gt;<\/span><span class="w">[^<]*\d:00/);
+  assert.match(h, /<a class="tri-join" href="https:\/\/zoom\.us\/j\/9"[^>]*>Join<\/a>/);
+  assert.doesNotMatch(h, /javascript:|<b>Q1|c%3Ataken/);
+  // Upcoming reads soonest first.
+  assert.ok(h.indexOf("c%3Aplan") < h.indexOf("c%3Abad-link"), "the sooner meeting first");
+  // Selected, it shows what Outlook says, and Open in calendar jumps to it.
+  P.select(P.entryKey(SITE, "c:plan"));
+  const m = P.list();
+  assert.match(m, /<h2 class="tri-title">Planning &lt;b&gt;Q1&lt;\/b&gt;<\/h2>/);
+  assert.match(m, /<span class="k">Where<\/span> Room &lt;1&gt;/);
+  assert.match(m, /<span class="k">Invited<\/span> Ann, Bo<\/div>/);
+  assert.match(m, /Join meeting ↗/);
+  const idx = /data-open-cal="(\d+)"/.exec(m)[1];
+  P.click({ openCal: idx });
+  assert.deepEqual(opened, [{ site: SITE, eventId: "plan", startMs: tomorrow.getTime() }]);
+  // Back on Needs review the selection is sticky; moving it on drops the event from the list.
+  P.setFilter("review");
+  assert.match(P.list(), /c%3Aplan/);
+  P.select(P.entryKey(SITE, "m:m1"));
+  assert.doesNotMatch(P.list(), /c%3Aplan/);
+});
+
+test("XERK-2899: the daily meeting's calendar occurrence joins its daily entry, not an entry of its own", () => {
+  const at = Date.now() + 2 * 864e5;
+  const P = loadPage(META);
+  P.setHooks({ nextOf: () => ({ meetingAt: at, runAt: at - 30 * 60000 }), openCalendar: () => {},
+    upcomingOf: () => [calEv("standup", at + 5 * 60000, { subject: "Standup" }), calEv("later", at + 4 * HOUR)] });
+  const d = data([]);
+  const list = P.entriesOf(d, SITE, Date.now());
+  const daily = list.find((e) => e.daily);
+  assert.equal(daily.event.id, "standup");
+  assert.deepEqual(list.filter((e) => e.cal).map((e) => e.id), ["c:later"]);
+  // Pairing adds nothing to review: the daily entry is current already, the event changes no count.
+  assert.equal(daily.pending, 0);
+  P.setCache(d);
+  P.select(daily.key);
+  assert.match(P.list(), /<span class="k">On the calendar<\/span> Standup · /);
+  assert.match(P.list(), /data-open-cal=/);
+});
+
+test("XERK-2899: a linked capture shows its Outlook title, time and attendees; an impromptu one is labeled", () => {
+  const opened = [];
+  const P = calPage([], opened);
+  const ev = { host: "h1", org: SITE, subject: "Design <review>", startMs: 1.7e12, endMs: 1.7e12 + HOUR,
+    canceled: false, moved: true, attendees: ["Ann", "Bo <x>"] };
+  const d = data([meeting({ title: "Zoom meeting", calendarEventId: "ev1", calendarEvent: ev, summary: "We met." }),
+    meeting({ meetingId: "m2", title: "Hallway", startedAt: 1.6e12 }),
+    meeting({ meetingId: "m3", title: "Hidden", startedAt: 1.5e12, calendarEventId: "pv",
+      calendarEvent: { ...ev, subject: "Private event", private: true, attendees: [] } })]);
+  P.setCache(d);
+  P.setFilter("all");
+  P.select(P.entryKey(SITE, "m:m1"));
+  let h = P.list();
+  assert.match(h, /<h2 class="tri-title">Design &lt;review&gt;<\/h2>/);
+  assert.match(h, /<span class="t">Design &lt;review&gt;<\/span><span class="w">/, "the rail names it by Outlook too");
+  assert.match(h, /<span class="k">On the calendar<\/span> [^<]*· moved since<\/div>/);
+  assert.match(h, /<span class="k">Invited<\/span> Ann, Bo &lt;x&gt;<\/div>/);
+  assert.match(h, /mt-summary/);
+  assert.doesNotMatch(h, /Impromptu/);
+  assert.match(h, /<span class="t">Hallway<\/span><span class="tri-tag">impromptu<\/span>/);
+  P.click({ openCal: /data-open-cal="(\d+)"/.exec(h)[1] });
+  assert.deepEqual(opened, [{ site: SITE, meetingId: "m1", eventId: "ev1", startMs: 1.7e12 }]);
+  P.select(P.entryKey(SITE, "m:m2"));
+  h = P.list();
+  assert.match(h, /<span class="mt-tag">Impromptu<\/span> Not on the calendar\./);
+  P.click({ openCal: /data-open-cal="(\d+)"/.exec(h)[1] });
+  assert.deepEqual(opened[1], { site: SITE, meetingId: "m2", eventId: "", startMs: 1.6e12 });
+  // A private event never names the capture "Private event".
+  P.select(P.entryKey(SITE, "m:m3"));
+  assert.match(P.list(), /<h2 class="tri-title">Hidden<\/h2>/);
+});
+
+test("XERK-2899: Open in notes review selects the capture or meeting wherever the filters put it", () => {
+  const soon = Date.now() + 864e5 * 2;
+  const P = calPage([calEv("soon", soon, { subject: "Soon" })]);
+  const d = data([meeting({ meetingId: "old", title: "Old one", archivedAt: 1.7e12 + 5e6, items: [] }), meeting()]);
+  P.setCache(d);
+  P.renderMeetings(d);
+  P.setQuery("sprint");
+  // An archived capture: the filter moves to Archived and the search that hid it clears.
+  P.reveal({ site: SITE, meetingId: "old" });
+  assert.equal(P.state().filter, "archived");
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:old"));
+  assert.equal(P.state().narrowMain, true);
+  assert.match(P.list(), /<h2 class="tri-title">Old one<\/h2>/);
+  // An upcoming calendar meeting from Archived: All, and it stays selected under Needs review too.
+  P.reveal({ site: SITE, eventId: "soon" });
+  assert.equal(P.state().filter, "all");
+  assert.equal(P.state().selected, P.entryKey(SITE, "c:soon"));
+  P.setFilter("review");
+  assert.equal(P.state().selected, P.entryKey(SITE, "c:soon"));
+  // A collapsed org opens to show it.
+  P.click({ orgToggle: SITE });
+  assert.deepEqual(P.state().collapsed, [SITE]);
+  P.reveal({ site: SITE, meetingId: "m1" });
+  assert.deepEqual(P.state().collapsed, []);
+  assert.equal(P.state().selected, P.entryKey(SITE, "m:m1"));
+});
+
+test("XERK-2899 QA: an org color is only a palette slot; a week-out meeting carries its date", () => {
+  const G = "globex.atlassian.net";
+  const far = new Date(); far.setDate(far.getDate() + 6); far.setHours(9, 0, 0, 0);
+  const P = calPage([calEv("a", Date.now() + 2 * 864e5), calEv("g", far.getTime(), { org: G })]);
+  const d = { ...data([]), agents: [{ org: SITE, jira: { siteKey: SITE, orgName: "Acme" } }, { org: G, jira: { siteKey: G, orgName: "Globex" } }] };
+  P.setCache(d);
+  P.setFilter("all");
+  const h = P.list();
+  assert.match(h, /data-entry="[^"]*c%3Aa"[^>]*style="--org:var\(--s3\)"/);
+  assert.match(h, /data-entry="[^"]*c%3Ag">/, "a non-palette color paints neutral");
+  assert.doesNotMatch(h, /url\(x\)/);
+  const day = far.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  assert.ok(h.includes(`<span class="w">${day} `), `dated: ${day}`);
 });

@@ -21,6 +21,7 @@ const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case it
 const MODAL_OPEN = '.td-backdrop:not([hidden]) > [aria-modal="true"]';
 const RETRY_ERROR_MAX_MS = 300000;  // a failed read's longest back-off
 const MODE_KEY = "turma-calendar-mode";
+const UPCOMING_MS = 7 * DAY_MS;     // how far ahead the notes review lists calendar meetings (XERK-2899)
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -120,6 +121,28 @@ function styleOf(ev, now) {
   if (ev.source === "tenir") c.push("tenir");
   return c;
 }
+// A meeting the notes review lists as upcoming (XERK-2899): an Outlook event that is
+// a timed, live meeting of an org — not a holiday-like all-day block, a canceled or
+// declined one, a free / out-of-office / working-elsewhere block, or one already captured.
+const NOT_MEETING_BUSY = new Set(["free", "outOfOffice", "workingElsewhere"]);
+function isUpcomingMeeting(ev, now) {
+  return !!ev && ev.source !== "tenir" && typeof ev.org === "string" && !!ev.org && !inBand(ev)
+    && ev.canceled !== true && ev.myResponse !== "declined" && !NOT_MEETING_BUSY.has(ev.busy)
+    && !(Array.isArray(ev.meetings) && ev.meetings.length)
+    && num(ev.endMs) && ev.endMs > now && ev.startMs < now + UPCOMING_MS;
+}
+// Where "Open in notes review" lands for an event: its capture (Tenir-only, or the
+// first linked one), else the upcoming meeting itself; null when the notes review
+// has no entry for it.
+function notesTarget(ev, now) {
+  if (!ev) return null;
+  if (ev.source === "tenir" && typeof ev.site === "string" && typeof ev.meetingId === "string") {
+    return { site: ev.site, meetingId: ev.meetingId };
+  }
+  const m = Array.isArray(ev.meetings) ? ev.meetings.find((x) => x && typeof x.site === "string" && typeof x.meetingId === "string") : null;
+  if (m) return { site: m.site, meetingId: m.meetingId };
+  return isUpcomingMeeting(ev, now) ? { site: ev.org, eventId: String(ev.id) } : null;
+}
 const titleOf = (ev) => {
   const s = String(ev.subject || "").trim() || "(no title)";
   return ev.canceled === true ? `Canceled: ${s}` : s;
@@ -177,10 +200,19 @@ let shown = [];                   // the events of the last paint, indexed by da
 let scrolled = false;             // the grid opened at working hours once
 const weeks = new Map();          // `${orgKey}|${weekMs}` -> {cal, hol, loading, again, err, retry}
 let nowFn = () => Date.now();
+let onData = null;                // the page's callback once a read lands (the notes review's upcoming list)
+let openNotes = null;             // the page's "Open in notes review" (XERK-2899)
+let upcomingWanted = false;       // the notes review reads the upcoming weeks (upcoming())
+let revealing = null;             // {eventId?, site?, meetingId?} to select once its week is read (reveal())
+let revealFocus = false;          // the revealed event's panel takes focus on the next paint
+let scrollToMin = -1;             // the grid scrolls to this wall minute on the next paint
 
 const wideMode = () => (modes && (modes.wide === "week" || modes.wide === "work") ? modes.wide : "work");
 const narrowMode = () => (modes && (modes.narrow === "three" || modes.narrow === "day") ? modes.narrow : "day");
-const mode = () => (narrow ? narrowMode() : wideMode());
+// A weekend meeting revealed from the notes review shows the full Week (XERK-2899 QA:
+// Work week drew a panel for an event not on the grid). Not saved: a mode pick ends it.
+let revealWeek = false;
+const mode = () => (narrow ? narrowMode() : (revealWeek ? "week" : wideMode()));
 function setMode(m) {
   if (!(m in MODES)) return;
   modes = { ...(modes && typeof modes === "object" ? modes : {}), [narrow ? "narrow" : "wide"]: m };
@@ -258,10 +290,11 @@ async function loadWeek(ws, keys = orgKeys()) {
   // back off (20s doubling to 5 min): an older hub's 404 is no reason to hammer it.
   if (w.err || (w.cal && hostNotices(w.cal, ws).some((n) => n.syncing))) {
     const wait = w.err ? Math.min(RETRY_PENDING_MS * 2 ** (w.fails - 1), RETRY_ERROR_MAX_MS) : RETRY_PENDING_MS;
-    w.retry = setTimeout(() => { w.retry = 0; if (active) loadWeek(ws, keys); }, wait);
+    w.retry = setTimeout(() => { w.retry = 0; if (active || upcomingWanted) loadWeek(ws, keys); }, wait);
     if (w.retry && w.retry.unref) w.retry.unref();
   }
   if (active) paint();
+  if (onData) onData();
 }
 // Fetch what is shown (and the weeks either side, so ‹ › paints at once).
 function wantedWeeks(days) {
@@ -279,15 +312,66 @@ function ensureLoaded(days) {
 // either side. Every other week is dropped and read again when shown, so a frame
 // costs the same however many weeks this tab has browsed. The shown weeks keep
 // their copy on screen until the new one lands.
+// The notes review's upcoming weeks are kept and re-read too, shown or not (XERK-2899).
 function refetch() {
   const org = orgKeyOf();
-  const keep = new Set(wantedWeeks(visibleDays(anchor, mode())).map((ws) => `${org}|${ws}`));
+  const keep = new Set(active ? wantedWeeks(visibleDays(anchor, mode())).map((ws) => `${org}|${ws}`) : []);
+  if (upcomingWanted) for (const ws of upcomingWeeks()) keep.add(`${org}|${ws}`);
   for (const [k, w] of [...weeks]) {
-    if (keep.has(k) && active) continue;
+    if (keep.has(k)) continue;
     clearTimeout(w.retry);
     weeks.delete(k);
   }
-  if (active) for (const k of keep) loadWeek(Number(k.slice(org.length + 1)));
+  for (const k of keep) loadWeek(Number(k.slice(org.length + 1)));
+}
+// The weeks the next UPCOMING_MS touch.
+function upcomingWeeks() {
+  const now = nowFn();
+  return weeksOf([dayStart(now), dayStart(now + UPCOMING_MS)]);
+}
+// The upcoming calendar meetings of `site` (XERK-2899), earliest first, from the
+// weeks already read; asks for those weeks when they are not. The notes review
+// reads this on every paint; `onData` tells the page when a read lands.
+function upcoming(site) {
+  upcomingWanted = true;
+  const now = nowFn();
+  const byId = new Map();
+  for (const ws of upcomingWeeks()) {
+    const w = weekEntry(ws);
+    if ((!w.cal || w.err) && !w.loading && !w.retry) loadWeek(ws);
+    for (const ev of (w.cal && Array.isArray(w.cal.events) ? w.cal.events : [])) {
+      if (!ev || typeof ev !== "object" || !num(ev.startMs) || ev.org !== site || !isUpcomingMeeting(ev, now)) continue;
+      if (!byId.has(String(ev.id))) byId.set(String(ev.id), ev);   // one meeting on two hosts of a tenant
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.startMs - b.startMs || a.endMs - b.endMs);
+}
+// "Open in calendar" from the notes review (XERK-2899): move to the week of
+// `startMs` and open the event's panel once that week is read — the event by its
+// id, or the one carrying the capture (`site` + `meetingId`: a linked Outlook
+// event's `meetings`, or the capture's own Tenir-only entry).
+function reveal(target) {
+  if (!target || typeof target !== "object") return;
+  const at = num(target.startMs) ? target.startMs : nowFn();
+  revealing = { eventId: typeof target.eventId === "string" ? target.eventId : "",
+    site: typeof target.site === "string" ? target.site : "",
+    meetingId: typeof target.meetingId === "string" ? target.meetingId : "" };
+  anchor = dayStart(at);
+  const wd = new Date(at).getDay();
+  revealWeek = !narrow && wideMode() === "work" && (wd === 0 || wd === 6);   // a weekday reveal ends it
+  picker = null;
+  detail = null;
+  detailFrom = null;
+  if (active) paint(true);
+}
+function revealHit(ev) {
+  const r = revealing;
+  if (!r || !ev) return false;
+  if (r.meetingId) {
+    if (ev.source === "tenir") return ev.site === r.site && ev.meetingId === r.meetingId;
+    if (Array.isArray(ev.meetings) && ev.meetings.some((x) => x && x.site === r.site && x.meetingId === r.meetingId)) return true;
+  }
+  return !!r.eventId && ev.source !== "tenir" && String(ev.id) === r.eventId;
 }
 // The events, holidays and host rows of the shown weeks, an event held by two weeks once.
 function collect(days) {
@@ -438,12 +522,15 @@ function detailHtml(ev, now) {
   row("Calendar", ev.source === "tenir" ? "Captured by Tenir — not on Outlook" : (ev.host ? (typeof TurmaBoard !== "undefined" && TurmaBoard.hostName ? TurmaBoard.hostName(ev.host) : String(ev.host)) : ""));
   const join = safeHttps(ev.joinUrl);
   const state = styleOf(ev, now).filter((c) => ["canceled", "tentative", "free"].includes(c));
+  const notes = openNotes && notesTarget(ev, now)
+    ? `<div class="cal-drow"><button type="button" class="btn-sm" data-open-notes>Open in notes review</button></div>` : "";
   return `<aside class="cal-detail" role="dialog" aria-modal="false" aria-labelledby="calDetailTitle" tabindex="-1">`
     + `<div class="cal-detail-head"><h2 id="calDetailTitle">${esc(titleOf(ev))}</h2>`
     + `<button type="button" class="cal-ic" data-close-detail aria-label="Close">✕</button></div>`
     + (state.length ? `<div class="cal-dstate">${esc(state.join(" · "))}</div>` : "")
     + rows.join("")
     + (join ? `<div class="cal-drow"><a href="${esc(join)}" target="_blank" rel="noopener noreferrer">Join meeting</a></div>` : "")
+    + notes
     + `<p class="cal-dnote">Meeting details, notes and proposals open here soon.</p></aside>`;
 }
 function headerHtml(days) {
@@ -466,6 +553,19 @@ function calendarHtml() {
   const days = visibleDays(anchor, mode());
   ensureLoaded(days);
   const got = collect(days);
+  if (revealing) {
+    // A capture's own entry outranks an event that only shares its id.
+    const hit = got.events.find((e) => revealing.meetingId && revealHit(e) && e.source === "tenir")
+      || got.events.find(revealHit);
+    if (hit) {
+      detail = hit;
+      const day = dayStart(hit.startMs);
+      detailFrom = { ev: `${hit.host}\u0000${hit.id}`, day: String(day) };
+      if (!inBand(hit)) scrollToMin = wallMinutes(hit.startMs, day);
+      revealing = null;
+      revealFocus = true;
+    } else if (got.have && !got.loading) revealing = null;    // read, and not there: stay on its week
+  }
   const colors = colorMap();
   shown = [];
   const today = dayKey(now);
@@ -535,7 +635,10 @@ function paint(force = false) {
   if (T) T.preserveScroll($root, put); else put();
   restoreFocusSig(sig);
   const sc = $root.querySelector && $root.querySelector("#calScroll");
-  if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
+  if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
+  else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
+  scrollToMin = -1;
+  if (revealFocus) { revealFocus = false; focusQ(".cal-detail"); }
 }
 
 // Arrow keys walk between events: ↑/↓ within a day (all-day band first), ←/→ to
@@ -593,18 +696,20 @@ function closeDetail() {
   paint(true);
   if (back) restoreFocusSig(back);
 }
-function go(ms) { anchor = dayStart(ms); paint(true); }
+function go(ms) { revealing = null; anchor = dayStart(ms); paint(true); }
 
 function mount(el, opts = {}) {
   if ($root) return;
   $root = el;
   if (opts && typeof opts.now === "function") nowFn = opts.now;
+  if (opts && typeof opts.onData === "function") onData = opts.onData;
+  if (opts && typeof opts.openNotes === "function") openNotes = opts.openNotes;
   const mq = typeof window !== "undefined" && window.matchMedia ? window.matchMedia(`(max-width: ${NARROW_PX - 1}px)`) : null;
   narrow = !!(mq && mq.matches);
   if (mq && mq.addEventListener) mq.addEventListener("change", (e) => { narrow = !!e.matches; paint(true); });
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
-      ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail]") : null;
+      ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],[data-open-notes]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -621,9 +726,14 @@ function mount(el, opts = {}) {
       return;
     }
     if (d.closeDetail !== undefined) return void closeDetail();
+    if (d.openNotes !== undefined) {
+      const t = notesTarget(detail, nowFn());
+      if (t && openNotes) openNotes(t);
+      return;
+    }
     if (d.step !== undefined) return void go(stepAnchor(anchor, mode(), Number(d.step) < 0 ? -1 : 1));
     if (d.calToday !== undefined) return void go(nowFn());
-    if (d.mode !== undefined) { setMode(d.mode); return void paint(true); }
+    if (d.mode !== undefined) { revealWeek = false; revealing = null; setMode(d.mode); return void paint(true); }
     if (d.openPicker !== undefined) {
       picker = picker === null ? new Date(new Date(anchor).getFullYear(), new Date(anchor).getMonth(), 1).getTime() : null;
       paint(true);
@@ -668,13 +778,14 @@ function setActive(on) {
 }
 
 const api = {
-  mount, update, setActive, refetch,
+  mount, update, setActive, refetch, upcoming, reveal,
   // pure helpers, for tests
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
-  calendarHtml, safeHttps,
+  calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),
   _go: go,
+  _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
 };
 if (typeof window !== "undefined") window.TurmaCalendar = api;
 if (typeof module !== "undefined" && module.exports) module.exports = api;

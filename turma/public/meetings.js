@@ -42,6 +42,16 @@ function clock(ms) {
 // The hub only stores an http(s) URL with no quote/space/bracket (meetingUrlOk);
 // re-checked here so a link is never built from anything else.
 const safeUrl = (u) => (typeof u === "string" && /^https?:\/\/[^\s"'<>`\\]+$/i.test(u) ? u : "");
+// A calendar join link: https only, as the calendar builds it (calendar.js safeHttps).
+const safeHttps = (u) => (typeof u === "string" && /^https:\/\/[^\s"'<>`\\]+$/i.test(u) ? u : "");
+// An org color is only ever a palette slot from orgColorMap; anything else paints neutral.
+const safeColor = (c) => (typeof c === "string" && /^var\(--s[1-8]\)$/.test(c) ? c : "");
+function fmtSpan(s, e) {
+  const day = (ms) => new Date(ms).toDateString();
+  return isTime(e) && e > s ? `${fmtWhen(s)} – ${day(s) === day(e) ? fmtTime(e) : fmtWhen(e)}` : fmtWhen(s);
+}
+// A daily entry and its calendar occurrence are one meeting when they start this close.
+const DAILY_EVENT_MS = 20 * 60000;
 // That moment in Tenir: a W3C media fragment on the meeting's own link.
 function momentUrl(tenirUrl, atMs) {
   const u = safeUrl(tenirUrl);
@@ -94,6 +104,8 @@ let curOrder = [];               // the item order curItem was last seen in (fol
 let selMemo = null;              // the selected entry's org, time, briefs and meetings (pickSelected)
 let narrowMain = false;          // a phone shows the main pane, not the rail
 let drawer = null;               // site whose settings drawer is open
+let revealing = null;            // {site, meetingId?, eventId?} to select once it is listed (reveal)
+const calTargets = [];           // "Open in calendar" targets of the last paint, by data-open-cal index
 // Per-viewer niceties in localStorage, every access guarded (private mode throws).
 function loadStore(key, fallback) {
   try { const v = JSON.parse(localStorage.getItem(key) || "null"); return v ?? fallback; } catch { return fallback; }
@@ -189,12 +201,28 @@ function entriesOf(data, site, now) {
   }
   const next = hooks.nextOf ? hooks.nextOf(site) : null;
   if (next && isTime(next.meetingAt)) dayEntry(next.meetingAt).upcoming = next;
+  // The org's upcoming calendar meetings (XERK-2899, the calendar's read): the
+  // daily meeting's occurrence joins its daily entry; any other is an entry of its
+  // own. One already captured is that capture's (its `calendarEventId`).
+  const linked = new Set(meetingsOf(data, site).map((m) => m.calendarEventId).filter(Boolean));
+  const evs = hooks.upcomingOf ? hooks.upcomingOf(site) : [];
+  const seen = new Set();
+  for (const ev of Array.isArray(evs) ? evs : []) {
+    if (!ev || typeof ev.id !== "string" || !isTime(ev.startMs) || linked.has(ev.id) || seen.has(ev.id)) continue;
+    seen.add(ev.id);
+    const day = [...daily.values()].find((e) => !e.event && Math.abs(e.at - ev.startMs) <= DAILY_EVENT_MS);
+    if (day) day.event = ev;
+    else out.push({ id: `c:${ev.id}`, site, daily: false, cal: true, at: ev.startMs, meetings: [], briefs: [], event: ev });
+  }
   for (const e of daily.values()) {
     // Served newest first; a linked brief joined out of order, so order again (stable).
     e.briefs.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
     out.push(e);
   }
-  out.sort((a, b) => b.at - a.at);
+  // Newest first, except the Upcoming bucket, which reads soonest first (XERK-2899:
+  // the next meeting tops the org, as a calendar's agenda does).
+  const tomorrow = startOfDay(now) + 864e5;
+  out.sort((a, b) => ((a.at >= tomorrow && b.at >= tomorrow) ? a.at - b.at : b.at - a.at));
   // The org's current daily entries: today's and any upcoming one (Run now lives
   // there); with none, the newest, so an org with only old briefs still has one.
   const today = startOfDay(now);
@@ -220,7 +248,7 @@ function bucketOf(at, now) {
 }
 function matches(e, q) {
   if (!q) return true;
-  const hay = [e.daily ? "daily meeting" : ""];
+  const hay = [e.daily ? "daily meeting" : "", e.event ? String(e.event.subject || "") : ""];
   for (const m of e.meetings) {
     hay.push(meetingTitle(m));
     for (const it of m.items || []) if (it) hay.push(it.title || "");
@@ -266,7 +294,14 @@ function buildView(data, sel = selected) {
   // The selection stands while its entry is still in the list (a collapsed org
   // keeps it); else the first entry shown.
   const all = visible.flatMap((o) => o.shown);
-  return { now, name, orgs, visible, flat, sel: pickSelected(all, flat, sel), q };
+  return { now, name, orgs, visible, flat, sel: pickSelected(all, flat, sel), q, colors: colorMap(data) };
+}
+// The org colors the calendar paints with (board.js orgColorMap + the hub's pins).
+function colorMap(data) {
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  if (!B || !B.orgColorMap || !B.mergeSites) return new Map();
+  const pins = typeof TurmaOrg !== "undefined" && TurmaOrg.orgColors ? TurmaOrg.orgColors() : null;
+  return B.orgColorMap(B.mergeSites(data.agents || []).map((s) => s.siteKey), pins);
 }
 // The selected entry, or what took its place: an entry can be re-keyed under the
 // viewer (a title-matched daily meeting claims a brief-only `d:<M>` entry), and
@@ -277,14 +312,15 @@ function pickSelected(all, flat, sel) {
   if (hit || !sel || !selMemo || selMemo.key !== sel) return hit || flat[0] || null;
   const same = all.filter((e) => e.site === selMemo.site);
   const carries = same.find((e) => e.briefs.some((b) => selMemo.runIds.includes(b.runId))
-    || e.meetings.some((m) => selMemo.meetingIds.includes(m.meetingId)));
+    || e.meetings.some((m) => selMemo.meetingIds.includes(m.meetingId))
+    || (!!selMemo.eventId && !!e.event && e.event.id === selMemo.eventId));
   if (carries) return carries;
   const near = same.slice().sort((a, b) => Math.abs(a.at - selMemo.at) - Math.abs(b.at - selMemo.at))[0];
   return near || flat[0] || null;
 }
 function rememberSelected(e) {
   selMemo = e ? { key: e.key, site: e.site, at: e.at, runIds: e.briefs.map((b) => b.runId),
-    meetingIds: e.meetings.map((m) => m.meetingId) } : null;
+    meetingIds: e.meetings.map((m) => m.meetingId), eventId: e.event ? e.event.id : "" } : null;
 }
 // The keyboard cursor follows its place, not its key: when the current proposal
 // leaves the list (answered here, or an SSE frame saying so — the hub broadcasts
@@ -439,9 +475,45 @@ function meetingMeta(m, orgName) {
   if (isTime(m.archivedAt)) bits.push("archived");
   return bits.map((b, i) => `<span class="bit${i < bits.length - 1 ? " sep" : ""}">${esc(b)}</span>`).join("");
 }
-// A meeting's name: the title the model inferred for a generic Tenir one
-// ("Meeting", a Teams call id; XERK-2894), else Tenir's own.
-const meetingTitle = (m) => m.inferredTitle || m.title || "Untitled meeting";
+// A linked capture's calendar event as served (XERK-2896), else null.
+const calEventOf = (m) => (m && m.calendarEvent && typeof m.calendarEvent === "object" ? m.calendarEvent : null);
+// A meeting's name: its Outlook event's subject when linked (XERK-2899; never a
+// private event's "Private event"), else the title the model inferred for a generic
+// Tenir one ("Meeting", a Teams call id; XERK-2894), else Tenir's own.
+function meetingTitle(m) {
+  const ev = calEventOf(m);
+  const subject = ev && !ev.private && typeof ev.subject === "string" ? ev.subject.trim() : "";
+  return subject || m.inferredTitle || m.title || "Untitled meeting";
+}
+// Captured with no calendar event: Tenir's own entry on the calendar.
+const impromptu = (m) => !m.calendarEventId && !calEventOf(m);
+// The calendar line of a capture: its Outlook event (time, attendees) or why it has none.
+function calLineHtml(m) {
+  const ev = calEventOf(m);
+  if (ev) {
+    const bits = [];
+    if (isTime(ev.startMs)) bits.push(fmtSpan(ev.startMs, ev.endMs));
+    if (ev.canceled === true) bits.push("canceled");
+    if (ev.moved === true) bits.push("moved since");
+    const who = Array.isArray(ev.attendees) ? ev.attendees.filter((x) => typeof x === "string" && x) : [];
+    return `<div class="mt-cal"><span class="k">On the calendar</span> ${esc(bits.join(" · "))}</div>`
+      + (who.length ? `<div class="mt-cal"><span class="k">Invited</span> ${esc(who.join(", "))}</div>` : "");
+  }
+  if (m.calendarEventMissing) return `<div class="mt-cal">Its calendar event is no longer on the calendar.</div>`;
+  if (!impromptu(m)) return "";
+  return `<div class="mt-cal"><span class="mt-tag">Impromptu</span> Not on the calendar${m.calendarAmbiguous ? " — more than one calendar event could be it" : ""}.</div>`;
+}
+// An "Open in calendar" button for `target` ({site, meetingId?, eventId?, startMs}).
+function openCalHtml(target) {
+  if (!hooks.openCalendar) return "";
+  calTargets.push(target);
+  return `<button type="button" class="btn-sm" data-open-cal="${calTargets.length - 1}">Open in calendar</button>`;
+}
+function meetingCalTarget(site, m) {
+  const ev = calEventOf(m);
+  return { site, meetingId: m.meetingId, eventId: m.calendarEventId || "",
+    startMs: ev && isTime(ev.startMs) ? ev.startMs : m.startedAt };
+}
 // The written summary (XERK-2894): plain text, ESCAPED, paragraphs on blank lines.
 function summaryHtml(m) {
   if (m.status !== "ok" || typeof m.summary !== "string" || !m.summary.trim()) return "";
@@ -455,7 +527,7 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {})
   const url = safeUrl(m.tenirUrl);
   const link = url ? `<a class="mt-tenir" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Tenir ↗</a>` : "";
   const mk = meetingKey(site, m.meetingId);
-  const tools = `<span class="mt-tools">${link}${archiveButton(site, m)}</span>`;
+  const tools = `<span class="mt-tools">${link}${openCalHtml(meetingCalTarget(site, m))}${archiveButton(site, m)}</span>`;
   const head = primary
     ? `<div class="tri-head">${back}<h2 class="tri-title">${esc(meetingTitle(m))}</h2>${tools}</div>`
     : `<div class="mt-head"><h3 class="mt-title">${esc(meetingTitle(m))}</h3>${tools}</div>`;
@@ -487,6 +559,7 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {})
   }
   return `<section class="mt-meeting${primary ? " primary" : ""}">${head}`
     + `<div class="mt-meta">${meetingMeta(m, orgName)}</div>`
+    + calLineHtml(m)
     + (aerr ? `<div class="mt-err">${esc(aerr)}</div>` : "")
     + summaryHtml(m)
     + body + `</section>`;
@@ -494,14 +567,18 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {})
 
 // ---- render: the rail ---------------------------------------------------------------
 function entryTitle(e) {
+  if (e.cal) return String(e.event.subject || "").trim() || "(no title)";
   return e.daily ? "Daily meeting" : meetingTitle(e.meetings[0]);
 }
 function entryWhen(e, now) {
   if (!isTime(e.at)) return "";
   const b = bucketOf(e.at, now);
+  // Six days out or more, a weekday alone reads as this week's (XERK-2899 QA): add the date.
+  if (b === "Upcoming" && e.at >= startOfDay(now) + 6 * 864e5) return `${fmtDay(e.at)} ${fmtTime(e.at)}`;
   return b === "Today" ? fmtTime(e.at) : b === "Upcoming" || b === "Yesterday" ? `${fmtDay(e.at).split(",")[0]} ${fmtTime(e.at)}` : fmtDay(e.at);
 }
 function entrySide(e) {
+  if (e.cal) return "";
   if (e.pending) return `<span class="tri-count" aria-label="${e.pending} to review">${e.pending}</span>`;
   if (e.inflight) return `<span class="tri-note">reading…</span>`;
   if (e.daily && !e.meetings.length) {
@@ -517,11 +594,17 @@ function entrySide(e) {
   if (e.meetings.every((x) => !(x.items || []).length)) return `<span class="tri-note">nothing proposed</span>`;
   return `<span class="tri-note good" aria-label="all reviewed">✓</span>`;
 }
-function entryHtml(e, sel, now) {
+function entryHtml(e, sel, now, colors) {
   const on = sel && sel.key === e.key;
-  return `<button type="button" class="tri-entry${on ? " sel" : ""}${!e.pending && !e.inflight && !e.current ? " done" : ""}" data-entry="${esc(e.key)}"${on ? ' aria-current="true"' : ""}>`
-    + `<span class="t">${esc(entryTitle(e))}</span><span class="w">${esc(entryWhen(e, now))}</span>`
+  // An upcoming calendar meeting is org-colored as the calendar draws it, and is
+  // never greyed as "done": it has nothing to review yet.
+  const color = e.cal ? safeColor(colors && colors.get(e.site)) : "";
+  const tag = !e.daily && !e.cal && e.meetings.length === 1 && impromptu(e.meetings[0]) ? `<span class="tri-tag">impromptu</span>` : "";
+  const btn = `<button type="button" class="tri-entry${e.cal ? " cal" : ""}${on ? " sel" : ""}${!e.cal && !e.pending && !e.inflight && !e.current ? " done" : ""}" data-entry="${esc(e.key)}"${on ? ' aria-current="true"' : ""}${color ? ` style="--org:${color}"` : ""}>`
+    + `<span class="t">${esc(entryTitle(e))}</span>${tag}<span class="w">${esc(entryWhen(e, now))}</span>`
     + `<span class="sp"></span>${entrySide(e)}</button>`;
+  const join = e.event && e.at + 864e5 > now ? safeHttps(e.event.joinUrl) : "";
+  return join ? `<div class="tri-entry-row">${btn}<a class="tri-join" href="${esc(join)}" target="_blank" rel="noopener noreferrer" aria-label="Join ${esc(entryTitle(e))}">Join</a></div>` : btn;
 }
 function orgRailHtml(o, v) {
   const open = !collapsed.has(o.site);
@@ -531,7 +614,7 @@ function orgRailHtml(o, v) {
     for (const e of o.shown) {
       const b = bucketOf(e.at, v.now);
       if (b !== last) { body += `<div class="tri-sec">${esc(b)}</div>`; last = b; }
-      body += entryHtml(e, v.sel, v.now);
+      body += entryHtml(e, v.sel, v.now, v.colors);
     }
     if (!o.shown.length) {
       body = `<div class="tri-none">${filter === "review" ? "Nothing to review" : filter === "archived" ? "Nothing archived" : "No meetings yet"}</div>`;
@@ -564,6 +647,7 @@ function mainHtml(v) {
       : filter === "archived" ? "No archived meetings." : "No meetings yet."}</div>`;
   }
   const orgName = v.name(e.site);
+  if (e.cal) return calendarEntryHtml(e, orgName, back);
   if (!e.daily) return meetingHtml(e.site, e.meetings[0], { primary: true, orgName, back });
   const now = v.now;
   const brief = hooks.briefHtml ? hooks.briefHtml(e.site, e) : "";
@@ -571,10 +655,37 @@ function mainHtml(v) {
     : `<div class="mt-status">${e.at > now
       ? "Its proposals land here once Tenir sends the meeting."
       : "No meeting was captured for this one."}</div>`;
+  // The daily meeting's calendar occurrence (XERK-2899): its time and join link.
+  const ev = e.event;
+  const join = ev ? safeHttps(ev.joinUrl) : "";
+  const calTools = ev ? `<span class="mt-tools">${join ? `<a href="${esc(join)}" target="_blank" rel="noopener noreferrer">Join meeting ↗</a>` : ""}`
+    + `${openCalHtml({ site: e.site, eventId: ev.id, startMs: ev.startMs })}</span>` : "";
   return `<div class="tri-head">${back}<h2 class="tri-title">Daily meeting</h2>`
-    + `<span class="tri-sub">${esc(orgName)} · ${esc(isTime(e.at) ? fmtWhen(e.at) : "")}</span></div>`
+    + `<span class="tri-sub">${esc(orgName)} · ${esc(isTime(e.at) ? fmtWhen(e.at) : "")}</span>${calTools}</div>`
+    + (ev ? `<div class="mt-cal"><span class="k">On the calendar</span> ${esc(String(ev.subject || "").trim() || "(no title)")} · ${esc(fmtSpan(ev.startMs, ev.endMs))}</div>` : "")
     + `<div class="tri-brief">${brief}</div>`
     + `<h3 class="tri-h">Proposals</h3>${meetings}`;
+}
+
+// An upcoming calendar meeting (XERK-2899): what Outlook says about it. Its notes
+// and proposals arrive once Tenir captures it (the capture then links to this event).
+function calendarEntryHtml(e, orgName, back) {
+  const ev = e.event;
+  const join = safeHttps(ev.joinUrl);
+  const tools = `<span class="mt-tools">${join ? `<a href="${esc(join)}" target="_blank" rel="noopener noreferrer">Join meeting ↗</a>` : ""}`
+    + `${openCalHtml({ site: e.site, eventId: ev.id, startMs: ev.startMs })}</span>`;
+  const rows = [];
+  const row = (k, val) => { if (val) rows.push(`<div class="mt-cal"><span class="k">${esc(k)}</span> ${esc(val)}</div>`); };
+  row("When", fmtSpan(ev.startMs, ev.endMs));
+  row("Where", typeof ev.location === "string" ? ev.location : "");
+  row("Organizer", typeof ev.organizer === "string" ? ev.organizer : "");
+  const who = Array.isArray(ev.attendees) ? ev.attendees
+    .filter((p) => p && typeof p === "object" && p.role !== "resource").map((p) => p.name || p.email).filter(Boolean) : [];
+  row("Invited", who.slice(0, 30).join(", ") + (who.length > 30 ? ` and ${who.length - 30} more` : ""));
+  return `<div class="tri-head">${back}<h2 class="tri-title">${esc(entryTitle(e))}</h2>`
+    + `<span class="tri-sub">${esc(orgName)} · Upcoming</span>${tools}</div>`
+    + rows.join("")
+    + `<div class="mt-status">Its notes and proposals land here once Tenir captures the meeting.</div>`;
 }
 
 // ---- Tenir labels (XERK-2638) ---------------------------------------------------------
@@ -755,7 +866,7 @@ function editing() {
 }
 // What has focus, as keys that survive the swap: the page's own (hooks) first,
 // else one of this pane's controls by its data attribute.
-const FOCUS_ATTRS = ["search", "filter", "orgToggle", "orgSettings", "entry", "showReviewed", "archive",
+const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "archive",
   "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus"];
 function focusKey() {
   if (hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
@@ -782,6 +893,7 @@ function renderMeetings(data, force = false) {
   if (!$list) return;
   if (pointerDown || (!force && editing())) { paintPending = true; return; }
   paintPending = false;
+  if (revealing) resolveReveal(data);
   const v = buildView(data);
   selected = v.sel ? v.sel.key : null;
   rememberSelected(v.sel);
@@ -789,6 +901,7 @@ function renderMeetings(data, force = false) {
   if (v.sel && needsProject(v.sel.meetings)) ensureMeta(v.sel.site);
   if (drawer) ensureMeta(drawer);
   followCursor(itemOrder(v));
+  calTargets.length = 0;
   const full = missesHtml(data, v.name)
     + `<div class="tri${narrowMain && v.sel ? " show-main" : ""}">`
     + `<nav class="tri-rail" aria-label="Meetings by org">${railHtml(v)}</nav>`
@@ -994,10 +1107,38 @@ function startEdit(k) {
   repaint(true);
 }
 function select(key) {
+  revealing = null;
   selected = key;
   curItem = null;
   narrowMain = true;
   repaint(true);
+}
+
+// "Open in notes review" from the calendar (XERK-2899): select the entry carrying
+// that capture or calendar meeting, wherever the viewer's filter, search or
+// collapsed orgs had put it. One not listed yet (the calendar's upcoming read is
+// still in flight) is selected once it is.
+function reveal(target) {
+  if (!target || typeof target !== "object" || typeof target.site !== "string") return;
+  revealing = { site: target.site, meetingId: typeof target.meetingId === "string" ? target.meetingId : "",
+    eventId: typeof target.eventId === "string" ? target.eventId : "", until: Date.now() + 30000 };
+  repaint(true);
+}
+function resolveReveal(data) {
+  const r = revealing;
+  if (Date.now() > r.until) { revealing = null; return; }
+  const e = entriesOf(data, r.site, nowMs()).find((x) => (r.meetingId && x.meetings.some((m) => m.meetingId === r.meetingId))
+    || (r.eventId && x.event && x.event.id === r.eventId));
+  if (!e) return;
+  revealing = null;
+  // Needs review lists the selected entry, so only Archived (or its absence) hides it.
+  if (e.archived && filter !== "archived") filter = "archived";
+  else if (!e.archived && filter === "archived") filter = "all";
+  if (query && !matches(e, query.trim().toLowerCase())) query = "";
+  if (collapsed.has(e.site)) setCollapsed(e.site, false);
+  selected = e.key;
+  curItem = null;
+  narrowMain = true;
 }
 
 // ---- keyboard triage --------------------------------------------------------------
@@ -1046,9 +1187,14 @@ function mount(el, pageHooks = {}) {
   $list.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],"
-        + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-archive]") : null;
+        + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-archive],[data-open-cal]") : null;
     if (!b) return;
     const d = b.dataset;
+    if (d.openCal !== undefined) {
+      const t = calTargets[Number(d.openCal)];
+      if (t && hooks.openCalendar) hooks.openCalendar(t);
+      return;
+    }
     if (d.entry !== undefined) return void select(d.entry);
     if (d.filter !== undefined) {
       if (FILTERS.some(([f]) => f === d.filter)) filter = d.filter;
@@ -1184,7 +1330,7 @@ function pendingCount(data) {
   return n;
 }
 
-const api = { mount, update, invalidate, hold, pendingCount,
+const api = { mount, update, invalidate, hold, pendingCount, reveal,
   // test hooks (tests/meetings.test.js, tests/brief.test.js)
   renderMeetings, review, archive, startEdit, edits, setProject, itemKey, entryKey, meetingKey, saveLabel,
   missesHtml, saveFocus, onKey, entriesOf, select,
@@ -1192,6 +1338,7 @@ const api = { mount, update, invalidate, hold, pendingCount,
   setFilter: (f) => { filter = f; repaint(true); },
   setQuery: (q) => { query = q; repaint(true); },
   state: () => ({ selected, curItem, filter, drawer, narrowMain, collapsed: [...collapsed] }),
-  setCache: (c) => { cache = c; } };
+  setCache: (c) => { cache = c; },
+  setHooks: (h) => { Object.assign(hooks, h); } };
 if (typeof window !== "undefined") window.TurmaMeetings = api;
 })();

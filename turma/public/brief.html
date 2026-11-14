@@ -71,6 +71,13 @@
   .tri-entry .w { color: var(--muted); font-size: 11.5px; white-space: nowrap; flex: none; }
   .tri-entry .sp { flex: 1 1 auto; }
   .tri-note { color: var(--muted); font-size: 11.5px; white-space: nowrap; flex: none; }
+  /* An upcoming calendar meeting (XERK-2899): the org's color as a bar, a Join link beside it. */
+  button.tri-entry.cal { box-shadow: inset 3px 0 0 var(--org, var(--hairline)); }
+  .tri-entry-row { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .tri-entry-row > .tri-entry { flex: 1 1 auto; min-width: 0; width: auto; }
+  .tri-join { flex: none; font-size: 12px; color: var(--accent-text); padding: 2px 6px; }
+  .tri-tag, .mt-tag { flex: none; font-size: 10.5px; color: var(--muted); border: 1px solid var(--hairline);
+    border-radius: 999px; padding: 0 6px; line-height: 16px; white-space: nowrap; }
   .tri-note.bad { color: var(--critical-text); }
   .tri-note.good { color: var(--good-text); }
   .tri-none { color: var(--muted); font-size: 12.5px; padding: 6px 6px 6px 22px; }
@@ -164,6 +171,9 @@
   .mt-tools > a { font-size: 13px; color: var(--accent-text); white-space: nowrap; }
   .mt-title { font-size: 16px; font-weight: 600; margin: 0; flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
   .mt-meta { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .mt-cal { font-size: 13px; color: var(--ink-2); margin-top: 6px; overflow-wrap: anywhere; }
+  .mt-cal .k { color: var(--muted); margin-right: 4px; }
+  .tri-head > .mt-tools { margin-left: auto; }
   /* The meta bits wrap between bits (each is nowrap), never off the pane. */
   div.mt-meta { display: flex; flex-wrap: wrap; }
   .mt-meta .bit { white-space: nowrap; }
@@ -625,6 +635,9 @@ TurmaMeetings.mount($briefs, {
     return sch && sch.enabled && n && n.next ? n.next : null;
   },
   briefHtml, scheduleHtml, focusKey, restoreFocus,
+  // The calendar's upcoming meetings and the jump to one there (XERK-2899).
+  upcomingOf: (site) => TurmaCalendar.upcoming(site),
+  openCalendar: (target) => { TurmaCalendar.reveal(target); showView("calendar", true); },
 });
 
 // The Calendar view (XERK-2897, calendar.js) and the notes review share the page;
@@ -632,7 +645,11 @@ TurmaMeetings.mount($briefs, {
 // `?site=` deep link is about proposals, so it opens the notes review.
 const VIEW_KEY = "turma-meetings-view";
 const $calendar = document.getElementById("calendarView");
-TurmaCalendar.mount($calendar, { now: () => Date.now() });
+TurmaCalendar.mount($calendar, { now: () => Date.now(),
+  // A week read landed: the notes review's Upcoming list may have changed.
+  onData: () => { if (lastData) TurmaMeetings.update(lastData); },
+  openNotes: (target) => { showView("notes", true); TurmaMeetings.reveal(target); },
+});
 function storedView() {
   try { const v = localStorage.getItem(VIEW_KEY); return v === "notes" || v === "calendar" ? v : null; } catch { return null; }
 }

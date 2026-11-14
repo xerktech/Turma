@@ -22,7 +22,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   - Nav label is "Meetings" (XERK-2893); the Daily Brief inside it keeps its own name.
 - Rail: one group per org (the header org pick scopes it), collapsible; the collapsed set is per
   viewer in `localStorage` (`turma-meetings-collapsed`), every access guarded.
-  - Entries bucketed Upcoming / Today / Yesterday / This week / Earlier, newest first.
+  - Entries bucketed Upcoming / Today / Yesterday / This week / Earlier, newest first — except
+    Upcoming, soonest first (XERK-2899).
   - Filters Needs review (default) / All / Archived; search over meeting + proposal titles.
 - **The daily meeting is ONE entry per `meetingAt`** (`entriesOf`): a meeting's `daily.meetingAt`
   keys it, its `daily.briefRunId` pulls that brief in; other briefs key by their own `meetingAt`.
@@ -38,6 +39,34 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   `d:<M>`) keeps the selection: the entry now carrying its brief/meeting, else the nearest in its
   org (`pickSelected`) — never another org's first entry (QA).
 - Narrow (<760px): one pane at a time (`show-main`), a Back button.
+
+## The calendar in the notes review (XERK-2899)
+
+- **Upcoming calendar meetings are rail entries** (`c:<eventId>`), read through the page's
+  `upcomingOf` hook = `TurmaCalendar.upcoming(site)`: meetings.js still fetches nothing itself.
+  - Listed: the org's timed Outlook events ending after now and starting within 7 days
+    (`UPCOMING_MS`), not canceled/declined/free/OOO/working-elsewhere, not all-day, not captured.
+  - The calendar keeps reading those weeks while hidden (`upcomingWanted`; `refetch` keeps them);
+    `onData` re-renders the triage when a read lands.
+  - **An event alone never needs review**: pending 0, never `current`, so Needs review shows it only
+    while selected (the sticky selection); counts and `pendingCount` ignore it.
+  - Org-colored (`--org`, `safeColor`), time + a Join link (`safeHttps`) beside the button — a link
+    can't nest in the rail's `<button>`.
+  - The daily meeting's occurrence (start within 20 min of a daily entry) joins that entry
+    (`e.event`), never a second entry.
+- **A linked capture is named by its Outlook subject** (`meetingTitle`: subject, else
+  `inferredTitle`, else Tenir's title; never a private event's "Private event"), with the event's
+  time and invitees (`calendarEvent.attendees`) under its meta.
+- **Impromptu** = no `calendarEventId` and no `calendarEvent`: labeled in the rail and the pane.
+- **Open in calendar** (`hooks.openCalendar` → `TurmaCalendar.reveal`) moves to the week and opens
+  the event's panel: matched by the capture (`meetings[]` or its Tenir-only entry) before the id.
+  A weekend event in Work week shows Week until a mode pick or weekday reveal (`revealWeek`,
+  unsaved); any
+  navigation drops a reveal still waiting on its week.
+- **Open in notes review** (the calendar panel, `notesTarget` → `TurmaMeetings.reveal`) selects the
+  capture or upcoming entry, switching Archived ⇄ All, clearing a hiding search, opening its org.
+  A target not listed yet resolves on a later paint (≤30s).
+- Tests: the `XERK-2899` cases in `meetings.test.js` and `calendar.test.js`.
 
 ## Proposals
 
@@ -92,7 +121,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - Android port of the triage is its own ticket (`android/PARITY.md`, Brief section).
 - **A settled meeting shows its written summary above the proposals** (XERK-2894, `summaryHtml`;
   Android `meetingSummaryParagraphs` in `MeetingPart`): plain text, escaped, paragraphs on blank
-  lines; and is named `meetingTitle` = `inferredTitle || title` everywhere (head, rail, search).
+  lines; and is named `meetingTitle` everywhere (head, rail, search; XERK-2899 above).
 - Tests: `turma/tests/meetings.test.js`, `turma/tests/brief.test.js` (the `XERK-2857` cases).
 
 ## The Calendar view (`calendar.js`, XERK-2897)
