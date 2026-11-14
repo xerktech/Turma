@@ -293,7 +293,8 @@ _wsl_interop_state() {  # wsl.conf's [interop] enabled, as WSL reads it: prints 
   # One reader, not a mirror: session_cli.py's wsl_conf_interop_off (a port of
   # WSL's own parser). python3 is ensured by ensure_apt_pkgs and the agent cannot
   # run without it. -I keeps the cwd and PYTHON* env out of the import path.
-  [ -r "$WSL_CONF" ] || { echo on; return; }
+  [ -e "$WSL_CONF" ] || { echo on; return; }
+  [ -r "$WSL_CONF" ] || { echo unknown; return; }  # e.g. root-owned 0600, read without sudo
   local rc=0
   python3 -SI -c 'import sys; sys.path.insert(0, sys.argv[1]); import session_cli
 sys.exit(10 if session_cli.wsl_conf_interop_off(sys.argv[2]) else 11)' \
