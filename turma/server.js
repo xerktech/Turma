@@ -6472,9 +6472,11 @@ function relinkTenantMeetings(t) {
 // calendar withholds it (private), `moved` when it no longer overlaps the capture.
 function meetingCalendarEventWire(siteKey, m, index) {
   const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
-  const c = ix.byId.get(m.calendarEventId);
-  if (!c) return null;
   const orgs = calendarOrgsOfTenant(ix.t);
+  // The copy counting for the capture's org (newest first), else the newest copy.
+  const all = ix.copies.get(m.calendarEventId) || [];
+  const c = all.find((x) => calendarMatchOrg(x.key, x.ev, orgs, calendarHostSettings[x.key]) === siteKey) || all[0];
+  if (!c) return null;
   const hs = calendarHostSettings[c.key];
   const w = calendarEventWire(c.key, c.ev, orgs, hs);
   const out = { host: c.key, org: calendarMatchOrg(c.key, c.ev, orgs, hs), subject: w.subject,
@@ -6506,7 +6508,7 @@ function setMeetingCalendarLink(siteKey, meetingId, body) {
   } else if (body.eventId === null) {
     fields = { calendarEventId: undefined, calendarBy: "operator", calendarAmbiguous: undefined };
   } else {
-    if (!index.byId.has(body.eventId)) return refuse(404, "no calendar event of this org's hosts has that id");
+    if (!index.byId.has(body.eventId)) return refuse(404, "no calendar event of this tenant's hosts has that id");
     fields = { calendarEventId: body.eventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const row = putMeeting(siteKey, { ...m, ...fields });

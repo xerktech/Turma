@@ -32557,3 +32557,23 @@ test("XERK-2896: one event on two orgs' hosts keeps each org's link when moved; 
     cleanup2896(S2, [D2]);
   }
 });
+
+test("XERK-2896: the newest copy of a shared event decides; a stale copy holds no link", async () => {
+  const S = "lkN2896.atlassian.net", D = "lkN2896", D2 = "lkN2896b";
+  cleanup2896(S, [D, D2]);
+  try {
+    await calHost2896(D, S, [ev2896("sh", T2896, 30)]);
+    await postMeeting2508(S, capture2896("c", T2896, 30));
+    assert.equal(row2896(S, "c").calendarEventId, "sh");
+    // A second host of the org, synced later, knows the meeting moved; it also holds another
+    // meeting at the capture's time. The newer copy says moved: the link holds.
+    await calHost2896(D2, S, [ev2896("sh", T2896 + 20 * 60 * MIN2896, 30),
+      ev2896("comp", T2896, 30, { joinUrl: "https://zoom.us/j/2" })]);
+    assert.equal(row2896(S, "c").calendarEventId, "sh");
+    const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body.meetingProposals[S];
+    const ev = fleet.find((m) => m.meetingId === "c").calendarEvent;
+    assert.deepEqual([ev.host, ev.moved], [D2, true]);
+  } finally {
+    cleanup2896(S, [D, D2]);
+  }
+});
