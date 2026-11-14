@@ -77,6 +77,7 @@
   let btnShown = false;
   // { sites, siteKey, source, meta, types, values, busy, error, created }
   let createState = null, createSeq = 0;
+  let opener = null;         // what held focus when the form opened, handed back on close (XERK-2911)
   let orgOptsPainted = "";   // the org <select>'s last options, as built (not as the DOM reserializes them)
 
   // The org list a create can target: every org the fleet reports, shaped down
@@ -121,6 +122,10 @@
       values: { project: "", issueType: "", summary: "", description: "", labels: "" },
       busy: false, error: "", created: null,
     };
+    // Remember where the keyboard user was, so closing hands focus back there
+    // instead of dropping it on the page shell (XERK-2911).
+    const active = docRef && docRef.activeElement;
+    opener = active && active !== bodyEl && !backdrop.contains?.(active) ? active : null;
     backdrop.hidden = false;
     if (bodyEl) bodyEl.classList.add("td-open");
     paintCreate();
@@ -147,6 +152,20 @@
     if (backdrop) backdrop.hidden = true;
     if (panel) panel.replaceChildren();
     if (bodyEl && !anyBackdropOpen()) bodyEl.classList.remove("td-open");
+    restoreOpenerFocus();
+  }
+
+  // Return focus to the control that had it when the form opened (XERK-2911).
+  // If that control is gone or won't take focus (a calendar repaint replaced
+  // it, it became disabled), fall back to the header New-ticket button.
+  function restoreOpenerFocus() {
+    const prev = opener;
+    opener = null;
+    for (const el of [prev, btnEl]) {
+      if (!el || !el.focus || el.isConnected === false) continue;
+      el.focus({ preventScroll: true });
+      if (!docRef || docRef.activeElement === el) return;
+    }
   }
 
   // Read the text fields back into state before any repaint (a select change
