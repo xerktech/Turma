@@ -463,6 +463,12 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.match(h, /Part of a recurring series/);
   assert.match(h, /&lt;img src=x onerror=alert\(1\)&gt; \(o@x\.example\)/);
   assert.match(h, /<span class="k">You<\/span><span class="v">Accepted</);
+  // The attendee list starts collapsed (XERK-2942): a toggle naming the count, no names.
+  assert.match(h, /data-att-toggle aria-expanded="false">▸ Attendees \(2\)<\/button>/);
+  assert.doesNotMatch(h, /cal-people/, "the attendees start collapsed");
+  click({ attToggle: "" });
+  h = cal._els().info.innerHTML;
+  assert.match(h, /data-att-toggle aria-expanded="true">▾ Attendees \(2\)/);
   assert.match(h, /<span class="who" title="a@x\.example">&lt;img[^<]*<\/span><span class="role">optional<\/span><span class="resp declined">Declined/);
   assert.match(h, /<span class="who">b@x\.example<\/span><span class="resp accepted">Accepted/);
   assert.match(h, /<span class="cal-cat">&lt;img[^<]*<\/span><span class="cal-cat">Blue<\/span><\/span>/);
@@ -475,6 +481,11 @@ test("XERK-2898: the detail shows Outlook's details — moved, canceled, recurre
   assert.match(h, /<div class="cal-dbody">line one<br>&lt;img src=x onerror=alert\(1\)&gt;<\/div>/);
   click({ closeDetail: "" });
   assert.equal(cal._els().side.hidden, true);
+  // Reopened, the attendee list is collapsed again (XERK-2942).
+  h = await openEvent(at(2027, 3, 10), "Canceled: Plan");
+  assert.match(h, /data-att-toggle aria-expanded="false"/);
+  assert.doesNotMatch(h, /cal-people/);
+  click({ closeDetail: "" });
   // A join link is only ever an https URL.
   assert.doesNotMatch(cal.detailHtml({ host: "h", id: "x", startMs: 1, endMs: 2, joinUrl: "javascript:alert(1)" }, 0), /Join meeting|javascript:/);
   // An occurrence still at its original start says nothing about a move.
