@@ -32,7 +32,7 @@ for (const v of [
   "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
   "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE", "AGENT_IDENTITIES_FILE",
   "DECISIONS_FILE", "MODEL_POLICY_FILE", "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE",
-  "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_ORG_RULES_FILE", "CALENDAR_HOST_SETTINGS_FILE", "TENANCY_FILE", "MEETING_TOKENS_FILE", "ARCHIVE_PURGED_TENANTS_FILE",
+  "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_ORG_RULES_FILE", "CALENDAR_HOST_SETTINGS_FILE", "TENANCY_FILE", "MEETING_TOKENS_FILE", "ARCHIVE_PURGED_TENANTS_FILE",
   "ADMIN_AUDIT_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
@@ -72,6 +72,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     "meetingLabels", "meetingLabelMisses",
     // XERK-2514: whose work each org's meetings propose.
     "meetingFocus",
+    // XERK-2892: each org's holiday catalogs and days off.
+    "holidaySettings",
     // XERK-2531: one-time host enrollment codes (hashed; a used stamp must stick).
     "enrollCodes",
     // XERK-2530: hub users + tenants.

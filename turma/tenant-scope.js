@@ -82,6 +82,7 @@ const ROUTES = [
   ["GET", "/api/events", "filtered"], ["GET", "/api/agents", "filtered"],
   ["GET", "/api/permissions", "filtered"], ["GET", "/api/model-quality", "filtered"],
   ["GET", "/api/search", "filtered"], ["GET", "/api/archive", "filtered"],
+  ["GET", "/api/holidays", "filtered"],
   ["GET POST", "/api/enroll-codes", "filtered"], ["DELETE", "/api/enroll-codes/:id", "filtered"],
   ["POST", "/api/jira/refresh", "filtered"],
   // The caller's hosts' calendars (XERK-2891): calendarView keeps only hosts it may drive.
@@ -131,6 +132,7 @@ const ROUTES = [
   ["POST", "/api/orgs/:site/meetings/:id/archive", "org"],
   ["POST", "/api/orgs/:site/meeting-label", "org"],
   ["POST", "/api/orgs/:site/meeting-focus", "org"],
+  ["PUT", "/api/orgs/:site/holidays", "org"],
   ["POST", "/api/orgs/:site/calendar-rules", "org"],
   ["POST", "/api/orgs/:site/decisions", "org"],
   ["POST", "/api/orgs/:site/daily-brief/run", "org"],
@@ -230,6 +232,7 @@ const SCOPERS = {
   // hub-wide, no tenant data
   now: () => (v) => v,
   pushEnabled: () => (v) => v,
+  holidayCatalog: () => (v) => v,
   error: () => (v) => v,
   // The routing policy is learned fleet-wide; whether it may be (XERK-2550 decides).
   modelPolicy: () => (v) => v,
@@ -239,6 +242,7 @@ const SCOPERS = {
   dedupeLinkOrgs: bySite, orgColors: bySite, triagePolicies: bySite,
   decisions: bySite, decisionCounts: bySite, dailyBriefSchedules: bySite,
   dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite, meetingFocus: bySite,
+  holidaySettings: bySite,
   ticketModels: byTicket, ticketRuntimes: byTicket, ticketPlatforms: byTicket,
   ticketTriageActions: byTicket, epicRuns: byTicket,
   ticketAgents: (view) => (m) => filterMap(m, (k, v) =>
