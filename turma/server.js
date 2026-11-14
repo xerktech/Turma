@@ -8552,12 +8552,21 @@ registerTenantMigration({
 });
 // The ledgers: a row's tenant is its host key (XERK-2550), so each host's rows
 // move under `<device>@<tenant>` — the binding alone never carries them.
+// Hosts the first run re-keyed whose step was not yet recorded: a save refused
+// while a re-key was still unsaved (XERK-2870) resumes at this step, and the
+// rerun finds them already moved in memory — so the marker counts them here.
+let usageMigrationMoved = 0;
 registerTenantMigration({
   name: "usageLedger",
   count: (t, scope) => usageLedger.keys().filter((k) => hostMovable(k, scope)).length,
-  apply: (t, scope) => usageLedger.keys().filter((k) => hostMovable(k, scope))
-    .filter((k) => usageLedger.rekeyHost(k, tenantHostKey(k, t),
-      { siteKey: (s) => (plainKey(s) ? scopeSite(s, t) : s) })).length,
+  apply: (t, scope) => {
+    const n = usageLedger.keys().filter((k) => hostMovable(k, scope))
+      .filter((k) => usageLedger.rekeyHost(k, tenantHostKey(k, t),
+        { siteKey: (s) => (plainKey(s) ? scopeSite(s, t) : s) })).length;
+    if (scope) return n;
+    usageMigrationMoved += n;
+    return usageMigrationMoved;
+  },
 });
 registerTenantMigration({
   name: "permissionLedger",
@@ -8698,6 +8707,8 @@ function hostMergeTick(now = Date.now()) {
   // Under HA the outcome table loads after boot; merging into a half-loaded model
   // would lose the rows its rescan then brings back under the old name.
   if (!outcomeLedger.isLoaded()) return;
+  // Usage re-keys wait for its stored history; a rescan retries a failed load.
+  if (!usageLedger.isLoaded()) { usageLedger.rehydrate().catch(() => {}); return; }
   hostMergeAt = now;
   // Settled once nothing moved and every old name found its host: a source still
   // waiting for its target (not beaten yet, migration unfinished) keeps it going.
@@ -8744,6 +8755,12 @@ async function flushMigratedStores() {
   // (rollup XERK-2870): fail the step so the marker never completes over it.
   const unsettled = await usageLedger.rekeysSettled();
   if (unsettled) throw new Error(`${unsettled} usage-ledger re-key(s) not yet written to Postgres`);
+  // Re-keys wait for the ledger to load; a step recorded before then moved nothing.
+  // A rescan retries a failed scan or a partly-landed pre-HA seed.
+  if (!usageLedger.isLoaded()) await usageLedger.rehydrate().catch(() => {});
+  if (!usageLedger.isLoaded()) {
+    throw new Error("the usage ledger has not finished loading its stored history (Postgres scan or pre-HA seed)");
+  }
 }
 // A refusal or failure the tick retries every 15s is logged when it changes, and
 // at most hourly while it holds.

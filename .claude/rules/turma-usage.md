@@ -204,6 +204,10 @@ paths:
   `installOf` → `sumSeries`). Case twins and identity renames (`formerNames`) are one transcript
   store reported twice (max); k8x/k8x-01 and maxai/maxai-win were different installs, and the
   high-water cutoff rule dropped one era outright (QA: 50% of the total).
+  - The live report raises the live host's OWN install before installs are summed
+    (`liveInstallEntry`, rollup XERK-2870): raising the sum by it read a live host with no
+    ledger entry yet as the per-day MAX of its report and the old install's history.
+    Tests: `XERK-2870:` in `usage-ledger.test.js`.
 - **The sum is SERVE-time only — never store one.** Usage stays under each install's key: a
   stored sum re-ran on an HA failover (a stale follower still holds the old key; Postgres upserts
   GREATEST) and double-counted, and absorb's per-counter max froze the live host's models/sessions.
@@ -328,8 +332,21 @@ paths:
   is held, and only then forgets `from`. Never settle on a whole-store `flush`: the debounce may
   already have drained and failed `to`, so the flush sees nothing dirty and reads success.
   - `flushMigratedStores` fails the migration step while `rekeysSettled()` is non-zero, so the
-    marker never completes over history only memory holds. Tests: `XERK-2870:` in
-    `usage-ledger-store.test.js`.
+    marker never completes over history only memory holds. The usage step's first-run count
+    accumulates across such resumes (`usageMigrationMoved`), or the marker would record 0.
+  - Settling REPLACES `from`'s durable copy with what memory holds (`forgetKey`, then
+    `persistKey` if `from` beat again meanwhile) — also when `to` was forgotten (a tenant purge).
+    Kept, its old rows reloaded on restart: moved history twice, or purged history back untenanted.
+  - **No re-key before the store LOADED** (`isLoaded`: a scan that STARTED after the one-shot
+    file seed landed read the table — an earlier scan never saw the seeded rows; an overlapping
+    caller waits for the in-flight scan and scans again). Until then memory may hold only new beats, and settling would replace the
+    stored history with them. The migration step and `hostMergeTick` wait on it too, and each
+    asks for a `rehydrate()`, whose rescan also retries a partly-landed seed (never only the next
+    reconnect: one seed write blip otherwise stalled every migration save and host merge).
+  - A host forgotten while the seed is pending is dropped from the seed, or the retry restores it.
+  - A rescan (reconnect, promotion) skips a key whose re-key is still settling (`skipLoad`): its
+    stored rows ARE the moved history, and loading them back counted it twice.
+  - Tests: `XERK-2870:` in `usage-ledger-store.test.js` and `tenant-migration.test.js`.
 - Tests: `usage-ledger-store.test.js` drives the REAL `LedgerStore` against an in-memory fake `PgPool`
   that faithfully implements the emitted SQL (no live Postgres in CI, same constraint as
   `pgclient.test.js`): full-fidelity round-trip (repos + models + pre + sub-agent), the GREATEST

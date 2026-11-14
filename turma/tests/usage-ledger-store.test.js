@@ -467,6 +467,349 @@ test("XERK-2870: a re-key keeps the old host's rows until the tenant key's write
   ledger._internals.reset();
 });
 
+test("XERK-2870: purging the tenant key mid-retry deletes the old host's copy once Postgres is back", async (t) => {
+  ledger._internals.reset();
+  class DownPool extends FakePgPool {
+    constructor() { super(); this.down = false; }
+    query(text, params) {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      if (this.down && /^(INSERT|DELETE)/i.test(sql)) return Promise.reject(new Error("down"));
+      return super.query(text, params);
+    }
+  }
+  const pool = new DownPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  const T = "c".repeat(32);
+  ledger.ingest("box-3", {
+    device: "box-3", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(90, 0, 0, 0), days: { "2026-09-11": bucket(90) } }, repoUsage: [],
+  });
+  await new Promise((r) => ledger.flush(r));
+  const dayHosts = () => new Set([...pool.tables.get("usage_day").values()].map((row) => row.host));
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settle = async (n = 40) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+  pool.down = true;
+  assert.equal(ledger.rekeyHost("box-3", `box-3@${T}`), true);
+  await settle();
+  // The tenant is purged while its new key is still unsaved.
+  assert.deepEqual(ledger.purgeTenant(T), [`box-3@${T}`]);
+  t.mock.timers.tick(30 * 1000);
+  await settle();
+  assert.ok(dayHosts().has("box-3"), "still there while Postgres refuses the delete");
+  pool.down = false;
+  t.mock.timers.tick(30 * 1000);
+  await settle();
+  t.mock.timers.reset();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!dayHosts().has("box-3"), "the purged history's untenanted copy is deleted, not reloaded later");
+  assert.ok(!dayHosts().has(`box-3@${T}`));
+  assert.equal(await ledger.rekeysSettled(), 0);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: an old name that beats again keeps only its new beats in Postgres", async () => {
+  ledger._internals.reset();
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  const T = "d".repeat(32);
+  const beat = (n) => ({ device: "box-4", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(n, 0, 0, 0), days: { "2026-09-12": bucket(n) } }, repoUsage: [] });
+  ledger.ingest("box-4", beat(200));
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(ledger.rekeyHost("box-4", `box-4@${T}`), true);
+  // The old name beats again before the re-key settles, then its tenant is purged.
+  ledger.ingest("box-4", beat(5));
+  assert.deepEqual(ledger.purgeTenant(T), [`box-4@${T}`]);
+  assert.equal(await ledger.rekeysSettled(), 0);
+  await new Promise((r) => ledger.flush(r));
+  await new Promise((r) => setTimeout(r, 20));
+  // A restart reloads only what memory held: 5, never the moved (then purged) 200.
+  const H = ledger._internals.hosts();
+  for (const k of Object.keys(H)) delete H[k];
+  await ledger.rehydrate();
+  assert.deepEqual(ledger.keys(), ["box-4"]);
+  assert.equal(bTok(sTot(ledger._internals.hosts()["box-4"].host)), 5);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: an old name that beats again before the move lands is not counted twice", async () => {
+  ledger._internals.reset();
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  const T = "e".repeat(32);
+  const beat = (n) => ({ device: "box-5", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(n, 0, 0, 0), days: { "2026-09-13": bucket(n) } }, repoUsage: [] });
+  ledger.ingest("box-5", beat(200));
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(ledger.rekeyHost("box-5", `box-5@${T}`), true);
+  ledger.ingest("box-5", beat(5)); // the old name beats again before the settle
+  assert.equal(await ledger.rekeysSettled(), 0);
+  await new Promise((r) => ledger.flush(r));
+  await new Promise((r) => setTimeout(r, 20));
+  const H = ledger._internals.hosts();
+  for (const k of Object.keys(H)) delete H[k];
+  await ledger.rehydrate();
+  assert.equal(bTok(sTot(ledger._internals.hosts()["box-5"].host)), 5, "the old name keeps only its new beat");
+  assert.equal(bTok(sTot(ledger._internals.hosts()[`box-5@${T}`].host)), 200);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: a rescan while a re-key is still settling does not reload the moved history", async (t) => {
+  ledger._internals.reset();
+  class DownPool extends FakePgPool {
+    constructor() { super(); this.down = false; }
+    query(text, params) {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      if (this.down && /^(INSERT|DELETE)/i.test(sql)) return Promise.reject(new Error("down"));
+      return super.query(text, params);
+    }
+  }
+  const pool = new DownPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  const T = "f".repeat(32);
+  ledger.ingest("box-6", { device: "box-6", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(200, 0, 0, 0), days: { "2026-09-14": bucket(200) } }, repoUsage: [] });
+  await new Promise((r) => ledger.flush(r));
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settle = async (n = 40) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
+  pool.down = true;
+  assert.equal(ledger.rekeyHost("box-6", `box-6@${T}`), true);
+  await settle();
+  await ledger.rehydrate(); // a reconnect/promotion rescan inside the outage
+  assert.ok(!ledger.has("box-6"), "the old key's stored rows are the history being moved");
+  pool.down = false;
+  t.mock.timers.tick(30 * 1000);
+  await settle();
+  t.mock.timers.reset();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(await ledger.rekeysSettled(), 0);
+  const H = ledger._internals.hosts();
+  for (const k of Object.keys(H)) delete H[k];
+  await ledger.rehydrate();
+  assert.deepEqual(ledger.keys(), [`box-6@${T}`]);
+  assert.equal(bTok(sTot(ledger._internals.hosts()[`box-6@${T}`].host)), 200);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: no re-key before the ledger has read its stored history", async () => {
+  ledger._internals.reset();
+  // Seed 200 of stored history, as a previous hub process left it.
+  const pool = new FakePgPool();
+  const seed = replica(pool);
+  await ready(seed);
+  seed.model.set("box-7", base().coerce({ device: "box-7", siteKey: "acme.atlassian.net", firstSeen: 1, lastSeen: 1,
+    host: { days: { "2026-09-15": bucket(200) } }, repos: {} }));
+  seed.backend.onChange("box-7");
+  await flush(seed);
+  // This process boots while Postgres refuses reads: the boot scan fails.
+  class NoReadPool extends FakePgPool {
+    constructor(tables) { super(); this.tables = tables; this.noRead = true; }
+    query(text, params) {
+      if (this.noRead && /^\s*SELECT/i.test(String(text))) return Promise.reject(new Error("down"));
+      return super.query(text, params);
+    }
+  }
+  const pool2 = new NoReadPool(pool.tables);
+  await ledger.configure({ ha: true }, pool2, () => {});
+  await new Promise((r) => setTimeout(r, 20));
+  ledger.ingest("box-7", { device: "box-7", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(5, 0, 0, 0), days: { "2026-09-16": bucket(5) } }, repoUsage: [] });
+  const T = "9".repeat(32);
+  assert.equal(ledger.isLoaded(), false);
+  assert.equal(ledger.rekeyHost("box-7", `box-7@${T}`), false, "memory holds only the new beat");
+  pool2.noRead = false;
+  await ledger.rehydrate();
+  assert.equal(ledger.isLoaded(), true);
+  assert.equal(ledger.rekeyHost("box-7", `box-7@${T}`), true);
+  assert.equal(await ledger.rekeysSettled(), 0);
+  await new Promise((r) => setTimeout(r, 20));
+  const H = ledger._internals.hosts();
+  for (const k of Object.keys(H)) delete H[k];
+  await ledger.rehydrate();
+  assert.deepEqual(ledger.keys(), [`box-7@${T}`]);
+  assert.equal(bTok(sTot(ledger._internals.hosts()[`box-7@${T}`].host)), 205, "stored history + the new beat");
+  ledger._internals.reset();
+});
+
+test("XERK-2870: a partly-landed seed is not loaded until a rescan lands the rest", async () => {
+  class FlakyPool extends FakePgPool {
+    constructor() { super(); this.fail = true; }
+    query(text, params) {
+      const sql = String(text).replace(/\s+/g, " ").trim();
+      if (this.fail && /^INSERT INTO "usage_day"/i.test(sql) && JSON.stringify(params || []).includes("old-host")) {
+        return Promise.reject(new Error("blip"));
+      }
+      return super.query(text, params);
+    }
+  }
+  const pool = new FlakyPool();
+  const seed = {
+    "old-host": base().coerce({ device: "old-host", siteKey: "acme", firstSeen: 1, lastSeen: 1,
+      host: { days: { "2026-09-17": bucket(300) } }, repos: {} }),
+  };
+  const r = replica(pool, { seed });
+  await ready(r);
+  assert.equal(r.backend.loaded, false, "the scan read the table but the seed has not landed");
+  pool.fail = false;
+  await r.backend.rescan();
+  assert.equal(r.backend.loaded, true, "a rescan retries the seed");
+  assert.equal(bTok(sTot(r.model.get("old-host").host)), 300);
+});
+
+// A ledger booted on a Postgres that refuses box-8's seed INSERTs: the pre-HA file
+// held 300 for box-8, then it beats 7 under HA.
+class SeedPool extends FakePgPool {
+  constructor() { super(); this.failSeed = true; this.failSelect = false; this.gate = null; }
+  query(text, params) {
+    const sql = String(text).replace(/\s+/g, " ").trim();
+    if (this.failSeed && /^INSERT/i.test(sql) && JSON.stringify(params || []).includes("box-8")) {
+      return Promise.reject(new Error("blip"));
+    }
+    if (/^SELECT/i.test(sql)) {
+      if (this.failSelect) return Promise.reject(new Error("select down"));
+      if (this.gate) { const g = this.gate; return g.then(() => super.query(text, params)); }
+    }
+    return super.query(text, params);
+  }
+}
+async function bootWithPendingSeed() {
+  ledger._internals.reset();
+  ledger.ingest("box-8", { device: "box-8", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(300, 0, 0, 0), days: { "2026-09-18": bucket(300) } }, repoUsage: [] });
+  const pool = new SeedPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(ledger.isLoaded(), false, "the seed has not landed");
+  ledger.ingest("box-8", { device: "box-8", jira: { siteKey: "acme.atlassian.net" },
+    usage: { totals: bucket(7, 0, 0, 0), days: { "2026-09-19": bucket(7) } }, repoUsage: [] });
+  return pool;
+}
+async function tenantTotalAfterRestart(key) {
+  await new Promise((r) => setTimeout(r, 20));
+  const H = ledger._internals.hosts();
+  for (const k of Object.keys(H)) delete H[k];
+  await ledger.rehydrate();
+  return ledger.has(key) ? bTok(sTot(ledger._internals.hosts()[key].host)) : null;
+}
+
+test("XERK-2870: a seed that lands while the scan fails is not loaded until a scan reads it", async () => {
+  const pool = await bootWithPendingSeed();
+  pool.failSeed = false;
+  pool.failSelect = true;
+  await ledger.rehydrate(); // the seed lands, the scan fails
+  assert.equal(ledger.isLoaded(), false, "the seeded rows are not in memory yet");
+  const T = "8".repeat(32);
+  assert.equal(ledger.rekeyHost("box-8", `box-8@${T}`), false);
+  pool.failSelect = false;
+  await ledger.rehydrate();
+  assert.equal(ledger.isLoaded(), true);
+  assert.equal(ledger.rekeyHost("box-8", `box-8@${T}`), true);
+  assert.equal(await ledger.rekeysSettled(), 0);
+  assert.equal(await tenantTotalAfterRestart(`box-8@${T}`), 307);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: a rescan overlapping one that began before the seed landed scans again", async () => {
+  const pool = await bootWithPendingSeed();
+  let open;
+  pool.gate = new Promise((r) => { open = r; });
+  const a = ledger.rehydrate(); // its seed fails again; its scan waits on the gate
+  await new Promise((r) => setTimeout(r, 10));
+  pool.failSeed = false;
+  const b = ledger.rehydrate(); // lands the seed, then finds A's scan in flight
+  await new Promise((r) => setTimeout(r, 10));
+  pool.gate = null;
+  open();
+  await Promise.all([a, b]);
+  assert.equal(ledger.isLoaded(), true);
+  assert.equal(bTok(sTot(ledger._internals.hosts()["box-8"].host)), 307, "the seeded rows were read back");
+  const T = "7".repeat(32);
+  assert.equal(ledger.rekeyHost("box-8", `box-8@${T}`), true);
+  assert.equal(await ledger.rekeysSettled(), 0);
+  assert.equal(await tenantTotalAfterRestart(`box-8@${T}`), 307);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: a host forgotten while its seed is pending does not come back from it", async () => {
+  const pool = await bootWithPendingSeed();
+  assert.equal(ledger.forget("box-8"), true);
+  pool.failSeed = false;
+  await ledger.rehydrate();
+  assert.equal(ledger.isLoaded(), true);
+  assert.equal(ledger.has("box-8"), false);
+  assert.equal(await tenantTotalAfterRestart("box-8"), null);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: a host forgotten while the seed is being written is not written back", async () => {
+  ledger._internals.reset();
+  const day = (n, d) => ({ totals: bucket(n, 0, 0, 0), days: { [d]: bucket(n) } });
+  ledger.ingest("box-8", { device: "box-8", jira: { siteKey: "acme" }, usage: day(300, "2026-09-18"), repoUsage: [] });
+  ledger.ingest("box-9", { device: "box-9", jira: { siteKey: "acme" }, usage: day(40, "2026-09-18"), repoUsage: [] });
+  let open;
+  const gate = new Promise((r) => { open = r; });
+  class SlowPool extends FakePgPool {
+    query(text, params) {
+      if (/^\s*INSERT/i.test(String(text)) && JSON.stringify(params || []).includes("box-8")) {
+        return gate.then(() => super.query(text, params));
+      }
+      return super.query(text, params);
+    }
+  }
+  const pool = new SlowPool();
+  await ledger.configure({ ha: true }, pool, () => {});
+  await new Promise((r) => setTimeout(r, 10)); // the seed loop is waiting on box-8
+  ledger.ingest("box-9", { device: "box-9", jira: { siteKey: "acme" }, usage: day(2, "2026-09-19"), repoUsage: [] });
+  assert.equal(ledger.forget("box-9"), true);
+  open();
+  await new Promise((r) => setTimeout(r, 40));
+  const hostsIn = () => new Set([...pool.tables.values()].flatMap((t) => [...t.values()].map((row) => row.host)));
+  assert.ok(!hostsIn().has("box-9"), "the forgotten host's seed write was skipped");
+  assert.ok(hostsIn().has("box-8"));
+  ledger._internals.reset();
+});
+
+test("XERK-2870: every caller waiting on an early scan sees the model loaded", async () => {
+  const pool = await bootWithPendingSeed();
+  let open;
+  pool.gate = new Promise((r) => { open = r; });
+  const a = ledger.rehydrate(); // seed fails again; its scan waits on the gate
+  await new Promise((r) => setTimeout(r, 10));
+  pool.failSeed = false;
+  const seen = [];
+  const waiters = [1, 2, 3].map(() => ledger.rehydrate().then(() => seen.push(ledger.isLoaded())));
+  await new Promise((r) => setTimeout(r, 10));
+  pool.gate = null;
+  open();
+  await Promise.all([a, ...waiters]);
+  assert.deepEqual(seen, [true, true, true]);
+  ledger._internals.reset();
+});
+
+test("XERK-2870: concurrent reloads during an outage share one read", async () => {
+  ledger._internals.reset();
+  let selects = 0;
+  class DownPool extends FakePgPool {
+    constructor() { super(); this.down = false; }
+    query(text, params) {
+      if (/^\s*SELECT/i.test(String(text)) && this.down) {
+        selects++;
+        return new Promise((_r, rej) => setTimeout(() => rej(new Error("down")), 5));
+      }
+      return super.query(text, params);
+    }
+  }
+  const pool = new DownPool();
+  pool.down = true; // never loaded: every boot read fails
+  await ledger.configure({ ha: true }, pool, () => {});
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(ledger.isLoaded(), false);
+  selects = 0;
+  await Promise.all(Array.from({ length: 10 }, () => ledger.rehydrate()));
+  assert.ok(selects <= 2, `${selects} reads for 10 concurrent reloads`);
+  ledger._internals.reset();
+});
+
 test("XERK-2554: rekeyHost writes the tenant key to Postgres and deletes the old host's rows", async () => {
   ledger._internals.reset();
   const pool = new FakePgPool();

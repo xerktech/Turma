@@ -121,7 +121,6 @@ class LedgerStore {
     this._timer = null;
     this._closed = false;
     this._offHealth = null;
-    this._scanning = false;
     this._schemaReady = false;
     this._readyWork = null;
     // A per-host promise chain so two flushes never race one host's write set.
@@ -132,6 +131,18 @@ class LedgerStore {
     // history survives the cutover. Cleared after it lands; a reconnect never re-seeds.
     this._seed = cfg.seed && typeof cfg.seed === "object" ? cfg.seed : null;
     this._seeded = false;
+    // Whether a scan that STARTED after the one-shot seed landed has read the table
+    // (rollup XERK-2870): until then the model may lack a host's stored history —
+    // seeded or not — and a re-key would move only its new beats.
+    this._loaded = false;
+    this._scanP = null;   // the in-flight scan, so an overlapping caller can wait on it
+    this._lastScanSeedLanded = false;
+    this._seedWarnAt = 0;
+  }
+
+  // The served model holds every stored row.
+  get loaded() {
+    return this._loaded;
   }
 
   // Signal the hub that the served model changed with no local beat behind it (a
@@ -255,7 +266,11 @@ class LedgerStore {
     // so a beat that arrives mid-seed for the same host can't interleave its rows.
     let landed = 0;
     for (const [key, entry] of entries) {
-      if (await this._serialize(key, () => this._writeEntry(key, entry))) landed += 1;
+      // Forgotten while the loop ran (`onForget` deletes it from the seed): the seed's
+      // write would land after that DELETE on the same per-host chain and restore it.
+      const ok = await this._serialize(key, () => (this._seed && this._seed[key] === entry
+        ? this._writeEntry(key, entry) : true));
+      if (ok) landed += 1;
     }
     if (landed < entries.length) {
       // A transient write failure (the schema DDL already proved the connection up,
@@ -264,10 +279,14 @@ class LedgerStore {
       // hosts that DID land a no-op, so the retry is safe and only fills the gap —
       // without it a RETIRED host (which never beats again) would lose its history for
       // the life of the process. The count is of SUCCESSES, never attempts.
-      console.warn(
-        `usage ledger: seeded ${landed}/${entries.length} pre-HA host(s) into Postgres; ` +
-          `${entries.length - landed} failed and will retry on the next ready edge`
-      );
+      // Retried on every rescan (`rescan`), so throttled.
+      if (Date.now() - this._seedWarnAt > 10 * 60 * 1000) {
+        this._seedWarnAt = Date.now();
+        console.warn(
+          `usage ledger: seeded ${landed}/${entries.length} pre-HA host(s) into Postgres; ` +
+            `${entries.length - landed} failed and will retry on the next rescan`
+        );
+      }
       return;
     }
     this._seeded = true;
@@ -279,6 +298,9 @@ class LedgerStore {
   async rescan() {
     if (this._closed) return;
     if (!this._schemaReady) return this._onReady();
+    // A seed a write blip left partial retries here too (rollup XERK-2870): `loaded`
+    // waits on it, so leaving it to the next reconnect stalled every re-key.
+    if (this._seed) await this._seedFileModel();
     await this._scan();
   }
 
@@ -286,34 +308,49 @@ class LedgerStore {
   // replace), so a scan racing a write, or a re-scan after reconnect/promotion, can
   // only RAISE a figure. Guarded against overlap; a failure is logged, not fatal.
   async _scan() {
-    if (this._scanning) return;
-    this._scanning = true;
+    if (this._scanP) {
+      // One scan at a time. A caller that needs the model LOADED (the in-flight
+      // scan may have started before the seed landed) scans again once it ends;
+      // every waiter waits out a re-scan another waiter started, too.
+      while (this._scanP) await this._scanP;
+      // Only when that scan began before the seed landed: one that simply failed
+      // is the next caller's to retry, or N waiters mean N reads during an outage.
+      if (!this._loaded && !this._seed && !this._lastScanSeedLanded) return this._scan();
+      return;
+    }
+    this._scanP = this._scanOnce();
+    try { await this._scanP; } finally { this._scanP = null; }
+  }
+
+  async _scanOnce() {
+    // Only a scan that starts with the seed landed reads its rows back (XERK-2870).
+    const seedLanded = !this._seed;
+    this._lastScanSeedLanded = seedLanded;
+    let rawByHost;
     try {
-      let rawByHost;
-      try {
-        rawByHost = await this._readAll();
-      } catch (e) {
-        // A database not yet up must not crash the hub; the next ready edge re-runs.
-        console.error(`usage ledger: Postgres scan failed: ${(e && e.message) || e}`);
-        return;
-      }
-      let kept = 0;
-      for (const [host, raw] of rawByHost) {
-        const peer = this.ops.coerce(raw); // raw -> coerced entry, or null
-        if (!peer) continue;
-        const local = this.ops.getEntry(host);
-        if (local) this.ops.mergeEntry(local, peer); // raise, never lower
-        else this.ops.setEntry(host, peer);
-        kept += 1;
-      }
-      if (kept) {
-        console.log(`loaded usage history for ${kept} host(s) from Postgres`);
-        // The scan raised the served model with no beat behind it — invalidate the
-        // /api/agents cache so a reconnect/promotion load reaches the dashboard.
-        this._notifyExternal();
-      }
-    } finally {
-      this._scanning = false;
+      rawByHost = await this._readAll();
+    } catch (e) {
+      // A database not yet up must not crash the hub; the next ready edge re-runs.
+      console.error(`usage ledger: Postgres scan failed: ${(e && e.message) || e}`);
+      return;
+    }
+    let kept = 0;
+    for (const [host, raw] of rawByHost) {
+      // A re-key still settling: these rows ARE the history it moved (rollup XERK-2870).
+      if (this.ops.skipLoad && this.ops.skipLoad(host)) continue;
+      const peer = this.ops.coerce(raw); // raw -> coerced entry, or null
+      if (!peer) continue;
+      const local = this.ops.getEntry(host);
+      if (local) this.ops.mergeEntry(local, peer); // raise, never lower
+      else this.ops.setEntry(host, peer);
+      kept += 1;
+    }
+    if (seedLanded) this._loaded = true;
+    if (kept) {
+      console.log(`loaded usage history for ${kept} host(s) from Postgres`);
+      // The scan raised the served model with no beat behind it — invalidate the
+      // /api/agents cache so a reconnect/promotion load reaches the dashboard.
+      this._notifyExternal();
     }
   }
 
@@ -401,6 +438,8 @@ class LedgerStore {
 
   onForget(key) {
     if (this._closed) return;
+    // A forgotten host must not come back from a seed still waiting to land.
+    if (this._seed) delete this._seed[key];
     // Durable delete is immediate (an operator action, not a debounced re-state) and
     // must beat any in-flight dirty write for the key.
     this._dirty.delete(key);
@@ -429,6 +468,14 @@ class LedgerStore {
     this._dirty.delete(key);
     this._serialize(key, () => this._landHost(key))
       .then((ok) => done(ok ? null : new Error("usage ledger: a Postgres host write failed")));
+  }
+
+  // Delete ONE host now and report whether it landed — `rekeyHost` dropping the old
+  // copy of a moved host whose new key was forgotten (rollup XERK-2870).
+  forgetKey(key, done) {
+    this._dirty.delete(key);
+    this._serialize(key, () => this._deleteHost(key))
+      .then((ok) => done(ok ? null : new Error("usage ledger: a Postgres host delete failed")));
   }
 
   // `_persistHost` as a boolean that never rejects: false = swallowed write or a throw
@@ -582,8 +629,10 @@ class LedgerStore {
       for (const table of [T_HOST, T_SERIES, T_DAY, T_MODEL]) {
         await this.pool.query(`DELETE FROM ${quoteIdent(table)} WHERE host = $1`, [key]);
       }
+      return true;
     } catch (e) {
       console.error(`usage ledger: Postgres forget of a host failed: ${(e && e.message) || e}`);
+      return false;
     }
   }
 

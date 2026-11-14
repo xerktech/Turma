@@ -86,6 +86,20 @@ const servedTotal = (key, live) => {
   return f ? f.usage.totals.input : hub.usageLedger.retiredAgents([], NOW).find((r) => r.key === key).usage.totals.input;
 };
 
+test("XERK-2870: no host merge runs until the usage ledger has loaded its stored history", () => {
+  const { isLoaded, rehydrate } = hub.usageLedger;
+  let rescans = 0;
+  hub.usageLedger.isLoaded = () => false;
+  hub.usageLedger.rehydrate = () => { rescans++; return Promise.resolve(); };
+  try {
+    hub.hostMergeTick(NOW + 864e5);
+    assert.ok(hub.permissionLedger.hostKeys().includes("k8x"), "nothing moved while the ledger is unloaded");
+    assert.equal(rescans, 1, "the tick asks for the load to be retried");
+  } finally {
+    Object.assign(hub.usageLedger, { isLoaded, rehydrate });
+  }
+});
+
 test("renamed hosts: every store's rows move to the live host", () => {
   const r = hub.runHostMerges();
   assert.equal(r.pending, 0);

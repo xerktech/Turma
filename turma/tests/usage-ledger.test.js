@@ -1059,6 +1059,27 @@ test("XERK-2381: the pre-identity renames fold (k8x -> k8x-01, maxai <-> maxai-w
     "served as its agent sent it");
 });
 
+test("XERK-2870: a live renamed host with no ledger entry yet SUMS with its old install on shared days", () => {
+  reset();
+  // The old install recorded 300 on DAY; the live host has never been ingested
+  // (a beat the ingest skipped), and its own report also spends 120 on DAY.
+  ledger.ingest("k8x", beat({ [DAY]: 300 }, { app: { [DAY]: 300 } }), now);
+  const live = beat({ [DAY]: 120 }, { app: { [DAY]: 100 } }, { device: "k8x-01" });
+  assert.ok(!ledger.has("k8x-01"));
+  const out = ledger.fold("k8x-01", live, now, new Set(["k8x-01"]));
+  const served = out.usage;
+  assert.equal(bucketTokens(served.days[DAY]), 420, "two installs' day adds, never a per-day max");
+  assert.equal(totalOf(served), 420);
+  const app = out.repoUsage.find((r) => r.remoteKey === "rk-app");
+  assert.equal(bucketTokens(app.usage.days[DAY]), 400, "and so does a repo both installs worked in");
+  // Once ingested the same view holds (and a re-stated beat changes nothing).
+  ledger.ingest("k8x-01", live, now + 1000);
+  const again = ledger.fold("k8x-01", live, now, new Set(["k8x-01"]));
+  assert.equal(totalOf(again.usage), 420);
+  assert.equal(bucketTokens(again.repoUsage.find((r) => r.remoteKey === "rk-app").usage.days[DAY]), 400);
+  reset();
+});
+
 test("XERK-2381: a hub-recorded rename folds, including a rename back", () => {
   ledger.ingest("nodeA", beat({ "2026-08-16": 500 }), now);
   const live = beat({ [DAY]: 400 }, {}, { device: "nodeB" });
