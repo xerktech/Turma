@@ -75,6 +75,8 @@ import com.xerktech.turma.core.briefWhenLabel
 import com.xerktech.turma.core.effectiveOrgs
 import com.xerktech.turma.core.focusNames
 import com.xerktech.turma.core.meetingArchivable
+import com.xerktech.turma.core.meetingSummaryParagraphs
+import com.xerktech.turma.core.meetingTitle
 import com.xerktech.turma.core.meetingItemsSplit
 import com.xerktech.turma.core.meetingLabelMissLabels
 import com.xerktech.turma.core.meetingMetaLine
@@ -115,7 +117,7 @@ import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 
 /**
- * The Brief tab (XERK-2858, the web's two-pane triage of XERK-2857): every
+ * The Meetings tab (XERK-2858, the web's two-pane triage of XERK-2857): every
  * org's meetings in one list — collapsible orgs, date buckets, Needs review /
  * All / Archived, search — with the Daily brief folded into each org's
  * daily-meeting entry. A phone shows one pane at a time: the list, an entry,
@@ -268,7 +270,7 @@ fun BriefScreen(
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Brief")
+        ScreenHeader("Meetings")
         when {
             wide -> Row(Modifier.weight(1f).fillMaxWidth()) {
                 list(Modifier.width(360.dp).fillMaxHeight())
@@ -564,7 +566,7 @@ private fun EntryDetail(
             for (m in e.meetings) {
                 if (e.daily) {
                     HorizontalDivider()
-                    Text(m.title.ifBlank { "Untitled meeting" }, style = MaterialTheme.typography.titleMedium,
+                    Text(meetingTitle(m), style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold)
                 }
                 MeetingPart(site, m, mvm)
@@ -680,6 +682,10 @@ private fun MeetingPart(site: String, m: Meeting, mvm: MeetingsViewModel) {
                 { mvm.archive(site, m, !archived) }, enabled = !inFlight,
             )
         }
+    }
+    // The written summary (XERK-2894), plain text: Compose draws it, never parses it.
+    for (para in meetingSummaryParagraphs(m)) {
+        Text(para, style = MaterialTheme.typography.bodyMedium)
     }
     if (needsProject) {
         ProjectTarget(meta[site], project, { mvm.setProject(site, it) }, { mvm.retryMeta(site) })

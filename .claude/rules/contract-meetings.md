@@ -35,7 +35,7 @@ ticket builds to this file; change it here first.
   - No org, or two (colliding defaults), answering a label = 404 in words naming it, and the label
     is noted in `meetingLabelMisses` (`<label>[@tenant]` → `{at, shared?}`, ≤20 per tenant, 200
     in all trimmed by `trimByTenant`, a repeat re-written at most every 10 min) for
-    the Brief page to map. Tenir keeps retrying a 404, so mapping it delivers the meeting.
+    the Meetings page to map. Tenir keeps retrying a 404, so mapping it delivers the meeting.
   - Tests: the `XERK-2638:` cases in `server.test.js` (tenant isolation pinned by mutation).
   - Why in Turma: the capture PC should hold no tracker hosts. Tenir needs no version gate: the
     label rides the same URL slot the site key did.
@@ -82,8 +82,20 @@ ticket builds to this file; change it here first.
   remote watch); field order fixed, so a live row is a coerce fixed point.
   - **Written with no debounce** (`debounceMs: 0`): a 200 promises Tenir the meeting is kept.
 - Row: `{meetingId, status:"queued"|"running"|"ok"|"failed", title, platform, startedAt, endedAt,
-  receivedAt, tenirUrl?, participants, daily?, model?, host?, runId?, generatedAt?, archivedAt?,
-  items?, error?}`.
+  receivedAt, tenirUrl?, participants, daily?, calendarEventId?, calendarBy?, calendarAmbiguous?,
+  model?, host?, runId?, generatedAt?, archivedAt?, items?, summary?, inferredTitle?, error?}`.
+  - **The calendar link** (XERK-2896) is the hub's, set by the matcher or the operator, never by
+    Tenir (`meetingFromBody` drops it; `meetingTenirWire` strips it). Rules:
+    `contract-calendar.md` "Tenir captures ⇄ events".
+  - **`summary` / `inferredTitle` ride an `ok` row only** (XERK-2894, after `items` in field
+    order): the summary `meetingText` multiline ≤`MEETING_SUMMARY_MAX` (4000) code points and its
+    JSON ≤`MEETING_SUMMARY_BYTES_MAX` (16 KiB), measured apart from the items' budget; the title
+    one line ≤120. Empty or wrong-typed = absent. `inferredTitle` never replaces `title`: clients
+    show `inferredTitle || title`. Both are plain text, rendered ESCAPED.
+  - **The hub keeps `inferredTitle` only for a GENERIC title** (`meetingTitleGeneric`, the mirror
+    of the agent's `meeting_title_generic`; both pass `agent/tests/meeting_title_vectors.json` —
+    add a vector there, never to one side), so an agent cannot rename a meeting Tenir named.
+  - The push ("N proposals from …") and a logged decision's `label` use `meetingDisplayTitle`.
   - `segments` are kept ONLY while `queued`/`running` and dropped once settled; a running row also
     keeps `cmdId, sentAt, attempt, tried`. None of those four, nor `segments`, is ever served.
   - **Eviction drops settled rows first** — archived ones before the rest — oldest first; a
@@ -163,6 +175,11 @@ ticket builds to this file; change it here first.
   - `meetingAt` = M on a time match, else the meeting's `startedAt`.
   - `briefRunId` = the org's brief whose `meetingAt === M` (newest ok first, else newest), else
     the newest `ok` brief generated in the 24h before `startedAt`; absent when none.
+- `meetingWire` on `/api/agents` and the operator routes adds, for a linked row, `calendarEvent:
+  {host, org, subject, start, end, startMs, endMs, canceled, moved, private?}` (the event as the
+  calendar serves it, private ones withheld; `org` the one it matched under; `moved` = it no
+  longer overlaps the capture), or
+  `calendarEventMissing: true` when an operator's event left the store (XERK-2896).
 - `meetingWire` serves `daily` and `archivedAt`; **neither Tenir answer does** (`meetingTenirWire`,
   used for the first answer and the duplicate): they are the operator's, not Tenir's.
 - Tests: the `XERK-2856:` cases in `server.test.js` (window/weekday/zone, title, brief link,
@@ -214,16 +231,18 @@ ticket builds to this file; change it here first.
 
 - `meetings: {available, runtimes, models}`, coerced by `normalizeRunCapability` exactly like
   `dailyBrief` (absent = can't; unusable → null).
-- `meetingResults: [{runId, siteKey, meetingId, status:"ok"|"failed", items?, model?, error?}]`,
+- `meetingResults: [{runId, siteKey, meetingId, status:"ok"|"failed", items?, summary?,
+  inferredTitle?, model?, error?}]`,
   ≤5 rows a beat; outbox semantics (the agent clears a row once a beat carrying it was accepted).
   - Accepted only from the host asked, for that run, while it is still decided into `siteKey`
     (XERK-348) and the run is still `running`. A re-sent row after that changes nothing.
   - **The running → ok edge pushes "N proposals from <title>"** (XERK-2511,
     `notifyMeetingProposals`): once per meeting, since only that edge sends it; none for an empty
     list or a failure. Routed by the reporting host (its tenant's devices), `tags:"meetings"`,
-    `notifKey: meeting:<site>:<id>`, `click: /brief?site=…#meetings` (Android opens Brief's
-    Meetings pane; an older hub's `/meetings?site=…` lands there too, XERK-2623).
+    `notifKey: meeting:<site>:<id>`, `click: /meetings?site=…` (XERK-2893; Android opens its
+    Meetings tab, and an older hub's `/brief?site=…#meetings` lands there too).
   - `ok` with `items: []` is a real answer ("nothing to propose"); `ok` with no `items` array fails.
+  - An older agent sends no `summary`: the row is simply without one (no version gate).
 - An item (XERK-2509's schema, re-whitelisted by the hub, ≤`MEETING_ITEMS_MAX` (30) per meeting):
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee
   ≤100?, due ≤40?, quotes[{speaker ≤100, text ≤500, atMs}] ≤5, duplicateKeys[] ≤5 issue keys,
@@ -234,4 +253,5 @@ ticket builds to this file; change it here first.
     offers `meetings.runtimes: ["claude"]` alone (agent half: `agent-meetings.md`).
 - Both keys are in `HEARTBEAT_KNOWN_KEYS`; `meetingResults` is deleted from the payload before
   the record is stored.
-- Tests: the `XERK-2508:` cases in `server.test.js`; agent: `TestMeetingWorker`.
+- Tests: the `XERK-2508:`/`XERK-2894:` cases in `server.test.js`; agent: `TestMeetingWorker`,
+  `TestMeetingItems`; clients: `XERK-2894` in `meetings.test.js` and android `MeetingsTest`.

@@ -1,4 +1,4 @@
-// Meetings triage (XERK-2510; the Brief page's one pane since XERK-2857): every
+// Meetings triage (XERK-2510; the Meetings page's one pane since XERK-2857): every
 // org's meetings and daily briefs in a two-pane triage. The rail groups entries
 // by org (collapsible) and date; the main pane works one entry at a time: a
 // meeting's proposals, or a daily meeting's brief with that meeting's proposals.
@@ -222,7 +222,7 @@ function matches(e, q) {
   if (!q) return true;
   const hay = [e.daily ? "daily meeting" : ""];
   for (const m of e.meetings) {
-    hay.push(m.title || "");
+    hay.push(meetingTitle(m));
     for (const it of m.items || []) if (it) hay.push(it.title || "");
   }
   return hay.join("\n").toLowerCase().includes(q);
@@ -439,6 +439,16 @@ function meetingMeta(m, orgName) {
   if (isTime(m.archivedAt)) bits.push("archived");
   return bits.map((b, i) => `<span class="bit${i < bits.length - 1 ? " sep" : ""}">${esc(b)}</span>`).join("");
 }
+// A meeting's name: the title the model inferred for a generic Tenir one
+// ("Meeting", a Teams call id; XERK-2894), else Tenir's own.
+const meetingTitle = (m) => m.inferredTitle || m.title || "Untitled meeting";
+// The written summary (XERK-2894): plain text, ESCAPED, paragraphs on blank lines.
+function summaryHtml(m) {
+  if (m.status !== "ok" || typeof m.summary !== "string" || !m.summary.trim()) return "";
+  const paras = m.summary.trim().split(/\n{2,}/)
+    .map((p) => `<p>${p.split("\n").map(esc).join("<br>")}</p>`).join("");
+  return `<div class="mt-summary" aria-label="Summary">${paras}</div>`;
+}
 // `primary`: the entry IS this meeting (its title heads the pane, with the back
 // button); else it sits under a daily meeting's brief.
 function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {}) {
@@ -447,8 +457,8 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {})
   const mk = meetingKey(site, m.meetingId);
   const tools = `<span class="mt-tools">${link}${archiveButton(site, m)}</span>`;
   const head = primary
-    ? `<div class="tri-head">${back}<h2 class="tri-title">${esc(m.title || "Untitled meeting")}</h2>${tools}</div>`
-    : `<div class="mt-head"><h3 class="mt-title">${esc(m.title || "Untitled meeting")}</h3>${tools}</div>`;
+    ? `<div class="tri-head">${back}<h2 class="tri-title">${esc(meetingTitle(m))}</h2>${tools}</div>`
+    : `<div class="mt-head"><h3 class="mt-title">${esc(meetingTitle(m))}</h3>${tools}</div>`;
   const aerr = archErr.get(mk);
   let body;
   if (m.status === "queued") body = `<div class="mt-status">Waiting for a host of this org to read the captions…</div>`;
@@ -478,12 +488,13 @@ function meetingHtml(site, m, { primary = false, orgName = "", back = "" } = {})
   return `<section class="mt-meeting${primary ? " primary" : ""}">${head}`
     + `<div class="mt-meta">${meetingMeta(m, orgName)}</div>`
     + (aerr ? `<div class="mt-err">${esc(aerr)}</div>` : "")
+    + summaryHtml(m)
     + body + `</section>`;
 }
 
 // ---- render: the rail ---------------------------------------------------------------
 function entryTitle(e) {
-  return e.daily ? "Daily meeting" : (e.meetings[0].title || "Untitled meeting");
+  return e.daily ? "Daily meeting" : meetingTitle(e.meetings[0]);
 }
 function entryWhen(e, now) {
   if (!isTime(e.at)) return "";

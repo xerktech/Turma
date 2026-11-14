@@ -57352,8 +57352,52 @@ class TestMeetingItems(unittest.TestCase):
         it.update(over)
         return it
 
-    def reply(self, *items):
-        return json.dumps({"items": list(items) if items else [self.item()]})
+    SUMMARY = "We planned the sprint.\n\nDecisions: drop the PDF export.\nActions: Tom adds the key."
+
+    def reply(self, *items, summary=SUMMARY, title=None):
+        return json.dumps({"items": list(items) if items else [self.item()],
+                           "summary": summary, "title": title})
+
+    def test_xerk2894_the_reply_carries_a_summary_and_title_only_when_asked(self):
+        r = ha.parse_meeting_reply(self.reply(summary="  First.  \n\n\n\nDecisions: none \n"),
+                                   self.t, self.repos)
+        self.assertEqual(r["summary"], "First.\n\nDecisions: none")
+        self.assertNotIn("inferredTitle", r)
+        bad = ["", "   ", 3, None, "x" * (ha.MEETING_SUMMARY_MAX + 1)]
+        for summary in bad:
+            self.assertIsNone(ha.parse_meeting_reply(self.reply(summary=summary), self.t,
+                                                     self.repos), repr(summary)[:20])
+        # A titled meeting must not get an inferred one; the reply needs all three keys.
+        self.assertIsNone(ha.parse_meeting_reply(self.reply(title="Sprint"), self.t, self.repos))
+        self.assertIsNone(ha.parse_meeting_items(json.dumps({"items": []}), self.t, self.repos))
+        self.assertIsNone(ha.parse_meeting_items(
+            json.dumps({"items": [], "summary": "x"}), self.t, self.repos))
+        generic = dict(self.t, title="19:meeting_NjQ1ZTdk1@thread.v2")
+        data = json.loads(ha.meeting_input(generic, self.repos))
+        self.assertTrue(data["titleNeeded"])
+        r = ha.parse_meeting_reply(self.reply(title="  Sprint   planning "), generic, self.repos)
+        self.assertEqual(r["inferredTitle"], "Sprint planning")
+        for title in (None, "", "two\nlines", "x" * (ha.MEETING_INFERRED_TITLE_MAX + 1)):
+            self.assertIsNone(ha.parse_meeting_reply(self.reply(title=title), generic, self.repos))
+        self.assertFalse(json.loads(ha.meeting_input(self.t, self.repos))["titleNeeded"])
+
+    def test_xerk2894_generic_titles(self):
+        # The hub's meetingTitleGeneric reads the same vectors (server.test.js).
+        with open(os.path.join(os.path.dirname(__file__), "meeting_title_vectors.json")) as f:
+            vec = json.load(f)
+        for t in vec["generic"]:
+            self.assertTrue(ha.meeting_title_generic(t), t)
+        for t in vec["real"]:
+            self.assertFalse(ha.meeting_title_generic(t), t)
+
+    def test_xerk2894_a_reply_the_hub_would_blank_is_rejected(self):
+        generic = dict(self.t, title="Meeting")
+        for summary in ("\u0000", "\u200b\u202e", " \u2060 \n ", "\u2065"):
+            self.assertIsNone(ha.parse_meeting_reply(self.reply(summary=summary), self.t, self.repos))
+        self.assertIsNone(ha.parse_meeting_reply(self.reply(title="\u200b"), generic, self.repos))
+        # Padding is not length: 119 visible chars inside spaces is fine.
+        r = ha.parse_meeting_reply(self.reply(title="  " + "t" * 119 + "   "), generic, self.repos)
+        self.assertEqual(r["inferredTitle"], "t" * 119)
 
     def test_a_good_reply_parses_to_the_wire_shape(self):
         decision = self.item(kind="decision", title="Drop the legacy PDF export",
@@ -57369,7 +57413,7 @@ class TestMeetingItems(unittest.TestCase):
             "duplicateKeys": [], "repoGuess": "billing-api"})
         self.assertNotIn("suggestedAssignee", items[1])
         self.assertNotIn("repoGuess", items[1])
-        self.assertEqual(ha.parse_meeting_items('{"items": []}', self.t, self.repos), [])
+        self.assertEqual(ha.parse_meeting_items('{"items": [], "summary": "s", "title": null}', self.t, self.repos), [])
 
     def test_a_quote_matches_across_case_and_punctuation_only(self):
         q = self.quote("add the idempotency key to the charge call")
@@ -57408,8 +57452,9 @@ class TestMeetingItems(unittest.TestCase):
                self.item(extra=1), {k: v for k, v in self.item().items() if k != "quotes"}]
         for it in bad:
             self.assertIsNone(ha.parse_meeting_items(self.reply(it), self.t, self.repos), it)
-        for raw in ("", "no json", '{"items": {}}', '{"items": [], "note": 1}', "[1]",
-                    json.dumps({"items": [self.item()] * 31})):
+        for raw in ("", "no json", '{"items": {}, "summary": "s", "title": null}',
+                    '{"items": [], "summary": "s", "title": null, "note": 1}', "[1]",
+                    self.reply(*[self.item()] * 31)):
             self.assertIsNone(ha.parse_meeting_items(raw, self.t, self.repos), raw[:30])
         # An assignee is matched case-insensitively against participants AND speakers.
         self.assertIsNotNone(ha.parse_meeting_items(
@@ -57607,6 +57652,8 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(argv, ["claude", "-p", "--model", "haiku", *ha.ATTENTION_HINT_LOCKDOWN])
         self.assertTrue(stdin_text.startswith(ha.MEETING_INSTRUCTION))
         self.assertIn('"billing-api"', stdin_text)
+        self.assertEqual(row["summary"], TestMeetingItems.SUMMARY)   # XERK-2894
+        self.assertNotIn("inferredTitle", row)
         # Every field fits the hub's whitelist (contract-meetings.md).
         for it in row["items"]:
             self.assertLessEqual(set(it), {"kind", "title", "description", "suggestedAssignee",
@@ -57778,7 +57825,7 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(self.calls), 4)
 
     def test_nothing_to_propose_is_an_ok_row_with_no_items(self):
-        self.replies = ['{"items": []}']
+        self.replies = ['{"items": [], "summary": "Small talk only.", "title": null}']
         self.sm._stage_meeting(self._cmd())
         [row] = self._drain()
         self.assertEqual((row["status"], row["items"]), ("ok", []))

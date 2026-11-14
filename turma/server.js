@@ -5147,6 +5147,37 @@ const MEETING_SEGMENTS_MAX = 10000;
 const MEETING_ITEMS_MAX = 30;
 const MEETING_ITEMS_BYTES_MAX = 64 << 10;
 const MEETING_ERROR_MAX = 300;
+// The written summary and the title inferred for a generic Tenir title (XERK-2894).
+// The summary is held to its own JSON byte budget beside the items' (a settled row
+// is written whole with the store); 4000 code points can never pass 16 KiB.
+const MEETING_SUMMARY_MAX = 4000;
+const MEETING_SUMMARY_BYTES_MAX = 16 << 10;
+const MEETING_INFERRED_TITLE_MAX = 120;
+// A meeting title that names nothing — the mirror of hub-agent.py's
+// meeting_title_generic (both pass agent/tests/meeting_title_vectors.json). An
+// inferred title is kept only for such a meeting, so an agent cannot rename a
+// meeting Tenir named.
+const MEETING_GENERIC_TITLES = new Set(["meeting", "untitled", "untitled meeting", "new meeting",
+  "call", "new call", "teams meeting", "microsoft teams meeting", "teams call", "zoom meeting",
+  "google meet", "meet", "meeting now", "instant meeting", "personal meeting room", "recording",
+  "capture"]);
+function meetingTitleGeneric(title) {
+  const t = String(title || "").split(/\s+/).filter(Boolean).join(" ");
+  if (!t) return true;
+  if (MEETING_GENERIC_TITLES.has(t.toLowerCase().replace(/^[ .:-]+|[ .:-]+$/g, ""))) return true;
+  if (/^[0-9][0-9 -]{7,}[0-9]$/.test(t) && t.replace(/\D/g, "").length >= 9) return true;
+  return !t.includes(" ") && (/^(?:\d+:)?meeting_[A-Za-z0-9_=-]+(?:@thread\.v2)?$/.test(t)
+    || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t));
+}
+// What a meeting is called on every operator surface (push, decisions log, pages).
+const meetingDisplayTitle = (m) => m.inferredTitle || m.title;
+function meetingSummary(v) {
+  let s = meetingText(v, MEETING_SUMMARY_MAX, true);
+  while (s && Buffer.byteLength(JSON.stringify(s)) > MEETING_SUMMARY_BYTES_MAX) {
+    s = cpPrefix(s, [...s].length - 64).trimEnd();
+  }
+  return s;
+}
 const MEETING_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 // No quote, bracket, space, control, format (bidi) or invisible character: the
 // URL will be rendered as a link (XERK-2510), and those spoof its text.
@@ -5301,6 +5332,11 @@ function sanitizeMeetingItems(list) {
   while (meetingItemsBytes(out) > MEETING_ITEMS_BYTES_MAX) out.pop();
   return out;
 }
+// A calendar event id as sanitizeCalendarEvent keeps it (CAL_ID_RE). Inline
+// literal: sanitizeMeeting runs at module init, before the calendar constants.
+function meetingCalendarId(v) {
+  return typeof v === "string" && /^[^\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]{1,300}$/.test(v) ? v : "";
+}
 function sanitizeMeeting(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   if (typeof v.meetingId !== "string" || !MEETING_ID_RE.test(v.meetingId)) return null;
@@ -5322,6 +5358,17 @@ function sanitizeMeeting(v) {
     if (typeof v.daily.briefRunId === "string" && DAILY_BRIEF_RUN_ID_RE.test(v.daily.briefRunId)) {
       out.daily.briefRunId = v.daily.briefRunId;
     }
+  }
+  // The calendar link (XERK-2896, contract-calendar.md): the hub's, never Tenir's.
+  // An operator's choice (a link, or "never link" with no id) outranks the matcher.
+  const calEventId = meetingCalendarId(v.calendarEventId);
+  if (calEventId) {
+    out.calendarEventId = calEventId;
+    out.calendarBy = v.calendarBy === "operator" ? "operator" : "auto";
+  } else if (v.calendarBy === "operator") {
+    out.calendarBy = "operator";
+  } else if (v.calendarAmbiguous === true) {
+    out.calendarAmbiguous = true;
   }
   if (typeof v.model === "string" && MEETING_MODEL_RE.test(v.model)) out.model = v.model;
   if (typeof v.host === "string" && v.host && v.host.length <= 200) out.host = v.host;
@@ -5349,6 +5396,10 @@ function sanitizeMeeting(v) {
   if (v.status === "ok") {
     if (!Array.isArray(v.items)) return null;
     out.items = sanitizeMeetingItems(v.items);
+    const summary = meetingSummary(v.summary);
+    if (summary) out.summary = summary;
+    const inferredTitle = meetingText(v.inferredTitle, MEETING_INFERRED_TITLE_MAX);
+    if (inferredTitle && meetingTitleGeneric(v.title)) out.inferredTitle = inferredTitle;
   }
   if (v.status === "failed") {
     out.error = meetingText(v.error, MEETING_ERROR_MAX) || "the meeting could not be read";
@@ -5466,14 +5517,21 @@ function putMeeting(siteKey, row) {
   return m;
 }
 // A row as answered to Tenir: never the transcript or the in-flight bookkeeping.
-function meetingWire(m) {
+// With `siteKey`, a linked row also carries its event as the calendar shows it
+// now (`calendarEvent`, XERK-2896); `index` reuses one tenant's candidate index.
+function meetingWire(m, siteKey, index) {
   const { segments, cmdId, sentAt, attempt, tried, ...out } = m;
+  if (siteKey && m.calendarEventId) {
+    const ev = meetingCalendarEventWire(siteKey, m, index);
+    if (ev) out.calendarEvent = ev;
+    else out.calendarEventMissing = true;
+  }
   return out;
 }
 // Tenir's answer: the row with no operator review on it (host, cmdId, key, project),
-// nor the hub's own daily link or archive mark (XERK-2856).
+// nor the hub's own daily link, archive mark (XERK-2856) or calendar link (XERK-2896).
 function meetingTenirWire(m) {
-  const { daily, archivedAt, ...out } = meetingWire(m);
+  const { daily, archivedAt, calendarEventId, calendarBy, calendarAmbiguous, ...out } = meetingWire(m);
   if (Array.isArray(out.items)) out.items = out.items.map(({ review, ...it }) => it);
   return out;
 }
@@ -5482,8 +5540,12 @@ function meetingTenirWire(m) {
 const MEETINGS_WIRE_TAIL = 20;
 function meetingProposalsWire() {
   const out = Object.create(null);
+  const indexes = new Map(); // tenant -> its calendar event lookup, built once
   for (const [site, list] of Object.entries(meetingProposals)) {
-    out[site] = list.slice(0, MEETINGS_WIRE_TAIL).map(meetingWire);
+    const rows = list.slice(0, MEETINGS_WIRE_TAIL);
+    const t = tenantOfSite(site);
+    if (rows.some((m) => m.calendarEventId) && !indexes.has(t)) indexes.set(t, calendarEventLookup(t));
+    out[site] = rows.map((m) => meetingWire(m, site, indexes.get(t)));
   }
   return out;
 }
@@ -5971,18 +6033,24 @@ function applyCalendarSync(key, row, now) {
   calendarTrimHost(h, now);
   calendarEvents[key] = sanitizeCalendarHost(h);
   calendarEnforceTenant(tenantOfKey(key), now);
-  return true;
+  // "events" when the stored events differ: only that can change a capture's link.
+  return !prev || JSON.stringify(prev.events) !== JSON.stringify(calendarEvents[key].events) ? "events" : true;
 }
 function ingestCalendarSync(key, rows, now = Date.now()) {
   if (!Array.isArray(rows) || !rows.length) return false;
   let changed = false;
+  let eventsChanged = false;
   for (const row of rows.slice(0, CALENDAR_SYNC_ROWS_MAX)) {
-    if (row && typeof row === "object" && !Array.isArray(row)) changed = applyCalendarSync(key, row, now) || changed;
+    if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+    const r = applyCalendarSync(key, row, now);
+    changed = changed || !!r;
+    eventsChanged = eventsChanged || r === "events";
   }
   if (changed) {
     persistCalendarEvents();
     broadcastCalendarSoon(key);
   }
+  if (eventsChanged) scheduleCalendarRelink(tenantOfKey(key), now);
   return changed;
 }
 
@@ -6059,6 +6127,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
   for (const [k, a] of Object.entries(agents)) if (calendarCapable(a)) keys.add(k);
   const hosts = [];
   let events = [];
+  const tenir = calendarTenirView(p, from, until, orgFilter);
   for (const key of [...keys].sort()) {
     if (!principalMayDriveHost(p, key)) continue;
     const a = agents[key];
@@ -6085,9 +6154,13 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       if (ev.startMs >= until || ev.endMs < from || (ev.endMs === from && ev.endMs !== ev.startMs)) continue;
       const w = calendarEventWire(key, ev, orgs, hs);
       if (orgFilter && !orgFilter.has(w.org)) continue;
-      events.push(w);
+      const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
+      w.meetings = tenir.links.get(lk) || [];
+      tenir.linked.delete(lk);   // served: its captures ride on it
+      events.push({ source: "outlook", ...w });
     }
   }
+  events = events.concat(tenir.entries, ...tenir.linked.values());
   events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const truncated = events.length > CALENDAR_SERVE_MAX;
@@ -6128,6 +6201,7 @@ function setCalendarOrgRules(siteKey, body) {
   else delete calendarOrgRules[siteKey];
   persistCalendarOrgRules();
   for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
+  scheduleCalendarRelink(tenantOfSite(siteKey));
   return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
 }
 function setCalendarHostSettings(key, body) {
@@ -6159,6 +6233,7 @@ function setCalendarHostSettings(key, body) {
   calendarHostSettings[key] = sanitizeCalendarHostSettings(cur);
   persistCalendarHostSettings();
   broadcastCalendarSoon(key);
+  scheduleCalendarRelink(tenantOfKey(key));
   return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
 }
 
@@ -6166,16 +6241,328 @@ function setCalendarHostSettings(key, body) {
 // its last sync (served offline meanwhile), then loses it.
 function calendarTick(now = Date.now()) {
   let n = 0;
+  const tenants = new Set();
   for (const [k, h] of Object.entries(calendarEvents)) {
     if (Object.hasOwn(agents, k)) continue;
     if (now - Math.max(h.syncedAt, h.lastErrorAt || 0) > CALENDAR_HOST_RETAIN_MS) {
       delete calendarEvents[k];
       delete calendarHostSettings[k];
+      tenants.add(tenantOfKey(k));
       n++;
     }
   }
   if (n) { persistCalendarEvents(); persistCalendarHostSettings(); }
+  // An auto link to an event that just went has nothing to hold (XERK-2896).
+  for (const t of tenants) scheduleCalendarRelink(t);
   return n;
+}
+
+// ---- linking Tenir captures to calendar events (XERK-2896) ----------------------
+// A capture links to the Outlook event it belongs to by score: time overlap (with
+// CALENDAR_LINK_TOLERANCE_MS either side for joining early / running over), then
+// title words, join-URL platform, participants, and the daily pairing. The best
+// candidate at or above CALENDAR_LINK_MIN_SCORE wins; one within
+// CALENDAR_LINK_MARGIN of it is ambiguous and nothing links (flagged). The link is
+// the meeting row's `calendarEventId`; a capture with none is served as a
+// Turma-only calendar entry. Contract: contract-calendar.md.
+const CALENDAR_LINK_TOLERANCE_MS = 15 * 60e3;
+const CALENDAR_LINK_EVENT_MAX_MS = 12 * 3600e3;  // a longer block is not a meeting
+const CALENDAR_LINK_MIN_SCORE = 0.35;
+const CALENDAR_LINK_MARGIN = 0.05;
+const CALENDAR_LINK_SCAN_MAX = 200;              // candidates scored per capture
+const CALENDAR_RELINK_MIN_MS = 10e3;             // per tenant, between relinks
+const CAL_NOT_MEETING_BUSY = new Set(["free", "outOfOffice", "workingElsewhere"]);
+const CAL_PLATFORM_HOSTS = [["teams", /(^|\.)teams\.(microsoft|live)\.com$/], ["zoom", /(^|\.)zoom(gov)?\.us$/],
+  ["meet", /(^|\.)meet\.google\.com$/], ["webex", /(^|\.)webex\.com$/]];
+
+// The org an event counts for when matching: its assigned org, else (unassigned,
+// and not PINNED unassigned by a series override) its host's decided org.
+function calendarMatchOrg(key, ev, orgs, hs) {
+  const org = calendarEventOrg(ev, orgs, hs);
+  if (org) return org;
+  const so = hs && hs.seriesOrgs;
+  if (so && Object.hasOwn(so, ev.seriesId || ev.id)) return "";
+  return agents[key] ? decidedOrgOf(agents[key]) : "";
+}
+// id -> {key, ev, syncedAt} for tenant `t`'s stored events: what a link resolves
+// against. Cheap (no org decision), so the wire and the view build it freely. An
+// id held by two hosts (two people's Outlooks invited to one meeting) is one
+// meeting; the newest-synced host's copy is served.
+function calendarEventLookup(t) {
+  const byId = new Map();
+  const copies = new Map(); // id -> every host's copy, newest-synced first
+  for (const [key, h] of Object.entries(calendarEvents)) {
+    if (tenantOfKey(key) !== t) continue;
+    for (const ev of h.events) {
+      const c = { key, ev, syncedAt: h.syncedAt };
+      const prev = byId.get(ev.id);
+      if (!prev || h.syncedAt > prev.syncedAt) byId.set(ev.id, c);
+      if (!copies.has(ev.id)) copies.set(ev.id, []);
+      copies.get(ev.id).push(c);
+    }
+  }
+  for (const list of copies.values()) if (list.length > 1) list.sort((a, b) => b.syncedAt - a.syncedAt);
+  return { t, byId, copies };
+}
+// A real meeting, not a personal block (Focus time, Lunch, Gym, WFH): someone
+// else is invited or it has a join link; shown busy/tentative; not declined; not
+// all-day; at most CALENDAR_LINK_EVENT_MAX_MS. (XERK-2896 QA: a capture inside
+// such a block linked to it and never left.)
+function calendarLinkCandidate(ev) {
+  if (ev.allDay || ev.endMs - ev.startMs > CALENDAR_LINK_EVENT_MAX_MS) return false;
+  if (ev.myResponse === "declined" || CAL_NOT_MEETING_BUSY.has(ev.busy)) return false;
+  return ev.attendees.some((p) => p.role !== "organizer" && p.role !== "resource") ||
+    !!ev.joinUrl || ev.isOnlineMeeting;
+}
+// Every event a capture of tenant `t` could link to, with the org it counts for,
+// sorted by start, plus the lookup.
+function calendarCandidateIndex(t) {
+  const list = [];
+  const orgs = calendarOrgsOfTenant(t);
+  for (const [key, h] of Object.entries(calendarEvents)) {
+    if (tenantOfKey(key) !== t) continue;
+    const hs = calendarHostSettings[key];
+    for (const ev of h.events) {
+      if (calendarLinkCandidate(ev)) list.push({ key, ev, org: calendarMatchOrg(key, ev, orgs, hs) });
+    }
+  }
+  list.sort((a, b) => a.ev.startMs - b.ev.startMs);
+  return { ...calendarEventLookup(t), list };
+}
+const calWords = (s) => new Set(String(s || "").toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) || []);
+function calJaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let n = 0;
+  for (const w of a) if (b.has(w)) n++;
+  return n / (a.size + b.size - n);
+}
+function calEventPlatform(ev) {
+  for (const text of [ev.joinUrl, ev.location]) {
+    for (const m of String(text || "").matchAll(/https?:\/\/([^/\s:?#]+)/gi)) {
+      const host = m[1].toLowerCase();
+      for (const [name, re] of CAL_PLATFORM_HOSTS) if (re.test(host)) return name;
+    }
+  }
+  return "";
+}
+// One name matches another when every word of the shorter fits a word of the
+// other (equal, or one begins the other) — the meeting-focus rule (XERK-2514).
+function calNameMatch(a, b) {
+  const wa = [...calWords(a)], wb = [...calWords(b)];
+  if (!wa.length || !wb.length) return false;
+  const [short, long] = wa.length <= wb.length ? [wa, wb] : [wb, wa];
+  return short.every((w) => long.some((x) => x.startsWith(w) || w.startsWith(x)));
+}
+// A capture `m` against one event: a score in about [-0.2, 1.3]; 0 = not a candidate.
+function calendarLinkScore(m, ev) {
+  const s = m.startedAt, e = Math.max(m.endedAt, m.startedAt + 60e3);
+  if (!(s < ev.endMs + CALENDAR_LINK_TOLERANCE_MS && e > ev.startMs - CALENDAR_LINK_TOLERANCE_MS)) return 0;
+  const overlap = Math.max(0, Math.min(e, ev.endMs) - Math.max(s, ev.startMs));
+  const shorter = Math.max(60e3, Math.min(e - s, ev.endMs - ev.startMs));
+  // Time is worth up to 0.6: how much of the shorter span overlaps, and how close the starts are.
+  let score = 0.36 * Math.min(1, overlap / shorter) + 0.24 * Math.max(0, 1 - Math.abs(s - ev.startMs) / (30 * 60e3));
+  const title = m.inferredTitle || (meetingTitleGeneric(m.title) ? "" : m.title);
+  score += 0.25 * calJaccard(calWords(title), calWords(ev.subject));
+  const plat = calEventPlatform(ev);
+  if (plat && m.platform) score += m.platform.includes(plat) ? 0.1 : -0.2;
+  const people = ev.attendees.map((p) => p.name).filter(Boolean).concat(ev.organizer ? [ev.organizer] : []);
+  if (m.participants.length && people.length) {
+    const hits = m.participants.filter((n) => people.some((x) => calNameMatch(n, x))).length;
+    score += 0.2 * hits / Math.min(m.participants.length, people.length);
+  }
+  if (m.daily && Math.abs(ev.startMs - m.daily.meetingAt) <= MEETING_DAILY_BEFORE_MS) score += 0.15;
+  return Math.max(score, 1e-9);
+}
+// The event `m` (of org `siteKey`) links to -> {eventId} | {ambiguous: true} | null.
+// Canceled events never take a new link.
+function calendarBestMatch(siteKey, m, index) {
+  const lo = m.startedAt - CALENDAR_LINK_TOLERANCE_MS - CALENDAR_LINK_EVENT_MAX_MS;
+  const hi = Math.max(m.endedAt, m.startedAt) + CALENDAR_LINK_TOLERANCE_MS;
+  let a = 0, b = index.list.length;
+  while (a < b) { const mid = (a + b) >> 1; if (index.list[mid].ev.startMs < lo) a = mid + 1; else b = mid; }
+  const best = new Map(); // eventId -> score (one id on two hosts is one meeting)
+  for (let i = a, n = 0; i < index.list.length && index.list[i].ev.startMs < hi && n < CALENDAR_LINK_SCAN_MAX; i++) {
+    const c = index.list[i];
+    if (c.org !== siteKey || c.ev.canceled) continue;
+    n++;
+    const sc = calendarLinkScore(m, c.ev);
+    if (sc > (best.get(c.ev.id) || 0)) best.set(c.ev.id, sc);
+  }
+  const ranked = [...best.entries()].sort((x, y) => y[1] - x[1]);
+  if (!ranked.length || ranked[0][1] < CALENDAR_LINK_MIN_SCORE) return null;
+  if (ranked.length > 1 && ranked[1][1] >= ranked[0][1] - CALENDAR_LINK_MARGIN) return { ambiguous: true };
+  return { eventId: ranked[0][0], score: ranked[0][1] };
+}
+const calOverlapsCapture = (m, ev) => m.startedAt < ev.endMs + CALENDAR_LINK_TOLERANCE_MS &&
+  Math.max(m.endedAt, m.startedAt) > ev.startMs - CALENDAR_LINK_TOLERANCE_MS;
+// The link fields an auto-matched row should carry now. An operator's choice is
+// kept. An auto link whose event is still stored holds when that event was
+// canceled or moved (the capture is what happened); otherwise it yields only to a
+// different event scoring clearly higher (a late invite). Else the matcher decides.
+function meetingCalendarLinkFields(siteKey, m, index) {
+  if (m.calendarBy === "operator") {
+    return { calendarEventId: m.calendarEventId, calendarBy: "operator", calendarAmbiguous: undefined };
+  }
+  const keep = { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
+  // The stored copy that still counts for this org. None = the event was
+  // reassigned to another org (rule, default or series override) and the link goes
+  // back to the matcher. Any host's copy counts: one id on two hosts of different
+  // orgs is one meeting (XERK-2896 QA).
+  const orgs = calendarOrgsOfTenant(index.t);
+  const cur = m.calendarEventId && (index.copies.get(m.calendarEventId) || [])
+    .find((c) => calendarMatchOrg(c.key, c.ev, orgs, calendarHostSettings[c.key]) === siteKey);
+  if (cur) {
+    if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
+    const hit = calendarBestMatch(siteKey, m, index);
+    const curScore = calendarLinkCandidate(cur.ev) ? calendarLinkScore(m, cur.ev) : 0;
+    return hit && hit.eventId && hit.eventId !== m.calendarEventId && hit.score > curScore + CALENDAR_LINK_MARGIN
+      ? { ...keep, calendarEventId: hit.eventId } : keep;
+  }
+  const hit = calendarBestMatch(siteKey, m, index);
+  return { calendarEventId: hit && hit.eventId, calendarBy: hit && hit.eventId ? "auto" : undefined,
+    calendarAmbiguous: hit && hit.ambiguous ? true : undefined };
+}
+// Relinks run at most once per CALENDAR_RELINK_MIN_MS per tenant (a trailing
+// timer catches what a throttled call skipped): one host re-sending syncs every
+// beat must not block the shared event loop (XERK-2896 QA: ~0.55 s a beat).
+const calendarRelinkAt = new Map();     // tenant -> last relink ms
+const calendarRelinkTimers = new Map(); // tenant -> pending timer
+let calendarRelinkMinMs = CALENDAR_RELINK_MIN_MS;
+function scheduleCalendarRelink(t, now = Date.now()) {
+  if (calendarRelinkTimers.has(t)) return false;
+  const wait = (calendarRelinkAt.get(t) || 0) + calendarRelinkMinMs - now;
+  if (wait <= 0) {
+    calendarRelinkAt.set(t, now);
+    return relinkTenantMeetings(t);
+  }
+  const timer = setTimeout(() => {
+    calendarRelinkTimers.delete(t);
+    calendarRelinkAt.set(t, Date.now());
+    try { relinkTenantMeetings(t); } catch (e) { console.error(`calendar relink failed: ${e && e.message}`); }
+  }, wait);
+  if (timer.unref) timer.unref();
+  calendarRelinkTimers.set(t, timer);
+  return false;
+}
+// Re-run the matcher over every meeting of tenant `t` (a calendar sync, or an org
+// rule / host setting that can move an event's org). One write for all changes.
+function relinkTenantMeetings(t) {
+  let index = null;
+  let changed = false;
+  for (const [site, list] of Object.entries(meetingProposals)) {
+    if (tenantOfSite(site) !== t) continue;
+    if (!index) index = calendarCandidateIndex(t);
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      if (m.calendarBy === "operator") continue;
+      const next = sanitizeMeeting({ ...m, ...meetingCalendarLinkFields(site, m, index) });
+      if (!next || (next.calendarEventId === m.calendarEventId && next.calendarAmbiguous === m.calendarAmbiguous)) continue;
+      list[i] = next;
+      changed = true;
+    }
+  }
+  if (changed) {
+    persistMeetings();
+    invalidateAgentsCache();
+    broadcastMeetingsSoon();
+  }
+  return changed;
+}
+// A linked row's event as clients show it beside the capture: withheld like the
+// calendar withholds it (private), `moved` when it no longer overlaps the capture.
+function meetingCalendarEventWire(siteKey, m, index) {
+  const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
+  const orgs = calendarOrgsOfTenant(ix.t);
+  // The copy counting for the capture's org (newest first), else the newest copy.
+  const all = ix.copies.get(m.calendarEventId) || [];
+  const c = all.find((x) => calendarMatchOrg(x.key, x.ev, orgs, calendarHostSettings[x.key]) === siteKey) || all[0];
+  if (!c) return null;
+  const hs = calendarHostSettings[c.key];
+  const w = calendarEventWire(c.key, c.ev, orgs, hs);
+  const out = { host: c.key, org: calendarMatchOrg(c.key, c.ev, orgs, hs), subject: w.subject,
+    start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
+    moved: !calOverlapsCapture(m, w) };
+  if (w.private) out.private = true;
+  return out;
+}
+// The operator's relink/unlink (POST /api/orgs/<site>/meetings/<mid>/calendar):
+// {eventId: "<id>"} links to that event of the org's tenant, {eventId: null}
+// unlinks for good (never auto-linked again), {auto: true} hands it back to the
+// matcher.
+function setMeetingCalendarLink(siteKey, meetingId, body) {
+  const refuse = (status, error) => ({ status, body: { error } });
+  const ok = body && typeof body === "object" && !Array.isArray(body);
+  const auto = ok && body.auto === true;
+  if (!ok || auto === ("eventId" in body) || ("auto" in body && !auto) ||
+      (!auto && body.eventId !== null && !meetingCalendarId(body.eventId))) {
+    return refuse(400, "the body must be {eventId: \"<calendar event id>\"}, {eventId: null} or {auto: true}");
+  }
+  if (!decidedOrgs().has(siteKey)) return refuse(404, "no host is in that org");
+  const m = Object.hasOwn(meetingProposals, siteKey)
+    && meetingProposals[siteKey].find((x) => x.meetingId === meetingId);
+  if (!m) return refuse(404, "no such meeting");
+  const index = calendarCandidateIndex(tenantOfSite(siteKey));
+  let fields;
+  if (auto) {
+    fields = meetingCalendarLinkFields(siteKey, { ...m, calendarBy: undefined, calendarEventId: undefined }, index);
+  } else if (body.eventId === null) {
+    fields = { calendarEventId: undefined, calendarBy: "operator", calendarAmbiguous: undefined };
+  } else {
+    if (!index.byId.has(body.eventId)) return refuse(404, "no calendar event of this tenant's hosts has that id");
+    fields = { calendarEventId: body.eventId, calendarBy: "operator", calendarAmbiguous: undefined };
+  }
+  const row = putMeeting(siteKey, { ...m, ...fields });
+  return row ? { status: 200, body: { ok: true, meeting: meetingWire(row, siteKey, index) } }
+    : refuse(500, "the meeting could not be stored");
+}
+// The captures beside a calendar range: each served Outlook event's linked
+// captures (`id -> [{site, meetingId, title}]`, per tenant) and the Turma-only
+// entries of captures with no link — never written to Outlook.
+// A linked capture whose event this answer does not serve (moved out of the
+// range, filtered out by org) is served on its own time too, with
+// `calendarEventId`, so a capture never vanishes from its own day: `linked` holds
+// those entries per event key for calendarView to keep or drop.
+function calendarTenirView(p, from, until, orgFilter) {
+  const links = new Map(); // `${tenant}\u0000${eventId}` -> [capture]
+  const linked = new Map(); // same key -> [entry served only if the event is not]
+  const entries = [];
+  const lookups = new Map();
+  for (const [site, list] of Object.entries(meetingProposals)) {
+    if (!principalMaySite(p, site)) continue;
+    const t = tenantOfSite(site);
+    if (!lookups.has(t)) lookups.set(t, calendarEventLookup(t));
+    const lookup = lookups.get(t);
+    for (const m of list) {
+      const title = meetingDisplayTitle(m);
+      const endMs = Math.max(m.endedAt, m.startedAt);
+      const inRange = !(m.startedAt >= until || endMs < from || (orgFilter && !orgFilter.has(site)));
+      const c = m.calendarEventId && lookup.byId.get(m.calendarEventId);
+      let k = "";
+      if (c) {
+        k = `${t}\u0000${m.calendarEventId}`;
+        if (!links.has(k)) links.set(k, []);
+        links.get(k).push({ site, meetingId: m.meetingId, title });
+      }
+      if (!inRange) continue;
+      const e = { source: "tenir", host: "", org: site, id: `tenir:${m.meetingId}`, site,
+        meetingId: m.meetingId, subject: title, start: new Date(m.startedAt).toISOString(),
+        end: new Date(endMs).toISOString(), startMs: m.startedAt, endMs, allDay: false,
+        platform: m.platform, participants: m.participants, status: m.status };
+      if (m.summary) e.summary = m.summary;
+      if (m.tenirUrl) e.tenirUrl = m.tenirUrl;
+      if (m.calendarAmbiguous) e.ambiguous = true;
+      if (m.calendarEventId) e.calendarEventId = m.calendarEventId;
+      if (!c) {
+        if (m.calendarEventId) e.calendarEventMissing = true;
+        entries.push(e);
+        continue;
+      }
+      if (!calOverlapsCapture(m, c.ev)) e.moved = true;
+      if (!linked.has(k)) linked.set(k, []);
+      linked.get(k).push(e);
+    }
+  }
+  return { links, linked, entries };
 }
 
 // "Acme Corp" -> "acme-corp". "" when nothing label-shaped is left.
@@ -6280,8 +6667,8 @@ function resolveMeetingOrg(urlSite, t) {
   }
   noteMeetingLabelMiss(label, t, hits.length > 1);
   return { error: hits.length
-    ? `more than one org has the meeting label "${label}" — give one of them its own label on the Brief page`
-    : `no org has the meeting label "${label}" — set it on the Brief page` };
+    ? `more than one org has the meeting label "${label}" — give one of them its own label on the Meetings page`
+    : `no org has the meeting label "${label}" — set it on the Meetings page` };
 }
 // The operator sets (or, with null, resets) an org's label: {status, body}.
 function setMeetingLabel(siteKey, raw) {
@@ -9822,7 +10209,7 @@ function buildAgentsCache() {
     meetingProposals: meetingProposalsWire(),
     // Each org's meeting label (XERK-2638): siteKey -> {label, custom}, and the
     // labels Tenir sent that no single org answers to: "<label>[@tenant]" ->
-    // {at, shared?}. Hub-owned; the Brief page's Meetings pane maps them.
+    // {at, shared?}. Hub-owned; the Meetings page maps them.
     meetingLabels: meetingLabelsWire(),
     meetingLabelMisses,
     // Whose work each org's meetings propose (XERK-2514): siteKey -> {names, role}.
@@ -21807,7 +22194,8 @@ function meetingFromBody(body, now) {
   if (!Array.isArray(body.segments) || !body.segments.length) return { error: "segments must be a non-empty list" };
   const row = sanitizeMeeting({ ...body, status: "queued", receivedAt: now, model: undefined,
     host: undefined, runId: undefined, items: undefined, error: undefined,
-    daily: undefined, archivedAt: undefined });
+    daily: undefined, archivedAt: undefined,
+    calendarEventId: undefined, calendarBy: undefined, calendarAmbiguous: undefined });
   if (!row) return { error: "no segment carries any text" };
   return { row };
 }
@@ -21923,7 +22311,8 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
     return { status: 429, body: { error: "the meetings already waiting to be read fill the hub's transcript budget — try again later" } };
   }
   const daily = meetingDailyOf(siteKey, row);
-  const kept = putMeeting(siteKey, daily ? { ...row, daily } : row);
+  const kept = putMeeting(siteKey, { ...row, ...(daily ? { daily } : {}),
+    ...meetingCalendarLinkFields(siteKey, { ...row, daily }, calendarCandidateIndex(tenantOfSite(siteKey))) });
   if (!kept) return { status: 400, body: { error: "the meeting could not be stored" } };
   dispatchNextMeeting(siteKey, now);
   const m = meetingProposals[siteKey].find((x) => x.meetingId === row.meetingId) || kept;
@@ -21994,11 +22383,11 @@ function meetingRunOf(host, siteKey, runId) {
 function notifyMeetingProposals(host, siteKey, row) {
   const n = Array.isArray(row.items) ? row.items.length : 0;
   if (!n) return;
-  notify(`${n} proposal${n === 1 ? "" : "s"} from ${row.title || "a meeting"}`,
-    "Review them under Brief → Meetings — nothing reaches the board until you approve.", {
+  notify(`${n} proposal${n === 1 ? "" : "s"} from ${meetingDisplayTitle(row) || "a meeting"}`,
+    "Review them on the Meetings page — nothing reaches the board until you approve.", {
       tags: "meetings", route: { host },
       notifKey: `meeting:${siteKey}:${row.meetingId}`,
-      click: `/brief?site=${encodeURIComponent(siteKey)}#meetings`,
+      click: `/meetings?site=${encodeURIComponent(siteKey)}`,
     });
 }
 
@@ -22016,6 +22405,7 @@ function ingestMeetingResults(key, rows, now = Date.now()) {
       items: r.items.map((it) => (it && typeof it === "object" && !Array.isArray(it)
         ? { ...it, review: undefined } : it)),
       model: typeof r.model === "string" && MEETING_MODEL_RE.test(r.model) ? r.model : row.model,
+      summary: r.summary, inferredTitle: r.inferredTitle,
     });
     if (ok) {
       notifyMeetingProposals(key, r.siteKey, ok);
@@ -22116,7 +22506,7 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
       : undefined;
     const row = putMeeting(siteKey, { ...m, archivedAt: undefined,
       items: m.items.map((i) => (i.id === itemId ? { ...i, review: back } : i)) });
-    return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
+    return row ? { status: 200, body: { ok: true, meeting: meetingWire(row, siteKey) } }
       : refuse(500, "the review could not be stored");
   }
   if (cur === "creating") return refuse(409, "that proposal's ticket is already being created");
@@ -22127,7 +22517,7 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const save = (review) => {
     const row = putMeeting(siteKey, { ...m,
       items: m.items.map((i) => (i.id === itemId ? { ...i, review } : i)) });
-    return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
+    return row ? { status: 200, body: { ok: true, meeting: meetingWire(row, siteKey) } }
       : refuse(500, "the review could not be stored");
   };
   if (body.action === "reject") {
@@ -22149,7 +22539,7 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   const edited = title !== item.title || body.edited === true;
   if (item.kind === "decision") {
     const d = appendDecision(siteKey, { source: "meeting",
-      text: [title, description].filter(Boolean).join(" — "), label: m.title });
+      text: [title, description].filter(Boolean).join(" — "), label: meetingDisplayTitle(m) });
     if (!d) return refuse(409, "the hub holds decisions for too many orgs — try again later");
     return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}) });
   }
@@ -22179,7 +22569,7 @@ function archiveMeeting(siteKey, meetingId, body, now = Date.now()) {
     return refuse(409, "that meeting is still being read — archive it once it settles");
   }
   const row = putMeeting(siteKey, { ...m, archivedAt: body.archived ? (m.archivedAt || now) : undefined });
-  return row ? { status: 200, body: { ok: true, meeting: meetingWire(row) } }
+  return row ? { status: 200, body: { ok: true, meeting: meetingWire(row, siteKey) } }
     : refuse(500, "the meeting could not be stored");
 }
 
@@ -24633,15 +25023,16 @@ const server = http.createServer(async (req, res) => {
       return sendPage(req, res, INSIGHTS);
     }
 
-    // The Daily Brief page (XERK-2396). The URL was the retired org brief's
-    // (XERK-2386), so an old bookmark lands on its meeting-scheduled successor.
-    if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
+    // The Meetings page (XERK-2893): the meetings triage with the Daily Brief
+    // folded in, still served from brief.html.
+    if (req.method === "GET" && (url.pathname === "/meetings" || url.pathname === "/meetings.html")) {
       return sendPage(req, res, BRIEF);
     }
-    // Meetings live on the Brief page's Meetings pane (XERK-2623); the old URL —
-    // bookmarks, a notification already on a phone — lands there, query kept.
-    if (req.method === "GET" && (url.pathname === "/meetings" || url.pathname === "/meetings.html")) {
-      res.writeHead(302, { Location: `/brief${url.search}#meetings` });
+    // The page was /brief (XERK-2396; before that the retired org brief's URL,
+    // XERK-2386). Bookmarks and a push already on a phone (`/brief?site=…#meetings`)
+    // still land, query kept; the browser carries the fragment across the redirect.
+    if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
+      res.writeHead(302, { Location: `/meetings${url.search}` });
       return res.end();
     }
 
@@ -28405,6 +28796,24 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
+    // POST /api/orgs/<siteKey>/meetings/<meetingId>/calendar {eventId|null} | {auto:true}
+    // — the operator links a capture to a calendar event, unlinks it for good, or
+    // hands it back to the matcher (XERK-2896). Operator-authed like archive.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 6 && parts[3] === "meetings" && parts[5] === "calendar") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const meetingId = decodeURIComponent(parts[4]);
+      let body;
+      try {
+        body = JSON.parse((await readBody(req, 4096)) || "null");
+      } catch (e) {
+        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+        return json(res, 400, { error: "the body is not JSON" });
+      }
+      const out = setMeetingCalendarLink(siteKey, meetingId, body);
+      return json(res, out.status, out.body);
+    }
+
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
         parts.length === 4 && parts[3] === "decisions") {
       const siteKey = decodeURIComponent(parts[2]);
@@ -29406,6 +29815,10 @@ if (process.env.TURMA_TEST) {
     // XERK-2891: the calendar.
     sanitizeCalendarEvent, calendarEventsCoerce, ingestCalendarSync, calendarView, calendarTick,
     calendarEventOrg, calendarOnDemandAt,
+    // XERK-2896: linking captures to calendar events.
+    calendarLinkScore, calendarBestMatch, calendarCandidateIndex, relinkTenantMeetings, setMeetingCalendarLink,
+    scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,
+    __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     getCalendarOrgRules: () => calendarOrgRules,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
@@ -30025,7 +30438,7 @@ if (process.env.TURMA_TEST) {
     getMeetingLabelMisses: () => meetingLabelMisses, meetingLabelsCoerce, meetingLabelMissesCoerce,
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
     getHolidaySettings: () => holidaySettings, holidaySettingsCoerce,
-    meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick,
+    meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick, meetingTitleGeneric,
     putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
