@@ -532,6 +532,8 @@ class CalendarTest(unittest.TestCase):
         s = self.script_for("yesterday", days=3)
         self.assertIn("$from = [DateTime]::Today.AddDays(-1)", s)
         self.assertIn("$from.AddDays(3)", s)
+        for edge in ("1900-01-01", "2999-12-31"):     # the year bounds are inclusive
+            self.assertIn("New-Object DateTime", self.script_for(edge, days=31))
 
     def test_the_real_script_reads_a_dated_window(self):
         pwsh = shutil.which("pwsh")
