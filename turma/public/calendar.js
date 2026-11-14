@@ -202,7 +202,7 @@ let picker = null;                // the mini-month's shown month (ms of its 1st
 let detail = null;                // the event whose detail panel is open
 let lastGot = null;               // collect() of the last paint: the relink candidates
 let $grid = null, $side = null, $info = null, $mt = null;
-let bodyOpen = false;             // the open event's description is expanded
+let descOpen = false;             // the open event's description is expanded
 let panelHas = false;             // meetings.js painted the capture into the panel
 const linkBusy = new Set();       // capture keys with a relink POST in flight
 const linkErr = new Map();        // capture key -> the hub's refusal
@@ -586,8 +586,10 @@ function originalStart(ev) {
 function whenText(ev) {
   return inBand(ev) ? `${fmtLongDay(ev.startMs)}, all day` : `${fmtLongDay(ev.startMs)}, ${fmtSpan(ev.startMs, ev.endMs)}`;
 }
-// Body text as Outlook wrote it: escaped, line breaks kept.
-const textHtml = (t) => esc(String(t || "").trim()).replace(/\r?\n/g, "<br>");
+// Plain text as HTML: every line escaped, joined by <br>; "" for none.
+function linesHtml(t) {
+  return typeof t === "string" && t.trim() ? t.trim().split(/\r?\n/).map(esc).join("<br>") : "";
+}
 function attendeesHtml(list) {
   const rows = list.filter((a) => a && typeof a === "object" && (a.name || a.email)).map((a) => {
     const who = a.name ? String(a.name) : String(a.email);
@@ -658,7 +660,8 @@ function detailHtml(ev, now, hasPanel = false) {
   const openNotesBtn = openNotes && notesTarget(ev, now)
     ? `<div class="cal-drow"><button type="button" class="btn-sm" data-open-notes>Open in notes review</button></div>` : "";
   const att = Array.isArray(ev.attendees) ? attendeesHtml(ev.attendees) : "";
-  const body = typeof ev.body === "string" && ev.body.trim() ? ev.body : "";
+  // The description as Outlook wrote it: escaped line by line, breaks kept.
+  const descHtml = linesHtml(ev.body);
   const notes = [];
   if (ev.private === true) notes.push("A private event: its details are withheld.");
   if (tenir && ev.calendarEventMissing === true) notes.push("The Outlook event it was linked to is no longer on the calendar.");
@@ -671,7 +674,7 @@ function detailHtml(ev, now, hasPanel = false) {
     capture = (ev.status === "queued" || ev.status === "running" ? `<div class="mt-status">Reading the captions…</div>` : "")
       + (ppl.length ? `<div class="mt-people" aria-label="Participants">${ppl.map((x) => `<span>${esc(x)}</span>`).join("")}</div>` : "")
       + (typeof ev.summary === "string" && ev.summary.trim()
-        ? `<div class="mt-summary" aria-label="Summary">${ev.summary.trim().split(/\n{2,}/).map((x) => `<p>${textHtml(x)}</p>`).join("")}</div>` : "")
+        ? `<div class="mt-summary" aria-label="Summary">${ev.summary.trim().split(/\n{2,}/).map((x) => `<p>${x.split(/\r?\n/).map(esc).join("<br>")}</p>`).join("")}</div>` : "")
       + (url ? `<a class="mt-tenir" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open in Tenir ↗</a>` : "");
   }
   const caps = capturesOf(ev);
@@ -683,8 +686,10 @@ function detailHtml(ev, now, hasPanel = false) {
     + openNotesBtn
     + notes.map((n) => `<p class="cal-dnote">${esc(n)}</p>`).join("")
     + (att ? `<div class="cal-dsec"><div class="cal-dlabel">Attendees</div>${att}</div>` : "")
-    + (body ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-body-toggle aria-expanded="${bodyOpen}">`
-      + `${bodyOpen ? "▾" : "▸"} Description</button>${bodyOpen ? `<div class="cal-dbody">${textHtml(body)}</div>` : ""}</div>` : "")
+    + (descHtml ? `<div class="cal-dsec"><button type="button" class="linkish cal-dlabel" data-body-toggle aria-expanded="${descOpen}">`
+      // descHtml is linesHtml's output: every line esc()'d (Semgrep reads `ev.body` as an Express req.body).
+      // nosemgrep: javascript.express.security.injection.raw-html-format.raw-html-format
+      + `${descOpen ? "▾" : "▸"} Description</button>${descOpen ? `<div class="cal-dbody">${descHtml}</div>` : ""}</div>` : "")
     + capture
     + (caps.length ? caps.map((c) => captureLinkHtml(ev, c)).join("") : "")
     + (!tenir && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "");
@@ -917,7 +922,7 @@ function closeDetail() {
 }
 function openDetail(e, from) {
   detailFrom = from;
-  if (!detail || evKey(detail) !== evKey(e)) { bodyOpen = false; linkPick.clear(); linkErr.clear(); }
+  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; linkPick.clear(); linkErr.clear(); }
   detail = e;
   picker = null;
   paint(true);
@@ -1014,7 +1019,7 @@ function mount(el, opts = {}) {
       if (t && openNotes) openNotes(t);
       return;
     }
-    if (d.bodyToggle !== undefined) { bodyOpen = !bodyOpen; return void paintDetail(true); }
+    if (d.bodyToggle !== undefined) { descOpen = !descOpen; return void paintDetail(true); }
     if (d.linkGo !== undefined || d.linkUnlink !== undefined || d.linkAuto !== undefined) {
       if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
       if (d.linkUnlink !== undefined) return void relink(d.linkUnlink, { eventId: null });
