@@ -751,6 +751,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     tablet screen is that tall. The web widens the Calendar view to the board's 1640px column.
   - On for every org, no feature flag (XERK-2901). A host going offline or back re-reads the
     open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
+  - XERK-2943 (web) needs no Android change: a wide web window now narrows the week while the
+    detail panel is open, which Android already does by placing the detail beside the grid. The web
+    also hides a block's time line by the block's drawn height (`SHORT_DP` against fixed `SLOT_DP`
+    rows on Android, which never stretch).
 - **Calendar settings (XERK-2929)**: an org's ⚙ settings edit its days off (a tick per catalog
   country and per holiday, each saved at once) and its calendar email domains; the calendar's ⚙
   lists each host's Default org + Show private events; an Outlook event's Org row picks the
@@ -971,6 +975,12 @@ those are marked `[MODEL]`.
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 
 ### Board (`board.js` → `BoardScreen`/`core/Board`)
+
+- P1 **New-ticket attachments (XERK-2935) — web only.** The web form uploads each picked file to
+  `POST /api/jira/<site>/uploads?name=` (raw body, answers `{uploadId, name, size}`) and sends the
+  ids as `uploadIds` on the create; the poll waits up to 5 min when files ride. Android's
+  `CreateTicketSheet` creates without files. A port adds a file picker + those two calls; no new
+  `/api/agents` key (the `ticketAttachments` capability is untyped and skipped).
 - Azure DevOps org support (XERK-43) is at parity for free: the agent reports Azure work items in the
   SAME `jira` heartbeat block, ticket shape and detail shape as Jira (with `source:"azure"`), so the
   board renders them unchanged. The only client-side change was `orgName` — now takes the last path

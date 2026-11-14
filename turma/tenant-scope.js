@@ -111,7 +111,7 @@ const ROUTES = [
   ["GET", "/api/dsh/:tid/trajectory", "transcript"],
   // per org
   ["GET", "/api/jira/:site/create-meta", "org"],
-  ["POST", "/api/jira/:site/tickets", "org"], ["GET", "/api/jira/:site/tickets/:cmd", "org"],
+  ["POST", "/api/jira/:site/tickets", "org"], ["POST", "/api/jira/:site/uploads", "org"], ["GET", "/api/jira/:site/tickets/:cmd", "org"],
   ["GET POST", "/api/jira/:site/permission-policy", "org"],
   ["POST", "/api/jira/:site/epic-builder", "org"],
   ["DELETE", "/api/jira/:site/epic-builder/:id", "org"],

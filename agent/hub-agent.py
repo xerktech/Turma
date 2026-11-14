@@ -1222,6 +1222,10 @@ UPLOAD_DIR_MODE = 0o777 if IS_WINDOWS else 0o700
 UPLOAD_MAX_BYTES = _env_int("TURMA_UPLOAD_MAX_BYTES", 1 << 25)  # 32 MiB
 UPLOAD_MAX_PER_MESSAGE = _env_int("TURMA_UPLOAD_MAX_PER_MESSAGE", 10)
 UPLOAD_DOWNLOAD_TIMEOUT_SEC = _env_int("TURMA_UPLOAD_TIMEOUT_SEC", 60)
+# Wall clock for attaching a new ticket's files (XERK-2935): no file starts
+# after it, and the file in flight is abandoned at it, so the whole create
+# answers well inside the web form's 6-minute wait.
+TICKET_FILES_DEADLINE_SEC = _env_int("TURMA_TICKET_FILES_DEADLINE_SEC", 150, minimum=10)
 # Whole-batch wall clock for downloading a SPAWN's composer attachments, which
 # happens ON the beat at provision (unlike the running-session path, which is off
 # the beat). Bounds the beat cost well under OFFLINE_AFTER_MS (75s) even if a blob
@@ -24958,6 +24962,68 @@ def create_azure_issue(project, wtype, title, description, tags):
             "assigned": bool(assigned), "assignError": assign_error}
 
 
+
+# --- Files attached to a NEW ticket (XERK-2935) --------------------------------
+# The New-ticket form can carry files. The hub relays their bytes exactly like a
+# chat attachment (XERK-234); after the create lands, the manager uploads each
+# one to the tracker. Runs on a worker (see _stage_create_ticket), never the beat.
+
+def _raw_board_request(url, data, headers):
+    """POST raw bytes to the tracker and parse its JSON reply, with the same
+    error wording and bounded read as _board_urlopen."""
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    return _board_urlopen(req)
+
+
+def jira_attach_file(issue_key, name, blob):
+    """Attach one file to a Jira issue (multipart `file` field). Jira refuses
+    the request without `X-Atlassian-Token: no-check` (its XSRF guard)."""
+    site = normalize_jira_site(JIRA_SITE)
+    url = (f"https://{site}/rest/api/3/issue/"
+           f"{urllib.parse.quote(str(issue_key), safe='')}/attachments")
+    auth = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_TOKEN}".encode()).decode()
+    boundary = "turma" + secrets.token_hex(16)
+    # The name is already safe_upload_name'd (no quotes, no control bytes).
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n").encode() \
+        + blob + f"\r\n--{boundary}--\r\n".encode()
+    return _raw_board_request(url, body, {
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "X-Atlassian-Token": "no-check",
+        "User-Agent": "turma-agent/1.0",
+    })
+
+
+def azure_attach_file(work_item_id, name, blob):
+    """Attach one file to an Azure work item: upload it to the attachment
+    store, then link it to the item as an AttachedFile relation."""
+    auth = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
+    q = urllib.parse.urlencode({"fileName": name, "api-version": AZDO_API_VERSION})
+    up = _raw_board_request(f"{azure_base()}/_apis/wit/attachments?{q}", blob, {
+        "Authorization": f"Basic {auth}",
+        "Accept": "application/json",
+        "Content-Type": "application/octet-stream",
+        "User-Agent": "turma-agent/1.0",
+    })
+    ref = up.get("url") if isinstance(up, dict) else None
+    if not ref:
+        raise RuntimeError("Azure returned no attachment url")
+    azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(str(work_item_id))}",
+              None, body=[{"op": "add", "path": "/relations/-",
+                           "value": {"rel": "AttachedFile", "url": ref}}],
+              method="PATCH", content_type="application/json-patch+json")
+
+
+def attach_board_file(issue_key, name, blob):
+    """Attach one file to a ticket on whichever tracker this host polls."""
+    if board_source() == "azure":
+        return azure_attach_file(issue_key, name, blob)
+    return jira_attach_file(issue_key, name, blob)
+
+
 # --- Board source dispatch -----------------------------------------------------
 # The board is source-agnostic downstream: the hub, board.js and every client
 # read one `jira` block per agent and never branch on where its tickets came
@@ -27391,6 +27457,57 @@ CREATE_MAYBE_RAN_ERROR = ("this host restarted while creating the ticket — it 
                           "have been created, so check the board before making it again")
 
 
+def _call_with_deadline(fn, seconds):
+    """Run `fn()` on a daemon thread and return its result, or raise
+    TimeoutError once `seconds` pass (the thread is abandoned: it holds only its
+    own socket, which its own timeouts end). Exceptions from `fn` propagate."""
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fn()
+        except BaseException as e:
+            box["err"] = e
+    t = threading.Thread(target=run, name="bounded-call", daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError(f"no answer in {seconds:.0f}s")
+    if "err" in box:
+        raise box["err"]
+    return box.get("ok")
+
+
+class _LockedList:
+    """A list with an off-beat writer (a worker thread) and a beat reader that
+    clears only what it delivered, by identity."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items = []
+
+    def append(self, row):
+        with self._lock:
+            self._items.append(row)
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._items)
+
+    def drop(self, ids):
+        with self._lock:
+            self._items[:] = [x for x in self._items if id(x) not in ids]
+
+    def __len__(self):
+        with self._lock:
+            return len(self._items)
+
+
+# Guards the created-commands ledger: a create carrying files runs on a worker
+# (XERK-2935) while the beat may run another create.
+_CREATED_CMDS_LOCK = threading.RLock()
+
+
 def _created_cmd_row(cid, row):
     """A stored create answer re-shaped to plain scalars for `cid`, or None
     (XERK-2867). The file is session-writable: never re-send what it holds as-is
@@ -28742,6 +28859,10 @@ class SessionManager:
         self._create_meta_lock = threading.Lock()
         self._create_meta_inflight = set()
         self.create_ticket_results = []
+        # A create carrying files (XERK-2935) runs on a worker, so its row lands
+        # here under a lock and the beat clears only what it delivered, by
+        # identity (the create_meta_results discipline).
+        self.create_ticket_async_results = _LockedList()
         # Staged `setTicketPriority` results (XERK-483: the triage band written
         # back to the tracker's priority field) — same held-across-a-failed-POST
         # lifecycle as ticket_status_results above.
@@ -29685,19 +29806,21 @@ class SessionManager:
         if not cid:
             results.append(do_create())
             return
-        prior = self.created_cmds.get(cid)
-        if prior is not None:
-            row = _created_cmd_row(cid, prior.get("row"))
-            results.append(row if row is not None else maybe_row)
-            log(f"create {cid} was already run on this host; re-sending its answer")
-            return
-        self.created_cmds[cid] = {"at": time.time()}
-        self._save_created_cmds()
+        with _CREATED_CMDS_LOCK:
+            prior = self.created_cmds.get(cid)
+            if prior is not None:
+                row = _created_cmd_row(cid, prior.get("row"))
+                results.append(row if row is not None else maybe_row)
+                log(f"create {cid} was already run on this host; re-sending its answer")
+                return
+            self.created_cmds[cid] = {"at": time.time()}
+            self._save_created_cmds()
         row = do_create()
         results.append(row)
-        self.created_cmds.pop(cid, None)
-        self.created_cmds[cid] = {"at": time.time(), "row": row}
-        self._save_created_cmds()
+        with _CREATED_CMDS_LOCK:
+            self.created_cmds.pop(cid, None)
+            self.created_cmds[cid] = {"at": time.time(), "row": row}
+            self._save_created_cmds()
 
     def _load_blocks_links(self):
         try:
@@ -41537,23 +41660,88 @@ class SessionManager:
             return fail("a project is required")
         if not issue_type:
             return fail("an issue type is required")
+        files = [u for u in (cmd.get("uploads") or [])
+                 if isinstance(u, dict) and isinstance(u.get("id"), str)
+                 and u.get("id")][:UPLOAD_MAX_PER_MESSAGE]
+
         def do_create():
             try:
                 created = create_board_issue(project, issue_type, summary,
                                              description, labels)
                 log(f"created ticket {created.get('key')} in {project}")
-                return {"cmdId": cid, "key": created.get("key"),
-                        "url": created.get("url"), "error": None,
-                        "warning": None if created.get("assigned")
-                                   else unassigned_warning(created)}
             except Exception as e:
                 log(f"ticket creation failed in {project}: {e}")
                 return {"cmdId": cid, "key": None, "url": None,
                         "error": str(e)[:300]}
+            warnings = []
+            if not created.get("assigned"):
+                warnings.append(unassigned_warning(created))
+            missed = self._attach_ticket_files(created.get("key"), files)
+            if missed:
+                warnings.append("created, but these files could not be attached: "
+                                + "; ".join(missed))
+            return {"cmdId": cid, "key": created.get("key"),
+                    "url": created.get("url"), "error": None,
+                    "warning": " · ".join(warnings)[:600] or None}
 
-        self._create_once(cid, self.create_ticket_results, do_create,
-                          {"cmdId": cid, "key": None, "url": None,
-                           "error": CREATE_MAYBE_RAN_ERROR, "maybeCreated": True})
+        maybe = {"cmdId": cid, "key": None, "url": None,
+                 "error": CREATE_MAYBE_RAN_ERROR, "maybeCreated": True}
+        if not files:
+            self._create_once(cid, self.create_ticket_results, do_create, maybe)
+            return
+        # Downloading and uploading files is network-bound with no small worst
+        # case, so a create that carries files runs on its own thread, never the
+        # beat (XERK-395). The hub waits for its late result (ASYNC_RESULT_KINDS,
+        # "createTicketFiles").
+        def run():
+            self._create_once(cid, self.create_ticket_async_results,
+                              do_create, maybe)
+            _poke.set()
+        try:
+            threading.Thread(target=run, name="create-ticket", daemon=True).start()
+        except Exception as e:
+            fail(f"could not start the create worker: {e}"[:300])
+
+    def _attach_ticket_files(self, key, files):
+        """Upload the operator's files (staged on the hub relay) to the new
+        ticket `key`. Returns "<name> (<reason>)" for each file that did not
+        attach; a failed attachment never fails the create (the ticket exists)."""
+        missed = []
+        deadline = time.monotonic() + TICKET_FILES_DEADLINE_SEC
+        for item in files:
+            name = safe_upload_name(item.get("name"))
+            if not key:
+                missed.append(f"{name} (no ticket key)")
+                continue
+            left = deadline - time.monotonic()
+            if left <= 0:
+                missed.append(f"{name} (ran out of time)")
+                continue
+
+            def one(item=item, name=name, left=left):
+                blob = self._download_upload(
+                    item.get("id"), timeout=min(UPLOAD_DOWNLOAD_TIMEOUT_SEC, left))
+                if blob is None:
+                    return "expired on the hub"
+                if len(blob) > UPLOAD_MAX_BYTES:
+                    return "too large"
+                attach_board_file(key, name, blob)
+                log(f"ticket {key}: attached {len(blob)} bytes as {name}")
+                return None
+            try:
+                # Socket timeouts are per operation, so a server that drips
+                # bytes never trips them: the whole file gets the time left.
+                why = _call_with_deadline(one, max(left, 1.0))
+            except TimeoutError:
+                # The abandoned upload may still finish, so never claim it failed.
+                log(f"ticket {key}: attaching {name} ran past the deadline; no longer waiting")
+                why = "timed out, it may still appear on the ticket"
+            except Exception as e:
+                log(f"ticket {key}: attaching {name} failed: {e}")
+                why = str(e)[:120]
+            if why:
+                missed.append(f"{name} ({why})")
+        return missed
 
     def _stage_create_epic_child(self, cmd):
         """Handle a {type:"createEpicChild"} command (XERK-723): create a child
@@ -50367,6 +50555,10 @@ class SessionManager:
             # predates the reader would accept the request and never act on it.
             # Absent is coerced to "can't" hub-side (normalizeCloseTicket).
             "closeTicket": {"available": True},
+            # A `createTicket` may carry `uploads` and this manager attaches
+            # them to the new ticket (XERK-2935). Absent = "can't": the hub
+            # refuses files for such a host rather than drop them.
+            "ticketAttachments": {"available": True},
             # Whether this manager renders the hub's `renderDailyBrief`
             # (XERK-2394), on which runtimes and models. Absent = "can't".
             "dailyBrief": self._daily_brief_payload(),
@@ -50406,8 +50598,9 @@ class SessionManager:
         with self._create_meta_lock:
             if self.create_meta_results:
                 payload["createMetaResults"] = list(self.create_meta_results)
-        if self.create_ticket_results:
-            payload["createTicketResults"] = list(self.create_ticket_results)
+        ctr = list(self.create_ticket_results) + self.create_ticket_async_results.snapshot()
+        if ctr:
+            payload["createTicketResults"] = ctr
         if self.ticket_priority_results:
             payload["ticketPriorityResults"] = list(self.ticket_priority_results)
         if self.ticket_link_results:
@@ -50596,6 +50789,9 @@ class SessionManager:
         # (XERK-550): clear only what THIS beat delivered, by identity, so a
         # result appended by a merge that finished mid-beat is not lost.
         # The create-meta worker's results (XERK-2880), the same way.
+        tstaged = payload.get("createTicketResults")
+        if tstaged:
+            self.create_ticket_async_results.drop({id(x) for x in tstaged})
         cstaged = payload.get("createMetaResults")
         if cstaged:
             delivered = {id(x) for x in cstaged}

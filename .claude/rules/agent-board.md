@@ -127,6 +127,12 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   - **Every tracker JSON body read is bounded in TOTAL** (`_board_urlopen`,
     `BOARD_READ_DEADLINE_SEC`): a dripping server beat the per-read timeout, the worker never
     answered, and after 5 min the hub labelled a current agent "too old". Tests: `TestStageCreateMeta`.
+- **A `createTicket` may carry `uploads`** (XERK-2935, capability `ticketAttachments`): then the
+  whole create runs on a worker (`_create_once` on `create_ticket_async_results`, a
+  `_LockedList` cleared by identity) — downloads + tracker uploads have no small worst case.
+  `attach_board_file`: Jira multipart `/issue/<key>/attachments` (needs `X-Atlassian-Token:
+  no-check`); ADO uploads to `_apis/wit/attachments` then PATCHes an `AttachedFile` relation.
+  A miss is named in the result's `warning`. Tests: the `xerk2935` cases in `TestStageCreateTicket`.
 - `set_board_status` **re-reads the available options and applies only a `value` still on offer** —
   the board's workflow decides what a ticket can move to, not the browser.
 - A drag-and-drop move POSTs the target **COLUMN**, not a transition: `_status_option_for_column`

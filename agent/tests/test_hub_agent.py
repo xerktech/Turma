@@ -43840,6 +43840,130 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         base.update(kw)
         return base
 
+    def _wait_async(self, sm):
+        deadline = time.time() + 10
+        while not len(sm.create_ticket_async_results) and time.time() < deadline:
+            time.sleep(0.01)
+        return sm.create_ticket_async_results.snapshot()
+
+    def test_xerk2935_files_are_attached_off_the_beat_and_ride_the_result(self):
+        ok = {"key": "ENG-5", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        files = [{"id": "u1", "name": "a.png", "size": 3},
+                 {"id": "u2", "name": "../b.txt", "size": 2}]
+        with self._cfg(), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload",
+                                  side_effect=lambda i, **k: b"abc" if i == "u1" else None), \
+                mock.patch.object(ha, "attach_board_file") as att:
+            sm.handle_commands([self._cmd(uploads=files)])
+            # Nothing staged on the beat itself; the worker answers.
+            self.assertEqual(sm.create_ticket_results, [])
+            rows = self._wait_async(sm)
+        att.assert_called_once_with("ENG-5", "a.png", b"abc")
+        self.assertEqual(rows[0]["key"], "ENG-5")
+        self.assertIn("b.txt (expired on the hub)", rows[0]["warning"])
+        # It rides the next payload and is cleared by identity once delivered.
+        payload = {"createTicketResults": sm.create_ticket_results
+                   + sm.create_ticket_async_results.snapshot()}
+        sm.create_ticket_async_results.drop({id(x) for x in payload["createTicketResults"]})
+        self.assertEqual(len(sm.create_ticket_async_results), 0)
+
+    def test_xerk2935_the_create_never_runs_on_the_beat_and_its_row_clears_by_identity(self):
+        ok = {"key": "ENG-8", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        gate = threading.Event()
+
+        def slow(*_a, **_k):
+            gate.wait(10)
+        with self._cfg(), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(ha, "attach_board_file", side_effect=slow):
+            sm.handle_commands([self._cmd(uploads=[{"id": "u1", "name": "a"}])])
+            # handle_commands returned while the attach is still blocked.
+            self.assertEqual(len(sm.create_ticket_async_results), 0)
+            gate.set()
+            rows = self._wait_async(sm)
+        payload = {"createTicketResults": list(rows)}
+        late = {"cmdId": "late"}
+        sm.create_ticket_async_results.append(late)
+        sm._clear_delivered_staged(payload)
+        self.assertEqual(sm.create_ticket_async_results.snapshot(), [late])
+
+    def test_xerk2935_a_dripping_tracker_is_abandoned_at_the_deadline(self):
+        ok = {"key": "ENG-10", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        hold = threading.Event()
+        with self._cfg(), mock.patch.object(ha, "TICKET_FILES_DEADLINE_SEC", 1), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(ha, "attach_board_file", side_effect=lambda *a: hold.wait(30)):
+            t0 = time.monotonic()
+            sm._stage_create_ticket(self._cmd(uploads=[{"id": "u1", "name": "a"}]))
+            rows = self._wait_async(sm)
+            took = time.monotonic() - t0
+        hold.set()
+        self.assertLess(took, 10)
+        self.assertIn("a (timed out, it may still appear on the ticket)", rows[0]["warning"])
+
+    def test_xerk2935_no_file_starts_past_the_deadline(self):
+        ok = {"key": "ENG-9", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(ha, "TICKET_FILES_DEADLINE_SEC", 0), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload") as dl, \
+                mock.patch.object(ha, "attach_board_file") as att:
+            sm._stage_create_ticket(self._cmd(uploads=[{"id": "u1", "name": "a"}]))
+            rows = self._wait_async(sm)
+        dl.assert_not_called()
+        att.assert_not_called()
+        self.assertIn("a (ran out of time)", rows[0]["warning"])
+
+    def test_xerk2935_a_failed_attachment_never_fails_the_create(self):
+        ok = {"key": "ENG-6", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        with self._cfg(), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(ha, "attach_board_file", side_effect=RuntimeError("413 too big")):
+            sm._stage_create_ticket(self._cmd(uploads=[{"id": "u1", "name": "big.bin"}]))
+            rows = self._wait_async(sm)
+        self.assertEqual((rows[0]["key"], rows[0]["error"]), ("ENG-6", None))
+        self.assertIn("big.bin (413 too big)", rows[0]["warning"])
+
+    def test_xerk2935_jira_attach_is_multipart_with_the_xsrf_header(self):
+        seen = {}
+
+        def fake(req):
+            seen["url"], seen["headers"], seen["data"] = req.full_url, dict(req.headers), req.data
+            return [{"id": "1"}]
+        with self._cfg(), mock.patch.object(ha, "_board_urlopen", side_effect=fake):
+            ha.jira_attach_file("ENG-5", "a.png", b"PNG")
+        self.assertEqual(seen["url"], "https://s.atlassian.net/rest/api/3/issue/ENG-5/attachments")
+        self.assertEqual(seen["headers"]["X-atlassian-token"], "no-check")
+        self.assertIn(b'filename="a.png"', seen["data"])
+        self.assertIn(b"\r\nPNG\r\n", seen["data"])
+
+    def test_xerk2935_azure_attach_uploads_then_links(self):
+        calls = []
+
+        def fake(req):
+            calls.append((req.get_method(), req.full_url, req.data))
+            return {"url": "https://dev.azure.com/o/_apis/wit/attachments/abc"} if len(calls) == 1 else {}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/o", AZDO_TOKEN="t"), \
+                mock.patch.object(ha, "_board_urlopen", side_effect=fake):
+            ha.azure_attach_file("42", "a.png", b"PNG")
+        self.assertIn("/_apis/wit/attachments?fileName=a.png", calls[0][1])
+        self.assertEqual(calls[0][2], b"PNG")
+        self.assertEqual(calls[1][0], "PATCH")
+        self.assertIn("/_apis/wit/workitems/42", calls[1][1])
+        self.assertIn(b"AttachedFile", calls[1][2])
+
+    def test_xerk2935_the_capability_rides_the_heartbeat(self):
+        with open(ha.__file__) as fh:
+            self.assertIn('"ticketAttachments": {"available": True}', fh.read())
+
     def test_xerk2867_a_restarted_manager_never_creates_a_redelivered_ticket_twice(self):
         # The ack set is in memory, so the hub re-delivers an unacked create after
         # a restart (an update, a rename); the durable record answers it instead.
