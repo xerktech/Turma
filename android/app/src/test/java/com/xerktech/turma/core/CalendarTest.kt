@@ -478,4 +478,24 @@ class CalendarTest {
         assertEquals("Monday, November 9, 9:00 AM – 9:30 AM",
             calLongSpan(at(2026, 11, 9, 9), at(2026, 11, 9, 9, 30), ny, l))
     }
+
+    @Test fun `a timed event of 24h or more keeps its times in When and aria (XERK-2934)`() {
+        val l = Locale.US
+        val e = ev("long", at(2026, 11, 9, 9), at(2026, 11, 10, 10))
+        assertTrue(calInBand(e))
+        val want = "Monday, November 9, 9:00 AM – Tuesday, November 10, 10:00 AM"
+        assertEquals(want, calWhenText(e, ny, l))
+        for (d in listOf(calDay(e.startMs!!, ny), calDay(e.endMs!!, ny))) {
+            val a = calAria(e, d, "Acme", CalBadge(0, false), ny, l)
+            assertTrue(a, a.contains(want))
+            assertFalse(a, a.contains("all day"))
+        }
+        // A real all-day event still reads "all day".
+        val ad = ev("ad", at(2026, 11, 9, 0), at(2026, 11, 10, 0), allDay = true)
+        assertEquals("Monday, November 9, all day", calWhenText(ad, ny, l))
+        assertTrue(calAria(ad, calDay(ad.startMs!!, ny), "Acme", CalBadge(0, false), ny, l).contains("Monday, November 9, all day"))
+        // A multi-day all-day event names its last day (end is exclusive midnight).
+        val multi = ev("md", at(2026, 11, 9, 0), at(2026, 11, 12, 0), allDay = true)
+        assertEquals("Monday, November 9 – Wednesday, November 11, all day", calWhenText(multi, ny, l))
+    }
 }
