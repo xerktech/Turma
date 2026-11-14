@@ -731,17 +731,20 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   toast is cut at two lines (a platform limit on toasts).
 - `dailyBriefs`, `dailyBriefSchedules`, `meetingLabels`, `meetingLabelMisses` and `meetingFocus`
   decode per org (`LenientSiteMapSerializer`), so a malformed entry drops alone.
-- **GAP — the Calendar view (XERK-2897, web only so far)**: the web Meetings page opens on a
-  Teams-style week calendar (`calendar.js`) with a Calendar / Notes review switch; Android still
-  shows only the triage. Its port (week grid, day/3-day on a phone, detail, view switch) is
-  XERK-2900.
-- **GAP — the calendar in the notes review (XERK-2899, web only)**: upcoming calendar meetings in
-  the rail, a linked capture's Outlook title/time/invitees, the Impromptu label, and Open in
-  calendar / Open in notes review. Ports with the calendar (XERK-2900).
-- **GAP — the calendar's event detail panel (XERK-2898, web only so far)**: a click opens Outlook's
-  details (moved/canceled, recurrence, attendees + responses, body, categories), a linked capture's
-  summary + proposals reviewed in place, its relink/unlink, the Daily brief for a daily event, and
-  a review-count / reading badge on each block. Ported with the calendar in XERK-2900.
+- **The Calendar view (XERK-2897/2898/2899 → Android XERK-2900)**: a Calendar / Notes review switch
+  (kept per phone; a meetings push opens Notes review) over the same `/api/calendar` +
+  `/api/holidays` reads (`ui/CalendarScreen.kt`, `core/Calendar.kt`, `vm/CalendarViewModel.kt`).
+  - Phone: Day / 3 days under the week's day strip, ‹ › and swipe; wide: Work week / Week. The
+    range label opens a date picker (the web: a mini-month). Today, the all-day band with holidays
+    and day-off hatching, org-tinted blocks side by side, tentative hatched, free outlined,
+    canceled struck, past dimmed, the Tenir glyph, review badges, stale-host notices.
+  - The event detail: full screen on a phone (Back closes it), beside the grid when wide; the
+    capture is reviewed with the notes review's own `MeetingPart`; relink / unlink / Match
+    automatically; the daily meeting's brief; Open in notes review.
+  - Notes review: upcoming calendar meetings (org bar, Join), a linked capture named by its
+    Outlook subject with its time + invitees, Impromptu, Open in calendar.
+  - Platform differences: no keyboard walking (←/→/↑/↓, Esc) and no A/S/E/R/J/K in the panel;
+    the date picker is Material's, not the web's mini-month.
 
 ## Open (subsequent installments), by screen and priority
 

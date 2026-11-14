@@ -68,6 +68,18 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.TriageEntry
 import com.xerktech.turma.core.TriageFilter
+import com.xerktech.turma.core.CalTarget
+import com.xerktech.turma.core.NotesTarget
+import com.xerktech.turma.core.calSafeHttps
+import com.xerktech.turma.core.calSpanLong
+import com.xerktech.turma.core.calUpcoming
+import com.xerktech.turma.core.calUpcomingWeeks
+import com.xerktech.turma.core.meetingImpromptu
+import com.xerktech.turma.core.orgColorMap
+import com.xerktech.turma.core.triageShows
+import com.xerktech.turma.vm.CalendarViewModel
+import com.xerktech.turma.core.calMeetingLines
+import com.xerktech.turma.core.calMeetingTarget
 import com.xerktech.turma.core.briefAt
 import com.xerktech.turma.core.briefHeadline
 import com.xerktech.turma.core.briefSections
@@ -133,11 +145,15 @@ fun BriefScreen(
     onOpened: () -> Unit = {},
     vm: BriefViewModel = viewModel(),
     meetingsVm: MeetingsViewModel = viewModel(),
+    calendarVm: CalendarViewModel = viewModel(),
 ) {
     LaunchedEffect(Unit) { vm.start() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val stored by vm.orgFilter.collectAsStateWithLifecycle()
     val collapsed by meetingsVm.collapsed.collectAsStateWithLifecycle()
+    // Calendar / Notes review (XERK-2900, the web's two views), remembered on this phone.
+    val view by calendarVm.view.collectAsStateWithLifecycle()
+    val calWeeks by calendarVm.weeks.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     LaunchedEffect(Unit) {
@@ -145,6 +161,7 @@ fun BriefScreen(
         coroutineScope {
             launch { vm.messages.collect { toast(context, it) } }
             launch { meetingsVm.messages.collect { toast(context, it) } }
+            launch { calendarVm.messages.collect { toast(context, it) } }
         }
     }
 
@@ -164,12 +181,25 @@ fun BriefScreen(
         triageOrgs(fleet, scoped, sites.map { it.siteKey })
             .sortedWith(compareBy(byName) { s: String -> orgName(s, names[s].orEmpty()) }.thenBy { it })
     }
-    val entries = remember(fleet, orgs, now) {
+    // The notes review lists each org's upcoming calendar meetings (XERK-2899): the
+    // calendar keeps reading those weeks whichever view shows.
+    LaunchedEffect(scoped) { calendarVm.wantUpcoming(scoped) }
+    val upcomingEvents = remember(calWeeks, scoped, now) {
+        val keys = scoped.sorted()
+        calUpcomingWeeks(now, ZoneId.systemDefault())
+            .flatMap { calWeeks[calendarVm.weekKey(it, keys)]?.cal?.events.orEmpty() }
+    }
+    val entries = remember(fleet, orgs, now, upcomingEvents) {
         orgs.associateWith { s ->
             triageEntries(s, fleet.meetingProposals[s].orEmpty(), fleet.dailyBriefs[s].orEmpty(),
-                fleet.dailyBriefSchedules[s], now)
+                fleet.dailyBriefSchedules[s], now, events = calUpcoming(s, upcomingEvents, now))
         }
     }
+    val colors = remember(sites, fleet.orgColors) { orgColorMap(sites.map { it.siteKey }, fleet.orgColors) }
+    // A cross-link waiting for its view: "Open in calendar" / "Open in notes review".
+    var reveal by remember { mutableStateOf<CalTarget?>(null) }
+    var notesTarget by remember { mutableStateOf<NotesTarget?>(null) }
+    val openCalendar: (CalTarget) -> Unit = { t -> reveal = t; calendarVm.setView(CalendarViewModel.VIEW_CALENDAR) }
 
     // Wide (tablet / unfolded): the list and the open entry side by side, as the
     // web's rail + main pane, so the open entry must always be one the list shows
@@ -204,6 +234,8 @@ fun BriefScreen(
     // loaded yet, so wide holds the push until that org's entries arrive.
     LaunchedEffect(openSite) {
         val s = openSite ?: return@LaunchedEffect
+        // A push is about proposals: it opens the notes review (the web's `?site=`).
+        calendarVm.setView(CalendarViewModel.VIEW_NOTES)
         filter = TriageFilter.REVIEW
         query = ""
         settingsFor = ""
@@ -223,8 +255,26 @@ fun BriefScreen(
         onOpened()
     }
 
+    // "Open in notes review" (XERK-2899): select the capture's (or the upcoming
+    // meeting's) entry, switching Archived ⇄ All and clearing a search that hides
+    // it, its org unfolded. A target not listed yet resolves on a later paint (≤30s).
+    LaunchedEffect(notesTarget, entries) {
+        val t = notesTarget ?: return@LaunchedEffect
+        val hit = entries[t.site].orEmpty().firstOrNull { e ->
+            (t.meetingId.isNotEmpty() && e.meetings.any { it.meetingId == t.meetingId }) ||
+                (t.eventId.isNotEmpty() && e.event?.id == t.eventId)
+        }
+        if (hit == null) { kotlinx.coroutines.delay(30_000); notesTarget = null; return@LaunchedEffect }
+        if (hit.archived) filter = TriageFilter.ARCHIVED else if (filter == TriageFilter.ARCHIVED) filter = TriageFilter.ALL
+        if (query.isNotBlank() && !triageShows(hit, filter, query, hit)) query = ""
+        if (hit.siteKey in collapsed) meetingsVm.toggleCollapsed(hit.siteKey)
+        settingsFor = ""
+        selected = "${hit.siteKey}\u0000${hit.key}"
+        notesTarget = null
+    }
+
     // Back closes settings, then (narrow only — wide has no full-screen entry) the entry.
-    BackHandler(enabled = settingsFor.isNotEmpty() || (!wide && selected.isNotEmpty())) {
+    BackHandler(enabled = view == CalendarViewModel.VIEW_NOTES && (settingsFor.isNotEmpty() || (!wide && selected.isNotEmpty()))) {
         if (settingsFor.isNotEmpty()) settingsFor = "" else selected = ""
     }
 
@@ -251,6 +301,7 @@ fun BriefScreen(
                 key(open.siteKey, open.key) { EntryDetail(
                     m, open, orgName(site, names[site].orEmpty()), now, fleet,
                     vm, meetingsVm,
+                    onOpenCalendar = openCalendar,
                     next = triageNext(ordered, open),
                     onOpen = { n -> selected = "${n.siteKey}\u0000${n.key}" },
                     onBack = if (wide) null else ({ selected = "" }),
@@ -260,7 +311,7 @@ fun BriefScreen(
     }
     val list: @Composable (Modifier) -> Unit = { m ->
         TriageList(
-            m, fleet, orgs, names, entries, collapsed, filter, query, now,
+            m, fleet, orgs, names, entries, collapsed, filter, query, now, colors,
             selected = if (wide) open else null,
             onFilter = { filter = it }, onQuery = { query = it },
             onToggle = meetingsVm::toggleCollapsed,
@@ -271,7 +322,14 @@ fun BriefScreen(
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Meetings")
+        ViewSwitch(view) { calendarVm.setView(it) }
         when {
+            view == CalendarViewModel.VIEW_CALENDAR -> CalendarView(
+                Modifier.weight(1f), wide, fleet, scoped, names, colors, calendarVm, vm, meetingsVm,
+                reveal = reveal, onRevealed = { reveal = null },
+                onOpenNotes = { t -> notesTarget = t; calendarVm.setView(CalendarViewModel.VIEW_NOTES) },
+                dailyFor = { s, at -> dailyEntryNear(entries[s].orEmpty(), at) },
+            )
             wide -> Row(Modifier.weight(1f).fillMaxWidth()) {
                 list(Modifier.width(360.dp).fillMaxHeight())
                 VerticalDivider()
@@ -279,6 +337,20 @@ fun BriefScreen(
             }
             settingsFor.isNotEmpty() || selected.isNotEmpty() -> detail(Modifier.weight(1f))
             else -> list(Modifier.weight(1f))
+        }
+    }
+}
+
+/** The Calendar / Notes review switch (the web's `brief.html` view switch). */
+@Composable
+private fun ViewSwitch(view: String, onView: (String) -> Unit) {
+    val opts = listOf(CalendarViewModel.VIEW_CALENDAR to "Calendar", CalendarViewModel.VIEW_NOTES to "Notes review")
+    Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        for ((v, label) in opts) {
+            FilterChip(
+                selected = v == view, onClick = { onView(v) }, label = { Text(label, maxLines = 1) },
+                modifier = Modifier.testTag("view-$v"),
+            )
         }
     }
 }
@@ -325,6 +397,7 @@ private fun TriageList(
     filter: TriageFilter,
     query: String,
     now: Long,
+    colors: Map<String, Int>,
     selected: TriageEntry?,
     onFilter: (TriageFilter) -> Unit,
     onQuery: (String) -> Unit,
@@ -335,6 +408,7 @@ private fun TriageList(
     val zone = ZoneId.systemDefault()
     val locale = Locale.getDefault()
     val misses = remember(fleet.meetingLabelMisses) { meetingLabelMissLabels(fleet.meetingLabelMisses) }
+    val series = TurmaColors.series()
     // The filter and search stay put above the list, as the web rail's header does.
     Column(modifier.fillMaxSize()) {
         Column(Modifier.padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -417,7 +491,10 @@ private fun TriageList(
                     }
                     for (e in rows) {
                         item(key = "e:$site:${e.key}") {
-                            EntryRow(e, now, zone, locale, e.siteKey == selected?.siteKey && e.key == selected.key) { onOpen(e) }
+                            EntryRow(
+                                e, now, zone, locale, e.siteKey == selected?.siteKey && e.key == selected.key,
+                                orgColor = if (e.cal) colors[e.siteKey]?.let { series[it % series.size] } else null,
+                            ) { onOpen(e) }
                         }
                     }
                 }
@@ -470,17 +547,36 @@ private fun CountPill(n: Int) {
 }
 
 @Composable
-private fun EntryRow(e: TriageEntry, now: Long, zone: ZoneId, locale: Locale, current: Boolean, onClick: () -> Unit) {
+private fun EntryRow(
+    e: TriageEntry,
+    now: Long,
+    zone: ZoneId,
+    locale: Locale,
+    current: Boolean,
+    // An upcoming calendar meeting is org-coloured as the calendar draws it (XERK-2899).
+    orgColor: androidx.compose.ui.graphics.Color? = null,
+    onClick: () -> Unit,
+) {
     // The wide layout's open entry is marked in the list, as the web rail's is.
     val shape = RoundedCornerShape(12.dp)
     val mark = if (current) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier
+    val uri = LocalUriHandler.current
+    // Join while the meeting is today or ahead (a link can't nest in the row's tap target).
+    val join = e.event?.takeIf { e.at + 86_400_000L > now }?.let { calSafeHttps(it.joinUrl) }.orEmpty()
     TurmaCard(
         Modifier.fillMaxWidth().clip(shape).then(mark).clickable(onClick = onClick)
             .semantics { this.selected = current },
     ) {
-        Row(Modifier.padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.height(androidx.compose.foundation.layout.IntrinsicSize.Min), verticalAlignment = Alignment.CenterVertically) {
+        if (e.cal) {
+            Box(Modifier.width(4.dp).fillMaxHeight().background(orgColor ?: MaterialTheme.colorScheme.onSurfaceVariant))
+        }
+        Row(Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(triageTitle(e), fontWeight = FontWeight.SemiBold, maxLines = 2)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(triageTitle(e), Modifier.weight(1f, fill = false), fontWeight = FontWeight.SemiBold, maxLines = 2)
+                    if (!e.daily && !e.cal && e.meetings.size == 1 && meetingImpromptu(e.meetings[0])) ImpromptuTag()
+                }
                 Text(
                     entrySubline(e, now, zone, locale),
                     style = MaterialTheme.typography.bodySmall,
@@ -488,6 +584,8 @@ private fun EntryRow(e: TriageEntry, now: Long, zone: ZoneId, locale: Locale, cu
                 )
             }
             if (e.pending > 0) CountPill(e.pending)
+            if (join.isNotEmpty()) GhostButton("Join", { uri.openUri(join) }, Modifier.testTag("entry-join"))
+        }
         }
     }
 }
@@ -496,6 +594,7 @@ private fun EntryRow(e: TriageEntry, now: Long, zone: ZoneId, locale: Locale, cu
 internal fun entrySubline(e: TriageEntry, now: Long, zone: ZoneId, locale: Locale): String {
     val bits = mutableListOf<String>()
     if (e.at > 0) bits += briefWhenLabel(e.at, now, zone, locale)
+    if (e.cal) return (bits + "On the calendar").joinToString(" · ")
     triageBriefStatus(e)?.let { bits += it }
     val ok = e.meetings.filter { it.status == "ok" }
     val items = ok.sumOf { it.items.size }
@@ -529,6 +628,7 @@ private fun EntryDetail(
     fleet: FleetState,
     vm: BriefViewModel,
     mvm: MeetingsViewModel,
+    onOpenCalendar: (CalTarget) -> Unit,
     next: TriageEntry?,
     onOpen: (TriageEntry) -> Unit,
     // null on the wide layout: the list stays beside the entry, so there is no Back.
@@ -552,6 +652,8 @@ private fun EntryDetail(
         ) {
             Text(triageTitle(e), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold)
+            val ev = e.event
+            if (ev != null) CalendarEventPart(e, ev, zone, locale, onOpenCalendar)
             if (e.daily) {
                 val briefs = fleet.dailyBriefs[site].orEmpty()
                 DailyPart(
@@ -569,7 +671,13 @@ private fun EntryDetail(
                     Text(meetingTitle(m), style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold)
                 }
-                MeetingPart(site, m, mvm)
+                MeetingPart(site, m, mvm, onOpenCalendar)
+            }
+            if (e.cal) {
+                Text(
+                    "Its notes and proposals land here once Tenir captures the meeting.",
+                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (e.pending == 0 && !e.inflight) {
                 if (next != null) {
@@ -581,9 +689,47 @@ private fun EntryDetail(
     }
 }
 
+/**
+ * An entry's calendar meeting (XERK-2899): an upcoming one's Outlook details
+ * (when, where, organizer, invitees), or the daily meeting's occurrence — with
+ * Join and Open in calendar.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CalendarEventPart(
+    e: TriageEntry,
+    ev: com.xerktech.turma.model.CalendarEvent,
+    zone: ZoneId,
+    locale: Locale,
+    onOpenCalendar: (CalTarget) -> Unit,
+) {
+    val uri = LocalUriHandler.current
+    val start = ev.startMs ?: e.at
+    val span = calSpanLong(start, ev.endMs ?: start, zone, locale)
+    if (e.cal) {
+        CalLine("Upcoming", span)
+        if (ev.location.isNotEmpty()) CalLine("Where", ev.location)
+        if (ev.organizer.isNotEmpty()) CalLine("Organizer", ev.organizer)
+        val who = ev.attendees.filter { it.role != "resource" }.map { it.name.ifEmpty { it.email } }.filter { it.isNotEmpty() }
+        if (who.isNotEmpty()) {
+            CalLine("Invited", who.take(30).joinToString(", ") + if (who.size > 30) " and ${who.size - 30} more" else "")
+        }
+    } else {
+        CalLine("On the calendar", jsTrimSubject(ev) + " · " + span)
+    }
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        val join = calSafeHttps(ev.joinUrl)
+        if (join.isNotEmpty()) GhostButton("Join meeting ↗", { uri.openUri(join) }, Modifier.testTag("entry-join-meeting"))
+        GhostButton("Open in calendar", { onOpenCalendar(CalTarget(start, e.siteKey, eventId = ev.id)) }, Modifier.testTag("open-cal"))
+    }
+}
+
+private fun jsTrimSubject(ev: com.xerktech.turma.model.CalendarEvent): String =
+    com.xerktech.turma.core.jsTrim(ev.subject).ifEmpty { "(no title)" }
+
 /** A daily entry's brief: what it reads aloud, or why there is none, and Run now for the next meeting. */
 @Composable
-private fun DailyPart(
+internal fun DailyPart(
     e: TriageEntry,
     now: Long,
     zone: ZoneId,
@@ -650,7 +796,13 @@ internal fun BriefReadAloud(b: DailyBrief, now: Long, zone: ZoneId, locale: Loca
 /** A captured meeting's review: progress, Archive, the pending proposals, reviewed ones on demand. */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun MeetingPart(site: String, m: Meeting, mvm: MeetingsViewModel) {
+internal fun MeetingPart(
+    site: String,
+    m: Meeting,
+    mvm: MeetingsViewModel,
+    // The notes review's "Open in calendar" (XERK-2899); null inside the calendar's own detail.
+    onOpenCalendar: ((com.xerktech.turma.core.CalTarget) -> Unit)? = null,
+) {
     val busy by mvm.busy.collectAsStateWithLifecycle()
     val errors by mvm.errors.collectAsStateWithLifecycle()
     val drafts by mvm.drafts.collectAsStateWithLifecycle()
@@ -668,12 +820,19 @@ private fun MeetingPart(site: String, m: Meeting, mvm: MeetingsViewModel) {
     if (metaLine.isNotEmpty()) {
         Text(metaLine, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
+    // Its calendar event (time, invitees), or why it has none (XERK-2899).
+    for ((k, v) in calMeetingLines(m, ZoneId.systemDefault(), Locale.getDefault())) {
+        CalLine(k, v, impromptu = k == "Impromptu")
+    }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         meetingProgress(m)?.let {
             Text(it, Modifier.padding(vertical = 5.dp), style = MaterialTheme.typography.labelLarge)
         }
         val url = safeMeetingUrl(m.tenirUrl)
         if (url.isNotEmpty()) GhostButton("Open in Tenir ↗", { uri.openUri(url) })
+        if (onOpenCalendar != null) {
+            GhostButton("Open in calendar", { onOpenCalendar(calMeetingTarget(site, m)) }, Modifier.testTag("open-cal"))
+        }
         if (meetingArchivable(m)) {
             val inFlight = "$site\u0000${m.meetingId}" in archiving
             val archived = m.archivedAt > 0
@@ -1027,3 +1186,25 @@ private fun <T : Any> rememberDraft(site: String, remote: T): Draft<T> {
 
 private fun JsonObject.str(k: String): String? = (this[k] as? JsonPrimitive)?.takeIf { it.isString }?.content
 private fun JsonObject.obj(k: String): JsonObject? = this[k] as? JsonObject
+
+/** A "On the calendar …" / "Invited …" line, or the Impromptu tag (XERK-2899). */
+@Composable
+internal fun CalLine(k: String, v: String, impromptu: Boolean = false) {
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (impromptu) ImpromptuTag()
+        else if (k.isNotEmpty()) Text(k, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(v, Modifier.weight(1f, fill = false), style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+internal fun ImpromptuTag() {
+    Text(
+        "Impromptu",
+        Modifier.background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.12f), RoundedCornerShape(50))
+            .padding(horizontal = 7.dp, vertical = 1.dp).testTag("impromptu"),
+        fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}

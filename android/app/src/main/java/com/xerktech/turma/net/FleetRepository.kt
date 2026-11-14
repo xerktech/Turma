@@ -112,6 +112,17 @@ class FleetRepository(
     private val _state = MutableStateFlow(FleetState())
     val state: StateFlow<FleetState> = _state
 
+    // The Calendar view's re-read signal (XERK-2900, the web's `calendarSoon`):
+    // bumped by a `calendar`, `holidaySettings` or `meetingProposals` frame (a
+    // Tenir-only capture is announced only by the last) and by every stream
+    // (re)open, which may have missed frames. The events are not on the snapshot.
+    private val _calendarFrames = MutableStateFlow(0)
+    val calendarFrames: StateFlow<Int> = _calendarFrames
+
+    // Whether the SSE stream is open: while it is down the calendar polls.
+    private val _streamUp = MutableStateFlow(false)
+    val streamUp: StateFlow<Boolean> = _streamUp
+
     private var pollJob: Job? = null
     private var sseJob: Job? = null
     private var eventSource: EventSource? = null
@@ -133,6 +144,7 @@ class FleetRepository(
         pollJob?.cancel(); pollJob = null
         sseJob?.cancel(); sseJob = null
         eventSource?.cancel(); eventSource = null
+        _streamUp.value = false
     }
 
     /**
@@ -336,6 +348,7 @@ class FleetRepository(
      */
     @androidx.annotation.VisibleForTesting
     internal fun onSseEvent(type: String?, data: String) {
+        if (type == "calendar" || type == "holidaySettings" || type == "meetingProposals") _calendarFrames.value++
         when (type) {
             "agent" -> runCatching { TurmaJson.decodeFromString<AgentInfo>(data) }.getOrNull()?.let { upsert(it) }
             "removed" -> runCatching { TurmaJson.decodeFromString<JsonObject>(data) }
@@ -440,6 +453,11 @@ class FleetRepository(
         val url = config.current.baseUrl + "api/events" +
             (if (since.isNullOrEmpty()) "" else "?since=" + java.net.URLEncoder.encode(since, "UTF-8"))
         val listener = object : EventSourceListener() {
+            override fun onOpen(source: EventSource, response: okhttp3.Response) {
+                _streamUp.value = true
+                _calendarFrames.value++
+            }
+
             override fun onEvent(source: EventSource, id: String?, type: String?, data: String) {
                 onSseEvent(type, data)
             }
@@ -447,6 +465,7 @@ class FleetRepository(
             override fun onFailure(source: EventSource, t: Throwable?, response: okhttp3.Response?) {
                 // Reconnect after a short delay; the poll covers the gap.
                 eventSource = null
+                _streamUp.value = false
                 sseJob = scope.launch {
                     delay(3_000)
                     if (isActive && pollJob?.isActive == true) openSse()

@@ -125,8 +125,13 @@ fun meetingMetaLine(m: Meeting, zone: ZoneId = ZoneId.systemDefault(), locale: L
 }
 
 /** A meeting's name: the inferred title for a generic Tenir one (XERK-2894), else Tenir's. */
-fun meetingTitle(m: Meeting): String =
-    m.inferredTitle.ifBlank { m.title }.ifBlank { "Untitled meeting" }
+fun meetingTitle(m: Meeting): String {
+    // A linked capture is named by its Outlook subject (XERK-2899), never a
+    // private event's withheld "Private event".
+    val ev = m.calendarEvent
+    val subject = if (ev != null && !ev.private) jsTrim(ev.subject) else ""
+    return subject.ifEmpty { m.inferredTitle.ifBlank { m.title }.ifBlank { "Untitled meeting" } }
+}
 
 /** The summary's paragraphs (split on blank lines) for an `ok` run; empty = none. */
 fun meetingSummaryParagraphs(m: Meeting): List<String> =

@@ -75,9 +75,16 @@ class MeetingsScreenTest {
         """.trimIndent())
     }
 
+    // The Meetings tab opens on the Calendar (XERK-2900); these tests drive the notes review.
+    private val cvm by lazy {
+        main.track(com.xerktech.turma.vm.CalendarViewModel(hub.app)).also {
+            it.setView(com.xerktech.turma.vm.CalendarViewModel.VIEW_NOTES)
+        }
+    }
+
     private fun show(vm: MeetingsViewModel) = compose.setContent {
         TurmaTheme {
-            BriefScreen(Modifier.fillMaxSize(), vm = main.track(BriefViewModel(hub.app)), meetingsVm = vm)
+            BriefScreen(Modifier.fillMaxSize(), vm = main.track(BriefViewModel(hub.app)), meetingsVm = vm, calendarVm = cvm)
         }
     }
 
