@@ -32941,8 +32941,11 @@ test("XERK-2935 QA: files never ride a rejoined file-less create, stay on one ho
   const split = await post({ summary: "Split", uploadIds: [one.body.uploadId, three.body.uploadId] });
   assert.equal(split.status, 409);
   assert.match(split.body.error, /different hosts/);
-  // Another org's ticket file is not this org's.
+  // Another org's ticket file is not this org's, and ?host= naming another
+  // org's host is ignored (the hub picks one of this org's own).
   await jiraBeat("tf4", "tf4.atlassian.net", cap);
+  const hijack = await stageT("&host=tf4");
+  assert.ok(["tf3a", "tf3b"].includes(hijack.body.host));
   const foreign = await requestRaw("POST", "/api/jira/tf4.atlassian.net/uploads?name=g.txt",
     { body: Buffer.from("g"), headers: userHeaders });
   assert.equal((await post({ summary: "Foreign", uploadIds: [foreign.body.uploadId] })).status, 404);

@@ -1222,9 +1222,9 @@ UPLOAD_DIR_MODE = 0o777 if IS_WINDOWS else 0o700
 UPLOAD_MAX_BYTES = _env_int("TURMA_UPLOAD_MAX_BYTES", 1 << 25)  # 32 MiB
 UPLOAD_MAX_PER_MESSAGE = _env_int("TURMA_UPLOAD_MAX_PER_MESSAGE", 10)
 UPLOAD_DOWNLOAD_TIMEOUT_SEC = _env_int("TURMA_UPLOAD_TIMEOUT_SEC", 60)
-# Wall clock for attaching a new ticket's files (XERK-2935). No file STARTS
-# after it, so the whole create answers well inside the web form's 6-minute
-# wait (one in-flight upload can overshoot by its own timeouts, ~75s).
+# Wall clock for attaching a new ticket's files (XERK-2935): no file starts
+# after it, and the file in flight is abandoned at it, so the whole create
+# answers well inside the web form's 6-minute wait.
 TICKET_FILES_DEADLINE_SEC = _env_int("TURMA_TICKET_FILES_DEADLINE_SEC", 150, minimum=10)
 # Whole-batch wall clock for downloading a SPAWN's composer attachments, which
 # happens ON the beat at provision (unlike the running-session path, which is off
@@ -27457,6 +27457,27 @@ CREATE_MAYBE_RAN_ERROR = ("this host restarted while creating the ticket — it 
                           "have been created, so check the board before making it again")
 
 
+def _call_with_deadline(fn, seconds):
+    """Run `fn()` on a daemon thread and return its result, or raise
+    TimeoutError once `seconds` pass (the thread is abandoned: it holds only its
+    own socket, which its own timeouts end). Exceptions from `fn` propagate."""
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = fn()
+        except BaseException as e:
+            box["err"] = e
+    t = threading.Thread(target=run, name="bounded-call", daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError(f"no answer in {seconds:.0f}s")
+    if "err" in box:
+        raise box["err"]
+    return box.get("ok")
+
+
 class _LockedList:
     """A list with an off-beat writer (a worker thread) and a beat reader that
     clears only what it delivered, by identity."""
@@ -41696,20 +41717,29 @@ class SessionManager:
             if left <= 0:
                 missed.append(f"{name} (ran out of time)")
                 continue
-            blob = self._download_upload(
-                item.get("id"), timeout=min(UPLOAD_DOWNLOAD_TIMEOUT_SEC, left))
-            if blob is None:
-                missed.append(f"{name} (expired on the hub)")
-                continue
-            if len(blob) > UPLOAD_MAX_BYTES:
-                missed.append(f"{name} (too large)")
-                continue
-            try:
+
+            def one(item=item, name=name, left=left):
+                blob = self._download_upload(
+                    item.get("id"), timeout=min(UPLOAD_DOWNLOAD_TIMEOUT_SEC, left))
+                if blob is None:
+                    return "expired on the hub"
+                if len(blob) > UPLOAD_MAX_BYTES:
+                    return "too large"
                 attach_board_file(key, name, blob)
                 log(f"ticket {key}: attached {len(blob)} bytes as {name}")
+                return None
+            try:
+                # Socket timeouts are per operation, so a server that drips
+                # bytes never trips them: the whole file gets the time left.
+                why = _call_with_deadline(one, max(left, 1.0))
+            except TimeoutError:
+                log(f"ticket {key}: attaching {name} ran past the deadline; giving up on it")
+                why = "ran out of time"
             except Exception as e:
                 log(f"ticket {key}: attaching {name} failed: {e}")
-                missed.append(f"{name} ({str(e)[:120]})")
+                why = str(e)[:120]
+            if why:
+                missed.append(f"{name} ({why})")
         return missed
 
     def _stage_create_epic_child(self, cmd):

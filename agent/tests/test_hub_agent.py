@@ -43891,6 +43891,22 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         sm._clear_delivered_staged(payload)
         self.assertEqual(sm.create_ticket_async_results.snapshot(), [late])
 
+    def test_xerk2935_a_dripping_tracker_is_abandoned_at_the_deadline(self):
+        ok = {"key": "ENG-10", "url": "u", "assigned": True}
+        sm = self.make_manager()
+        hold = threading.Event()
+        with self._cfg(), mock.patch.object(ha, "TICKET_FILES_DEADLINE_SEC", 1), \
+                mock.patch.object(ha, "create_board_issue", return_value=ok), \
+                mock.patch.object(sm, "_download_upload", return_value=b"x"), \
+                mock.patch.object(ha, "attach_board_file", side_effect=lambda *a: hold.wait(30)):
+            t0 = time.monotonic()
+            sm._stage_create_ticket(self._cmd(uploads=[{"id": "u1", "name": "a"}]))
+            rows = self._wait_async(sm)
+            took = time.monotonic() - t0
+        hold.set()
+        self.assertLess(took, 10)
+        self.assertIn("a (ran out of time)", rows[0]["warning"])
+
     def test_xerk2935_no_file_starts_past_the_deadline(self):
         ok = {"key": "ENG-9", "url": "u", "assigned": True}
         sm = self.make_manager()
