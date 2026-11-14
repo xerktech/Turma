@@ -5,7 +5,6 @@ import com.xerktech.turma.model.CalendarCapture
 import com.xerktech.turma.model.CalendarEvent
 import com.xerktech.turma.model.Holiday
 import com.xerktech.turma.model.Meeting
-import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
 import java.time.OffsetDateTime
@@ -46,12 +45,16 @@ enum class CalMode(val days: Int, val label: String, val wide: Boolean) {
     }
 }
 
-/** The Monday of [d]'s week (Teams' week runs Monday–Sunday). */
-fun calWeekStart(d: LocalDate): LocalDate = d.minusDays((d.dayOfWeek.value - DayOfWeek.MONDAY.value).toLong())
+/** The Sunday of [d]'s week: the week runs Sunday–Saturday (XERK-2940); Work week is its Monday–Friday. */
+fun calWeekStart(d: LocalDate): LocalDate = d.minusDays((d.dayOfWeek.value % 7).toLong())
 
 /** The days [mode] shows around [anchor]. */
 fun calVisibleDays(anchor: LocalDate, mode: CalMode): List<LocalDate> {
-    val first = if (mode.weekly) calWeekStart(anchor) else anchor
+    val first = when (mode) {
+        CalMode.WORK -> calWeekStart(anchor).plusDays(1)
+        CalMode.WEEK -> calWeekStart(anchor)
+        else -> anchor
+    }
     return (0 until mode.days).map { first.plusDays(it.toLong()) }
 }
 
@@ -59,7 +62,7 @@ fun calVisibleDays(anchor: LocalDate, mode: CalMode): List<LocalDate> {
 fun calStep(anchor: LocalDate, mode: CalMode, dir: Int): LocalDate =
     anchor.plusDays(dir.toLong() * (if (mode.weekly) 7 else mode.days))
 
-/** The weeks (their Mondays) a set of days touches: what is fetched. */
+/** The weeks (their Sundays) a set of days touches: what is fetched. */
 fun calWeeksOf(days: List<LocalDate>): List<LocalDate> = days.map(::calWeekStart).distinct()
 
 /** The shown weeks plus one either side, so ‹ › paints at once (the web's `wantedWeeks`). */
@@ -538,7 +541,7 @@ fun calSpanLong(s: Long, e: Long, zone: ZoneId, locale: Locale): String {
     return "$start – $end"
 }
 
-/** One week's read (Monday–Sunday): the answer, its holidays, and the read's state. */
+/** One week's read (Sunday–Saturday): the answer, its holidays, and the read's state. */
 data class CalWeek(
     val cal: CalendarAnswer? = null,
     val hol: List<Holiday>? = null,
@@ -560,7 +563,7 @@ data class CalRange(
 
 /**
  * The events, holidays and stale-host notices of [days] from [weekOf] (a week's
- * read by its Monday): an event two weeks both hold appears once, earliest first.
+ * read by its Sunday): an event two weeks both hold appears once, earliest first.
  */
 fun calCollect(days: List<LocalDate>, zone: ZoneId, weekOf: (LocalDate) -> CalWeek?): CalRange {
     val evs = LinkedHashMap<String, CalendarEvent>()

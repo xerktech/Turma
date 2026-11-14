@@ -49,8 +49,8 @@ function saveStore(key, v) {
 // ---- week math (local wall time; Date's own calendar arithmetic, so DST days are 23/25h) ----
 function dayStart(ms) { const d = new Date(ms); d.setHours(0, 0, 0, 0); return d.getTime(); }
 function addDays(ms, n) { const d = new Date(dayStart(ms)); d.setDate(d.getDate() + n); d.setHours(0, 0, 0, 0); return d.getTime(); }
-// The Monday of `ms`'s week (Teams' week runs Monday–Sunday; Work week is Monday–Friday).
-function weekStart(ms) { const d = new Date(dayStart(ms)); return addDays(d.getTime(), -((d.getDay() + 6) % 7)); }
+// The Sunday of `ms`'s week: the week runs Sunday–Saturday (XERK-2940); Work week is its Monday–Friday.
+function weekStart(ms) { const d = new Date(dayStart(ms)); return addDays(d.getTime(), -d.getDay()); }
 const pad = (n) => String(n).padStart(2, "0");
 function dayKey(ms) { const d = new Date(ms); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
 // "YYYY-MM-DD" → that local midnight (a holiday's date is a calendar day, not an instant).
@@ -61,7 +61,7 @@ function parseDayKey(s) {
 const MODES = { work: 5, week: 7, day: 1, three: 3 };
 // The days a mode shows around `anchor`.
 function visibleDays(anchor, mode) {
-  const first = mode === "work" || mode === "week" ? weekStart(anchor) : dayStart(anchor);
+  const first = mode === "work" ? addDays(weekStart(anchor), 1) : mode === "week" ? weekStart(anchor) : dayStart(anchor);
   const n = MODES[mode] || 5;
   return Array.from({ length: n }, (_, i) => addDays(first, i));
 }
@@ -69,7 +69,7 @@ function visibleDays(anchor, mode) {
 function stepAnchor(anchor, mode, dir) {
   return addDays(anchor, dir * (mode === "work" || mode === "week" ? 7 : (MODES[mode] || 1)));
 }
-// The weeks (Monday ms) a set of days touches: what is fetched.
+// The weeks (Sunday ms) a set of days touches: what is fetched.
 function weeksOf(days) { return [...new Set(days.map(weekStart))]; }
 // "November 9–13, 2026" (Intl formats the range across a month or year boundary).
 function rangeLabel(days) {
@@ -291,7 +291,7 @@ async function getJson(url) {
   }
   return body;
 }
-// Read one week (Monday–Sunday) of events + holidays. A read already in flight
+// Read one week (Sunday–Saturday) of events + holidays. A read already in flight
 // is asked again once it lands, so a frame mid-read is never lost.
 // The read keeps the org pick it started with (its cache key), so a pick changed
 // mid-read never leaves that entry loading or fills it with another pick's events.

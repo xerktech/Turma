@@ -36,7 +36,7 @@ import kotlinx.serialization.json.JsonObject
 /**
  * Backs the Meetings tab's Calendar view (XERK-2900, the web's calendar.js data
  * half). The events are too big for the fleet snapshot, so this reads
- * `GET /api/calendar` + `GET /api/holidays` per Monday–Sunday week itself, keyed
+ * `GET /api/calendar` + `GET /api/holidays` per Sunday–Saturday week itself, keyed
  * by the header's org pick (`<orgs>|<week>`; a read keeps the pick it started with).
  *
  * What re-reads it (each a web QA finding): a `calendar`, `holidaySettings` or

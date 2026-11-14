@@ -45,12 +45,14 @@ class CalendarTest {
 
     // ---- week math ----
 
-    @Test fun `the week runs Monday to Sunday and Work week is its first five days`() {
+    @Test fun `the week runs Sunday to Saturday and Work week is its Monday to Friday`() {
         val sat = LocalDate.of(2026, 11, 14)
-        assertEquals(LocalDate.of(2026, 11, 9), calWeekStart(sat))
-        assertEquals(LocalDate.of(2026, 11, 9), calWeekStart(LocalDate.of(2026, 11, 9)))
+        assertEquals(LocalDate.of(2026, 11, 8), calWeekStart(sat))
+        assertEquals(LocalDate.of(2026, 11, 8), calWeekStart(LocalDate.of(2026, 11, 9)))
+        // A Sunday starts its own week (XERK-2940), not ends the one before.
+        assertEquals(LocalDate.of(2026, 11, 15), calWeekStart(LocalDate.of(2026, 11, 15)))
         assertEquals((9..13).map { LocalDate.of(2026, 11, it) }, calVisibleDays(sat, CalMode.WORK))
-        assertEquals((9..15).map { LocalDate.of(2026, 11, it) }, calVisibleDays(sat, CalMode.WEEK))
+        assertEquals((8..14).map { LocalDate.of(2026, 11, it) }, calVisibleDays(sat, CalMode.WEEK))
         assertEquals(listOf(sat), calVisibleDays(sat, CalMode.DAY))
         assertEquals((14..16).map { LocalDate.of(2026, 11, it) }, calVisibleDays(sat, CalMode.THREE))
     }
@@ -61,14 +63,14 @@ class CalendarTest {
         assertEquals(LocalDate.of(2026, 12, 23), calStep(d, CalMode.WEEK, -1))
         assertEquals(LocalDate.of(2027, 1, 2), calStep(d, CalMode.THREE, 1))
         assertEquals(LocalDate.of(2026, 12, 29), calStep(d, CalMode.DAY, -1))
-        // The week of New Year's Eve 2026 starts Monday Dec 28.
-        assertEquals(LocalDate.of(2026, 12, 28), calWeekStart(LocalDate.of(2027, 1, 1)))
+        // The week of New Year's Eve 2026 starts Sunday Dec 27.
+        assertEquals(LocalDate.of(2026, 12, 27), calWeekStart(LocalDate.of(2027, 1, 1)))
         assertEquals(
-            listOf(LocalDate.of(2026, 12, 21), LocalDate.of(2026, 12, 28), LocalDate.of(2027, 1, 4)),
+            listOf(LocalDate.of(2026, 12, 20), LocalDate.of(2026, 12, 27), LocalDate.of(2027, 1, 3)),
             calWantedWeeks(calVisibleDays(d, CalMode.WORK)),
         )
         // Three days over a week boundary fetch both weeks (± one).
-        assertEquals(2, calWeeksOf(calVisibleDays(LocalDate.of(2026, 11, 15), CalMode.THREE)).size)
+        assertEquals(2, calWeeksOf(calVisibleDays(LocalDate.of(2026, 11, 14), CalMode.THREE)).size)
     }
 
     @Test fun `a mode is kept per layout and an unknown one falls back`() {
