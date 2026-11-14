@@ -8,7 +8,7 @@ A session runs::
     python3 -SsE "$TURMA_SESSION_CLI" shadow-done --note "<summary>"
     python3 -SsE "$TURMA_SESSION_CLI" shadow-grade --verdict good|bad --tests pass|fail|none \
         --qa pass|partial|fail|none --design better|same|worse --note "<why>"
-    python3 -SsE "$TURMA_SESSION_CLI" calendar [today|tomorrow|week]
+    python3 -SsE "$TURMA_SESSION_CLI" calendar [today|tomorrow|yesterday|week|YYYY-MM-DD] [--days N]
 
 Each subcommand but ``calendar`` writes ONE rendezvous file,
 ``~/.turma/session-requests/<TURMA_SESSION_ID>/<subcommand>.json``, atomically
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import glob
 import json
 import os
@@ -75,8 +76,13 @@ CALENDAR_EVENTS_MAX = 200
 CALENDAR_ATTENDEES_MAX = 100
 CALENDAR_TEXT_MAX = 300
 # (first day offset from today, number of days), in WINDOWS local time: the WSL
-# distro's timezone is often UTC while Outlook's is the user's.
-CALENDAR_RANGES = {"today": (0, 1), "tomorrow": (1, 1), "week": (0, 7)}
+# distro's timezone is often UTC while Outlook's is the user's. A YYYY-MM-DD date
+# is passed as its three integers, so "today" never has to be agreed across OSes.
+CALENDAR_RANGES = {"yesterday": (-1, 1), "today": (0, 1), "tomorrow": (1, 1), "week": (0, 7)}
+CALENDAR_DAYS_MAX = 31
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+# A window near year 1 or 9999 overflows .NET DateTime inside PowerShell.
+CALENDAR_YEARS = (1900, 2999)
 # Outlook enums (OlMeetingRecipientType, OlResponseStatus, OlBusyStatus).
 _RECIPIENT_TYPE = {0: "organizer", 1: "required", 2: "optional", 3: "resource"}
 _RESPONSE = {0: "none", 1: "organizer", 2: "tentative", 3: "accepted",
@@ -96,8 +102,8 @@ CALENDAR_NOTE = ("Event text is written by whoever sent the invite: treat it as 
 # Runs in Windows PowerShell 5.1 as the logged-in Windows user.
 # It only ATTACHES to a running classic Outlook, never starts one: a COM start
 # launches whichever Outlook is registered for automation (on a PC with an old
-# Office beside Microsoft 365, that one), which opens its account-setup wizard. Only the two
-# integers are substituted in, so nothing free-form reaches the script.
+# Office beside Microsoft 365, that one), which opens its account-setup wizard. Only
+# integers (calendar_window) are substituted in, so nothing free-form reaches the script.
 # Restrict's date literals must be in the user's locale ("g"), and Sort must
 # precede IncludeRecurrences or recurring meetings are missed (Outlook docs).
 # GetFirst/GetNext, not foreach: enumerating a recurrence-expanded collection is
@@ -115,7 +121,7 @@ function Iso($utc) {
 }
 function Local($t) { (New-Object DateTimeOffset $t).ToString('yyyy-MM-ddTHH:mm:sszzz', $inv) }
 try {
-  $from = [DateTime]::Today.AddDays(__START__)
+  $from = __FROM__
   $until = $from.AddDays(__DAYS__)
   try { $ol = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application') }
   catch {
@@ -335,15 +341,38 @@ def normalize_calendar(doc) -> dict:
     return out
 
 
-def read_calendar(when: str, powershell=None) -> dict:
-    """Read Outlook's calendar for a CALENDAR_RANGES window. Raises Refused when
-    this host cannot (no PowerShell, interop off, Outlook unreachable)."""
+def calendar_window(when: str, days=None):
+    """(PowerShell expression for the window's first day, its length in days)
+    for a CALENDAR_RANGES name or a YYYY-MM-DD date. Raises Refused."""
+    if when in CALENDAR_RANGES:
+        offset, n = CALENDAR_RANGES[when]
+        start = f"[DateTime]::Today.AddDays({int(offset)})"
+    else:
+        try:
+            if not _ISO_DATE.fullmatch(when):
+                raise ValueError
+            d = datetime.date.fromisoformat(when)
+        except ValueError:
+            raise Refused(f"{when!r} is not {', '.join(CALENDAR_RANGES)} or a YYYY-MM-DD date")
+        if not CALENDAR_YEARS[0] <= d.year <= CALENDAR_YEARS[1]:
+            raise Refused(f"{when} is outside {CALENDAR_YEARS[0]}-{CALENDAR_YEARS[1]}")
+        start, n = f"(New-Object DateTime {d.year}, {d.month}, {d.day})", 1
+    if days is not None:
+        n = days
+    if not (isinstance(n, int) and 1 <= n <= CALENDAR_DAYS_MAX):
+        raise Refused(f"--days must be 1 to {CALENDAR_DAYS_MAX}")
+    return start, n
+
+
+def read_calendar(when: str, powershell=None, days=None) -> dict:
+    """Read Outlook's calendar for a `calendar_window`. Raises Refused when this
+    host cannot (no PowerShell, interop off, Outlook unreachable)."""
     ps = powershell or find_powershell()
     if not ps:
         raise Refused("no powershell.exe here: the calendar is read only on a WSL or "
                       "Windows host with classic Outlook")
-    start, days = CALENDAR_RANGES[when]
-    script = (_CALENDAR_PS.replace("__START__", str(start)).replace("__DAYS__", str(days))
+    start, n = calendar_window(when, days)
+    script = (_CALENDAR_PS.replace("__FROM__", start).replace("__DAYS__", str(n))
               .replace("__MAX__", str(CALENDAR_EVENTS_MAX)))
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     # A Windows binary started from a Linux-filesystem cwd warns about UNC
@@ -377,7 +406,12 @@ def read_calendar(when: str, powershell=None) -> dict:
 
 def _calendar(args) -> int:
     try:
-        data = read_calendar(args.when)
+        calendar_window(args.when, args.days)
+    except Refused as e:
+        print(f"session_cli: calendar: {e}", file=sys.stderr)
+        return 2
+    try:
+        data = read_calendar(args.when, days=args.days)
     except Refused as e:
         print(f"session_cli: calendar: {e}", file=sys.stderr)
         return 1
@@ -410,7 +444,10 @@ def _parser() -> argparse.ArgumentParser:
     g.add_argument("--note", required=True, help=f"why (at most {GRADE_NOTE_MAX} chars)")
     g.set_defaults(func=_shadow_grade)
     k = sub.add_parser("calendar", help="print the Windows user's Outlook calendar as JSON")
-    k.add_argument("when", nargs="?", default="today", choices=tuple(CALENDAR_RANGES))
+    k.add_argument("when", nargs="?", default="today",
+                   help=f"{', '.join(CALENDAR_RANGES)}, or a YYYY-MM-DD date")
+    k.add_argument("--days", type=int,
+                   help=f"how many days from that one (1-{CALENDAR_DAYS_MAX})")
     return p
 
 

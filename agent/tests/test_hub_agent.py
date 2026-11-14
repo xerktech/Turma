@@ -25520,7 +25520,7 @@ class TestSessionDirective(ManagerMixin, unittest.TestCase):
         self.assertTrue(cmd.startswith(prefix + " calendar "), (cmd, prefix))
         sm = self.make_manager()
         with mock.patch.object(ha, "_is_wsl", return_value=True):
-            self.assertIn(" calendar [today|tomorrow|week]", sm._session_directive(self._sess()))
+            self.assertIn(" calendar [today|tomorrow|yesterday|week|YYYY-MM-DD]", sm._session_directive(self._sess()))
             for rt in ("dsh", "qwen"):
                 self.assertNotIn(" calendar ", sm._session_directive(self._sess(agentType=rt), "X"))
 
