@@ -852,8 +852,20 @@ function paint(force = false) {
     else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
     scrollToMin = -1;
   }
+  refit();
   paintDetail(force);
   if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
+}
+// A stretched day (the pane taller than 24h) has nothing to scroll, so its
+// scrollTop is 0; once a resize makes the pane scroll again, open it at 8 AM like
+// a fresh paint instead of leaving it stuck at midnight (XERK-2937).
+let fitWas = false;
+function refit() {
+  const sc = $grid && $grid.querySelector && $grid.querySelector("#calScroll");
+  if (!sc) return;
+  const fits = sc.scrollHeight <= sc.clientHeight + 1;
+  if (fitWas && !fits) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
+  fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's
 // repaints (a frame, the clock) never swap the controls under the operator.
@@ -1031,6 +1043,7 @@ function mount(el, opts = {}) {
   const mq = typeof window !== "undefined" && window.matchMedia ? window.matchMedia(`(max-width: ${NARROW_PX - 1}px)`) : null;
   narrow = !!(mq && mq.matches);
   if (mq && mq.addEventListener) mq.addEventListener("change", (e) => { narrow = !!e.matches; paint(true); });
+  if (typeof window !== "undefined" && window.addEventListener) window.addEventListener("resize", refit);
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"

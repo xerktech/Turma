@@ -234,6 +234,8 @@
      overflowed when a notice wrapped. Below the 360px floor the page scrolls. */
   .page-scroll:has(> .tri-wrap > .cal:not([hidden])) { display: flex; flex-direction: column; }
   .wrap.tri-wrap:has(> .cal:not([hidden])) { max-width: var(--wrap-board); flex: 1 0 auto; width: 100%; padding-bottom: 16px; display: flex; flex-direction: column; }
+  /* The switch stays in the header's column, so it never jumps sideways between views. */
+  .wrap.tri-wrap:has(> .cal:not([hidden])) > .mt-views { max-width: var(--wrap); width: 100%; margin-inline: auto; flex: none; }
   .cal:not([hidden]) { flex: 1 0 auto; display: flex; flex-direction: column; }
   .cal-main { flex: 1 0 auto; display: flex; flex-direction: column; }
   .cal-main > * { flex: none; }
@@ -278,7 +280,9 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cal-scroll { min-height: 360px; container-type: size; overflow-y: auto; overscroll-behavior: contain; }
   /* 48 rows fill the pane once it is taller than 48 x 24px (XERK-2937). */
-  .cal-body { position: relative; --slot: max(24px, 100cqh / 48); }
+  .cal-body { position: relative; --slot: 24px; }
+  /* Gated: a browser without cqh would hold an invalid --slot and lose every row. */
+  @supports (height: 1cqh) { .cal-body { --slot: max(24px, 100cqh / 48); } }
   .cal-gutter { position: relative; }
   .cal-hr { position: absolute; right: 6px; transform: translateY(-50%); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
   .cal-col { position: relative; border-left: 1px solid var(--hairline);
