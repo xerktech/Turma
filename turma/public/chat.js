@@ -3912,23 +3912,33 @@
     // offset lands the reader a dozen messages away. When nothing starts in
     // view (one element covers the whole pane) that covering element anchors.
     const pane = stScroll.getBoundingClientRect(), top = pane.top;
-    let anchor = null, off = 0;
+    // One entry renders several elements under its uuid — a thought group, a
+    // tool card, a bubble, and (dsh/qwen) several text parts and tool cards —
+    // so the anchor is named by uuid, kind (first class) and which one of that
+    // kind it is (`nth`), and found again by all three.
+    const kindOf = (n) => (n.classList && n.classList[0]) || "";
+    const seen = new Map();
+    let anchor = null, off = 0, nth = 0;
     for (const el of stScroll.querySelectorAll("[data-uuid]")) {
+      const key = el.dataset.uuid + "\n" + kindOf(el);
+      const i = seen.get(key) || 0;
+      seen.set(key, i + 1);
       const r = el.getBoundingClientRect();
       if (r.bottom <= top) continue;
       if (r.top >= pane.bottom && anchor) break;
-      anchor = el; off = r.top - top;
+      anchor = el; off = r.top - top; nth = i;
       if (r.top >= top) break;
     }
-    // One entry renders several elements under its uuid (thought group, tool
-    // card, bubble), so find the same KIND of element again, not the first.
     const uuid = anchor && anchor.dataset.uuid;
-    const kind = anchor && anchor.classList && anchor.classList[0];
+    const kind = anchor && kindOf(anchor);
     repaintStatic();
     let el = null;
     if (uuid && window.CSS && CSS.escape) {
-      const same = stScroll.querySelectorAll('[data-uuid="' + CSS.escape(uuid) + '"]');
-      el = Array.from(same).find((n) => n.classList && n.classList[0] === kind) || same[0] || null;
+      const same = Array.from(stScroll.querySelectorAll('[data-uuid="' + CSS.escape(uuid) + '"]'));
+      const ofKind = same.filter((n) => kindOf(n) === kind);
+      // The new verbosity may hide that kind (a tool card under Concise):
+      // keep the entry's first element in place instead.
+      el = ofKind[Math.min(nth, ofKind.length - 1)] || same[0] || null;
     }
     if (el) stScroll.scrollTop += (el.getBoundingClientRect().top - top) - off;
   }

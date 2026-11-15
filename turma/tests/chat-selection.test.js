@@ -396,6 +396,65 @@ test("a verbosity change mid-transcript keeps the message the reader was on in p
   delete window.CSS; delete globalThis.CSS;
 });
 
+test("an entry with several bubbles restores the one the reader was on", () => {
+  // A dsh/qwen entry renders several text parts under one uuid; the reader
+  // is on the THIRD at +40.
+  const nodes = [
+    { uuid: "u5", cls: "tr-msg", rect: { top: -900, bottom: -800 } },
+    { uuid: "u5", cls: "tr-msg", rect: { top: -400, bottom: -300 } },
+    { uuid: "u5", cls: "tr-msg", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll8", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t8" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[0].rect = { top: -1400, bottom: -1300 }; nodes[1].rect = { top: -500, bottom: -400 };
+    nodes[2].rect = { top: 540, bottom: 640 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5500, "the third bubble is back at +40");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a verbosity change that hides the anchor's kind keeps the entry in place", () => {
+  // The reader is on u9's tool card; Concise drops tool cards, so u9's bubble
+  // (its remaining element) is what stays put.
+  const nodes = [
+    { uuid: "u9", cls: "tr-msg", rect: { top: -200, bottom: -100 } },
+    { uuid: "u9", cls: "tool-card", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll9", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t9" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() { nodes.pop(); nodes[0].rect = { top: 300, bottom: 400 }; },
+    get() { return ""; } });
+  verb.pick("concise");
+  assert.equal(st.scrollTop, 5260);
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a pane covered by one element anchors on it, not on the element below", () => {
+  const nodes = [
+    { uuid: "big", cls: "tr-msg", rect: { top: -100, bottom: 900 } },
+    { uuid: "next", cls: "tr-msg", rect: { top: 920, bottom: 980 } },
+  ];
+  const st = laidOutScroll("trScroll10", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t10" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[0].rect = { top: 100, bottom: 1100 }; nodes[1].rect = { top: 1500, bottom: 1560 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5200, "the covering element is back at -100");
+  delete window.CSS; delete globalThis.CSS;
+});
+
 test("a verbosity change at the bottom stays at the bottom", () => {
   const st = laidOutScroll("trScroll7", [{ uuid: "a", cls: "tr-msg", rect: { top: 30, bottom: 90 } }]);
   const verb = verbosityHost();
