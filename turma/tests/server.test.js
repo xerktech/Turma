@@ -33250,6 +33250,7 @@ test("XERK-2935 QA: files never ride a rejoined file-less create, stay on one ho
 });
 
 // ---- XERK-2968: Turma-created events, in one or more orgs ------------------------
+// (XERK-2972 QA cases on private events follow the XERK-2968 block.)
 const S2968A = "a2968.atlassian.net", S2968B = "b2968.atlassian.net";
 const D2968A = "cal2968a", D2968B = "cal2968b";
 const T2968 = Math.floor(Date.now() / 3.6e6) * 3.6e6 + 864e5;   // on the hour, tomorrow
@@ -33383,6 +33384,60 @@ test("XERK-2968: an org that stops being decided leaves its events after the gra
   } finally {
     cleanup2968(D2968A, D2968B);
     forget2533(D2968A, D2968B);
+  }
+});
+
+test("XERK-2972: a private or confidential event is changed only by its owner; nobody else may hide one", async () => {
+  const D = "cal2972";
+  try {
+    await beat1574(D, S2968A);
+    const bg = { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] };
+    const legacy = { kind: "legacy", userId: null, tenantId: null, roles: [] };
+    for (const sensitivity of ["private", "confidential"]) {
+      const c = hub.createTurmaEvent(legacy, ev2968([S2968A], { sensitivity }));
+      assert.equal(c.status, 200, JSON.stringify(c.body));
+      const id = c.body.event.id;
+      const v = hub.calendarView(bg, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === id);
+      assert.deepEqual([v.private, v.editable], [true, false], sensitivity);
+      // Refused before the version check: no `event` rides the refusal, even for a stale version.
+      for (const version of [1, 99]) {
+        const r = hub.patchTurmaEvent(bg, id, { version, subject: "x" });
+        assert.equal(r.status, 409);
+        assert.ok(!("event" in r.body), "a privacy refusal never carries the event");
+      }
+      assert.equal(hub.deleteTurmaEvent(bg, id).status, 409);
+      assert.equal(hub.patchTurmaEvent(legacy, id, { version: 1, sensitivity: "normal" }).status, 200);
+    }
+    // A non-owner may not hide someone else's event (it could never undo it).
+    const n = hub.createTurmaEvent(legacy, ev2968([S2968A]));
+    for (const sensitivity of ["private", "confidential"]) {
+      assert.equal(hub.patchTurmaEvent(bg, n.body.event.id, { version: 1, sensitivity }).status, 409);
+    }
+    assert.equal(hub.patchTurmaEvent(bg, n.body.event.id, { version: 1, subject: "Offsite" }).status, 200);
+    assert.equal(hub.patchTurmaEvent(legacy, n.body.event.id, { version: 2, sensitivity: "private" }).status, 200);
+  } finally {
+    cleanup2968(D);
+  }
+});
+
+test("XERK-2972: a tenant's own user owns a private event another principal left in its tenant", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2972");
+    const userA = { kind: "user", userId: T.A.user.id, tenantId: T.A.t, roles: ["user"] };
+    const c = hub.createTurmaEvent(userA, ev2968([F.SA], { sensitivity: "private" }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const id = c.body.event.id;
+    hub.getCalendarTurmaEvents()[T.A.t][id].createdBy = "breakglass";   // as the migration moves one in
+    const v = hub.calendarView(userA, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === id);
+    assert.deepEqual([v.subject, v.editable], ["Planning", true]);
+    assert.equal(hub.patchTurmaEvent(userA, id, { version: 1, subject: "Mine" }).status, 200);
+    assert.equal(hub.deleteTurmaEvent(userA, id).status, 200);
+  } finally {
+    cleanup2968();
+    if (F) forget2533("t2972", F.ka, F.kb, F.kl);
+    T.restore();
   }
 });
 
