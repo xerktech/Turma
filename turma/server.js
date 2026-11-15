@@ -5240,6 +5240,17 @@ function sanitizeMeetingReview(v) {
   const issueType = meetingText(v.issueType, 100);
   if (issueType) out.issueType = issueType;
   if (v.edited === true) out.edited = true;
+  // What the operator changed, for the eval set (XERK-2517): the final title
+  // when it differs from the proposal's, who the ticket went to, and whether
+  // that overrode the mapped speaker.
+  const title = meetingText(v.title, 200);
+  if (title) out.title = title;
+  if (v.unassigned === true) out.unassigned = true;
+  else {
+    const to = meetingText(v.assignedTo, 100);
+    if (to) out.assignedTo = to;
+  }
+  if (v.assigneeChanged === true) out.assigneeChanged = true;
   if (v.state === "creating") {
     if (typeof v.cmdId !== "string" || !MEETING_CMD_ID_RE.test(v.cmdId)) return null;
     if (typeof v.host !== "string" || !v.host || v.host.length > 200) return null;
@@ -5298,6 +5309,13 @@ function sanitizeMeetingSegment(v) {
   if (end !== null && (start === null || end >= start)) out.endMs = end;
   return out;
 }
+function meetingTrackerUser(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.id !== "string" || !v.id || v.id.length > 256
+    || /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Cs}]/u.test(v.id)) return null;
+  const name = meetingText(v.name, 100);
+  return name ? { id: v.id, name } : null;
+}
 function sanitizeMeetingItem(v, i) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const title = meetingText(v.title, 200);
@@ -5306,6 +5324,11 @@ function sanitizeMeetingItem(v, i) {
     description: meetingText(v.description, 4000, true) };
   const assignee = meetingText(v.suggestedAssignee, 100);
   if (assignee) out.suggestedAssignee = assignee;
+  // The tracker user the agent mapped that speaker to (XERK-2517). The id is
+  // sent back to the tracker on Approve, so it is kept only when it is a plain
+  // string a create command can carry: no control/format character.
+  const mapped = meetingTrackerUser(v.assignee);
+  if (mapped && out.suggestedAssignee) out.assignee = mapped;
   const due = meetingText(v.due, 40);
   if (due) out.due = due;
   out.quotes = (Array.isArray(v.quotes) ? v.quotes : []).slice(0, 20).map((q) => {
@@ -5565,7 +5588,7 @@ function meetingWire(m, siteKey, index) {
 // nor the hub's own daily link, archive mark (XERK-2856) or calendar link (XERK-2896).
 function meetingTenirWire(m) {
   const { daily, archivedAt, calendarEventId, calendarBy, calendarAmbiguous, ...out } = meetingWire(m);
-  if (Array.isArray(out.items)) out.items = out.items.map(({ review, ...it }) => it);
+  if (Array.isArray(out.items)) out.items = out.items.map(({ review, assignee, ...it }) => it);
   return out;
 }
 // What clients read (XERK-2510): each org's newest MEETINGS_WIRE_TAIL rows,
@@ -12955,6 +12978,8 @@ function normalizeRunCapability(payload, cap) {
   for (const [key, known] of Object.entries(lists)) {
     if (Array.isArray(t[key])) out[key] = known.filter((v) => t[key].includes(v));
   }
+  // XERK-2517: a createTicket on this host honours an `assignee`. Strict true.
+  if (cap === "meetings" && t.assign === true) out.assign = true;
   payload[cap] = out;
 }
 function normalizeDailyBrief(payload) {
@@ -13995,7 +14020,7 @@ function pickTicketAttachHost(siteKey) {
 // Returns {status, body}: 200 {ok, cmdId, host} (an identical create still in
 // flight rejoins its cmdId), else a refusal in the hub's own words.
 function queueCreateTicket(siteKey, { project, issueType, summary, description = "", labels = [] },
-  { host = null, uploads = null } = {}) {
+  { host = null, uploads = null, assignee } = {}) {
   if (!summary) return { status: 400, body: { error: "a title is required" } };
   if (!project) return { status: 400, body: { error: "a project is required" } };
   if (!issueType) return { status: 400, body: { error: "an issue type is required" } };
@@ -14006,8 +14031,13 @@ function queueCreateTicket(siteKey, { project, issueType, summary, description =
   // yet is a retry, not a second ticket, so it rejoins the first cmdId. Once
   // that create RESOLVES, an identical one is a new ticket again — deliberate
   // repeats stay possible.
+  // An explicit assignee (XERK-2517: null = unassigned, {id} = that user) is a
+  // different ticket from the same create assigned to the host's user, so it
+  // rides the single-flight fingerprint (in the file-id slot, NUL-prefixed so
+  // no upload id can equal it).
   const fields = [siteKey, project, issueType, summary, description, labels,
-    (uploads || []).map((u) => u.id).sort()];
+    [...(uploads || []).map((u) => u.id).sort(),
+      ...(assignee !== undefined ? [`\u0000assignee:${assignee ? assignee.id : ""}`] : [])]];
   const inFlight = findCreateInFlight(...fields);
   if (inFlight) return { status: 200, body: { ok: true, cmdId: inFlight.cmdId, host: inFlight.host } };
   // A create carrying files goes to the host its files were staged for (the
@@ -14024,6 +14054,7 @@ function queueCreateTicket(siteKey, { project, issueType, summary, description =
   if (gap) return { status: 409, body: { error: gap } };
   const cmd = { type: "createTicket", project, issueType, summary, description, labels };
   if (uploads && uploads.length) cmd.uploads = uploads;
+  if (assignee !== undefined) cmd.assignee = assignee ? { id: assignee.id } : null;
   const cmdId = queueCommand(key, cmd);
   awaitResult(agents[key], cmdId, cmd.uploads ? "createTicketFiles" : "createTicket");
   rememberCmdHost(cmdId, key, "createTicket");
@@ -23078,6 +23109,7 @@ const MEETING_CREATE_DEADLINE_MS = 15 * 60e3;
 const MEETING_TICKET_DESC_MAX = 8000;
 // A maybe-created review's advice (XERK-2865): clients prefix "Maybe created —".
 const MEETING_CHECK_BOARD = "check the board, and make it there if it is missing";
+const MEETING_ASSIGN_CHOICES = new Set(["me", "suggested", "none"]);
 const MEETING_MAYBE_CREATED_REFUSAL = "that proposal's ticket may have been created — check the "
   + "board and make it there if it is missing";
 function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
@@ -23133,6 +23165,17 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   for (const k of ["title", "description", "project", "issueType"]) {
     if (body[k] != null && typeof body[k] !== "string") return refuse(400, `${k} must be text`);
   }
+  // Who the ticket goes to (XERK-2517): "me" (the default, and every older
+  // client) = the host's tracker user; "suggested" = the tracker user the
+  // agent mapped the proposal's speaker to; "none" = unassigned. A token, never
+  // an id, so a client can only pick a user the hub already holds.
+  const assign = body.assignee == null ? "me" : body.assignee;
+  if (!MEETING_ASSIGN_CHOICES.has(assign)) {
+    return refuse(400, 'assignee must be "me", "suggested" or "none"');
+  }
+  if (assign === "suggested" && !item.assignee) {
+    return refuse(400, "that proposal has no tracker user to assign it to");
+  }
   const title = meetingText(body.title == null ? item.title : body.title, 200);
   if (!title) return refuse(400, "a title is required");
   const description = meetingText(body.description == null ? item.description : body.description,
@@ -23144,16 +23187,38 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
     const d = appendDecision(siteKey, { source: "meeting",
       text: [title, description].filter(Boolean).join(" — "), label: meetingDisplayTitle(m) });
     if (!d) return refuse(409, "the hub holds decisions for too many orgs — try again later");
-    return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}) });
+    return save({ state: "logged", at: now, ...(edited ? { edited: true } : {}),
+      ...(title !== item.title ? { title } : {}) });
   }
   const project = meetingText(body.project, 100);
   const issueType = meetingText(body.issueType, 100);
   if (!project) return refuse(400, "a project is required");
   if (!issueType) return refuse(400, "an issue type is required");
-  const q = queueCreateTicket(siteKey, { project, issueType, summary: title, description, labels: [] });
+  // The board lists the operator's OWN tickets, so one given to someone else
+  // never appears there and its session start would wait out the 2h for nothing.
+  if (assign !== "me" && body.start === true) {
+    return refuse(400, "a ticket assigned to someone else can't be started from here — approve it without a session");
+  }
+  let opts = {};
+  if (assign !== "me") {
+    // Only an agent that reads `assignee` may take it: an older one would
+    // self-assign the ticket the operator gave someone else.
+    const host = jiraHostPool(siteKey, true).find((k) => agents[k] && agents[k].meetings
+      && agents[k].meetings.assign === true && !agentGapError(agents[k], "createTicket", ""));
+    if (!host) {
+      return refuse(409, "no online host of this org can assign a ticket to someone else yet — update the agent, or approve it for yourself");
+    }
+    opts = { host, assignee: assign === "suggested" ? item.assignee : null };
+  }
+  const q = queueCreateTicket(siteKey, { project, issueType, summary: title, description, labels: [] }, opts);
   if (q.status !== 200) return q;
+  const who = assign === "suggested" ? { assignedTo: item.assignee.name }
+    : assign === "none" ? { unassigned: true } : {};
   return save({ state: "creating", at: now, project, issueType, cmdId: q.body.cmdId,
-    host: q.body.host, ...(edited ? { edited: true } : {}), ...(body.start === true ? { start: true } : {}) });
+    host: q.body.host, ...(edited ? { edited: true } : {}),
+    ...(title !== item.title ? { title } : {}), ...who,
+    ...(item.assignee && assign !== "suggested" ? { assigneeChanged: true } : {}),
+    ...(body.start === true ? { start: true } : {}) });
 }
 
 // Archive (or, with archived:false, unarchive) a settled meeting (XERK-2856).
@@ -31151,7 +31216,7 @@ if (process.env.TURMA_TEST) {
     getMeetingFocus: () => meetingFocus, meetingFocusCoerce,
     getHolidaySettings: () => holidaySettings, holidaySettingsCoerce,
     meetingLabelSlug, meetingsCoerce, sanitizeMeeting, meetingText, meetingsTick, meetingTitleGeneric,
-    putMeeting, reviewMeetingItem, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
+    putMeeting, reviewMeetingItem, meetingTenirWire, queueCreateTicket, settleMeetingReviews, archiveMeeting, meetingDailyOf, keepMeetings, meetingProposalsWire, MEETING_START_WAIT_MS,
     MEETING_CREATE_DEADLINE_MS, MEETING_MAYBE_CREATED_REFUSAL, acceptMeeting,
     ingestMeetingResults, normalizeRunCapability, meetingSent, meetingTranscripts, sweepMeetingTranscripts, MEETING_TRANSCRIPTS_DIR, MEETINGS_PENDING_BYTES_MAX, MEETINGS_PENDING_TOTAL_MAX, MEETINGS_PENDING_HARD_FACTOR, MEETING_RUN_TIMEOUT_MS,
     MEETING_QUEUE_MAX_MS, MEETINGS_KEEP, MEETINGS_AUTO_MODEL, DAILY_BRIEF_RUN_TIMEOUT_MS, DAILY_BRIEF_LATE_MS,

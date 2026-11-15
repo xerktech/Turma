@@ -45,6 +45,18 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
     `_DAILY_BRIEF_PROJECT_RE`, ADO names are `'`-escaped.
   - Best-effort: a search error, or `MEETING_DUP_BUDGET_SEC` spent, leaves `[]`; the items ship.
   - A `decision` files nothing, so is not searched.
+- **`assignee` maps the speaker to ONE tracker user** (XERK-2517, `meeting_assignee`), after the
+  duplicate check, READ-ONLY and best-effort (`MEETING_ASSIGNEE_BUDGET_SEC`; an error leaves the
+  rest unmapped). Never the model's: it names a caption spelling, the agent finds the identity.
+  - Jira: `user/assignable/multiProjectSearch` over the org's projects, queried by the name's
+    longest word. ADO: the assignees of the org's recently changed items (its identity search
+    lives on a different host for Services than Server; an AssignedTo is what the create takes).
+  - A match is the meeting-focus name rule (`_meeting_names_match`); two or zero candidates map to
+    nothing. Hits and misses cached per folded name for `MEETING_ASSIGNEE_TTL_SEC`; errors not.
+- **A `createTicket` with `assignee`** (`ASSIGN_SELF` absent / None / an id) assigns that user,
+  or nobody, instead of this host's (`meetings.assign` says so). A named assignee Jira refuses
+  with a 4xx is created unassigned with a warning (a 5xx is never re-sent). Tests:
+  `TestMeetingAssignee`, the `xerk2517` cases in `TestCreateJiraIssue`/`TestStageCreateTicket`.
 - **`repoGuess` reuses the triage candidates** (`self.triage_cands`, `_triage_candidates`): the
   same allowlist a ticket's repoGuess is checked against.
 - **Only `claude` is offered** (`meeting_runtimes` = `daily_brief_runtimes`), and only with a

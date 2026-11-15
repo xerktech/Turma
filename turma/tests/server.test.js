@@ -30508,6 +30508,66 @@ test("XERK-2867: a host that restarted mid-create reports it may have run, and R
   assert.equal((await review2510(S, "r1", "p2", { action: "reopen" })).status, 200);
 });
 
+test("XERK-2517: Approve assigns the mapped speaker, nobody, or me — only via an agent that can", async () => {
+  const S = "mtAs2517.atlassian.net";
+  const ann = { id: "557058:ann-1", name: "Ann Lee" };
+  hub.putMeeting(S, okMeeting2510("s1", { items: [
+    { kind: "task", title: "Write the runbook", suggestedAssignee: "Ann", assignee: ann },
+    { kind: "task", title: "Rotate the keys", suggestedAssignee: "Ann", assignee: ann },
+    { kind: "task", title: "Fix CI", suggestedAssignee: "Ann", assignee: { id: "bad\u0000id", name: "x" } },
+    { kind: "task", title: "Ship the docs", assignee: ann },
+    { kind: "task", title: "Old style" },
+  ] }));
+  // An older agent (no meetings.assign) is never handed an assignee.
+  await beat1574("mtOld2517", S, { meetings: { available: true } });
+  const items = item2510(S, "s1", "p1") && hub.getMeetings()[S][0].items;
+  assert.deepEqual(items.map((i) => i.assignee || null), [ann, ann, null, null, null],
+    "a control-char id and an assignee with no speaker are dropped");
+  const body = (iid, extra) => review2510(S, "s1", iid, { action: "approve", project: "ENG", issueType: "1", ...extra });
+  for (const [iid, extra, status, re] of [
+    ["p1", { assignee: "someone" }, 400, /assignee must be/],
+    ["p3", { assignee: "suggested" }, 400, /no tracker user/],
+    ["p1", { assignee: "suggested", start: true }, 400, /someone else/],
+    ["p1", { assignee: "suggested" }, 409, /update the agent/],
+  ]) {
+    const r = await body(iid, extra);
+    assert.equal(r.status, status, JSON.stringify(extra));
+    assert.match(r.body.error, re);
+  }
+  assert.equal(creates2510("mtOld2517").length, 0);
+  // "me" (or nothing) still goes to the older agent unchanged: no assignee key.
+  assert.equal((await body("p5", {})).status, 200);
+  const [old] = creates2510("mtOld2517");
+  assert.equal("assignee" in old, false);
+
+  // A current agent takes the assigned creates.
+  await beat1574("mtNew2517", S, { meetings: { available: true, assign: true } });
+  assert.equal(agents.mtNew2517.meetings.assign, true);
+  assert.equal((await body("p1", { assignee: "suggested" })).status, 200);
+  assert.equal((await body("p2", { assignee: "none", title: "Rotate the API keys" })).status, 200);
+  const news = creates2510("mtNew2517");
+  assert.deepEqual(news.map((c) => c.assignee), [{ id: ann.id }, null]);
+  const r1 = item2510(S, "s1", "p1").review, r2 = item2510(S, "s1", "p2").review;
+  assert.deepEqual([r1.assignedTo, "assigneeChanged" in r1, "title" in r1], ["Ann Lee", false, false]);
+  assert.deepEqual([r2.unassigned, r2.assigneeChanged, r2.title, r2.edited],
+    [true, true, "Rotate the API keys", true]);
+  // Kept through the settle; Tenir's answer never carries the tracker id.
+  await beat1574("mtNew2517", S, { meetings: { available: true, assign: true },
+    createTicketResults: [{ cmdId: news[0].cmdId, key: "ENG-7", url: null, error: null }] });
+  assert.deepEqual([item2510(S, "s1", "p1").review.state, item2510(S, "s1", "p1").review.assignedTo],
+    ["created", "Ann Lee"]);
+  const fleet = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.deepEqual(fleet.body.meetingProposals[S][0].items[0].assignee, ann);
+  assert.equal("assignee" in hub.meetingTenirWire(hub.getMeetings()[S][0]).items[0], false);
+  // The same title assigned differently is a different create, not a rejoin.
+  const fp = (a) => hub.queueCreateTicket(S, { project: "ENG", issueType: "1", summary: "Same" }, a);
+  const c1 = fp({ host: "mtNew2517", assignee: null }).body.cmdId;
+  assert.notEqual(fp({ host: "mtNew2517" }).body.cmdId, c1);
+  assert.equal(fp({ host: "mtNew2517", assignee: null }).body.cmdId, c1);
+  for (const d of ["mtOld2517", "mtNew2517"]) delete agents[d];
+  delete hub.getMeetings()[S];
+});
+
 test("XERK-2510: a create whose host goes silent fails in honest words; an agent cannot forge a review", async () => {
   const S = "mtF2510.atlassian.net";
   await beat1574("mtFail2510", S);

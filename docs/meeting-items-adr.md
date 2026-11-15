@@ -105,3 +105,23 @@ capture retitled "Meeting" (`run --generic-titles`):
 - Haiku's one failure answered `null` for a needed title on vague-ideas; in production that is
   rejected and retried. Sonnet stays the default; the decision above stands.
 - Not judged blind this time: the summaries were read by hand and track the meeting faithfully.
+
+## Assignees and the review feedback loop (XERK-2517, 2026-11-14)
+
+Goal: most proposals approved with no edit. Two changes, and a way to measure it.
+
+- **The speaker is mapped to a tracker user and pre-filled.** The model still names a caption
+  spelling; the agent maps it to one assignable tracker user (`meeting_assignee`, cached per name,
+  unambiguous matches only) and the review page pre-selects it. The operator can still pick "Me" or
+  "Unassigned". A ticket assigned to someone else cannot start a session from the page: the board
+  lists only the operator's own tickets.
+- **The standup is already tagged** (XERK-2856, `daily`), and its brief already rides the model
+  input, so nothing more was needed there.
+- **Reviews feed the eval.** The hub now records what the operator changed (final title, assignee
+  override). `bench/meeting-items/harvest.py report` prints the share of reviewed proposals
+  approved without an edit, the ticket's acceptance number; `harvest.py cases` writes each
+  reviewed meeting as a corpus case into the git-ignored `reviewed/` (real captions are never
+  committed), and `run_eval.py run --corpus bench/meeting-items/reviewed` scores a prompt or
+  model change against them.
+- Not yet measured: no week of real reviews exists in this repo. Run `harvest.py report` against
+  the hub after a week of meetings and record the number here.

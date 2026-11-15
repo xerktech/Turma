@@ -12,6 +12,9 @@ docs/meeting-items-adr.md.
     python3 bench/meeting-items/run_eval.py judge --results r.jsonl --out j.jsonl
     python3 bench/meeting-items/run_eval.py report --results r.jsonl --judged j.jsonl
 
+`--corpus reviewed` runs any of them over the cases harvest.py wrote from the
+operator's real reviews (XERK-2517) instead of the synthetic corpus.
+
 Every model call is the worker's lockdown: `claude -p` with no tool, no MCP
 server and user settings only, the prompt on stdin, cwd a scratch dir.
 """
@@ -274,7 +277,13 @@ def main():
     s = sub.add_parser("report")
     s.add_argument("--results", required=True)
     s.add_argument("--judged")
+    for s in sub.choices.values():
+        s.add_argument("--corpus", help="a corpus directory other than corpus/ "
+                       "(e.g. reviewed/, written by harvest.py from real reviews)")
     a = p.parse_args()
+    if a.corpus:
+        global CORPUS
+        CORPUS = os.path.abspath(a.corpus)
     {"run": cmd_run, "judge": cmd_judge, "report": cmd_report}[a.cmd](a)
 
 

@@ -14,6 +14,10 @@ spec = importlib.util.spec_from_file_location(
 ev = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ev)
 ha = ev.load_agent()
+hspec = importlib.util.spec_from_file_location(
+    "meeting_items_harvest", os.path.join(os.path.dirname(HERE), "meeting-items", "harvest.py"))
+hv = importlib.util.module_from_spec(hspec)
+hspec.loader.exec_module(hv)
 
 
 class TestCorpus(unittest.TestCase):
@@ -53,3 +57,56 @@ class TestScore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHarvest(unittest.TestCase):
+    """XERK-2517: the operator's reviews become outcomes and corpus cases."""
+
+    def _row(self):
+        item = lambda i, kind, title, review=None, **kw: dict(
+            id=i, kind=kind, title=title, description="", **kw, **({"review": review} if review else {}))
+        return {"meetingId": "m1", "status": "ok", "title": "Planning", "platform": "zoom",
+                "startedAt": 1, "endedAt": 2, "participants": ["Ann Lee"], "items": [
+                    item("p1", "task", "Write the deployment runbook",
+                         {"state": "created", "assignedTo": "Ann Lee"},
+                         suggestedAssignee="Ann Lee", assignee={"id": "a", "name": "Ann Lee"}),
+                    item("p2", "bug", "Retry storm on invoices",
+                         {"state": "creating", "edited": True, "title": "Fix the invoice retry storm"}),
+                    item("p3", "task", "Investigate quantum telemetry", {"state": "rejected"}),
+                    item("p4", "decision", "Ship Friday", {"state": "logged"}),
+                    item("p5", "task", "Rotate keys", {"state": "created", "unassigned": True,
+                                                       "assigneeChanged": True},
+                         suggestedAssignee="Ann Lee", assignee={"id": "a", "name": "Ann Lee"}),
+                    item("p6", "task", "Unreviewed"),
+                    item("p7", "task", "Failed create", {"state": "failed", "error": "x"}),
+                ]}
+
+    def test_outcomes_and_the_rate(self):
+        site = "acme.atlassian.net@" + "a" * 32
+        rows = hv.outcomes({site: [self._row(), {"meetingId": "q", "status": "running"}]})
+        self.assertEqual([r["outcome"] for r in rows],
+                         ["approved", "edited", "rejected", "approved", "edited", "pending", "failed"])
+        self.assertEqual(rows[0]["site"], "acme.atlassian.net", "the tenant suffix is dropped")
+        self.assertEqual(rows[1]["finalTitle"], "Fix the invoice retry storm")
+        s = hv.summarize(rows)
+        self.assertEqual(s["judged"], 5)
+        self.assertAlmostEqual(s["approvedWithoutEdits"], 2 / 5)
+        self.assertEqual((s["mappedAssigneeKept"], s["mappedAssigneeOf"]), (1, 2))
+        self.assertIsNone(hv.summarize([])["approvedWithoutEdits"])
+
+    def test_a_reviewed_meeting_becomes_a_scorable_case(self):
+        segs = [{"speaker": "Ann Lee", "text": "I will write the deployment runbook", "startMs": 0, "endMs": 900}]
+        case = hv.case_of("acme.atlassian.net", self._row(), segs)
+        self.assertEqual(case["source"], "review")
+        by = {tuple(e["words"]): e for e in case["expect"]}
+        self.assertEqual(by[("deployment", "runbook")]["assignee"], "Ann Lee")
+        self.assertIn(("invoice", "retry"), by, "the operator's edited title is the key")
+        self.assertNotIn("assignee", by[("rotate", "keys")], "an overridden assignee is not expected")
+        self.assertEqual(case["forbid"], ["investigate", "telemetry"])
+        # It loads through the eval's own normalizer and scores as the eval does.
+        t, repos = ev.prepared(ha, case)
+        self.assertIsNotNone(t)
+        good = [{"kind": "task", "title": "Write the deployment runbook", "suggestedAssignee": "Ann Lee"}]
+        self.assertEqual(ev.score_expect(case, good)["met"], 1)
+        self.assertIsNone(hv.case_of("s", {"items": [{"id": "p1", "kind": "task", "title": "x"}]}, segs))
+        self.assertIsNone(hv.case_of("s", self._row(), []))

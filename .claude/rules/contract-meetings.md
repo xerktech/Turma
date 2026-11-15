@@ -190,6 +190,17 @@ ticket builds to this file; change it here first.
   board, then `enqueueTicketStart(..., "manual")` — the Start button's queue. Past
   `MEETING_START_WAIT_MS` (2h) it gives up with "start it from the board".
 - Tests: the `XERK-2510:` cases in `server.test.js` (a Jira org AND an ADO org).
+- **Who the ticket goes to** (XERK-2517): `assignee: "me"|"suggested"|"none"` on Approve, absent =
+  `me` (every older client). A TOKEN, never an id: `suggested` sends the item's stored `assignee`.
+  - `me` queues the create exactly as before (no `assignee` key). Anything else needs an online
+    org host reporting `meetings.assign === true` (409 otherwise): an older agent would ignore the
+    key and self-assign. `suggested` with no mapped user is 400; so is `start` with a non-`me`
+    pick (the board lists only the operator's tickets, so the session start would never resolve).
+  - The command carries `assignee: {id}` or `assignee: null`; it joins the create's single-flight
+    fingerprint, so one title assigned two ways is two creates.
+  - The review records what the operator changed, for the eval set: `title` (the final title when
+    it differs), `assignedTo` (the mapped name) or `unassigned: true`, and `assigneeChanged: true`
+    when a mapped user was overridden. Tests: `XERK-2517:` in `server.test.js`, `meetings.test.js`.
 - **Reopen** (XERK-2856): `action:"reopen"` on a `rejected`/`failed` item removes its `review`
   (pending again), and unarchives the meeting (it has pending work again). Else 409 "only a
   rejected or failed proposal can be reopened".
@@ -272,8 +283,9 @@ ticket builds to this file; change it here first.
 
 ## Agent → hub: the heartbeat
 
-- `meetings: {available, runtimes, models}`, coerced by `normalizeRunCapability` exactly like
-  `dailyBrief` (absent = can't; unusable → null).
+- `meetings: {available, runtimes, models, assign?}`, coerced by `normalizeRunCapability` exactly
+  like `dailyBrief` (absent = can't; unusable → null). `assign: true` (strict) = this host's
+  `createTicket` honours an `assignee` (XERK-2517); meetings only.
 - `meetingResults: [{runId, siteKey, meetingId, status:"ok"|"failed", items?, summary?,
   inferredTitle?, model?, error?}]`,
   ≤5 rows a beat; outbox semantics (the agent clears a row once a beat carrying it was accepted).
@@ -289,7 +301,11 @@ ticket builds to this file; change it here first.
 - An item (XERK-2509's schema, re-whitelisted by the hub, ≤`MEETING_ITEMS_MAX` (30) per meeting):
   `{kind:"task"|"bug"|"followup"|"decision", title ≤200, description ≤4000, suggestedAssignee
   ≤100?, due ≤40?, quotes[{speaker ≤100, text ≤500, atMs}] ≤5, duplicateKeys[] ≤5 issue keys,
-  repoGuess ≤200?}`. A title-less or unknown-kind item is dropped; the hub stamps `id` "p1".."pN".
+  repoGuess ≤200?, assignee?}`. A title-less or unknown-kind item is dropped; the hub stamps `id`
+  "p1".."pN".
+  - `assignee: {id ≤256, name ≤100}` (XERK-2517) is the tracker user the agent mapped
+    `suggestedAssignee` to; kept only beside a `suggestedAssignee` and an id with no control/format
+    character. Served to the operator's clients, never in Tenir's answer (`meetingTenirWire`).
   Item text is stored as plain text, markup included: every client renders it ESCAPED.
   A result's `model` counts only as `^[A-Za-z0-9._:-]{1,40}$`, else the row keeps the one sent.
   - The agent fills `duplicateKeys` from a READ-ONLY tracker search, never from the model, and
