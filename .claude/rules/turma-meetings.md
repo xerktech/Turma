@@ -192,7 +192,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     spanning bar; not worth the layout here).
   - Holidays sit in the all-day band; a day off for an org in view (`offFor` ∩ header pick) is
     hatched grey with "Day off · <org>".
-- **Read-only grid**: nothing drags, creates or edits. A click opens the detail panel (XERK-2898).
+- **Outlook events are read-only; Turma events are made here** (XERK-2971). A click on an event
+  opens the detail panel (XERK-2898); nothing drags an event.
 - Keyboard: events are buttons in day order; ↑/↓ within a day, ←/→ to the nearest event of the
   next day, Esc closes the picker / panel. Every event carries an aria-label sentence.
 - **Esc listens on the document** (so it works after a click elsewhere) and yields to a SHOWN
@@ -255,3 +256,41 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   paint and a panel push would collide with it.
 - Tests: the `XERK-2898` cases in `calendar.test.js` and `meetings.test.js` (incl. an end-to-end
   calendar→panel→review run with both modules in one sandbox).
+
+## Turma-made events (XERK-2971)
+
+- Wire: `contract-calendar.md` "Turma-created events". The web half is all in `calendar.js`.
+- **Create**: "+ New event" in the bar, or a click/drag on an empty grid slot (30-min rows,
+  `slotMinAt`); a TOUCH that moved >10px is a swipe, never a create. The header's org pick
+  (∩ pickable orgs) pre-fills the orgs; a lone org is picked for you.
+- **The editor is a `.td-backdrop` modal** (`role=dialog aria-modal`, so `trapModalTab` traps
+  Tab and the calendar's own Esc yields): Esc / ✕ / Cancel / backdrop close it, full screen under
+  760px. Field values live in `ed.f` (read on input), so a repaint never loses a draft; repaints go
+  through `focusKeyIn`/`restoreFocusIn`.
+- **Validation mirrors the hub before it refuses** (`validateForm`): ≥1 pickable org (≤20), the
+  hub's `CAL_EMAIL_RE` (`EMAIL_RE`, keep the two in step), https join link, code-point lengths,
+  end ≥ start. A typed attendee commits on Enter / comma / Save.
+- **Times are the creator's wall clock in the picked zone** (`wallToIso`, default the browser's):
+  the ISO carries that zone's offset; a skipped DST time lands on a real instant. All-day = local
+  midnight to the midnight after the last day (end date shown inclusive).
+- **Edit/Delete only when `source === "turma" && editable === true`**; Outlook panels are
+  unchanged. Delete asks first. A PATCH carries `version`; a 409 shows the hub's words and
+  RELOADS the form from the `event` it sends (the draft is dropped, as the hub says to redo it).
+- No optimistic paint: every write refetches, and the hub's `calendar` frame re-reads too. A saved
+  event that leaves every filtered org closes its panel; a Turma event gone from its own shown week
+  (deleted elsewhere) closes it on the next read.
+- **Look** (operator's pick): every Turma event fills with the Turma icon's blue → purple
+  (`favicon.svg`'s lit "T", white text); its left bar is its org color, split top-to-bottom into
+  each org's color for a multi-org event (`orgBarHtml`, `safeColor` slots only). It renders ONCE
+  (keyed `"" + id`); the hub's `?org=` filter already matches any of its orgs.
+- **A multi-org event counts for EVERY org it is in** (`evOrgs`): the notes review's `upcoming`
+  and relink candidates, not just `org` (= `orgs[0]`).
+- **A typed field's `change` never repaints or writes** (QA): it fires on blur, and a repaint then
+  detaches the button the mouse is pressing, so the browser drops the click (Save did nothing).
+  It also fires when a repaint removes the focused attendee input, carrying the text a comma just
+  committed. `input` owns typed drafts; only checkboxes (their change follows their own click)
+  repaint. Unit tests can't see this ordering: drive a real mouse (`fill()` hides it).
+- A skipped DST time takes the offset BEFORE the switch, a repeated one its first pass, east of UTC
+  too (`wallToIso` tries the offsets a day either side).
+- Repeat is a disabled placeholder until XERK-2969.
+- Tests: the `XERK-2971:` cases in `calendar.test.js`.

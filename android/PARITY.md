@@ -756,6 +756,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     "Zoom in" / "Zoom out" actions in place of the buttons.
   - On for every org, no feature flag (XERK-2901). A host going offline or back re-reads the
     open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
+  - **Turma-made events (XERK-2971, web only so far → Android XERK-2972)**: the web creates,
+    edits and deletes Turma events (New event + slot click/drag, the Teams-style editor, an org
+    multi-select, Edit/Delete on an editable Turma event's panel, a 409 reload) and draws them in
+    the Turma blue → purple with a split org bar. Android still reads them as plain events.
   - XERK-2943 (web) needs no Android change: a wide web window now narrows the week while the
     detail panel is open, which Android already does by placing the detail beside the grid. The web
     also hides a block's time line by the block's drawn height (`SHORT_DP` against the zoomed row
