@@ -61,6 +61,9 @@ class AppContainer(context: Context) {
      */
     val modelSwitches = ModelSwitchStore()
 
+    /** The open calendar-event editor (XERK-2972), kept across tab switches and rotation. */
+    val calendarEditor = kotlinx.coroutines.flow.MutableStateFlow<com.xerktech.turma.core.EventEditor?>(null)
+
     /**
      * The in-session chat text size (XERK-144). Here for the same reason as [org]:
      * it is ONE value shared by every chat — set from any session's settings menu,

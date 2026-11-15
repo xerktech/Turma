@@ -202,6 +202,8 @@ class CalendarTurmaEventsTest {
         compose.onNodeWithTag("cal-ed-title").performTextInput("Draft kept")
         // Held by the view model, so a rotation or a tab switch keeps it.
         assertEquals("Draft kept", cvm.editor.value?.draft?.subject)
+        // A fresh view model (the Meetings tab left and re-entered) still has it.
+        assertEquals("Draft kept", main.track(CalendarViewModel(hub.app)).editor.value?.draft?.subject)
         compose.onNodeWithTag("cal-editor-close").performClick()
         compose.onNodeWithTag("cal-editor-discard").assertExists()
         compose.onNodeWithText("Keep editing").performClick()

@@ -67,6 +67,20 @@ data class TurmaEventDraft(
     val editing: Boolean get() = id.isNotEmpty()
 }
 
+/**
+ * The open editor's state: [draft] as typed, [base] as opened (a draft that
+ * differs asks before it is discarded), the org order an edit started with
+ * (`orgs[0]` colours the event) and the last refusal.
+ */
+data class EventEditor(
+    val draft: TurmaEventDraft,
+    val base: TurmaEventDraft,
+    val orgsOrder: List<String>,
+    val error: String = "",
+) {
+    val dirty: Boolean get() = draft != base
+}
+
 /** The default new event's length (Outlook's own default). */
 const val CAL_NEW_EVENT_MIN = 30
 
@@ -128,10 +142,13 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
 // A name with a separator or quote in it is written quoted ("Smith, John"), so a
 // save that changed nothing parses back to the same attendee (XERK-2972 QA).
 private fun attendeeText(name: String, email: String): String {
-    val n = if (name.any { it in ",;\"<>\n" }) "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"" else name
+    val n = if (name.any { it in ",;\"<>@\n\\" }) "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"" else name
     return when {
         name.isNotEmpty() && email.isNotEmpty() -> "$n <$email>"
-        else -> n.ifEmpty { email }
+        name.isNotEmpty() -> n
+        // A bare address with a separator in it would split: it rides in angle brackets.
+        email.any { it in ",;\"<>\n" } -> "<$email>"
+        else -> email
     }
 }
 
@@ -158,8 +175,9 @@ fun calJoinUrlOk(url: String): Boolean = url.length <= 500 && URL_RE.matches(url
  */
 fun calParseAttendees(text: String, role: String): List<TurmaAttendee> =
     splitAttendees(text).map { jsTrim(it) }.filter { it.isNotEmpty() }.map { tok ->
-        val lt = tok.lastIndexOf('<')
-        val named = lt >= 0 && tok.endsWith(">") && tok.indexOf('>') == tok.length - 1
+        // The `<` opening the address is the last one OUTSIDE quotes: a quoted name may hold `<`/`>`.
+        val lt = lastUnquoted(tok, '<')
+        val named = lt >= 0 && tok.endsWith(">") && tok.indexOf('>', lt) == tok.length - 1
         val (rawName, email) = if (named) tok.substring(0, lt) to jsTrim(tok.substring(lt + 1, tok.length - 1)) else tok to ""
         val name = unquote(jsTrim(rawName))
         when {
@@ -191,6 +209,19 @@ private fun splitAttendees(text: String): List<String> {
     return out
 }
 
+private fun lastUnquoted(s: String, ch: Char): Int {
+    var quoted = false
+    var last = -1
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        if (quoted && c == '\\') { i += 2; continue }
+        if (c == '"') quoted = !quoted else if (c == ch && !quoted) last = i
+        i++
+    }
+    return last
+}
+
 private fun unquote(s: String): String {
     if (s.length < 2 || !s.startsWith("\"") || !s.endsWith("\"")) return s.trim('"')
     val b = StringBuilder()
@@ -208,7 +239,8 @@ private val OFFSET_ZONE = Regex("^(?:UTC|GMT|UT)?[+-]")
 
 fun calZoneOrNull(id: String): ZoneId? {
     val t = id.trim()
-    if (t.isEmpty() || t.length > 64 || OFFSET_ZONE.containsMatchIn(t)) return null
+    // "UT" is a named ZoneId in java.time but not a zone the hub's Intl knows.
+    if (t.isEmpty() || t.length > 64 || OFFSET_ZONE.containsMatchIn(t) || t.equals("UT", ignoreCase = true)) return null
     return runCatching { ZoneId.of(t) }.getOrNull()?.takeIf { it !is ZoneOffset }
 }
 

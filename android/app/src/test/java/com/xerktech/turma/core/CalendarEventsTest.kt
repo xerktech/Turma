@@ -9,6 +9,7 @@ import java.time.ZoneId
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.builtins.serializer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -161,5 +162,26 @@ class CalendarEventsTest {
             "subject": "a\u200bb", "startMs": 1, "endMs": 2 } ]""").single()
         assertEquals(listOf("o\u200b"), ev.orgs)
         assertEquals("ab", ev.subject)
+    }
+
+    @Test fun `XERK-2972 QA every attendee shape the hub keeps survives an unchanged save`() {
+        val people = listOf(
+            TurmaAttendee("R&D <lab>", "rd@x.com", "required"),
+            TurmaAttendee("a>b", "ab@x.com", "required"),
+            TurmaAttendee("bob@home", "", "required"),
+            TurmaAttendee("", "c,d@x.com", "required"),
+            TurmaAttendee("Back\\slash", "", "required"),
+            TurmaAttendee("", "plain@x.com", "required"),
+        )
+        val json = people.joinToString(",") { """{ "name": ${TurmaJson.encodeToString(String.serializer(), it.name)}, "email": "${it.email}", "role": "required" }""" }
+        val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:a", "orgs": ["o"], "org": "o", "editable": true, "version": 1,
+            "start": "2026-11-16T14:00:00Z", "end": "2026-11-16T15:00:00Z", "startMs": 1, "endMs": 2, "timeZone": "UTC",
+            "attendees": [ $json ] } ]""").single()
+        assertEquals(people, calParseAttendees(calDraftOf(ev, ny).required, "required"))
+    }
+
+    @Test fun `XERK-2972 QA UT is refused and the payload's subject is cleaned`() {
+        assertTrue(calDraftErrors(draft("o").copy(timeZone = "UT")).isNotEmpty())
+        assertEquals("AB", calDraftPayload(draft("o").copy(subject = " A\u200bB\u202e ")) ["subject"]!!.jsonPrimitive.content)
     }
 }

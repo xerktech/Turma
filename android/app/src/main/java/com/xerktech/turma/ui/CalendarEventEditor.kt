@@ -54,7 +54,7 @@ import com.xerktech.turma.core.calDraftErrors
 import com.xerktech.turma.core.calLongDay
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.CalendarViewModel
-import com.xerktech.turma.vm.EventEditor
+import com.xerktech.turma.core.EventEditor
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime

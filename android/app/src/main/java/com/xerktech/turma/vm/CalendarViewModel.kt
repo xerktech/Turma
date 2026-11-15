@@ -14,6 +14,7 @@ import com.xerktech.turma.core.calHostNotices
 import com.xerktech.turma.core.calUpcomingWeeks
 import com.xerktech.turma.core.calWantedWeeks
 import com.xerktech.turma.core.calZoomClamp
+import com.xerktech.turma.core.EventEditor
 import com.xerktech.turma.core.TurmaEventDraft
 import com.xerktech.turma.core.calDraftErrors
 import com.xerktech.turma.core.calDraftPayload
@@ -64,20 +65,6 @@ sealed class EventResult {
     /** The event changed since it was opened: the hub's words and the event as it is now. */
     data class Conflict(val message: String, val event: CalendarEvent) : EventResult()
     data class Failed(val message: String) : EventResult()
-}
-
-/**
- * The editor's state: [draft] as typed, [base] as opened (a draft that differs
- * asks before it is discarded), the org order an edit started with (`orgs[0]`
- * colours the event) and the last refusal.
- */
-data class EventEditor(
-    val draft: TurmaEventDraft,
-    val base: TurmaEventDraft,
-    val orgsOrder: List<String>,
-    val error: String = "",
-) {
-    val dirty: Boolean get() = draft != base
 }
 
 class CalendarViewModel(app: Application) : AndroidViewModel(app) {
@@ -400,12 +387,12 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private val _editor = MutableStateFlow<EventEditor?>(null)
+    // The app container's, not this view model's: the Meetings tab's view model is
+    // cleared when another bottom tab opens (tabs keep no state, XERK-814), and the
+    // draft must outlive that as well as a rotation (XERK-2972 QA).
+    private val _editor = container.calendarEditor
 
-    /**
-     * The open Turma-event editor (XERK-2972), or null. Held here, not in the
-     * composable, so a rotation or a tab switch keeps what was typed (QA).
-     */
+    /** The open Turma-event editor (XERK-2972), or null. */
     val editor: StateFlow<EventEditor?> = _editor
 
     fun openEditor(draft: TurmaEventDraft) {
@@ -424,7 +411,8 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         return saveEvent(ed.draft, ed.orgsOrder) { r ->
             when (r) {
                 is EventResult.Saved, EventResult.Deleted -> if (_editor.value?.base == ed.base) _editor.value = null
-                is EventResult.Conflict -> {
+                is EventResult.Conflict -> if (_editor.value?.base == ed.base) {
+                    // Only into the editor this save came from: one discarded meanwhile stays closed.
                     val fresh = com.xerktech.turma.core.calDraftOf(r.event, zone)
                     _editor.value = EventEditor(fresh, fresh, fresh.orgs.toList(), r.message)
                 }
