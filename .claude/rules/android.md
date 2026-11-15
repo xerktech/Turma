@@ -70,6 +70,9 @@ A pure-core/adapter-shell split:
 - **Narrow Sessions keeps the list's place across a session** (XERK-2955): `SessionsRoute` owns the
   list's `LazyListState` and the last-closed session (`lastKey`, the selected border), because narrow
   mode disposes `SessionsListPane` while a chat is open. Never move either back into the pane.
+  - `endedOpen` is hoisted too: a collapsed Ended section on Back loses an ended row and its anchor.
+  - The hoisted state attaches only once the fleet has loaded: measured against an empty list (a
+    restore after process death) it clamps to the top.
   Tests: `ui/SessionsBackPositionTest`.
 - No in-place chat/terminal toggle (terminal is its own screen), so the compose draft lives in
   `data/DraftStore.kt` keyed per (host, session); `ChatViewModel` mirrors it into

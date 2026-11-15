@@ -76,4 +76,36 @@ class SessionsBackPositionTest {
         val markedCards = compose.onAllNodes(isSelected().and(hasAnyDescendant(hasText("Session ", substring = true))))
         assertEquals(1, markedCards.fetchSemanticsNodes().size)
     }
+
+    @Test
+    fun backFromAnEndedReviewKeepsTheEndedSectionOpenAndMarked() {
+        val running = (0 until 3).joinToString(",") { i ->
+            """{ "id": "r$i", "status": "running", "summary": "${name(i)}", "repo": "Turma" }"""
+        }
+        val ended = (0 until 30).joinToString(",") { i ->
+            """{ "id": "e$i", "status": "stopped", "summary": "Ended %02d", "repo": "Turma",
+                 "transcriptId": "t$i", "stoppedAt": "2026-08-12T00:%02d:00Z" }""".format(i, i)
+        }
+        hub.seedFleet(
+            """{ "now": 1, "agents": [ { "key": "h1", "device": "h1", "online": true,
+                 "repos": [ { "name": "Turma", "lastActivity": "2026-08-12T00:00:00Z" } ],
+                 "sessions": [ $running, $ended ] } ] }"""
+        )
+        compose.setContent { SessionsRoute(wide = false, onNavigate = {}, onTerminal = { _, _ -> }) }
+
+        val list = compose.onNode(hasScrollAction())
+        list.performScrollToNode(hasText("Ended sessions", substring = true, ignoreCase = true))
+        compose.onNodeWithText("Ended sessions", substring = true, ignoreCase = true).performClick()
+        val target = "Ended 05"
+        list.performScrollToNode(hasText(target))
+        compose.onNodeWithText(target).performClick()
+        compose.waitForIdle()
+        compose.onNodeWithContentDescription("Back").performClick()
+        compose.waitForIdle()
+
+        // The section is still open, the list is still on the row, and it is marked.
+        compose.onNodeWithText(target).assertIsDisplayed()
+        assertEquals(0, compose.onAllNodes(hasText(name(0))).fetchSemanticsNodes().size)
+        compose.onNode(isSelected().and(hasAnyDescendant(hasText(target)))).assertIsDisplayed()
+    }
 }

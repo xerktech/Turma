@@ -44,6 +44,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
@@ -438,6 +439,10 @@ fun SessionsRoute(
     // a state remembered inside it came back at the top on every Back. Saveable,
     // so it also survives a terminal/trajectory round trip and a fold/unfold.
     val listState = rememberLazyListState()
+    // Whether the Ended section is expanded — hoisted for the same reason: an ended
+    // session opened from it must come back to an open section, or its row (and the
+    // scroll anchor on it) is gone on Back.
+    val endedOpen = rememberSaveable { mutableStateOf(false) }
     // The session last backed out of in narrow mode (XERK-2955), so the list
     // marks where the operator just was — the wide pane marks its live selection
     // the same way. Replaced by the next pick.
@@ -513,7 +518,7 @@ fun SessionsRoute(
             Row(m.fillMaxSize()) {
                 SessionsListPane(
                     selectedKey = selKey(selHost, selId) ?: selKey(endHost, endTid),
-                    listState = listState,
+                    listState = listState, endedOpenState = endedOpen,
                     onSelect = select,
                     onSelectEnded = selectEnded,
                     query = query, onQuery = { query = it },
@@ -529,7 +534,7 @@ fun SessionsRoute(
         // Narrow, nothing picked: just the list.
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             SessionsListPane(
-                selectedKey = lastKey, listState = listState,
+                selectedKey = lastKey, listState = listState, endedOpenState = endedOpen,
                 onSelect = select, onSelectEnded = selectEnded,
                 query = query, onQuery = { query = it }, modifier = m,
             )
@@ -555,6 +560,7 @@ fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
     listState: LazyListState = rememberLazyListState(),
+    endedOpenState: MutableState<Boolean> = rememberSaveable { mutableStateOf(false) },
     onSelectEnded: (String, String) -> Unit = { _, _ -> },
     query: String = "",
     onQuery: (String) -> Unit = {},
@@ -607,7 +613,7 @@ fun SessionsListPane(
     val (review, active, idle, sleeping) = groups
     val queued = lists.queued
     val ended = lists.ended
-    var endedOpen by rememberSaveable { mutableStateOf(false) }
+    var endedOpen by endedOpenState
     // A filtered Ended list is a search RESULT, so searching opens the section —
     // a match hiding behind a collapsed header reads as "nothing matched". Only
     // on the edge into searching, so it stays collapsible while a query is up.
@@ -634,7 +640,10 @@ fun SessionsListPane(
         )
         LazyColumn(
             Modifier.fillMaxSize(),
-            state = listState,
+            // A fleet still loading (a restore after process death) would measure the
+            // saved position against an empty list and clamp it to the top, so the
+            // hoisted state is attached only once there is something to scroll.
+            state = if (fleet.loading && fleet.agents.isEmpty()) rememberLazyListState() else listState,
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
