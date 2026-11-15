@@ -12,6 +12,9 @@ docs/meeting-items-adr.md.
     python3 bench/meeting-items/run_eval.py judge --results r.jsonl --out j.jsonl
     python3 bench/meeting-items/run_eval.py report --results r.jsonl --judged j.jsonl
 
+`--corpus reviewed` runs any of them over the cases harvest.py wrote from the
+operator's real reviews (XERK-2517) instead of the synthetic corpus.
+
 Every model call is the worker's lockdown: `claude -p` with no tool, no MCP
 server and user settings only, the prompt on stdin, cwd a scratch dir.
 """
@@ -86,6 +89,16 @@ def claude(model, prompt, timeout=400):
     return j.get("result"), meta
 
 
+def _same_person(want, got):
+    """A caption spelling and the model's pick name one person when every word
+    of one begins a word of the other ("Ann" / "Ann Lee"): the agent's
+    meeting-focus rule. Exact for the synthetic corpus, whose names are whole."""
+    norm = lambda s: [w for w in "".join(c if c.isalnum() else " " for c in (s or "").lower()).split()]
+    a, b = norm(want), norm(got)
+    fit = lambda x, y: bool(x) and all(any(p.startswith(q) or q.startswith(p) for q in y) for p in x)
+    return fit(a, b) or fit(b, a)
+
+
 def _text(it):
     return f"{it.get('title', '')} {it.get('description', '')}".lower()
 
@@ -105,7 +118,7 @@ def score_expect(case, items):
             if test(w in _text(it) for w in e["words"]):
                 used.add(i)
                 met += 1
-                who += e.get("assignee") is None or it.get("suggestedAssignee") == e["assignee"]
+                who += e.get("assignee") is None or _same_person(e["assignee"], it.get("suggestedAssignee"))
                 break
     forbidden = sum(any(f in _text(it) for f in case["forbid"]) for it in items)
     return {"expected": len(case["expect"]), "met": met, "assigneeOk": who,
@@ -274,7 +287,13 @@ def main():
     s = sub.add_parser("report")
     s.add_argument("--results", required=True)
     s.add_argument("--judged")
+    for s in sub.choices.values():
+        s.add_argument("--corpus", help="a corpus directory other than corpus/ "
+                       "(e.g. reviewed/, written by harvest.py from real reviews)")
     a = p.parse_args()
+    if a.corpus:
+        global CORPUS
+        CORPUS = os.path.abspath(a.corpus)
     {"run": cmd_run, "judge": cmd_judge, "report": cmd_report}[a.cmd](a)
 
 

@@ -42966,7 +42966,82 @@ class TestCreateJiraIssue(unittest.TestCase):
         self.assertEqual(f["description"]["type"], "doc")
         self.assertEqual(out, {"key": "ENG-99",
                                "url": "https://myorg.atlassian.net/browse/ENG-99",
-                               "assigned": True})
+                               "assigned": True, "assignError": None})
+
+    def test_xerk2517_a_named_assignee_or_none(self):
+        bodies = []
+
+        def fp(path, body):
+            bodies.append(json.loads(json.dumps(body)))
+            return {"key": "E-2"}
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp), \
+                mock.patch.object(ha, "_jira_account_id", lambda: "me-1"):
+            named = ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+            nobody = ha.create_jira_issue("E", "1", "T", "", [], assignee=None)
+        self.assertEqual(bodies[0]["fields"]["assignee"], {"id": "ann-7"})
+        self.assertTrue(named["assigned"])
+        # Unassigned is SENT as null: an absent field takes the project's
+        # default assignee, often the operator (XERK-2517 QA).
+        self.assertIn("assignee", bodies[1]["fields"])
+        self.assertIsNone(bodies[1]["fields"]["assignee"])
+        self.assertFalse(nobody["assigned"])
+
+    def test_xerk2517_a_refused_assignee_still_creates_the_ticket(self):
+        bodies = []
+
+        class Refused(Exception):
+            code = 400
+
+        def fp(path, body):
+            bodies.append(json.loads(json.dumps(body)))
+            if body["fields"].get("assignee"):
+                raise Refused("HTTP 400: user cannot be assigned issues")
+            return {"key": "E-3"}
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp):
+            out = ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+        self.assertEqual(len(bodies), 2)
+        self.assertIsNone(bodies[1]["fields"]["assignee"], "the retry is explicitly unassigned")
+        self.assertEqual((out["key"], out["assigned"]), ("E-3", False))
+        self.assertIn("cannot be assigned", out["assignError"])
+
+        # Unassigned refused too: the create fails in Jira's words, never a
+        # silent fall to the project default.
+        def fp_none(path, body):
+            raise Refused("HTTP 400: assignee is required")
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp_none):
+            with self.assertRaises(Refused):
+                ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+
+        # A 429 is a busy tracker, not a refused assignee: not re-sent unassigned.
+        class Busy(Exception):
+            code = 429
+        sent = []
+
+        def fp429(path, body):
+            sent.append(1)
+            raise Busy("HTTP 429")
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp429):
+            with self.assertRaises(Busy):
+                ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+        self.assertEqual(len(sent), 1)
+
+        # A 5xx may have created it: never re-sent.
+        class Down(Exception):
+            code = 503
+        calls = []
+
+        def fp2(path, body):
+            calls.append(1)
+            raise Down("HTTP 503")
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp2):
+            with self.assertRaises(Down):
+                ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+        self.assertEqual(len(calls), 1)
 
     def test_omits_optional_fields_when_empty(self):
         captured = {}
@@ -43328,6 +43403,47 @@ class TestCreateAzureIssue(unittest.TestCase):
         """The common case: the type carries System.Description."""
         return mock.patch.object(
             ha, "_azure_description_field", lambda s, p, w: "System.Description")
+
+    def test_xerk2517_a_named_assignee_on_ado(self):
+        sent = []
+
+        class Err(Exception):
+            def __init__(self, code):
+                super().__init__(f"HTTP {code}")
+                self.code = code
+
+        def run(codes):
+            sent.clear()
+
+            def fc(p, w, ops):
+                who = {o["path"]: o["value"] for o in ops}.get("/fields/System.AssignedTo")
+                sent.append(who)
+                if who and codes:
+                    raise Err(codes.pop(0))
+                return {"id": 5}
+            with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p", AZDO_USER=""), \
+                    self._has_description(), \
+                    mock.patch.object(ha, "_azure_identities", lambda: ["me@x"]), \
+                    mock.patch.object(ha, "azure_create_workitem", fc):
+                return ha.create_azure_issue("P", "Task", "T", "d", [], assignee="ann@x")
+        self.assertTrue(run([])["assigned"])
+        self.assertEqual(sent, ["ann@x"])
+        out = run([400])
+        self.assertEqual((sent, out["assigned"]), (["ann@x", None], False))
+        self.assertIn("HTTP 400", out["assignError"])
+        self.assertNotIn("every identity", out["assignError"])
+        # A 429 is not a refused assignee: never re-sent without it.
+        with self.assertRaises(Exception):
+            run([429])
+        self.assertEqual(sent, ["ann@x"])
+        # Unassigned on purpose: no identity tried at all.
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p", AZDO_USER=""), \
+                self._has_description(), \
+                mock.patch.object(ha, "azure_create_workitem",
+                                  lambda p, w, ops: sent.append([o["path"] for o in ops]) or {"id": 6}):
+            sent.clear()
+            ha.create_azure_issue("P", "Task", "T", "d", [], assignee=None)
+        self.assertNotIn("/fields/System.AssignedTo", sent[0])
 
     def test_builds_json_patch_ops(self):
         seen = {}
@@ -43880,6 +43996,46 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
             time.sleep(0.01)
         return sm.create_ticket_async_results.snapshot()
 
+    def test_xerk2517_the_assignee_rides_to_the_create(self):
+        sm = self.make_manager()
+        seen = []
+
+        def create(*a, **k):
+            seen.append(k.get("assignee", "MISSING"))
+            return {"key": "ENG-1", "url": "u", "assigned": k.get("assignee") is not None}
+        with self._cfg(), mock.patch.object(ha, "create_board_issue", side_effect=create):
+            sm.handle_commands([self._cmd(cmdId="a1"),
+                                self._cmd(cmdId="a2", assignee=None),
+                                self._cmd(cmdId="a3", assignee={"id": "ann-7"}),
+                                self._cmd(cmdId="a4", assignee={"id": "x\u0007y"}),
+                                self._cmd(cmdId="a5", assignee="ann-7")])
+        self.assertIs(seen[0], ha.ASSIGN_SELF)
+        self.assertEqual(seen[1:], [None, "ann-7"])
+        rows = {r["cmdId"]: r for r in sm.create_ticket_results}
+        # Unassigned on purpose is no warning; a bad assignee creates nothing.
+        self.assertIsNone(rows["a2"]["warning"])
+        self.assertIsNone(rows["a3"]["warning"])
+        for c in ("a4", "a5"):
+            self.assertEqual(rows[c]["error"], "the assignee is not a tracker user id")
+
+    def test_xerk2517_a_refused_named_assignee_warns(self):
+        sm = self.make_manager()
+        with self._cfg(), mock.patch.object(ha, "create_board_issue", return_value={
+                "key": "ENG-2", "url": "u", "assigned": False, "assignError": "not assignable"}):
+            sm.handle_commands([self._cmd(cmdId="b1", assignee={"id": "ann-7"})])
+        row = sm.create_ticket_results[0]
+        w = row["warning"]
+        self.assertIn("created unassigned", w)
+        self.assertIn("not assignable", w)
+        self.assertNotIn("your board", w)
+        self.assertIs(row["assignRefused"], True)
+        # A self-assign create never carries the flag.
+        sm.create_ticket_results.clear()
+        with self._cfg(), mock.patch.object(ha, "create_board_issue", return_value={
+                "key": "ENG-3", "url": "u", "assigned": False}):
+            sm.handle_commands([self._cmd(cmdId="b2")])
+        self.assertNotIn("assignRefused", sm.create_ticket_results[0])
+
     def test_xerk2935_files_are_attached_off_the_beat_and_ride_the_result(self):
         ok = {"key": "ENG-5", "url": "u", "assigned": True}
         sm = self.make_manager()
@@ -44150,7 +44306,7 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
                 ha, "create_board_issue",
                 return_value={"key": "ENG-5", "url": "u", "assigned": True}) as f:
             sm._stage_create_ticket(self._cmd())
-        f.assert_called_once_with("ENG", "1", "Hi", "d", ["a"])
+        f.assert_called_once_with("ENG", "1", "Hi", "d", ["a"], assignee=ha.ASSIGN_SELF)
         self.assertEqual(sm.create_ticket_results[0],
                          {"cmdId": "c1", "key": "ENG-5", "url": "u", "error": None,
                           "warning": None})
@@ -57779,6 +57935,108 @@ class TestMeetingItems(unittest.TestCase):
             self.assertEqual(bool(job and job.get("reportable")), reportable, over)
 
 
+class TestMeetingAssignee(unittest.TestCase):
+    """XERK-2517: a caption name maps to ONE tracker user, read-only, cached;
+    an ambiguous or unknown name maps to nothing."""
+
+    def setUp(self):
+        ha._MEETING_ASSIGNEE_CACHE.clear()
+        ha._MEETING_ADO_ROSTER.update(until=0.0, people=[])
+
+    def test_jira_unique_match_is_kept_and_cached(self):
+        seen = []
+
+        def get(path, params):
+            seen.append((path, dict(params)))
+            return [{"accountId": "a-1", "displayName": "Ann Lee", "accountType": "atlassian"},
+                    {"accountId": "a-2", "displayName": "Annette Smith", "accountType": "atlassian"},
+                    {"accountId": "bot", "displayName": "Ann Lee (app)", "accountType": "app"},
+                    {"accountId": "a-3", "displayName": "Ann Lee", "active": False}]
+        with mock.patch.object(ha, "azure_configured", lambda: False), \
+                mock.patch.object(ha, "jira_get", get):
+            got = ha.meeting_assignee("Ann L.", ["ENG", "bad key!"])
+            again = ha.meeting_assignee("ann  l.", ["ENG"])
+        self.assertEqual(got, {"id": "a-1", "name": "Ann Lee"})
+        self.assertEqual(again, got)
+        self.assertEqual(len(seen), 1, "the second lookup is served from the cache")
+        path, params = seen[0]
+        self.assertEqual(path, "/rest/api/3/user/assignable/multiProjectSearch")
+        self.assertEqual(params["projectKeys"], "ENG")
+        self.assertEqual(params["query"], "ann")
+
+    def test_ambiguous_or_unknown_maps_to_nothing(self):
+        people = [{"accountId": "a-1", "displayName": "Ann Lee"},
+                  {"accountId": "a-2", "displayName": "Ann Smith"}]
+        with mock.patch.object(ha, "azure_configured", lambda: False), \
+                mock.patch.object(ha, "jira_get", lambda p, q: people):
+            self.assertIsNone(ha.meeting_assignee("Ann", ["ENG"]))
+            self.assertEqual(ha.meeting_assignee("Ann Smith", ["ENG"])["id"], "a-2")
+            self.assertIsNone(ha.meeting_assignee("Bob", ["ENG"]))
+            self.assertIsNone(ha.meeting_assignee("", ["ENG"]))
+
+    def test_a_tracker_error_caches_nothing(self):
+        def boom(p, q):
+            raise RuntimeError("HTTP 500")
+        with mock.patch.object(ha, "azure_configured", lambda: False), \
+                mock.patch.object(ha, "jira_get", boom):
+            with self.assertRaises(RuntimeError):
+                ha.meeting_assignee("Ann Lee", ["ENG"])
+        self.assertEqual(ha._MEETING_ASSIGNEE_CACHE, {})
+
+    def test_azure_roster_from_recent_assignees(self):
+        wiqls = []
+
+        def req(path, params, body=None, **k):
+            wiqls.append(body["query"])
+            return {"workItems": [{"id": 1}, {"id": 2}, {"id": 3}]}
+        rows = [{"fields": {"System.AssignedTo": {"displayName": "Ann Lee", "uniqueName": "ann@x.com"}}},
+                {"fields": {"System.AssignedTo": {"displayName": "Ann Lee", "uniqueName": "ann@x.com"}}},
+                {"fields": {"System.AssignedTo": {"displayName": "Bo Ng", "uniqueName": "bo@x.com"}}}]
+        with mock.patch.object(ha, "azure_configured", lambda: True), \
+                mock.patch.object(ha, "AZDO_PROJECT", ""), \
+                mock.patch.object(ha, "azure_req", req), \
+                mock.patch.object(ha, "_azure_batch_get", lambda ids, f: rows):
+            self.assertEqual(ha.meeting_assignee("Ann", ["Fleet"]), {"id": "ann@x.com", "name": "Ann Lee"})
+            self.assertEqual(ha.meeting_assignee("Bo N.", ["Fleet"])["id"], "bo@x.com")
+        self.assertEqual(len(wiqls), 1, "the roster is read once")
+        self.assertIn("[System.TeamProject] IN ('Fleet')", wiqls[0])
+
+    def test_worker_stamps_items_and_skips_decisions(self):
+        sm = ha.SessionManager.__new__(ha.SessionManager)
+        sm.jira = {"tickets": [{"project": "ENG"}]}
+        items = [{"kind": "task", "title": "a", "suggestedAssignee": "Ann"},
+                 {"kind": "decision", "title": "b", "suggestedAssignee": "Ann"},
+                 {"kind": "task", "title": "c", "suggestedAssignee": "Zed"},
+                 {"kind": "task", "title": "d"}]
+        calls = []
+
+        def look(name, projects):
+            calls.append((name, projects))
+            return {"id": "a-1", "name": "Ann Lee"} if name == "Ann" else None
+        with mock.patch.object(ha, "meeting_assignee", look):
+            sm._meeting_assignees(items)
+        self.assertEqual([i.get("assignee") for i in items],
+                         [{"id": "a-1", "name": "Ann Lee"}, None, None, None])
+        self.assertEqual(calls, [("Ann", ["ENG"]), ("Zed", ["ENG"])])
+
+        # A spent budget maps nothing more (and asks nothing).
+        items = [{"kind": "task", "title": "a", "suggestedAssignee": "Ann"}]
+        calls.clear()
+        with mock.patch.object(ha, "meeting_assignee", look), \
+                mock.patch.object(ha, "MEETING_ASSIGNEE_BUDGET_SEC", 0):
+            sm._meeting_assignees(items)
+        self.assertEqual((calls, "assignee" in items[0]), ([], False))
+
+        # An error stops the pass; the items still ship unmapped.
+        items = [{"kind": "task", "title": "a", "suggestedAssignee": "Ann"}]
+
+        def boom(n, p):
+            raise RuntimeError("down")
+        with mock.patch.object(ha, "meeting_assignee", boom):
+            sm._meeting_assignees(items)
+        self.assertNotIn("assignee", items[0])
+
+
 class TestMeetingDuplicates(unittest.TestCase):
     """XERK-2509: the duplicate check is a READ-ONLY search over the org's open
     issues, ranked by shared title words; only [a-z0-9] reaches JQL/WIQL."""
@@ -58137,7 +58395,8 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         payload = self.sm.build_payload(1, light=True)
         self.assertEqual(len(payload["meetingResults"]), ha.MEETING_RESULTS_MAX)
         self.assertEqual(payload["meetings"],
-                         {"available": True, "runtimes": ["claude"], "models": ["haiku", "sonnet"]})
+                         {"available": True, "runtimes": ["claude"], "models": ["haiku", "sonnet"],
+                          "assign": True})
         self.sm._meeting_push({"runId": "ee", "siteKey": self.SITE, "meetingId": "m"}, items=[])
         self.sm._clear_delivered_staged(payload)
         self.assertEqual([r["runId"] for r in self.sm.meeting_results], ["ee"])

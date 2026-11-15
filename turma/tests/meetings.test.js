@@ -302,6 +302,65 @@ test("XERK-2885: focus on Retry follows the swap to the picker instead of droppi
   assert.ok(focused.length >= 2, `focus restored on the loading swap and the picker (${focused.length})`);
 });
 
+test("XERK-2517: a mapped speaker is pre-filled as the assignee; the pick rides the approve", async () => {
+  const ann = { id: "557058:<ann>", name: "Ann <Lee>" };
+  const row = meeting({ items: [{ ...meeting().items[0], assignee: ann },
+    { id: "p3", kind: "task", title: "Old", description: "", suggestedAssignee: "Bo", quotes: [], duplicateKeys: [] }] });
+  const P = loadPage((u, init) => (init.method === "POST" ? { ok: true, meeting: row } : META(u)));
+  const d = data([row]);
+  P.setCache(d);
+  P.renderMeetings(d);
+  await P.settle();
+  const h = P.list();
+  const k1 = P.itemKey(SITE, "m1", "p1");
+  // Pre-filled with the mapped user, escaped; the tracker id is never painted.
+  assert.match(h, /Assign to <select data-assign="acme\.atlassian\.net\/m1\/p1"><option value="suggested" selected>Ann &lt;Lee&gt;<\/option><option value="me">Me<\/option><option value="none">Unassigned<\/option>/);
+  assert.doesNotMatch(h, /557058/);
+  // No mapping: the plain owner line, no picker, Approve + start as before.
+  assert.match(h, /<span>Owner: Bo<\/span>/);
+  assert.equal((h.match(/data-act="start"/g) || []).length, 1, "start only on the unmapped proposal");
+  await P.review(k1, "approve");
+  let post = P.fetches.filter((f) => f.method === "POST").pop();
+  assert.equal(post.body.assignee, "suggested");
+  // Picking "Me" brings Approve + start back and sends nothing (the old body).
+  for (const fn of P.els.meetingList.listeners.change) fn({ target: { value: "me", dataset: { assign: k1 } } });
+  assert.equal((P.list().match(/data-act="start"/g) || []).length, 2);
+  await P.review(k1, "approve");
+  post = P.fetches.filter((f) => f.method === "POST").pop();
+  assert.equal("assignee" in post.body, false);
+  for (const fn of P.els.meetingList.listeners.change) fn({ target: { value: "none", dataset: { assign: k1 } } });
+  const before = P.fetches.filter((f) => f.method === "POST").length;
+  await P.review(k1, "approve", true);   // the S key: refused here, never posted
+  assert.equal(P.fetches.filter((f) => f.method === "POST").length, before);
+  assert.match(P.list(), /approve it without a session/);
+  await P.review(k1, "approve");
+  assert.equal(P.fetches.filter((f) => f.method === "POST").pop().body.assignee, "none");
+  // A refused assignee is said on the created proposal, escaped.
+  const created = meeting({ items: [{ ...row.items[0], review: { state: "created", at: 1, key: "ACME-9",
+    unassigned: true, assigneeRefused: true, warning: "created unassigned: <refused>" } }] });
+  P.setCache(data([created]));
+  P.renderMeetings(data([created]), true);
+  P.click({ showReviewed: P.meetingKey(SITE, "m1") });
+  assert.match(P.list(), /· created unassigned: &lt;refused&gt;/);
+  P.setCache(d);
+  P.renderMeetings(d, true);
+  // Focus follows the picker across the repaint its change causes (QA: it fell
+  // to <body> and the next ArrowDown did nothing).
+  const list = P.els.meetingList, focused = [];
+  P.document.activeElement = { dataset: { assign: k1 }, tagName: "SELECT" };
+  list.contains = (el) => el === P.document.activeElement;
+  list.querySelectorAll = (sel) => (/select/.test(sel)
+    ? [{ dataset: { assign: k1 }, focus() { focused.push(k1); } }] : []);
+  for (const fn of list.listeners.change) fn({ target: { value: "me", dataset: { assign: k1 } } });
+  assert.ok(focused.length >= 1, "focus restored on the picker");
+  list.contains = () => false;
+  list.querySelectorAll = () => [];
+  P.document.activeElement = null;
+  // The unmapped proposal never sends one.
+  await P.review(P.itemKey(SITE, "m1", "p3"), "approve");
+  assert.equal("assignee" in P.fetches.filter((f) => f.method === "POST").pop().body, false);
+});
+
 test("XERK-2510: Approve + start posts the org's project, the kind's issue type and the meeting context", async () => {
   const P = loadPage((u, init) => (init.method === "POST"
     ? { ok: true, meeting: meeting({ items: [{ ...meeting().items[0], review: { state: "creating", at: 1, start: true } }, meeting().items[1]] }) }

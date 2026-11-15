@@ -101,6 +101,10 @@ let pointerDown = false;
 const busy = new Set();          // item keys with a POST in flight
 const itemErr = new Map();       // item key -> the hub's refusal
 const edits = new Map();         // item key -> {title, description, issueType}
+// Who an approved ticket goes to (XERK-2517), per proposal: "suggested" (the
+// tracker user the agent mapped the speaker to — the default when there is
+// one), "me" or "none". Absent = the default.
+const assignPicks = new Map();
 const meta = new Map();          // site -> {loading} | {projects} | {error}
 const types = new Map();         // site\0project -> {loading} | {types} | {error}
 const archBusy = new Set();      // meeting keys with an archive POST in flight
@@ -362,9 +366,26 @@ function quotesHtml(m, it) {
     return `<li>${q.speaker ? `<span class="who">${esc(q.speaker)}:</span> ` : ""}“${esc(q.text)}”${link}</li>`;
   }).join("")}</ul>`;
 }
-function factsHtml(site, it) {
+// The pick for one proposal: the operator's, else the mapped user when the
+// agent found one, else "me" (what Approve always did).
+function assignPickOf(k, it) {
+  const p = assignPicks.get(k);
+  if (p === "me" || p === "none" || (p === "suggested" && it.assignee)) return p;
+  return it.assignee ? "suggested" : "me";
+}
+function assignHtml(k, it) {
+  if (it.kind === "decision" || !it.assignee || !it.assignee.name || !reviewable(it)) return "";
+  const pick = assignPickOf(k, it);
+  const opt = (v, label) => `<option value="${v}"${v === pick ? " selected" : ""}>${esc(label)}</option>`;
+  return `<label class="mt-assign">Assign to <select data-assign="${esc(k)}">`
+    + opt("suggested", it.assignee.name) + opt("me", "Me") + opt("none", "Unassigned")
+    + `</select></label>`;
+}
+function factsHtml(site, it, k) {
   const f = [];
-  if (it.suggestedAssignee) f.push(`<span>Owner: ${esc(it.suggestedAssignee)}</span>`);
+  const assign = k ? assignHtml(k, it) : "";
+  if (assign) f.push(assign);
+  else if (it.suggestedAssignee) f.push(`<span>Owner: ${esc(it.suggestedAssignee)}</span>`);
   if (it.due) f.push(`<span>Due: ${esc(it.due)}</span>`);
   if (it.repoGuess) f.push(`<span>Repo: ${esc(it.repoGuess)}</span>`);
   const dups = (it.duplicateKeys || []).map((k) => `<a href="${esc(boardUrl(site, k))}">${esc(k)}</a>`);
@@ -387,6 +408,9 @@ function reviewStateHtml(site, it) {
           : "session starts once the board lists it with a repo";
       s += `<span class="state${r.session === "failed" ? " bad" : ""}">· ${esc(sess)}</span>`;
     }
+    // What the tracker did not do (XERK-2517): an assignee it refused, files it
+    // would not attach. Said here, never left to look like a clean create.
+    if (r.warning) s += `<span class="state bad">· ${esc(r.warning)}</span>`;
     return s;
   }
   return "";
@@ -409,7 +433,7 @@ function editHtml(site, m, it, k) {
     + `<label>${isDecision ? "Detail" : "Description"} <textarea data-edit-desc="${esc(k)}"${isDecision ? ' maxlength="290"' : ""}>${esc(e.description)}</textarea></label>`
     + typeSel
     + `<div class="row"><button class="btn-sm primary" data-act="approve" data-k="${esc(k)}"${dis}>${isDecision ? "Log decision" : "Approve"}</button>`
-    + (isDecision ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session</button>`)
+    + (isDecision || assignPickOf(k, it) !== "me" ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session</button>`)
     + `<button class="btn-sm" data-act="cancel" data-k="${esc(k)}">Cancel</button></div></div>`;
 }
 function itemHtml(site, m, it) {
@@ -428,7 +452,7 @@ function itemHtml(site, m, it) {
     actions = `<button class="btn-sm" data-act="reject" data-k="${esc(k)}"${dis}>${busy.has(k) ? "Working…" : "Reject"}</button>`;
   } else if (reviewable(it)) {
     actions = `<button class="btn-sm primary" data-act="approve" data-k="${esc(k)}"${dis}>${busy.has(k) ? "Working…" : isDecision ? "Log decision" : "Approve"}${kbd(cur, "A")}</button>`
-      + (isDecision ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session${kbd(cur, "S")}</button>`)
+      + (isDecision || assignPickOf(k, it) !== "me" ? "" : `<button class="btn-sm" data-act="start" data-k="${esc(k)}"${dis}>Approve + start session${kbd(cur, "S")}</button>`)
       + `<button class="btn-sm" data-act="edit" data-k="${esc(k)}"${dis}>Edit${kbd(cur, "E")}</button>`
       + `<button class="btn-sm" data-act="reject" data-k="${esc(k)}"${dis}>Reject${kbd(cur, "R")}</button>`
       + (state === "failed" && !it.review.maybeCreated ? `<button class="btn-sm" data-act="reopen" data-k="${esc(k)}"${dis}>Reopen</button>` : "");
@@ -440,7 +464,7 @@ function itemHtml(site, m, it) {
     + `<div class="mt-item-head"><span class="mt-kind ${esc(it.kind)}">${esc(KIND_LABEL[it.kind] || it.kind)}</span>`
     + `<span class="mt-item-title">${esc(it.title)}</span></div>`
     + (it.description ? `<p class="mt-desc">${esc(it.description)}</p>` : "")
-    + factsHtml(site, it) + quotesHtml(m, it)
+    + factsHtml(site, it, k) + quotesHtml(m, it)
     + (editing ? `${review ? `<div class="mt-review">${review}</div>` : ""}${actions}`
       : (review || actions ? `<div class="mt-review">${review}${actions}</div>` : ""))
     + (err ? `<div class="mt-err">${esc(err)}</div>` : "")
@@ -1018,7 +1042,7 @@ const editing = () => fieldIn($list);
 // else one of this pane's controls by its data attribute.
 const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "transcript", "archive",
   "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus",
-  "holOff", "holCountry"];
+  "holOff", "holCountry", "assign"];
 function focusKey(root = $list) {
   if (root === $list && hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
   const a = document.activeElement;
@@ -1180,6 +1204,13 @@ async function review(k, action, start = false) {
       if (!issueType) return void fail("That project offers no issue type to create");
       body.project = project;
       body.issueType = issueType;
+      // A ticket given to someone else is not on the operator's board, so it
+      // cannot start a session here (the hub refuses it too).
+      const assign = assignPickOf(k, it);
+      if (assign !== "me") {
+        if (start) return void fail("Assigned to someone else — approve it without a session");
+        body.assignee = assign;
+      }
       if (start) body.start = true;
     }
   }
@@ -1552,6 +1583,9 @@ function onChange(ev) {
   } else if (d.editType !== undefined) {
     const e = edits.get(d.editType);
     if (e) e.issueType = t.value;
+  } else if (d.assign !== undefined) {
+    assignPicks.set(d.assign, t.value);
+    repaint(true);
   }
 }
 

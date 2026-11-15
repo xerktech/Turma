@@ -87,6 +87,14 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   viewer in `localStorage`, guarded), the type by kind (`defaultType`: bug → a "Bug" type, else
   "Task"). Edit overrides title, description and type. Fetched only for the selected entry's org
   and the open drawer's.
+- **"Assign to" is pre-filled with the mapped speaker** (XERK-2517, `assignHtml`): shown only on a
+  proposal whose item carries `assignee`; options that name, Me, Unassigned; the pick is per
+  proposal in `assignPicks` and rides Approve as `assignee`. A pick other than Me hides Approve +
+  start (S answers "approve it without a session"). Never paint the tracker id. No mapping = the
+  plain "Owner:" line and the old Approve. Android: a `PARITY.md` gap.
+  - `assign` is in `FOCUS_ATTRS`: the pick repaints, and without it keyboard focus fell to
+    `<body>` mid-ArrowDown (QA).
+  - A created proposal shows the review's `warning` (a refused assignee, unattached files).
 - **The default description is the proposal only** (`ticketDescription`, XERK-2514): no meeting
   title, date, quote or Tenir link. The ticket lands in the org's tracker where colleagues read
   it; captions stay in Turma. Android's `meetingTicketDescription` sends the same.

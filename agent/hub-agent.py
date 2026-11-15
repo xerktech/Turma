@@ -23921,8 +23921,14 @@ def jira_issue_types(project):
     return out
 
 
+# A create assigns the tracker user this host runs as unless told otherwise
+# (XERK-2517): `assignee=None` leaves it unassigned, a string names the tracker
+# identity (Jira accountId / ADO uniqueName) to assign instead.
+ASSIGN_SELF = object()
+
+
 def create_jira_issue(project, issue_type, summary, description, labels,
-                      parent=None):
+                      parent=None, assignee=ASSIGN_SELF):
     """Create one Jira issue and return {key, url}. `issue_type` is an issue-type
     id (from jira_issue_types); labels are the array Jira stores verbatim. The
     issue is assigned to the configured user (best-effort) so it lands on their
@@ -23942,15 +23948,39 @@ def create_jira_issue(project, issue_type, summary, description, labels,
         fields["description"] = _text_to_adf(description)
     if labels:
         fields["labels"] = labels
-    acct = _jira_account_id()
+    acct = _jira_account_id() if assignee is ASSIGN_SELF else assignee
+    assign_error = None
     if acct:
         fields["assignee"] = {"id": acct}
-    data = jira_post("/rest/api/3/issue", {"fields": fields})
+    elif assignee is None:
+        # Unassigned is SAID, never left out: Jira gives an issue created with
+        # no assignee field the project's default assignee (often the project
+        # lead, i.e. the operator), which is the self-assignment the operator
+        # just declined (XERK-2517 QA).
+        fields["assignee"] = None
+    try:
+        data = jira_post("/rest/api/3/issue", {"fields": fields})
+    except Exception as e:
+        # A named assignee Jira refuses (not assignable in that project) must
+        # not cost the operator the ticket: a 4xx proves nothing was created,
+        # so create it explicitly UNASSIGNED and say why. A 429 is not a
+        # refusal of the assignee (only a busy tracker), so it fails as it
+        # stands. If unassigned is refused too, the create fails in Jira's
+        # words: never a silent fall to the project default.
+        code = getattr(e, "code", None)
+        if assignee is ASSIGN_SELF or not acct or not _write_was_refused(e) or code == 429:
+            raise
+        fields["assignee"] = None
+        reason = str(e).strip().splitlines()
+        assign_error = (reason[0] if reason else "refused")[:BOARD_ERROR_MAX_CHARS]
+        log(f"jira create rejected assignee {acct!r} ({assign_error}); creating unassigned")
+        data = jira_post("/rest/api/3/issue", {"fields": fields})
+        acct = None
     key = data.get("key")
     if not key:
         raise RuntimeError("Jira returned no issue key")
     return {"key": key, "url": f"https://{site_key}/browse/{key}",
-            "assigned": bool(acct)}
+            "assigned": bool(acct), "assignError": assign_error}
 
 
 # --- Azure DevOps work-item polling --------------------------------------------
@@ -24935,7 +24965,8 @@ def azure_workitem_types(project):
     return out
 
 
-def create_azure_issue(project, wtype, title, description, tags):
+def create_azure_issue(project, wtype, title, description, tags,
+                       assignee=ASSIGN_SELF):
     """Create one Azure work item and return {key, url}. `wtype` is the work-item
     type name; `tags` become System.Tags. Self-assigns to the PAT owner
     (best-effort) so the item lands on the board."""
@@ -24962,7 +24993,8 @@ def create_azure_issue(project, wtype, title, description, tags):
     # REFUSED write (4xx) is retried: after a timeout the create may have
     # landed, and re-sending would duplicate it.
     data, assigned, first, refused = None, None, None, None
-    candidates = _azure_identities()
+    candidates = (_azure_identities() if assignee is ASSIGN_SELF
+                  else [assignee] if assignee else [])
     for me in candidates + [None]:
         attempt = list(ops)
         if me:
@@ -24976,7 +25008,11 @@ def create_azure_issue(project, wtype, title, description, tags):
             # Keep the FIRST error: it describes the real problem, where a later
             # one only says the identity after it didn't work either.
             first = first if first is not None else e
-            if not _write_was_refused(e):
+            # A 429 is a busy server, not a refused identity: an operator-picked
+            # assignee is never dropped over one (XERK-2517 QA). The self-assign
+            # ladder keeps its old reading.
+            if not _write_was_refused(e) or (
+                    assignee is not ASSIGN_SELF and getattr(e, "code", None) == 429):
                 raise first from None
             if me is not None:
                 refused = refused if refused is not None else e
@@ -24984,16 +25020,19 @@ def create_azure_issue(project, wtype, title, description, tags):
     if data is None:
         raise first
     assign_error = None
-    if assigned is None:
+    if assigned is None and (candidates or assignee is ASSIGN_SELF):
         # Say what was tried and what the server said. An unassigned item is
         # invisible on the board, so this line (and the warning built from it)
         # is the operator's only lead on which spelling their server wants.
         tried = ", ".join(repr(c) for c in candidates) or "no candidate identity"
         reason = str(refused or "").strip().splitlines()
-        assign_error = (
-            f"the server refused every identity this host could find "
-            f"({reason[0][:BOARD_ERROR_MAX_CHARS]})" if reason else
-            "this host could not work out your identity")
+        if assignee is not ASSIGN_SELF:
+            assign_error = (reason[0] if reason else "refused")[:BOARD_ERROR_MAX_CHARS]
+        else:
+            assign_error = (
+                f"the server refused every identity this host could find "
+                f"({reason[0][:BOARD_ERROR_MAX_CHARS]})" if reason else
+                "this host could not work out your identity")
         log(f"azure work item in {project} created UNASSIGNED — tried {tried}")
     wid = data.get("id")
     if wid is None:
@@ -26479,6 +26518,120 @@ def meeting_duplicate_keys(title, projects):
     return _meeting_dup_rank(title, found)
 
 
+# --- Speaker -> tracker user (XERK-2517) ---------------------------------------
+# A proposal's suggestedAssignee is a caption NAME ("Ann L."). Approve can assign
+# the new ticket to that person only through a tracker identity (a Jira
+# accountId, an ADO uniqueName), so the worker maps each name once, READ-ONLY,
+# and caches the answer per name: a host serves one org, so per host is per org.
+# Only an UNAMBIGUOUS match is kept — two candidates, or none, map to nothing
+# and the operator picks "me" or "unassigned" instead.
+MEETING_ASSIGNEE_TTL_SEC = 6 * 3600   # a hit or a miss is trusted this long
+MEETING_ASSIGNEE_CACHE_MAX = 200
+MEETING_ASSIGNEE_BUDGET_SEC = 30      # the whole mapping, per meeting
+MEETING_ASSIGNEE_ID_MAX = 256
+MEETING_ADO_ROSTER_FETCH = 200        # recently-changed items whose assignees form the roster
+_MEETING_ASSIGNEE_CACHE = {}          # folded name -> (expires monotonic, {id, name} | None)
+_MEETING_ADO_ROSTER = {"until": 0.0, "people": []}
+_MEETING_ASSIGNEE_LOCK = threading.Lock()
+
+
+def _meeting_names_match(a, b):
+    """The meeting-focus rule (XERK-2514): every word of one name fits a word of
+    the other, in either direction ("Ann L." = "Ann Lee", "Ann Smith" != it)."""
+    ga, gb = _meeting_name_tokens(a), _meeting_name_tokens(b)
+    return _meeting_words_fit(ga, gb) or _meeting_words_fit(gb, ga)
+
+
+def _meeting_identity_ok(v):
+    return (isinstance(v, str) and 0 < len(v) <= MEETING_ASSIGNEE_ID_MAX
+            and not any(unicodedata.category(c)[0] == "C" for c in v))
+
+
+def _jira_people_named(name, projects):
+    """Jira users ASSIGNABLE in the org's projects whose display name could be
+    `name`. Queried by the name's longest word (Jira matches a prefix of a
+    display-name word, so "Ann L." as a whole finds nobody)."""
+    words = sorted(_meeting_name_tokens(name), key=len, reverse=True)
+    if not words or len(words[0]) < 2:
+        return []
+    keys = [p.upper() for p in projects or [] if isinstance(p, str)
+            and _DAILY_BRIEF_PROJECT_RE.fullmatch(p)][:DAILY_BRIEF_PROJECTS_MAX]
+    params = {"query": words[0], "maxResults": 50}
+    if keys:
+        params["projectKeys"] = ",".join(keys)
+        path = "/rest/api/3/user/assignable/multiProjectSearch"
+    else:
+        path = "/rest/api/3/user/search"
+    data = jira_get(path, params)
+    out = []
+    for u in data if isinstance(data, list) else []:
+        if not isinstance(u, dict) or u.get("active") is False:
+            continue
+        if u.get("accountType", "atlassian") != "atlassian":
+            continue   # apps and customers are never a meeting's owner
+        acct, disp = u.get("accountId"), u.get("displayName")
+        if _meeting_identity_ok(acct) and isinstance(disp, str) and disp:
+            out.append({"id": acct, "name": disp[:100]})
+    return out
+
+
+def _azure_people(projects):
+    """The org's people as ADO knows them: the assignees of its most recently
+    changed work items (cached). ADO's identity search lives on a different host
+    for Services than for Server, while every work item's System.AssignedTo is
+    an identity the create PATCH accepts back as-is (its uniqueName)."""
+    with _MEETING_ASSIGNEE_LOCK:
+        if time.monotonic() < _MEETING_ADO_ROSTER["until"]:
+            return list(_MEETING_ADO_ROSTER["people"])
+    names = [AZDO_PROJECT] if AZDO_PROJECT else [
+        p for p in projects or [] if isinstance(p, str) and 0 < len(p) <= 64]
+    if not names:
+        return []
+    q = lambda v: "'" + str(v).replace("'", "''") + "'"
+    wiql = ("SELECT [System.Id] FROM WorkItems WHERE "
+            f"[System.TeamProject] IN ({', '.join(q(n) for n in names[:DAILY_BRIEF_PROJECTS_MAX])})"
+            " AND [System.AssignedTo] <> '' ORDER BY [System.ChangedDate] DESC")
+    res = azure_req("/_apis/wit/wiql", {"$top": MEETING_ADO_ROSTER_FETCH}, body={"query": wiql})
+    ids = [w.get("id") for w in (res.get("workItems") or []) if w.get("id") is not None]
+    rows = _azure_batch_get(ids[:MEETING_ADO_ROSTER_FETCH], ["System.AssignedTo"])
+    seen, people = set(), []
+    for wi in rows:
+        who = (wi.get("fields") or {}).get("System.AssignedTo")
+        if not isinstance(who, dict):
+            continue
+        uid, disp = who.get("uniqueName"), who.get("displayName")
+        if _meeting_identity_ok(uid) and isinstance(disp, str) and disp and uid not in seen:
+            seen.add(uid)
+            people.append({"id": uid, "name": disp[:100]})
+    with _MEETING_ASSIGNEE_LOCK:
+        _MEETING_ADO_ROSTER.update(until=time.monotonic() + MEETING_ASSIGNEE_TTL_SEC,
+                                   people=people)
+    return list(people)
+
+
+def meeting_assignee(name, projects):
+    """{id, name} of the ONE tracker user `name` (a caption spelling) can be, or
+    None. Cached per folded name, hits and misses alike; a tracker error
+    propagates and caches nothing."""
+    key = " ".join(sorted(_meeting_name_tokens(name)))
+    if not key:
+        return None
+    now = time.monotonic()
+    with _MEETING_ASSIGNEE_LOCK:
+        hit = _MEETING_ASSIGNEE_CACHE.get(key)
+        if hit and hit[0] > now:
+            return dict(hit[1]) if hit[1] else None
+    people = (_azure_people(projects) if azure_configured()
+              else _jira_people_named(name, projects))
+    found = {p["id"]: p for p in people if _meeting_names_match(name, p["name"])}
+    got = next(iter(found.values())) if len(found) == 1 else None
+    with _MEETING_ASSIGNEE_LOCK:
+        _MEETING_ASSIGNEE_CACHE[key] = (now + MEETING_ASSIGNEE_TTL_SEC, got)
+        while len(_MEETING_ASSIGNEE_CACHE) > MEETING_ASSIGNEE_CACHE_MAX:
+            del _MEETING_ASSIGNEE_CACHE[next(iter(_MEETING_ASSIGNEE_CACHE))]
+    return dict(got) if got else None
+
+
 def meeting_runtimes():
     """The runtimes this host can extract a meeting on — the daily brief's
     rule (a verified locked-down `claude -p`, a usable login)."""
@@ -26758,11 +26911,14 @@ def board_issue_types(project):
     return jira_issue_types(project)
 
 
-def create_board_issue(project, issue_type, summary, description, labels):
+def create_board_issue(project, issue_type, summary, description, labels,
+                       assignee=ASSIGN_SELF):
     """Create one ticket in the configured source and return {key, url}."""
     if azure_configured():
-        return create_azure_issue(project, issue_type, summary, description, labels)
-    return create_jira_issue(project, issue_type, summary, description, labels)
+        return create_azure_issue(project, issue_type, summary, description, labels,
+                                  assignee=assignee)
+    return create_jira_issue(project, issue_type, summary, description, labels,
+                             assignee=assignee)
 
 
 # --- Epic Builder (XERK-724, epic XERK-721) ------------------------------------
@@ -41763,6 +41919,18 @@ class SessionManager:
         description = (cmd.get("description") or "")[:CREATE_DESC_MAX_CHARS]
         labels = [str(l).strip() for l in (cmd.get("labels") or [])
                   if str(l).strip()][:CREATE_LABELS_MAX]
+        # XERK-2517: absent = assign this host's tracker user (every older hub);
+        # null = unassigned; {id} = that tracker identity (a meeting proposal's
+        # mapped speaker).
+        assignee, bad_assignee = ASSIGN_SELF, False
+        if "assignee" in cmd:
+            a = cmd.get("assignee")
+            if a is None:
+                assignee = None
+            elif isinstance(a, dict) and _meeting_identity_ok(a.get("id")):
+                assignee = a["id"]
+            else:
+                bad_assignee = True
 
         def fail(msg):
             self.create_ticket_results.append(
@@ -41783,6 +41951,8 @@ class SessionManager:
 
         if not board_configured():
             return fail("no board credentials on this host")
+        if bad_assignee:
+            return fail("the assignee is not a tracker user id")
         if not summary:
             return fail("a title is required")
         if not project:
@@ -41796,22 +41966,34 @@ class SessionManager:
         def do_create():
             try:
                 created = create_board_issue(project, issue_type, summary,
-                                             description, labels)
+                                             description, labels, assignee=assignee)
                 log(f"created ticket {created.get('key')} in {project}")
             except Exception as e:
                 log(f"ticket creation failed in {project}: {e}")
                 return {"cmdId": cid, "key": None, "url": None,
                         "error": str(e)[:300]}
             warnings = []
-            if not created.get("assigned"):
-                warnings.append(unassigned_warning(created))
+            assign_refused = False
+            if assignee is ASSIGN_SELF:
+                if not created.get("assigned"):
+                    warnings.append(unassigned_warning(created))
+            elif assignee is not None and not created.get("assigned"):
+                why = str(created.get("assignError") or "").strip()
+                warnings.append("created unassigned: the tracker refused the assignee"
+                                + (f" — {why}" if why else ""))
+                assign_refused = True
             missed = self._attach_ticket_files(created.get("key"), files)
             if missed:
                 warnings.append("created, but these files could not be attached: "
                                 + "; ".join(missed))
-            return {"cmdId": cid, "key": created.get("key"),
-                    "url": created.get("url"), "error": None,
-                    "warning": " · ".join(warnings)[:600] or None}
+            row = {"cmdId": cid, "key": created.get("key"),
+                   "url": created.get("url"), "error": None,
+                   "warning": " · ".join(warnings)[:600] or None}
+            if assign_refused:
+                # XERK-2517: the operator's pick did not land; the hub's
+                # review must not go on claiming it did.
+                row["assignRefused"] = True
+            return row
 
         maybe = {"cmdId": cid, "key": None, "url": None,
                  "error": CREATE_MAYBE_RAN_ERROR, "maybeCreated": True}
@@ -45441,6 +45623,7 @@ class SessionManager:
                 "assigned to someone else")
         reply["items"] = kept
         self._meeting_duplicates(kept)
+        self._meeting_assignees(kept)
         return reply, None
 
     def _meeting_duplicates(self, items):
@@ -45460,6 +45643,28 @@ class SessionManager:
                 it["duplicateKeys"] = meeting_duplicate_keys(it["title"], projects)
             except Exception as e:
                 log(f"meeting: duplicate search failed: {_board_error_summary(e)}")
+
+    def _meeting_assignees(self, items):
+        """OFF THE BEAT: map each work item's suggestedAssignee to a tracker
+        user (XERK-2517) as `assignee: {id, name}`. Best-effort like the
+        duplicate check: an error or MEETING_ASSIGNEE_BUDGET_SEC spent leaves
+        the rest unmapped, and the items still ship."""
+        projects = daily_brief_projects(self.jira)
+        deadline = time.monotonic() + MEETING_ASSIGNEE_BUDGET_SEC
+        for it in items:
+            who = it.get("suggestedAssignee")
+            if it["kind"] == "decision" or not who:
+                continue
+            if time.monotonic() >= deadline:
+                log("meeting: assignee lookup out of time; the rest go unmapped")
+                return
+            try:
+                got = meeting_assignee(who, projects)
+            except Exception as e:
+                log(f"meeting: assignee lookup failed: {_board_error_summary(e)}")
+                return
+            if got:
+                it["assignee"] = got
 
     def _meeting_push(self, job, items=None, error=None):
         """Stage one row on the `meetingResults` outbox (bounded, oldest
@@ -45498,8 +45703,10 @@ class SessionManager:
             runtimes = meeting_runtimes() if board_configured() else []
         except Exception:
             runtimes = []
+        # `assign`: a createTicket here honours an `assignee` (XERK-2517); an
+        # older agent would self-assign the ticket the operator gave someone else.
         return {"available": bool(runtimes), "runtimes": runtimes,
-                "models": list(MEETING_MODELS)}
+                "models": list(MEETING_MODELS), "assign": True}
 
     @staticmethod
     def _daily_brief_payload():
