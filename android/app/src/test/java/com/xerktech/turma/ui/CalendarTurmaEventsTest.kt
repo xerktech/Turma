@@ -57,10 +57,10 @@ class CalendarTurmaEventsTest {
     private fun host(key: String, site: String) = """{ "key": "$key", "device": "$key", "online": true, "lastSeen": 1, "org": "$site",
         "jira": { "available": true, "siteKey": "$site", "site": "$site", "tickets": [] } }"""
 
-    private fun turmaEvent(subject: String = "Joint planning", version: Int = 3, editable: Boolean = true) = """
+    private fun turmaEvent(subject: String = "Joint planning", version: Int = 3, editable: Boolean = true, extra: String = "") = """
         { "source": "turma", "host": "", "id": "turma:0123456789abcdef", "orgs": ["$a", "$b"], "org": "$a",
           "subject": "$subject", "start": "${iso(10)}", "end": "${iso(11)}", "startMs": ${t(10)}, "endMs": ${t(11)},
-          "timeZone": "${zone.id}", "busy": "busy", "editable": $editable, "version": $version, "meeting": false }"""
+          "timeZone": "${zone.id}", "busy": "busy", "editable": $editable, "version": $version, "meeting": false $extra }"""
 
     private val outlook = """
         { "host": "h1", "org": "$a", "matchOrg": "$a", "id": "E1", "source": "outlook", "subject": "Outlook standup",
@@ -182,5 +182,33 @@ class CalendarTurmaEventsTest {
         val sent = hub.findRequest("/api/calendar/events/turma:0123456789abcdef")
         assertEquals("DELETE", sent.method)
         compose.waitUntil(5_000) { compose.onAllNodes(hasTestTag("cal-detail")).fetchSemanticsNodes().isEmpty() }
+    }
+
+    @Test fun `XERK-2972 QA a withheld private event offers no Edit or Delete, even when the hub says editable`() {
+        seed(turmaEvent("Private event", extra = ""","private": true"""))
+        show()
+        awaitEvent("Private event")
+        compose.onNode(event("Private event")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-detail").assertExists()
+        compose.onNodeWithTag("cal-edit").assertDoesNotExist()
+        compose.onNodeWithTag("cal-delete").assertDoesNotExist()
+    }
+
+    @Test fun `XERK-2972 QA the draft lives in the view model and a changed one asks before it is discarded`() {
+        seed(outlook)
+        val cvm = show()
+        awaitEvent("Outlook standup")
+        compose.onNodeWithTag("cal-new-event").performClick()
+        compose.onNodeWithTag("cal-ed-title").performTextInput("Draft kept")
+        // Held by the view model, so a rotation or a tab switch keeps it.
+        assertEquals("Draft kept", cvm.editor.value?.draft?.subject)
+        compose.onNodeWithTag("cal-editor-close").performClick()
+        compose.onNodeWithTag("cal-editor-discard").assertExists()
+        compose.onNodeWithText("Keep editing").performClick()
+        compose.onNodeWithTag("cal-editor").assertExists()
+        compose.onNodeWithTag("cal-editor-close").performClick()
+        compose.onNodeWithTag("cal-editor-discard").performClick()
+        compose.onNodeWithTag("cal-editor").assertDoesNotExist()
+        assertEquals(null, cvm.editor.value)
     }
 }

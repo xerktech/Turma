@@ -115,4 +115,51 @@ class CalendarEventsTest {
         assertEquals(setOf("b"), calDefaultOrgs(listOf("b", "gone"), listOf("a", "b")))
         assertEquals(LocalTime.of(9, 0), calDefaultStart(day.plusDays(3), 0, ny))
     }
+
+    @Test fun `XERK-2972 QA a name with a comma survives an unchanged save, and quoted names parse`() {
+        val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:a", "orgs": ["o"], "org": "o", "editable": true, "version": 1,
+            "start": "2026-11-16T14:00:00Z", "end": "2026-11-16T15:00:00Z", "startMs": 1, "endMs": 2, "timeZone": "UTC",
+            "attendees": [ { "name": "Smith, John", "email": "john@x.com", "role": "required" },
+                           { "name": "Ann \"A\" Lee", "email": "", "role": "required" } ] } ]""").single()
+        val d = calDraftOf(ev, ny)
+        assertEquals(
+            listOf(TurmaAttendee("Smith, John", "john@x.com", "required"), TurmaAttendee("Ann \"A\" Lee", "", "required")),
+            calParseAttendees(d.required, "required"),
+        )
+        assertEquals(
+            listOf(TurmaAttendee("Smith, John", "j@x.com", "optional"), TurmaAttendee("", "bo@x.com", "optional")),
+            calParseAttendees("\"Smith, John\" <j@x.com>; bo@x.com", "optional"),
+        )
+    }
+
+    @Test fun `XERK-2972 QA validation agrees with the hub on emails, links, zones, titles and skipped times`() {
+        val ok = draft("o")
+        assertTrue(calEmailOk("jöhn@exämple.de"))
+        assertTrue(calEmailOk("foo@bar.x"))
+        assertFalse(calEmailOk("a b@x.com"))
+        assertTrue(calDraftErrors(ok.copy(online = true, joinUrl = "https://x y.com")).isNotEmpty())
+        assertTrue(calDraftErrors(ok.copy(online = true, joinUrl = "https://")).isNotEmpty())
+        assertTrue(calDraftErrors(ok.copy(online = true, joinUrl = "https://x.com/\"q")).isNotEmpty())
+        assertTrue(calDraftErrors(ok.copy(required = "x".repeat(101))).isNotEmpty())
+        assertTrue(calDraftErrors(ok.copy(timeZone = "GMT")).isEmpty())
+        assertTrue(calDraftErrors(ok.copy(timeZone = "EST5EDT")).isEmpty())
+        assertTrue(calDraftErrors(ok.copy(timeZone = "+05:00")).isNotEmpty())
+        assertTrue(calDraftErrors(ok.copy(subject = "\u0007\u200b")).isNotEmpty())
+        val gap = LocalDate.of(2027, 3, 14)
+        val skipped = ok.copy(startDate = gap, endDate = gap, startTime = LocalTime.of(2, 30), endTime = LocalTime.of(3, 30))
+        assertTrue(calDraftErrors(skipped).any { "does not exist" in it })
+    }
+
+    @Test fun `XERK-2972 QA a withheld private event is never editable`() {
+        val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:p", "orgs": ["o"], "org": "o", "editable": true,
+            "version": 1, "private": true, "subject": "Private event", "startMs": 1, "endMs": 2 } ]""").single()
+        assertFalse(ev.canEdit)
+    }
+
+    @Test fun `XERK-2972 QA orgs are ids, never cleaned at decode`() {
+        val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:z", "orgs": ["o\u200b"], "org": "o\u200b",
+            "subject": "a\u200bb", "startMs": 1, "endMs": 2 } ]""").single()
+        assertEquals(listOf("o\u200b"), ev.orgs)
+        assertEquals("ab", ev.subject)
+    }
 }

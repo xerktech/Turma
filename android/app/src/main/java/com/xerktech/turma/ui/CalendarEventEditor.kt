@@ -51,15 +51,13 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.core.CAL_SHOW_AS
 import com.xerktech.turma.core.TurmaEventDraft
 import com.xerktech.turma.core.calDraftErrors
-import com.xerktech.turma.core.calDraftOf
 import com.xerktech.turma.core.calLongDay
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.CalendarViewModel
-import com.xerktech.turma.vm.EventResult
+import com.xerktech.turma.vm.EventEditor
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
-import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import java.util.Locale
@@ -78,38 +76,44 @@ import java.util.Locale
 @Composable
 internal fun CalendarEventEditor(
     modifier: Modifier,
-    initial: TurmaEventDraft,
+    ed: EventEditor,
     orgOptions: List<Pair<String, String>>,
     cvm: CalendarViewModel,
-    onClose: () -> Unit,
 ) {
     val locale = Locale.getDefault()
     val busy by cvm.eventBusy.collectAsStateWithLifecycle()
-    var d by remember(initial) { mutableStateOf(initial) }
-    // The org order an edit started with: orgs[0] colours the event, so an edit keeps it.
-    val orgsOrder = remember(initial) { initial.orgs.toList() }
-    var err by remember(initial) { mutableStateOf("") }
-    var tried by remember(initial) { mutableStateOf(false) }
-    var picker by remember(initial) { mutableStateOf("") }   // "startDate" | "endDate" | "startTime" | "endTime"
-    BackHandler(enabled = picker.isEmpty()) { onClose() }
+    val d = ed.draft
+    fun set(next: TurmaEventDraft) = cvm.editDraft(next)
+    val err = ed.error
+    var tried by remember(ed.base) { mutableStateOf(false) }
+    var picker by remember(ed.base) { mutableStateOf("") }   // "startDate" | "endDate" | "startTime" | "endTime"
+    var confirmDiscard by remember { mutableStateOf(false) }
+    // Closing a changed draft asks first: a Back meant for the keyboard otherwise lost it (QA).
+    fun close() { if (ed.dirty) confirmDiscard = true else cvm.closeEditor() }
+    BackHandler(enabled = picker.isEmpty() && !confirmDiscard) { close() }
 
     val problems = calDraftErrors(d)
     fun save() {
         tried = true
         if (problems.isNotEmpty()) return
-        err = ""
-        cvm.saveEvent(d, orgsOrder) { r ->
-            when (r) {
-                is EventResult.Saved, EventResult.Deleted -> onClose()
-                is EventResult.Conflict -> { err = r.message; d = calDraftOf(r.event, ZoneId.systemDefault()) }
-                is EventResult.Failed -> err = r.message
-            }
-        }
+        cvm.saveEditor()
+    }
+
+    if (confirmDiscard) {
+        AlertDialog(
+            onDismissRequest = { confirmDiscard = false },
+            title = { Text("Discard this event?") },
+            text = { Text("What you typed is not saved.") },
+            confirmButton = {
+                TextButton({ confirmDiscard = false; cvm.closeEditor() }, Modifier.testTag("cal-editor-discard")) { Text("Discard") }
+            },
+            dismissButton = { TextButton({ confirmDiscard = false }) { Text("Keep editing") } },
+        )
     }
 
     Column(modifier.fillMaxSize().testTag("cal-editor")) {
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClose, Modifier.testTag("cal-editor-close")) { Icon(Icons.Filled.Close, "Discard and close") }
+            IconButton(::close, Modifier.testTag("cal-editor-close")) { Icon(Icons.Filled.Close, "Discard and close") }
             Text(
                 if (d.editing) "Edit event" else "New event", Modifier.weight(1f).semantics { heading() },
                 style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
@@ -125,25 +129,25 @@ internal fun CalendarEventEditor(
                 for (p in problems) Text(p, color = TurmaColors.critical, style = MaterialTheme.typography.bodySmall)
             }
             OutlinedTextField(
-                d.subject, { d = d.copy(subject = it) }, Modifier.fillMaxWidth().testTag("cal-ed-title"),
+                d.subject, { set(d.copy(subject = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-title"),
                 label = { Text("Title") }, singleLine = true,
             )
             OutlinedTextField(
-                d.required, { d = d.copy(required = it) }, Modifier.fillMaxWidth().testTag("cal-ed-required"),
+                d.required, { set(d.copy(required = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-required"),
                 label = { Text("Required attendees") }, placeholder = { Text("Ann <ann@example.com>, bo@example.com") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
             )
             OutlinedTextField(
-                d.optional, { d = d.copy(optional = it) }, Modifier.fillMaxWidth().testTag("cal-ed-optional"),
+                d.optional, { set(d.copy(optional = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-optional"),
                 label = { Text("Optional attendees") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
             )
             HorizontalDivider()
-            CheckRow("All day", d.allDay, { d = d.copy(allDay = it) }, Modifier.testTag("cal-ed-allday"))
+            CheckRow("All day", d.allDay, { set(d.copy(allDay = it)) }, Modifier.testTag("cal-ed-allday"))
             WhenRow("Starts", d.startDate, d.startTime, d.allDay, locale, "start", { picker = it })
             WhenRow("Ends", d.endDate, d.endTime, d.allDay, locale, "end", { picker = it })
             OutlinedTextField(
-                d.timeZone, { d = d.copy(timeZone = it) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
+                d.timeZone, { set(d.copy(timeZone = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
                 label = { Text("Time zone") }, singleLine = true,
             )
             // Recurrence is the next child of the epic (XERK-2969): shown, not yet editable.
@@ -153,33 +157,33 @@ internal fun CalendarEventEditor(
             }
             HorizontalDivider()
             OutlinedTextField(
-                d.location, { d = d.copy(location = it) }, Modifier.fillMaxWidth().testTag("cal-ed-location"),
+                d.location, { set(d.copy(location = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-location"),
                 label = { Text("Location") }, singleLine = true,
             )
-            CheckRow("Online meeting", d.online, { d = d.copy(online = it) }, Modifier.testTag("cal-ed-online"))
+            CheckRow("Online meeting", d.online, { set(d.copy(online = it)) }, Modifier.testTag("cal-ed-online"))
             if (d.online) {
                 OutlinedTextField(
-                    d.joinUrl, { d = d.copy(joinUrl = it) }, Modifier.fillMaxWidth().testTag("cal-ed-join"),
+                    d.joinUrl, { set(d.copy(joinUrl = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-join"),
                     label = { Text("Join link (https://)") }, singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 )
             }
             OutlinedTextField(
-                d.body, { d = d.copy(body = it) }, Modifier.fillMaxWidth().height(140.dp).testTag("cal-ed-body"),
+                d.body, { set(d.copy(body = it)) }, Modifier.fillMaxWidth().height(140.dp).testTag("cal-ed-body"),
                 label = { Text("Details") },
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Show as", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Picker(
                     CAL_SHOW_AS.firstOrNull { it.first == d.busy }?.second ?: "Busy", CAL_SHOW_AS,
-                    { d = d.copy(busy = it) }, Modifier.testTag("cal-ed-busy"),
+                    { set(d.copy(busy = it)) }, Modifier.testTag("cal-ed-busy"),
                 )
             }
             OutlinedTextField(
-                d.categories, { d = d.copy(categories = it) }, Modifier.fillMaxWidth().testTag("cal-ed-categories"),
+                d.categories, { set(d.copy(categories = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-categories"),
                 label = { Text("Categories (comma-separated)") }, singleLine = true,
             )
-            CheckRow("Private", d.private, { d = d.copy(private = it) }, Modifier.testTag("cal-ed-private"))
+            CheckRow("Private", d.private, { set(d.copy(private = it)) }, Modifier.testTag("cal-ed-private"))
             HorizontalDivider()
             Text("Orgs", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
@@ -195,7 +199,7 @@ internal fun CalendarEventEditor(
                 for ((key, label) in opts) {
                     FilterChip(
                         selected = key in d.orgs,
-                        onClick = { d = d.copy(orgs = if (key in d.orgs) d.orgs - key else d.orgs + key) },
+                        onClick = { set(d.copy(orgs = if (key in d.orgs) d.orgs - key else d.orgs + key)) },
                         label = { Text(label) },
                         modifier = Modifier.testTag("cal-ed-org-$key"),
                     )
@@ -215,7 +219,7 @@ internal fun CalendarEventEditor(
                     TextButton({
                         state.selectedDateMillis?.let { ms ->
                             val day = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate()
-                            d = if (picker == "startDate") moveStart(d, day, d.startTime) else d.copy(endDate = day)
+                            set(if (picker == "startDate") moveStart(d, day, d.startTime) else d.copy(endDate = day))
                         }
                         picker = ""
                     }) { Text("OK") }
@@ -231,7 +235,7 @@ internal fun CalendarEventEditor(
                 confirmButton = {
                     TextButton({
                         val t = LocalTime.of(state.hour, state.minute)
-                        d = if (picker == "startTime") moveStart(d, d.startDate, t) else d.copy(endTime = t)
+                        set(if (picker == "startTime") moveStart(d, d.startDate, t) else d.copy(endTime = t))
                         picker = ""
                     }, Modifier.testTag("cal-ed-time-ok")) { Text("OK") }
                 },

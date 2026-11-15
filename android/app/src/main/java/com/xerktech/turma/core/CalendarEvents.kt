@@ -5,6 +5,7 @@ import java.time.LocalDate
 import java.time.LocalTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -124,32 +125,95 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
     )
 }
 
-private fun attendeeText(name: String, email: String): String = when {
-    name.isNotEmpty() && email.isNotEmpty() -> "$name <$email>"
-    else -> name.ifEmpty { email }
+// A name with a separator or quote in it is written quoted ("Smith, John"), so a
+// save that changed nothing parses back to the same attendee (XERK-2972 QA).
+private fun attendeeText(name: String, email: String): String {
+    val n = if (name.any { it in ",;\"<>\n" }) "\"" + name.replace("\\", "\\\\").replace("\"", "\\\"") + "\"" else name
+    return when {
+        name.isNotEmpty() && email.isNotEmpty() -> "$n <$email>"
+        else -> n.ifEmpty { email }
+    }
 }
 
-// The hub's `calEmail` accepts one plain address; anything looser is a 400 there.
-private val EMAIL_RE = Regex("^[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$")
-private val NAMED_RE = Regex("^(.*?)\\s*<([^<>]+)>$")
+// The hub's CAL_EMAIL_PART / CAL_URL_RE, with JavaScript's `\s` (JS_WS + "\n").
+private const val EMAIL_PART =
+    "[^@$JS_WS\n/\"<>`\u0000-\u001f\u007f-\u009f\u00ad\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+"
+private val EMAIL_RE = Regex("^$EMAIL_PART@$EMAIL_PART\\.$EMAIL_PART$")
+private val URL_RE = Regex("^https://[^$JS_WS\n\"'<>\\\\`]+$")
+
+/** Would the hub's `calEmail` keep [email] (trimmed, lowercased, ≤200)? */
+fun calEmailOk(email: String): Boolean {
+    val e = jsTrim(email).lowercase()
+    return e.length <= 200 && EMAIL_RE.matches(e)
+}
+
+/** Would the hub take [url] as a join link (`https://`, no space, quote, angle bracket, backslash or backtick)? */
+fun calJoinUrlOk(url: String): Boolean = url.length <= 500 && URL_RE.matches(url)
 
 /**
- * The attendees written in one field — "Ann <ann@x.com>", "bo@x.com" or a bare
- * name — split on commas, semicolons and new lines. A bare address is its own
- * name-less attendee; a bare name has no email.
+ * The attendees written in one field — `Ann <ann@x.com>`, `"Smith, John" <j@x.com>`,
+ * `bo@x.com` or a bare name — split on commas, semicolons and new lines outside
+ * double quotes and angle brackets. A bare address is a name-less attendee; a
+ * bare name has no email.
  */
 fun calParseAttendees(text: String, role: String): List<TurmaAttendee> =
-    text.split(',', ';', '\n').map { jsTrim(it) }.filter { it.isNotEmpty() }.map { tok ->
-        val m = NAMED_RE.matchEntire(tok)
+    splitAttendees(text).map { jsTrim(it) }.filter { it.isNotEmpty() }.map { tok ->
+        val lt = tok.lastIndexOf('<')
+        val named = lt >= 0 && tok.endsWith(">") && tok.indexOf('>') == tok.length - 1
+        val (rawName, email) = if (named) tok.substring(0, lt) to jsTrim(tok.substring(lt + 1, tok.length - 1)) else tok to ""
+        val name = unquote(jsTrim(rawName))
         when {
-            m != null -> TurmaAttendee(jsTrim(m.groupValues[1]).trim('"'), jsTrim(m.groupValues[2]), role)
-            '@' in tok -> TurmaAttendee("", tok, role)
-            else -> TurmaAttendee(tok, "", role)
+            named -> TurmaAttendee(name, email, role)
+            !rawName.trimStart().startsWith("\"") && '@' in tok -> TurmaAttendee("", tok, role)
+            else -> TurmaAttendee(name, "", role)
         }
     }
 
-fun calZoneOrNull(id: String): ZoneId? =
-    if (id.isBlank()) null else runCatching { ZoneId.of(id.trim()) }.getOrNull()?.takeIf { it.id.contains('/') || it.id == "UTC" }
+private fun splitAttendees(text: String): List<String> {
+    val out = mutableListOf<String>()
+    val cur = StringBuilder()
+    var quoted = false
+    var angle = false
+    var i = 0
+    while (i < text.length) {
+        val c = text[i]
+        when {
+            quoted && c == '\\' && i + 1 < text.length -> { cur.append(c).append(text[i + 1]); i++ }
+            c == '"' && !angle -> { quoted = !quoted; cur.append(c) }
+            c == '<' && !quoted -> { angle = true; cur.append(c) }
+            c == '>' && !quoted -> { angle = false; cur.append(c) }
+            (c == ',' || c == ';' || c == '\n') && !quoted && !angle -> { out += cur.toString(); cur.clear() }
+            else -> cur.append(c)
+        }
+        i++
+    }
+    out += cur.toString()
+    return out
+}
+
+private fun unquote(s: String): String {
+    if (s.length < 2 || !s.startsWith("\"") || !s.endsWith("\"")) return s.trim('"')
+    val b = StringBuilder()
+    var i = 1
+    while (i < s.length - 1) {
+        val c = s[i]
+        if (c == '\\' && i + 1 < s.length - 1) { b.append(s[i + 1]); i += 2 } else { b.append(c); i++ }
+    }
+    return b.toString()
+}
+
+// A named zone the hub's Intl knows (GMT, EST5EDT, America/New_York); never a raw
+// offset ("+05:00", "UTC+5"), which names no DST rules.
+private val OFFSET_ZONE = Regex("^(?:UTC|GMT|UT)?[+-]")
+
+fun calZoneOrNull(id: String): ZoneId? {
+    val t = id.trim()
+    if (t.isEmpty() || t.length > 64 || OFFSET_ZONE.containsMatchIn(t)) return null
+    return runCatching { ZoneId.of(t) }.getOrNull()?.takeIf { it !is ZoneOffset }
+}
+
+/** The subject as the hub stores it: control / bidi / zero-width characters removed, trimmed. */
+private fun calCleanSubject(s: String): String = jsTrim(com.xerktech.turma.model.cleanCalendarText(s))
 
 /** The draft's start and end instants, all-day ending at the midnight after its last day. */
 fun calDraftSpan(d: TurmaEventDraft): Pair<OffsetDateTime, OffsetDateTime>? {
@@ -161,19 +225,29 @@ fun calDraftSpan(d: TurmaEventDraft): Pair<OffsetDateTime, OffsetDateTime>? {
 
 /** Every reason the draft cannot be saved yet, in the order the editor shows its fields; empty = saveable. */
 fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
-    if (jsTrim(d.subject).isEmpty()) add("Give the event a title.")
-    if (jsTrim(d.subject).codePointCount() > 300) add("The title is longer than 300 characters.")
+    if (calCleanSubject(d.subject).isEmpty()) add("Give the event a title.")
+    if (calCleanSubject(d.subject).codePointCount() > 300) add("The title is longer than 300 characters.")
     val people = calParseAttendees(d.required, "required") + calParseAttendees(d.optional, "optional")
-    people.firstOrNull { it.email.isNotEmpty() && !EMAIL_RE.matches(it.email) }?.let { add("${it.email} is not an email address.") }
+    people.firstOrNull { it.email.isNotEmpty() && !calEmailOk(it.email) }?.let { add("${it.email} is not an email address.") }
+    people.firstOrNull { it.name.codePointCount() > 100 }?.let { add("An attendee's name is longer than 100 characters.") }
     if (people.size > 100) add("An event has at most 100 attendees.")
-    if (calZoneOrNull(d.timeZone) == null) add("The time zone must be one like America/New_York.")
+    val zone = calZoneOrNull(d.timeZone)
+    if (zone == null) add("The time zone must be one like America/New_York.")
     else {
+        // A wall time the clocks skip (spring forward) does not exist; java.time would move it silently.
+        if (!d.allDay) {
+            for ((label, day, t) in listOf(Triple("start", d.startDate, d.startTime), Triple("end", d.endDate, d.endTime))) {
+                if (day.atTime(t).atZone(zone).toLocalDateTime() != day.atTime(t)) {
+                    add("The $label time does not exist on that day in ${zone.id} (the clocks skip it).")
+                }
+            }
+        }
         val (s, e) = calDraftSpan(d)!!
         if (e.isBefore(s)) add("The event must end after it starts.")
     }
     if (jsTrim(d.location).codePointCount() > 300) add("The location is longer than 300 characters.")
     val url = jsTrim(d.joinUrl)
-    if (url.isNotEmpty() && (!url.startsWith("https://") || url.length > 500)) add("The join link must be an https:// link.")
+    if (d.online && url.isNotEmpty() && !calJoinUrlOk(url)) add("The join link must be an https:// link with no spaces or quotes.")
     if (d.body.codePointCount() > CAL_BODY_MAX) add("The details are longer than $CAL_BODY_MAX characters.")
     val cats = calCategories(d.categories)
     if (cats.size > 20 || cats.any { it.codePointCount() > 100 }) add("At most 20 categories of at most 100 characters.")
@@ -204,7 +278,7 @@ fun calDraftPayload(d: TurmaEventDraft, orgsOrder: List<String> = emptyList()): 
     return buildJsonObject {
         if (d.editing) d.version?.let { put("version", it) }
         put("orgs", JsonArray(orgs.map { JsonPrimitive(it) }))
-        put("subject", jsTrim(d.subject))
+        put("subject", calCleanSubject(d.subject))
         put("start", s.format(ISO))
         put("end", e.format(ISO))
         put("timeZone", calZoneOrNull(d.timeZone)!!.id)

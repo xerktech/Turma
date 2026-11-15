@@ -66,6 +66,20 @@ sealed class EventResult {
     data class Failed(val message: String) : EventResult()
 }
 
+/**
+ * The editor's state: [draft] as typed, [base] as opened (a draft that differs
+ * asks before it is discarded), the org order an edit started with (`orgs[0]`
+ * colours the event) and the last refusal.
+ */
+data class EventEditor(
+    val draft: TurmaEventDraft,
+    val base: TurmaEventDraft,
+    val orgsOrder: List<String>,
+    val error: String = "",
+) {
+    val dirty: Boolean get() = draft != base
+}
+
 class CalendarViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
     val fleet: StateFlow<FleetState> get() = container.fleet.state
@@ -383,6 +397,39 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
                 _setErr.update { it + (host to err) }
                 _messages.tryEmit("✗ $err")
             } else refetch()
+        }
+    }
+
+    private val _editor = MutableStateFlow<EventEditor?>(null)
+
+    /**
+     * The open Turma-event editor (XERK-2972), or null. Held here, not in the
+     * composable, so a rotation or a tab switch keeps what was typed (QA).
+     */
+    val editor: StateFlow<EventEditor?> = _editor
+
+    fun openEditor(draft: TurmaEventDraft) {
+        _editor.value = EventEditor(draft, draft, draft.orgs.toList())
+    }
+
+    fun editDraft(draft: TurmaEventDraft) = _editor.update { it?.copy(draft = draft) }
+
+    fun closeEditor() {
+        _editor.value = null
+    }
+
+    /** Save the open editor; it closes on success, and a 409 reloads it from the event as it is now. */
+    fun saveEditor(zone: ZoneId = this.zone): Job? {
+        val ed = _editor.value ?: return null
+        return saveEvent(ed.draft, ed.orgsOrder) { r ->
+            when (r) {
+                is EventResult.Saved, EventResult.Deleted -> if (_editor.value?.base == ed.base) _editor.value = null
+                is EventResult.Conflict -> {
+                    val fresh = com.xerktech.turma.core.calDraftOf(r.event, zone)
+                    _editor.value = EventEditor(fresh, fresh, fresh.orgs.toList(), r.message)
+                }
+                is EventResult.Failed -> _editor.update { it?.copy(error = r.message) }
+            }
         }
     }
 

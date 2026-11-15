@@ -280,13 +280,13 @@ private fun CalendarBody(
     var scrollTo by remember { mutableStateOf(-1.0) }
     var picker by rememberSaveable { mutableStateOf(false) }
     var hostSetOpen by rememberSaveable { mutableStateOf(false) }
-    // The Turma-event editor (XERK-2972), full screen while open.
-    var editor by remember { mutableStateOf<com.xerktech.turma.core.TurmaEventDraft?>(null) }
+    // The Turma-event editor (XERK-2972), full screen while open; its state is the view model's.
+    val editor by cvm.editor.collectAsStateWithLifecycle()
     val orgOptions = remember(names) {
         names.keys.sorted().map { it to com.xerktech.turma.core.orgName(it, names[it].orEmpty()) }
     }
     fun newEvent(day: LocalDate, start: java.time.LocalTime) {
-        editor = calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys))
+        cvm.openEditor(calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys)))
     }
 
     fun go(d: LocalDate) { anchorDay = d.toEpochDay() }
@@ -387,13 +387,13 @@ private fun CalendarBody(
                 m, ev, colors[ev.org]?.let { series[it % series.size] },
                 side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
-                onEdit = { e -> editor = calDraftOf(e, zone) },
+                onEdit = { e -> cvm.openEditor(calDraftOf(e, zone)) },
             )
         }
     }
     val draft = editor
     when {
-        draft != null -> CalendarEventEditor(modifier.fillMaxSize(), draft, orgOptions, cvm, onClose = { editor = null })
+        draft != null -> CalendarEventEditor(modifier.fillMaxSize(), draft, orgOptions, cvm)
         detail == null -> grid(modifier.fillMaxSize())
         side -> Row(modifier.fillMaxSize()) {
             grid(Modifier.weight(1f).fillMaxHeight())

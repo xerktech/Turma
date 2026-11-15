@@ -162,7 +162,12 @@ A pure-core/adapter-shell split:
   - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact
     POST/PATCH body), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.
     - Edit/Delete only when `CalendarEvent.canEdit` (`source:"turma"`, `editable:true`, a
-      `version`): an older hub serves none of them, so its events stay read-only.
+      `version`, NOT `private`): an older hub serves none of them, so its events stay read-only.
+      A withheld private event's fields are blanked; editing it would save the blanks (QA).
+    - The open draft lives in `CalendarViewModel.editor`, never composable state: a rotation or tab
+      switch lost it (QA). A changed draft asks before it is discarded.
+    - Validation ports the hub's own rules (`CAL_EMAIL_PART`, `CAL_URL_RE`, named zones only) and
+      refuses a wall time the clocks skip; a name with a comma is written quoted.
     - A multi-org event's org list is `calOrgsOf` (`orgs`, else `org`); every per-org read (upcoming
       meetings) goes through it, never `ev.org` alone. `orgs` is an id key (never cleaned).
     - A 409's error body is read ONCE in `eventResult` (it carries the current `event`); never read

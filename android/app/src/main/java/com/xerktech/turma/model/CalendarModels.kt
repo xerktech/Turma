@@ -102,8 +102,12 @@ data class CalendarEvent(
     /** A Turma-created event (XERK-2967): owned by the hub, never on Outlook. */
     val turma: Boolean get() = source == "turma"
 
-    /** Edit and Delete are offered only for a Turma event the hub says this caller may change. */
-    val canEdit: Boolean get() = turma && editable == true && version != null
+    /**
+     * Edit and Delete are offered only for a Turma event the hub says this caller
+     * may change — never a withheld private one (`private`): its served fields are
+     * blanked, so saving them back would wipe the creator's event (XERK-2972 QA).
+     */
+    val canEdit: Boolean get() = turma && editable == true && version != null && !private
 
     /** Host + id: one meeting on two hosts is two rows of the answer (the web's `evKey`). */
     val key: String get() = "$host\u0000$id"
