@@ -60,6 +60,7 @@ const ROUTES = [
   // automation
   ["POST", "/api/trigger", "automation"],
   ["POST", "/api/orgs/:site/meetings", "automation"],
+  ["GET", "/api/orgs/:site/meetings/missing-transcripts", "automation"],
   // pages (static shells: the data they show comes from the scoped routes)
   ["GET", "/", "signed-in"], ["GET", "/index.html", "signed-in"],
   ["GET", "/usage", "signed-in"], ["GET", "/usage.html", "signed-in"],

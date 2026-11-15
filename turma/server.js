@@ -7014,7 +7014,10 @@ function forgetMeetingLabelMiss(label, t) {
 // The org a Tenir post's URL names, for the token's tenant `t`: {site} (scoped;
 // an org no host is in still reaches the route's own 404) or {error} for a
 // label no org, or more than one, answers to — noted so the operator can map it.
-function resolveMeetingOrg(urlSite, t) {
+// `note: false` (the read-only missing-transcripts GET, XERK-2965) records no
+// miss: Tenir asks it daily under every label it ever delivered to, and an old
+// label after a relabel must not re-raise the Meetings page's banner.
+function resolveMeetingOrg(urlSite, t, { note = true } = {}) {
   const scoped = scopeSite(urlSite, t);
   const orgs = decidedOrgs();
   if (orgs.has(scoped)) return { site: scoped };
@@ -7025,7 +7028,7 @@ function resolveMeetingOrg(urlSite, t) {
     if (forgetMeetingLabelMiss(label, t)) broadcastMeetingLabels();
     return { site: hits[0] };
   }
-  noteMeetingLabelMiss(label, t, hits.length > 1);
+  if (note) noteMeetingLabelMiss(label, t, hits.length > 1);
   return { error: hits.length
     ? `more than one org has the meeting label "${label}" — give one of them its own label on the Meetings page`
     : `no org has the meeting label "${label}" — set it on the Meetings page` };
@@ -22724,11 +22727,38 @@ function sweepMeetingTranscripts(now = Date.now()) {
     .finally(() => { meetingTranscriptSweeping = false; });
 }
 
+// Save a duplicate's segments as the transcript of a settled meeting that has
+// none kept, locally nor in Postgres (XERK-2965). A store that cannot tell saves
+// nothing: never overwrite a kept transcript on a guess.
+// -> "saved" | "kept" | "unknown" (the store could not tell; Tenir asks again soon).
+async function backfillMeetingTranscript(m) {
+  try {
+    if (!(await meetingTranscripts.missing([m])).length) return "kept";
+  } catch {
+    return "unknown";
+  }
+  return saveMeetingTranscript(m) ? "saved" : "unknown";
+}
+
 function acceptMeeting(siteKey, body, now = Date.now()) {
   const { row, error } = meetingFromBody(body, now);
   if (error) return { status: 400, body: { error } };
   const dup = (meetingProposals[siteKey] || []).find((m) => m.meetingId === row.meetingId);
-  if (dup) return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup) } };
+  if (dup) {
+    // A settled meeting with no transcript kept (one read before XERK-2941, or
+    // its document lost) takes it from Tenir's resend (XERK-2965). The row is
+    // untouched — first copy wins. A pending row keeps its own segments, which
+    // the sweep back-fills from.
+    // The route (`backfillMeetingTranscript`) checks the store, Postgres
+    // included, before saving: under HA a promoted leader's disk is empty.
+    const backfill = !MEETING_PENDING.has(dup.status)
+      ? { ...dup, participants: row.participants, segments: row.segments } : null;
+    return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup) }, backfill };
+  }
+  // A resend for a transcript only (`backfill`) never creates a meeting: the
+  // hub dropped this one since it listed it, and reading it again would propose
+  // its work twice (XERK-2965).
+  if (body.backfill === true) return { status: 404, body: { error: "no such meeting" } };
   if (siteKey.length > MEETINGS_SITE_MAX) {
     return { status: 400, body: { error: `org key too long — the limit is ${MEETINGS_SITE_MAX} characters` } };
   }
@@ -24946,9 +24976,14 @@ const server = http.createServer(async (req, res) => {
 
     // Tenir posting a finished meeting (XERK-2508): its own TURMA_MEETINGS_TOKEN
     // bearer, never the trigger token (which starts sessions) nor the login.
+    // Tenir asking which of an org's meetings have no transcript kept, to send
+    // those again (XERK-2965): the same bearer, the same org resolution.
+    const isMeetingsMissing =
+      req.method === "GET" && parts[0] === "api" && parts[1] === "orgs" &&
+      parts[3] === "meetings" && parts[4] === "missing-transcripts" && parts.length === 5;
     const isMeetingsIngest =
-      req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
-      parts[3] === "meetings" && parts.length === 4;
+      (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+       parts[3] === "meetings" && parts.length === 4) || isMeetingsMissing;
 
     if (url.pathname === "/api/heartbeat") {
       // The heartbeat names the host it acts as in its BODY, so it is bound to
@@ -25084,7 +25119,7 @@ const server = http.createServer(async (req, res) => {
           const t = meetingsTenant(req);
           if (tenantOfSite(site) || t == null) return json(res, 404, { error: "no host is in that org" });
           // A short label (XERK-2638) or, from an older config, the site itself.
-          const org = resolveMeetingOrg(site, t);
+          const org = resolveMeetingOrg(site, t, { note: !isMeetingsMissing });
           if (org.error) return json(res, 404, { error: org.error });
           parts[2] = encodeURIComponent(org.site);
         } else if (!principalMaySite(requestPrincipal(req), site)) {
@@ -29506,7 +29541,29 @@ const server = http.createServer(async (req, res) => {
           limit: MEETING_SEGMENTS_MAX });
       }
       const out = acceptMeeting(siteKey, body);
+      if (out.backfill) {
+        const r = await backfillMeetingTranscript(out.backfill);
+        if (r === "saved") out.body.transcriptSaved = true;
+        else if (r === "unknown") out.body.transcriptUnknown = true;
+      }
       return json(res, out.status, out.body);
+    }
+
+    // GET /api/orgs/<siteKey>/meetings/missing-transcripts — Tenir asking which of
+    // the org's settled meetings have no transcript kept (XERK-2965), so it can
+    // send those again with `backfill: true`. Tenir's bearer, like the POST.
+    // Answers {meetingIds}; 503 while the store is unreachable.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 5 && parts[3] === "meetings" && parts[4] === "missing-transcripts") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) return json(res, 404, { error: "no host is in that org" });
+      const rows = (Object.hasOwn(meetingProposals, siteKey) ? meetingProposals[siteKey] : [])
+        .filter((m) => m && m.meetingId && m.receivedAt && !MEETING_PENDING.has(m.status));
+      let missing;
+      try { missing = await meetingTranscripts.missing(rows); } catch (e) {
+        return json(res, 503, { error: `the transcript store is unreachable (${e && e.message}) — try again shortly` });
+      }
+      return json(res, 200, { meetingIds: missing.map((m) => m.meetingId) });
     }
 
     // POST /api/orgs/<siteKey>/daily-brief/run — "Run now" (XERK-2395): the

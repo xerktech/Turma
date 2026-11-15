@@ -73,7 +73,30 @@ ticket builds to this file; change it here first.
   transcripts out of the policy store.
 - **Idempotent on `meetingId` per org**: a repeat answers 200 `{ok, meeting, duplicate:true}`
   and changes nothing (first copy wins), so Tenir retries freely, also after a hub restart.
+  - Except the transcript (XERK-2965): a repeat of a SETTLED meeting with no document kept saves
+    its segments as that document and answers `transcriptSaved: true`; the row is untouched.
+    - "No document" asks Postgres too (`meetingTranscripts.missing`): a promoted leader's disk is
+      empty, and a local-only check overwrote its cache with a resend (QA). Can't tell = no save,
+      answered `transcriptUnknown: true` so Tenir retries soon.
+  - `backfill: true` on the body: a meeting the hub does not hold is 404 "no such meeting",
+    never created — a resend for its transcript must not have its work proposed twice.
 - Answers `{ok, meeting}`: the row without its transcript.
+
+## Tenir → hub: transcript back-fill (XERK-2965)
+
+- `GET /api/orgs/<siteKey>/meetings/missing-transcripts` — Tenir's bearer and org resolution, as
+  the POST (`isMeetingsIngest` covers both). Answers `{meetingIds}`: the org's SETTLED rows with no
+  document kept, locally nor in Postgres; 503 when Postgres can't tell (never "all missing").
+  - It notes no label miss (`resolveMeetingOrg(…, {note:false})`): Tenir asks under every label
+    it ever delivered to, daily, and an old label must not re-raise the Meetings page banner.
+- Tenir re-POSTs each one it still holds with `backfill: true` (the dup rule above). Why push,
+  not a hub pull: the hub holds no Tenir address or credential, and each tenant's Tenir already
+  holds its own bearer.
+- Tenir asks at its delivery loop's start and then daily, so a transcript the byte budget evicts
+  is re-sent at most once a day. A pass that hit a TRANSIENT answer (hub down, 5xx/429, a non-hub
+  200, `transcriptUnknown`) is retried after 15 min. A 4xx is not: an old label 404s forever, and
+  retrying it re-ran every org's pass 96 times a day (QA).
+- Tests: `XERK-2965:` cases in `server.test.js`; Tenir's `test_turma_delivery.py`.
 
 ## The proposal store (hub, XERK-2508)
 
@@ -181,7 +204,7 @@ ticket builds to this file; change it here first.
 ## Archive and the daily meeting (hub, XERK-2856)
 
 - `POST /api/orgs/<site>/meetings/<mid>/archive {archived: bool}` — OPERATOR-authed (in
-  `tenant-scope.js`; `isMeetingsIngest` is the 4-part POST only). Answers `{ok, meeting}`.
+  `tenant-scope.js`; `isMeetingsIngest` is the 4-part POST and the missing-transcripts GET). Answers `{ok, meeting}`.
   - 400 body → 404 org no host is decided into / meeting → 409 a `queued`/`running` meeting.
   - `archivedAt` (epoch ms) on a SETTLED row only; re-archiving keeps the first; `false` deletes it.
 - **`daily: {meetingAt, briefRunId?}`** is decided ONCE, at Tenir's POST (`meetingDailyOf`), never
