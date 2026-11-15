@@ -1778,3 +1778,34 @@ test("XERK-2973 QA: keyboard focus follows the scope prompt and its Cancel", () 
     assert.deepEqual(focused, ['[data-ev-scope="occurrence"]', "[data-ev-edit]", "[data-ev-scope-no]", "[data-ev-delete]"]);
   } finally { delete info.querySelector; click({ closeDetail: "" }); }
 }));
+
+test("XERK-2973 QA: a split's move on a clamped day, its until, a 409 reload's anchor, and the whole-series count", () => withOrgs(async () => {
+  const apr = occ({ id: "turma:0123456789abcdef:2027-04-30T14:00:00Z", originalStart: "2027-04-30T14:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-04-30T10:00:00-04:00", end: "2027-04-30T11:00:00-04:00",
+    startMs: Date.parse("2027-04-30T14:00:00Z"), endMs: Date.parse("2027-04-30T15:00:00Z"), recurrence: { freq: "monthly", interval: 1, count: 8 } });
+  const label = () => /data-ed-rep-summary[^>]*><svg[^]*?<\/svg>([^<]*)</.exec(cal._edEls().panel.innerHTML)[1];
+  const change = (dataset, value) => { for (const f of cal._edEls().panel.listeners.change) f({ target: { dataset, value } }); };
+  cal.openEditor({ event: apr, scope: "following" });
+  assert.equal(label(), "Every month on day 31, 8 times in the whole series");
+  assert.match(cal._edEls().panel.innerHTML, /occurrences in the whole series/);
+  // Moved a day earlier: the new series runs on the 29th (never "the series shifted": day 30).
+  change({ edField: "startDate" }, "2027-04-29");
+  change({ edRep: "end" }, "count");
+  assert.match(label(), /^Every month on day 29/);
+  // Its until may not end before the NEW start.
+  const f = cal._ed().f;
+  f.repeat = { ...f.repeat, end: "until", until: "2027-04-28" };
+  assert.equal(cal.validateForm(f).repeat, "It must repeat until a day on or after its start.");
+  f.repeat = { ...f.repeat, until: "2027-04-29" };
+  assert.equal(cal.validateForm(f).repeat, undefined);
+  cal.closeEditor();
+  // After a 409 reload a move still re-anchors (the reload keeps the opened date).
+  replies = { "/api/calendar/events/": () => ({ status: 409, body: { error: "changed", event: { ...apr, subject: "Theirs", version: 3 } } }) };
+  cal.openEditor({ event: apr, scope: "following" });
+  editorFill({ subject: "Mine" });
+  await cal.saveEditor();
+  change({ edField: "startDate" }, "2027-04-29");
+  change({ edRep: "end" }, "count");
+  assert.match(label(), /^Every month on day 29/);
+  cal.closeEditor();
+}));

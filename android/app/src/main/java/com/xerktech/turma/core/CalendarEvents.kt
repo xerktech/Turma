@@ -71,6 +71,8 @@ data class TurmaEventDraft(
     val seriesDate: LocalDate? = null,
     // The start day the occurrence was opened on: a date MOVE re-anchors its repeat (QA).
     val openDate: LocalDate? = null,
+    // "This and following" of a count series: its count is the whole run's, as the hub reads it.
+    val wholeCount: Boolean = false,
 ) {
     val editing: Boolean get() = id.isNotEmpty()
 
@@ -158,6 +160,7 @@ fun calDraftFor(ev: CalendarEvent, fallback: ZoneId, scope: String): TurmaEventD
             scope = scope,
             seriesDate = if (scope.isNotEmpty()) calAnchorDay(ev, fallback) else null,
             openDate = if (scope.isNotEmpty()) d.startDate else null,
+            wholeCount = scope == "following" && calRuleOf(ev.recurrence)?.count != null,
         )
     }
 
@@ -173,6 +176,13 @@ fun calRepeatDay(d: TurmaEventDraft): LocalDate {
     if (d.startDate == opened || d.scope == "occurrence") return series
     if (d.scope == "following") return d.startDate
     return series.plusDays(java.time.temporal.ChronoUnit.DAYS.between(opened, d.startDate))
+}
+
+/** The editor's summary line: a split count series' count is the whole run's, and says so. */
+fun calEditorSummary(d: TurmaEventDraft): String {
+    val rule = calRuleOfRepeat(d.repeat, calRepeatDay(d))
+    val s = calRepeatSummary(rule, calRepeatDay(d))
+    return if (d.wholeCount && rule?.count != null) "$s in the whole series" else s
 }
 
 /** The first day a "following" split's until may name: the day the new series starts. */

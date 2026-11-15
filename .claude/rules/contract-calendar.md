@@ -455,8 +455,9 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
     exceptions from it on → `{ok, event: <new series>, previous: <old series>}`. DELETE only ends
     the old one. From the first occurrence it is `series`.
   - A `recurrence` SENT with it is the series' rule as the client edited it (XERK-2973): the hub
-    re-anchors it like the kept one — the day pin below, and a `count` equal to the series' own is
-    what is left of it; a different count is the new series'.
+    re-anchors it like the kept one — the day pin below, and on a count series a sent `count` is
+    the WHOLE run's (clients say "in the whole series"): the new series gets what is left, a 400
+    in words when nothing is.
   - A monthly/yearly rule with an implicit day gets `byMonthDay` = the old anchor's day on the new
     series: split at Apr 30 of "the 31st", it must stay on the 31st, not move to the 30th. Not
     when the edit moves the occurrence to another DATE (the local date, not the day number, never on

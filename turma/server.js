@@ -6861,8 +6861,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   //   CLAMPED one (Apr 30 of "the 31st"): name the old day outright — unless the edit moves
   //   the occurrence to another DATE, which then names the new series' day (a start or zone
   //   resent on the same date does not).
-  // - The series' count is its whole run: the new series takes what is left of it. A count
-  //   sent that differs from the series' is the person's own, for the new series.
+  // - A count series' count is its WHOLE run, and so is a count sent for it (clients label it
+  //   "in the whole series"): the new series takes what is left of it.
   const dom = (ms, tz) => Number(recurrence.localDate(ms, tz).slice(8));
   const newTz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
   const newStart = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.occ.startMs;
@@ -6870,7 +6870,11 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   const day = sent && (sent.freq === "monthly" || sent.freq === "yearly") && !sent.byMonthDay && !sent.byWeekday &&
     recurrence.localDate(newStart, newTz) === recurrence.localDate(f.occ.startMs, f.rec.timeZone)
     ? { byMonthDay: dom(f.rec.startMs, f.rec.timeZone) } : {};
-  const rest = sent && count && sent.count === count ? { count: count - prev.recurrence.count } : {};
+  const rest = sent && count && Number.isSafeInteger(sent.count) ? { count: sent.count - prev.recurrence.count } : {};
+  if (rest.count !== undefined && rest.count < 1) {
+    return { status: 400, body: { error: `${prev.recurrence.count} of this series' occurrences come before this one: ` +
+      `end it after more than ${prev.recurrence.count} in all` } };
+  }
   const rule = sent ? { ...sent, ...day, ...rest } : null;
   // The new series is anchored at this occurrence's ORIGINAL start, so the
   // exceptions from it on still land; a start/end in the edit re-times it (and,

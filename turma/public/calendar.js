@@ -1607,6 +1607,8 @@ function openEditor(opts = {}) {
     // moved occurrence the editor read "day 30" / "Wed" while the series runs on the 31st /
     // Tuesdays); a "following" split starts at this occurrence, so its until may not end before it.
     if (scope) Object.assign(f, { seriesDate: evAnchorYmd(opts.event), openDate: f.startDate, repScope: scope });
+    // A count series split here: its count is the whole run's, as the hub reads it (QA).
+    if (scope === "following" && opts.event.recurrence && Number.isSafeInteger(opts.event.recurrence.count)) f.wholeCount = true;
     ed = { mode: "edit", id: String(opts.event.id), version: opts.event.version, scope, f, errors: {}, err: "", busy: false, tried: false };
     // A scoped edit sends only what changed (scopedBody): the form as opened is the base.
     if (scope) ed.base = formPayload(f, undefined, scope);
@@ -1705,11 +1707,17 @@ function editorHtml() {
     + `<div class="cal-ed-foot"><button type="button" data-ed-cancel>Cancel</button>`
     + `<button type="button" class="primary" data-ed-save${dis}>${ed.busy ? "Saving…" : ed.mode === "edit" ? "Save" : "Save event"}</button></div>`;
 }
+// The editor's summary line: a split count series' count is the whole run's, and says so.
+function editorSummary(f) {
+  const rule = ruleFromRepeat(f.repeat, repDay(f));
+  const s = repeatSummary(rule, repDay(f));
+  return f.wholeCount && rule && Number.isSafeInteger(rule.count) ? `${s} in the whole series` : s;
+}
 // The Repeat control (XERK-2973): a preset menu, and for a repeating event its days /
 // interval / month mode / end, then the one-line summary the panel shows too.
 function repeatRowsHtml(f, one) {
   const r = f.repeat || blankRepeat();
-  const summary = repeatSummary(ruleFromRepeat(r, repDay(f)), repDay(f));
+  const summary = editorSummary(f);
   if (one) {
     return `<div class="cal-ed-row"><span class="k">Repeat</span><span class="cal-dnote cal-ed-note">${esc(summary)}. `
       + `A series repeats as a whole: edit All events to change it.</span></div>`;
@@ -1737,7 +1745,7 @@ function repeatRowsHtml(f, one) {
   h += `<div class="cal-ed-row"><span class="k"></span><div class="cal-ed-when"><select data-ed-rep="end" aria-label="Repeat ends">`
     + opt("never", "Never ends", r.end) + opt("until", "Ends on", r.end) + opt("count", "Ends after", r.end) + `</select>`
     + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(splitDay(f) || repDay(f))}" value="${esc(r.until)}">` : "")
-    + (r.end === "count" ? `<input type="number" class="cal-ed-num" data-ed-rep="count" min="1" max="${R_COUNT_MAX}" step="1" aria-label="Number of occurrences" value="${esc(r.count)}"> occurrences` : "")
+    + (r.end === "count" ? `<input type="number" class="cal-ed-num" data-ed-rep="count" min="1" max="${R_COUNT_MAX}" step="1" aria-label="Number of occurrences${f.wholeCount ? " in the whole series" : ""}" value="${esc(r.count)}"> occurrences${f.wholeCount ? " in the whole series" : ""}` : "")
     + `</div></div>`;
   return h + `<div class="cal-ed-row"><span class="k"></span><span class="cal-ed-sum" data-ed-rep-summary aria-live="polite">${RECUR_SVG}${esc(summary)}</span></div>`;
 }
@@ -1756,7 +1764,7 @@ function refreshRepeatText() {
   if (!ed || !$edPanel || !$edPanel.querySelector) return;
   const f = ed.f;
   const sum = $edPanel.querySelector("[data-ed-rep-summary]");
-  if (sum) sum.innerHTML = RECUR_SVG + esc(repeatSummary(ruleFromRepeat(f.repeat, repDay(f)), repDay(f)));
+  if (sum) sum.innerHTML = RECUR_SVG + esc(editorSummary(f));
   const sel = $edPanel.querySelector('[data-ed-rep="preset"]');
   if (sel && sel.options) {
     const labels = new Map(repeatPresets(repDay(f), f.repeat));
@@ -1837,6 +1845,7 @@ async function saveEditor() {
       const fresh = { source: "turma", ...r.out.event, orgs: Array.isArray(r.out.event.orgs) ? r.out.event.orgs : cur.f.orgs };
       cur.f = formFromEvent(fresh);
       if (cur.scope) Object.assign(cur.f, { seriesDate: evAnchorYmd(fresh), openDate: cur.f.startDate, repScope: cur.scope });
+      if (cur.scope === "following" && fresh.recurrence && Number.isSafeInteger(fresh.recurrence.count)) cur.f.wholeCount = true;
       if (cur.scope) cur.base = formPayload(cur.f, undefined, cur.scope);
       cur.version = r.out.event.version;
       cur.tried = false;

@@ -320,7 +320,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     re-anchors it as the hub does: "following" on the new day, "All events" shifted by the move.
     A "following" until may not end before the split (`splitDay`).
   - A rule sent for "following" is the SERIES' rule as changed; the hub re-anchors it at the split
-    (implicit month day pinned, the series' own count shared out) — `contract-calendar.md`.
+    (implicit month day pinned; a count series' count is the whole run's, and the editor says
+    "in the whole series", `wholeCount`) — `contract-calendar.md`.
   - "This event" disables the orgs and zone (with a note) and sends no `recurrence`: the hub refuses
     an occurrence's own rule, orgs or zone.
 - **Every repeating event wears `RECUR_SVG`** (Outlook's circling arrows) beside its title and in

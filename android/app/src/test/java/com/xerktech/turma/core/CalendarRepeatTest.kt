@@ -182,4 +182,18 @@ class CalendarRepeatTest {
         assertEquals("Every week on Wed, 8 times", sum(moved("series")))
         assertEquals("Every week on Tue, 8 times", sum(moved("occurrence")))
     }
+
+    @Test fun `QA a split moved on a clamped day reads the new day, and a split count is the whole series'`() {
+        val apr = TurmaJson.decodeFromString(CalendarEvent.serializer(), """{ "source": "turma", "id": "turma:0123456789abcdef:2027-04-30T14:00:00Z",
+            "seriesId": "turma:0123456789abcdef", "recurring": true, "originalStart": "2027-04-30T14:00:00Z", "seriesStart": "2027-01-31T10:00:00-05:00",
+            "start": "2027-04-30T10:00:00-04:00", "end": "2027-04-30T11:00:00-04:00", "startMs": 1, "endMs": 2,
+            "timeZone": "America/New_York", "orgs": ["acme"], "editable": true, "version": 4, "recurrence": { "freq": "monthly", "interval": 1, "count": 8 } }""")
+        val d = calDraftFor(apr, zone, "following")
+        assertEquals("Every month on day 31, 8 times in the whole series", calEditorSummary(d))
+        val moved = d.copy(startDate = LocalDate.of(2027, 4, 29), endDate = LocalDate.of(2027, 4, 29))
+        assert(calEditorSummary(moved).startsWith("Every month on day 29"))
+        val early = moved.copy(repeat = moved.repeat.copy(end = "until", until = LocalDate.of(2027, 4, 28)))
+        assert("It must repeat until a day on or after its start." in calDraftErrors(early))
+        assertEquals("Every month on day 31, 8 times", calEditorSummary(calDraftFor(apr, zone, "series")))
+    }
 }

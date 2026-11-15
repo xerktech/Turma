@@ -306,7 +306,7 @@ private fun moveStart(d: TurmaEventDraft, day: LocalDate, time: LocalTime): Turm
 private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pick: (String) -> Unit, locale: Locale) {
     val r = d.repeat
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val summary = calRepeatSummary(calRuleOfRepeat(r, calRepeatDay(d)), calRepeatDay(d))
+    val summary = com.xerktech.turma.core.calEditorSummary(d)
     fun put(next: RepeatForm) = set(d.copy(repeat = next))
     @Composable
     fun label(t: String) = Text(t, Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = muted)
@@ -382,7 +382,7 @@ private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pi
                     r.count, { put(r.copy(count = it.filter(Char::isDigit).take(4))) }, Modifier.width(84.dp).testTag("cal-ed-rep-count"),
                     singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
-                Text("occurrences", style = MaterialTheme.typography.bodySmall)
+                Text(if (d.wholeCount) "occurrences in the whole series" else "occurrences", style = MaterialTheme.typography.bodySmall)
             }
         }
     }
