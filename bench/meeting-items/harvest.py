@@ -117,7 +117,10 @@ def case_of(site, m, segments):
         if not words:
             continue
         e = {"kind": it.get("kind"), "words": words, "any": True}
-        if it.get("suggestedAssignee") and not r.get("assigneeChanged") and not r.get("unassigned"):
+        # A tracker-refused assignee was still the operator's answer (it reads
+        # unassigned only because the tracker said no).
+        kept_speaker = not r.get("assigneeChanged") and (r.get("assigneeRefused") or not r.get("unassigned"))
+        if it.get("suggestedAssignee") and kept_speaker:
             e["assignee"] = it["suggestedAssignee"]
         expect.append(e)
     forbid = []

@@ -130,3 +130,10 @@ class TestHarvestFixes(unittest.TestCase):
              "review": {"state": "created", "unassigned": True, "assigneeRefused": True}}]}]})
         s = hv.summarize(rows)
         self.assertEqual((s["mappedAssigneeKept"], s["mappedAssigneeOf"], s["approvedWithoutEdits"]), (0, 1, 1.0))
+
+    def test_a_refused_assignee_keeps_the_speaker_in_the_case(self):
+        m = {"meetingId": "m", "items": [{"id": "p1", "kind": "task", "title": "Write the runbook",
+              "suggestedAssignee": "Ann", "review": {"state": "created", "unassigned": True,
+                                                     "assigneeRefused": True}}]}
+        case = hv.case_of("s", m, [{"speaker": "Ann", "text": "runbook", "startMs": 0}])
+        self.assertEqual(case["expect"][0]["assignee"], "Ann")

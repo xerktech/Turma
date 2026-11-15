@@ -43404,6 +43404,47 @@ class TestCreateAzureIssue(unittest.TestCase):
         return mock.patch.object(
             ha, "_azure_description_field", lambda s, p, w: "System.Description")
 
+    def test_xerk2517_a_named_assignee_on_ado(self):
+        sent = []
+
+        class Err(Exception):
+            def __init__(self, code):
+                super().__init__(f"HTTP {code}")
+                self.code = code
+
+        def run(codes):
+            sent.clear()
+
+            def fc(p, w, ops):
+                who = {o["path"]: o["value"] for o in ops}.get("/fields/System.AssignedTo")
+                sent.append(who)
+                if who and codes:
+                    raise Err(codes.pop(0))
+                return {"id": 5}
+            with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p", AZDO_USER=""), \
+                    self._has_description(), \
+                    mock.patch.object(ha, "_azure_identities", lambda: ["me@x"]), \
+                    mock.patch.object(ha, "azure_create_workitem", fc):
+                return ha.create_azure_issue("P", "Task", "T", "d", [], assignee="ann@x")
+        self.assertTrue(run([])["assigned"])
+        self.assertEqual(sent, ["ann@x"])
+        out = run([400])
+        self.assertEqual((sent, out["assigned"]), (["ann@x", None], False))
+        self.assertIn("HTTP 400", out["assignError"])
+        self.assertNotIn("every identity", out["assignError"])
+        # A 429 is not a refused assignee: never re-sent without it.
+        with self.assertRaises(Exception):
+            run([429])
+        self.assertEqual(sent, ["ann@x"])
+        # Unassigned on purpose: no identity tried at all.
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p", AZDO_USER=""), \
+                self._has_description(), \
+                mock.patch.object(ha, "azure_create_workitem",
+                                  lambda p, w, ops: sent.append([o["path"] for o in ops]) or {"id": 6}):
+            sent.clear()
+            ha.create_azure_issue("P", "Task", "T", "d", [], assignee=None)
+        self.assertNotIn("/fields/System.AssignedTo", sent[0])
+
     def test_builds_json_patch_ops(self):
         seen = {}
 

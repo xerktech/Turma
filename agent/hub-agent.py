@@ -25008,7 +25008,11 @@ def create_azure_issue(project, wtype, title, description, tags,
             # Keep the FIRST error: it describes the real problem, where a later
             # one only says the identity after it didn't work either.
             first = first if first is not None else e
-            if not _write_was_refused(e):
+            # A 429 is a busy server, not a refused identity: an operator-picked
+            # assignee is never dropped over one (XERK-2517 QA). The self-assign
+            # ladder keeps its old reading.
+            if not _write_was_refused(e) or (
+                    assignee is not ASSIGN_SELF and getattr(e, "code", None) == 429):
                 raise first from None
             if me is not None:
                 refused = refused if refused is not None else e

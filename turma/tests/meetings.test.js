@@ -344,6 +344,18 @@ test("XERK-2517: a mapped speaker is pre-filled as the assignee; the pick rides 
   assert.match(P.list(), /· created unassigned: &lt;refused&gt;/);
   P.setCache(d);
   P.renderMeetings(d, true);
+  // Focus follows the picker across the repaint its change causes (QA: it fell
+  // to <body> and the next ArrowDown did nothing).
+  const list = P.els.meetingList, focused = [];
+  P.document.activeElement = { dataset: { assign: k1 }, tagName: "SELECT" };
+  list.contains = (el) => el === P.document.activeElement;
+  list.querySelectorAll = (sel) => (/select/.test(sel)
+    ? [{ dataset: { assign: k1 }, focus() { focused.push(k1); } }] : []);
+  for (const fn of list.listeners.change) fn({ target: { value: "me", dataset: { assign: k1 } } });
+  assert.ok(focused.length >= 1, "focus restored on the picker");
+  list.contains = () => false;
+  list.querySelectorAll = () => [];
+  P.document.activeElement = null;
   // The unmapped proposal never sends one.
   await P.review(P.itemKey(SITE, "m1", "p3"), "approve");
   assert.equal("assignee" in P.fetches.filter((f) => f.method === "POST").pop().body, false);

@@ -30597,6 +30597,10 @@ test("XERK-2517: a refused assignee settles as unassigned with the warning; an o
   assert.equal((await review2510(S, "r1", "p2", { action: "approve", project: "ENG", issueType: "1" })).status, 200);
   const r2 = item2510(S, "r1", "p2").review;
   assert.equal("assigneeChanged" in r2, false);
+  // The stored warning is capped at 300 code points, control/bidi stripped.
+  const long = hub.sanitizeMeeting({ ...okMeeting2510("w1"), items: [{ kind: "task", title: "x",
+    review: { state: "created", at: 1, key: "ENG-1", warning: "\u202ew" + "x".repeat(1000) } }] });
+  assert.equal(long.items[0].review.warning, "w" + "x".repeat(299));
   delete agents.mtNew2517b;
   delete hub.getMeetings()[S];
 });
