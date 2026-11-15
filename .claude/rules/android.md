@@ -171,6 +171,8 @@ A pure-core/adapter-shell split:
     - A TAP mid-settle is swallowed (its up consumed): Compose picks the tapped child at the down,
       before the land moves the days, so it opened the day that was sliding away (QA).
     - Only the shown days size a row: an off-screen day's all-day chips grew the band (QA).
+    - The grid's minute-holding re-scroll uses `dispatchRawDelta`, never `scrollTo`: a land changes
+      the band (so the pane) under a vertical flick, and `scrollTo`'s lock cancelled the fling (QA).
     - The off-screen cells carry no test tags and no semantics (`clearAndSetSemantics`).
     - Tests touching the grid aim at on-screen points: `cal-scroll`'s node spans all 24 hours.
   - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact

@@ -790,7 +790,11 @@ private fun WeekGrid(
                 lastSlotPx = with(density) { slot.toPx() }
                 val (min, y) = hold ?: (if (was > 0f) scroll.value / was * 30.0 to 0f else return@LaunchedEffect)
                 withFrameNanos { }
-                scroll.scrollTo(with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) })
+                // A raw delta, never scrollTo: that takes the scroll's lock and cancels a fling in
+                // flight. A swipe landing at a vertical flick's down changes the band (so the pane)
+                // under it, and this hold then killed the flick (QA, emulator).
+                val to = with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) }
+                scroll.dispatchRawDelta((to - scroll.value).toFloat())
                 hold = null
             }
             val hours by rememberUpdatedState(zoomHours)

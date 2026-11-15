@@ -2,6 +2,7 @@ package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasContentDescription
@@ -439,6 +440,44 @@ class CalendarScreenTest {
         compose.onNodeWithTag("cal-prev").performClick()
         compose.waitForIdle()
         assertEquals(rest, xOf("cal-dh-$today"), 1f)
+    }
+
+    private fun scrollY() =
+        compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value()
+
+    // A quick vertical flick of [dy] px on the visible grid: < 0 scrolls on, > 0 back. Aimed at
+    // the viewport's middle: the scroll node spans 24 hours, and the test screen is small.
+    private fun flick(dy: Float) {
+        val n = compose.onNodeWithTag("cal-scroll").fetchSemanticsNode()
+        compose.onRoot().performTouchInput {
+            down(Offset(width * 0.6f, n.positionInRoot.y + n.size.height / 2f))
+            repeat(4) { moveBy(Offset(0f, dy / 4), delayMillis = 2) }   // all inside one frame
+            up()
+        }
+    }
+
+    @Test fun `a vertical fling during a settle keeps its momentum (XERK-2980)`() {
+        seed()   // today's holiday chip makes its band taller than tomorrow's
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        cvm.setZoom(4f)
+        compose.waitForIdle()
+        // At rest a flick flings well past the finger's 40px (or to the top).
+        val y0 = scrollY()
+        flick(40f)
+        compose.waitForIdle()
+        assertTrue("at rest: ${y0 - scrollY()}", y0 - scrollY() > 120f || scrollY() == 0f)
+        // Mid-settle the same flick, landing the day (and its shorter band) at its down.
+        compose.mainClock.autoAdvance = false
+        dragOn(0.5f)
+        compose.mainClock.advanceTimeByFrame()
+        val y1 = scrollY()
+        flick(-40f)
+        compose.mainClock.autoAdvance = true
+        compose.waitForIdle()
+        assertTrue(shown("cal-dh-${today.plusDays(1)}"))
+        assertTrue("mid-settle: ${scrollY() - y1}", scrollY() - y1 > 120f)
     }
 
     @Test fun `the view switch is kept on this phone and a push opens the notes review`() {
