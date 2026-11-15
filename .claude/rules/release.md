@@ -135,6 +135,7 @@ paths:
 - **Instruction file size limits** — `CLAUDE.md` + every `.claude/rules/*.md` must stay under 40,000
   characters (Claude Code's own perf threshold). Measured in CHARS not bytes (`wc -m`). See
   `CLAUDE.md`'s "Editing these files".
+  - The same gate covers `android/PARITY*.md` (the parity tracker, split across files to fit).
 - `turma-image-scan.yml` — builds the hub image locally (no push), Trivy-scans for CVEs+secrets
   (`ignore-unfixed`, HIGH/CRITICAL gate). Path-filtered to `turma/`.
 - `android-ci.yml` — path-filtered to `android/**`: JVM unit tests + `assembleDebug`.
