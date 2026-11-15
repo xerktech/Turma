@@ -16,7 +16,7 @@
      meetings and daily briefs, painted by meetings.js; the brief block and the
      schedule editor are this page's (mount hooks). Tokens/base/nav live in app.css.
      Android's Meetings tab is its counterpart (android/PARITY.md). */
-  .wrap.tri-wrap { --tri-wrap: 1280px; max-width: var(--tri-wrap); padding-top: 16px; }
+  .wrap.tri-wrap { --tri-wrap: 1280px; max-width: var(--tri-wrap); }
   .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
     opacity: 0.5; cursor: default; border-color: var(--border); }
   .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
@@ -238,7 +238,7 @@
   /* ---- the view switch + the Calendar view (calendar.js, XERK-2897) ---- */
   /* Held at the header's content column (--wrap less its 20px padding) in both views,
      so the switch never jumps sideways when the calendar widens (XERK-2937). */
-  .mt-views { display: flex; gap: 6px; margin: 0 auto 12px; width: min(100%, calc(var(--wrap) - 40px)); }
+  .mt-views { display: flex; gap: 6px; margin: 2px auto 12px; width: min(100%, calc(var(--wrap) - 40px)); }
   button.tri-chip[aria-pressed="true"] { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
   .cal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 10px 12px 12px; min-width: 0; }
   /* The shown calendar fills the page's height, and widens to the board's
