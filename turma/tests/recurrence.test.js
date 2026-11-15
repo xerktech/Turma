@@ -1,0 +1,170 @@
+// Unit tests for the recurrence rule whitelist and its expansion (XERK-2969,
+// turma/recurrence.js): DST transitions, month-end and nth-weekday rules,
+// until/count, the serve-range cut and the expansion bounds.
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const r = require("../recurrence.js");
+
+const NY = "America/New_York";
+const ms = (s) => Date.parse(s);
+const series = (start, end, rule, timeZone = NY) => ({ startMs: ms(start), endMs: ms(end), timeZone, rule });
+const keys = (s, lo, hi, max = 100) => r.occurrences(s, lo, hi, max).map((o) => o.key);
+const local = (o, tz = NY) => new Date(r.wallOf(o.startMs, tz)).toISOString().slice(0, 16);
+
+test("XERK-2969: a weekly 9:00 stays 9:00 local across both DST transitions", () => {
+  const s = series("2026-10-26T09:00:00-04:00", "2026-10-26T10:00:00-04:00", { freq: "weekly", interval: 1 });
+  const occ = r.occurrences(s, ms("2026-10-01T00:00:00Z"), ms("2026-11-10T00:00:00Z"), 10);
+  assert.deepEqual(occ.map((o) => o.key), ["2026-10-26T13:00:00Z", "2026-11-02T14:00:00Z", "2026-11-09T14:00:00Z"]);
+  assert.deepEqual(occ.map((o) => local(o)), ["2026-10-26T09:00", "2026-11-02T09:00", "2026-11-09T09:00"]);
+  for (const o of occ) assert.equal(o.endMs - o.startMs, 3600e3);
+  // Spring forward: March 2027.
+  const spring = keys(series("2027-03-01T09:00:00-05:00", "2027-03-01T09:30:00-05:00", { freq: "weekly", interval: 1 }),
+    ms("2027-03-01T00:00:00Z"), ms("2027-03-20T00:00:00Z"));
+  assert.deepEqual(spring, ["2027-03-01T14:00:00Z", "2027-03-08T14:00:00Z", "2027-03-15T13:00:00Z"]);
+});
+
+test("XERK-2969: a time the spring-forward skips reads an hour later and keeps its length; a repeated one is its first", () => {
+  const gap = r.occurrences(series("2026-03-07T02:30:00-05:00", "2026-03-07T03:00:00-05:00", { freq: "daily", interval: 1, count: 3 }),
+    0, Infinity, 5);
+  assert.deepEqual(gap.map((o) => o.key), ["2026-03-07T07:30:00Z", "2026-03-08T07:30:00Z", "2026-03-09T06:30:00Z"]);
+  assert.deepEqual(gap.map((o) => o.endMs - o.startMs), [18e5, 18e5, 18e5], "never an end before its start");
+  const back = r.occurrences(series("2026-10-31T01:30:00-04:00", "2026-10-31T02:00:00-04:00", { freq: "daily", interval: 1, count: 2 }),
+    0, Infinity, 5);
+  assert.equal(back[1].key, "2026-11-01T05:30:00Z", "1:30 on the fall-back day is the first (EDT) 1:30");
+  // A zone east of +12 (Auckland's DST starts the last Sunday of September).
+  const nz = keys(series("2026-09-24T09:00:00+12:00", "2026-09-24T10:00:00+12:00", { freq: "weekly", interval: 1, count: 2 }, "Pacific/Auckland"),
+    0, Infinity);
+  assert.deepEqual(nz, ["2026-09-23T21:00:00Z", "2026-09-30T20:00:00Z"]);
+});
+
+test("XERK-2969: the 31st clamps to each month's last day; nth and last weekday", () => {
+  const s = series("2027-01-31T09:00:00-05:00", "2027-01-31T10:00:00-05:00", { freq: "monthly", interval: 1, count: 5 });
+  assert.deepEqual(r.occurrences(s, 0, Infinity, 10).map((o) => local(o).slice(0, 10)),
+    ["2027-01-31", "2027-02-28", "2027-03-31", "2027-04-30", "2027-05-31"]);
+  const leap = series("2028-02-29T12:00:00Z", "2028-02-29T13:00:00Z", { freq: "yearly", interval: 1, count: 3 }, "UTC");
+  assert.deepEqual(keys(leap, 0, Infinity), ["2028-02-29T12:00:00Z", "2029-02-28T12:00:00Z", "2030-02-28T12:00:00Z"]);
+  const second = series("2026-11-10T15:00:00-05:00", "2026-11-10T16:00:00-05:00",
+    { freq: "monthly", interval: 1, byWeekday: { n: 2, day: "TU" } });
+  assert.deepEqual(r.occurrences(second, 0, ms("2027-02-01T00:00:00Z"), 10).map((o) => local(o).slice(0, 10)),
+    ["2026-11-10", "2026-12-08", "2027-01-12"]);
+  const lastFri = series("2026-11-27T15:00:00-05:00", "2026-11-27T16:00:00-05:00",
+    { freq: "monthly", interval: 2, byWeekday: { n: -1, day: "FR" } });
+  assert.deepEqual(r.occurrences(lastFri, 0, ms("2027-04-01T00:00:00Z"), 10).map((o) => local(o).slice(0, 10)),
+    ["2026-11-27", "2027-01-29", "2027-03-26"]);
+});
+
+test("XERK-2969: weekdays, every other week, until (inclusive, local) and count", () => {
+  const wk = series("2026-11-16T09:00:00-05:00", "2026-11-16T09:15:00-05:00",
+    { freq: "weekly", interval: 2, byDay: ["MO", "WE", "FR"], until: "2026-12-02" });
+  assert.deepEqual(r.occurrences(wk, 0, Infinity, 50).map((o) => local(o).slice(0, 10)),
+    ["2026-11-16", "2026-11-18", "2026-11-20", "2026-11-30", "2026-12-02"]);
+  const weekdays = series("2026-11-20T09:00:00-05:00", "2026-11-20T09:15:00-05:00",
+    { freq: "daily", interval: 1, byDay: ["MO", "TU", "WE", "TH", "FR"], count: 3 });
+  assert.deepEqual(r.occurrences(weekdays, 0, Infinity, 50).map((o) => local(o).slice(0, 10)),
+    ["2026-11-20", "2026-11-23", "2026-11-24"]);
+  // A start that is not on the rule's days: the anchor sets the time, the rule the days.
+  assert.equal(local(r.occurrences(series("2026-11-18T09:00:00-05:00", "2026-11-18T10:00:00-05:00",
+    { freq: "weekly", interval: 1, byDay: ["MO"] }), 0, Infinity, 1)[0]), "2026-11-23T09:00");
+});
+
+test("XERK-2969: expansion covers only the asked range, from far away, and is bounded", () => {
+  const s = series("2020-01-01T09:00:00-05:00", "2020-01-01T10:00:00-05:00", { freq: "daily", interval: 1 });
+  const lo = ms("2031-06-01T00:00:00Z"), hi = lo + 100 * 864e5;
+  const occ = r.occurrences(s, lo, hi, 1000);
+  assert.equal(occ.length, 100);
+  assert.ok(occ.every((o) => o.startMs >= lo && o.startMs < hi));
+  assert.equal(r.occurrences(s, lo, hi, 7).length, 7, "max cuts it");
+  // Monthly from years back lands on the right month (no skip-ahead overshoot).
+  const m = series("2020-01-15T12:00:00Z", "2020-01-15T13:00:00Z", { freq: "monthly", interval: 1 }, "UTC");
+  assert.deepEqual(keys(m, ms("2030-03-01T00:00:00Z"), ms("2030-05-01T00:00:00Z")), ["2030-03-15T12:00:00Z", "2030-04-15T12:00:00Z"]);
+  // A rule with no occurrence in its until window costs at most PERIODS_MAX periods.
+  const never = series("2026-11-16T09:00:00Z", "2026-11-16T10:00:00Z", { freq: "yearly", interval: 1, until: "2026-11-01" }, "UTC");
+  assert.deepEqual(keys(never, 0, Infinity), []);
+});
+
+test("XERK-2969: occurrenceAt and localDate", () => {
+  const s = series("2026-10-26T09:00:00-04:00", "2026-10-26T10:00:00-04:00", { freq: "weekly", interval: 1 });
+  assert.equal(r.occurrenceAt(s, "2026-11-02T14:00:00Z").startMs, ms("2026-11-02T14:00:00Z"));
+  for (const bad of ["2026-11-02T13:00:00Z", "2026-11-02T14:00:00.000Z", "2026-10-19T13:00:00Z", "nope", 5]) {
+    assert.equal(r.occurrenceAt(s, bad), null, String(bad));
+  }
+  assert.equal(r.localDate(ms("2026-11-02T03:00:00Z"), NY, -1), "2026-10-31");
+});
+
+test("XERK-2969: ruleError refuses in words; sanitizeRule is a fixed point", () => {
+  for (const bad of [null, [], { freq: "hourly" }, { freq: "weekly", interval: 0 }, { freq: "weekly", byDay: [] },
+    { freq: "weekly", byDay: ["MO", "MO"] }, { freq: "monthly", byDay: ["MO"] }, { freq: "weekly", byMonthDay: 3 },
+    { freq: "monthly", byMonthDay: 32 }, { freq: "monthly", byMonthDay: 1, byWeekday: { n: 1, day: "MO" } },
+    { freq: "monthly", byWeekday: { n: 5, day: "MO" } }, { freq: "daily", until: "2026-02-30" },
+    { freq: "daily", until: "2027-01-01", count: 3 }, { freq: "daily", count: 1000 }, { freq: "daily", tz: "x" }]) {
+    assert.equal(typeof r.ruleError(bad), "string", JSON.stringify(bad));
+    assert.equal(r.sanitizeRule(bad), null);
+  }
+  const rule = r.sanitizeRule({ count: 4, byDay: ["FR", "MO"], freq: "weekly" });
+  assert.deepEqual(rule, { freq: "weekly", interval: 1, byDay: ["MO", "FR"], count: 4 });
+  assert.equal(JSON.stringify(r.sanitizeRule(JSON.parse(JSON.stringify(rule)))), JSON.stringify(rule));
+});
+
+test("XERK-2969: a count series skips straight to the range (never walked from its start) and agrees with a full walk", () => {
+  for (const rule of [{ freq: "daily", interval: 3, byDay: ["MO", "WE"], count: 50 }, { freq: "weekly", interval: 2, byDay: ["SU", "TH"], count: 40 },
+    { freq: "monthly", interval: 1, byMonthDay: 5, count: 30 }, { freq: "yearly", interval: 1, byWeekday: { n: -1, day: "MO" }, count: 9 },
+    { freq: "daily", interval: 1, count: 999 }]) {
+    const s = series("2024-01-20T09:00:00-05:00", "2024-01-20T10:00:00-05:00", rule);
+    const lo = ms("2025-06-01T00:00:00Z"), hi = ms("2026-06-01T00:00:00Z");
+    const all = keys(s, 0, Infinity, 2000).filter((k) => ms(k) >= lo && ms(k) < hi);
+    assert.deepEqual(keys(s, lo, hi, 2000), all, JSON.stringify(rule));
+  }
+  // A month of a 999-count daily series, and one exception check, cost a few zone
+  // lookups — not one per occurrence since the start (QA: 73 ms a series, 17 s a GET).
+  // Counted as Intl calls, not wall time, so a loaded CI runner cannot flake it.
+  // 09:37 so no earlier test has warmed the zone cache for these instants.
+  const s = series("2024-01-01T09:37:00-05:00", "2024-01-01T10:37:00-05:00", { freq: "daily", interval: 1, count: 999 });
+  const real = Intl.DateTimeFormat.prototype.formatToParts;
+  let calls = 0;
+  Intl.DateTimeFormat.prototype.formatToParts = function (...a) { calls++; return real.apply(this, a); };
+  try {
+    assert.equal(r.occurrences(s, ms("2026-08-01T00:00:00Z"), ms("2026-09-01T00:00:00Z"), 100).length, 31);
+    assert.ok(r.occurrenceAt(s, "2026-09-20T13:37:00Z"));
+  } finally {
+    Intl.DateTimeFormat.prototype.formatToParts = real;
+  }
+  assert.ok(calls < 31 * 8 + 100, `${calls} zone lookups`);
+  // A byDay the interval never meets has no occurrence, found without walking PERIODS_MAX.
+  calls = 0;
+  Intl.DateTimeFormat.prototype.formatToParts = function (...a) { calls++; return real.apply(this, a); };
+  try {
+    assert.deepEqual(keys({ ...s, rule: { freq: "daily", interval: 7, byDay: ["TU"] } }, 0, Infinity), []);
+  } finally {
+    Intl.DateTimeFormat.prototype.formatToParts = real;
+  }
+  assert.ok(calls < 10, `${calls} zone lookups for a rule that never meets its days`);
+  assert.equal(r.occurrenceAt(null, "2026-09-20T13:00:00Z"), null, "no series, no occurrence");
+});
+
+test("XERK-2969: the cached zone offset equals Intl's at every minute around each transition (00:01 movers included)", () => {
+  let checked = 0;
+  for (const tz of ["America/St_Johns", "Asia/Gaza", "America/New_York", "Europe/London", "Australia/Lord_Howe",
+    "Pacific/Chatham", "America/Santiago"]) {
+    const f = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "numeric",
+      day: "numeric", hour: "numeric", minute: "numeric", second: "numeric" });
+    const off = (ms) => {
+      const p = {};
+      for (const { type, value } of f.formatToParts(new Date(ms))) p[type] = Number(value);
+      return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - ms;
+    };
+    // From 1985: St Johns moved at 00:01 until 2011, Gaza in 2010 — the cases a
+    // whole-bucket cache got wrong.
+    let prev = off(Date.UTC(1985, 0, 1));
+    for (let day = Date.UTC(1985, 0, 2); day < Date.UTC(2031, 0, 1); day += 864e5) {
+      const o = off(day);
+      if (o === prev) continue;
+      let lo = day - 864e5, hi = day;   // the transition minute, by bisection
+      while (hi - lo > 6e4) { const mid = lo + Math.floor((hi - lo) / 12e4) * 6e4; if (off(mid) === prev) lo = mid; else hi = mid; }
+      for (let t = hi - 30 * 6e4; t <= hi + 30 * 6e4; t += 6e4) { assert.equal(r.wallOf(t, tz), t + off(t), `${tz} ${new Date(t).toISOString()}`); checked++; }
+      prev = o;
+    }
+  }
+  assert.ok(checked > 5000);
+});

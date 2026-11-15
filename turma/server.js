@@ -71,6 +71,7 @@ const tenancy = require("./tenancy.js");
 const tenantMigration = require("./tenant-migration.js");
 const routeScope = require("./tenant-scope.js");
 const holidays = require("./holidays.js");
+const recurrence = require("./recurrence.js");
 const { createLeader } = require("./leader.js");
 // The archive's object-store backend + mirror (XERK-759, epic XERK-751). The
 // durable archive's BYTES (rendered + raw layers) move to object storage as the
@@ -5989,6 +5990,15 @@ const CAL_ACTOR_RE = /^[\w.:@-]{1,200}$/;
 // The fields a client writes; everything else on a record is the hub's.
 const CAL_TURMA_FIELDS = ["subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
   "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity"];
+// The fields one occurrence of a series may override (XERK-2969): every client
+// field but the zone (the series') — and orgs, which are series-level.
+const CAL_TURMA_OVERRIDE_FIELDS = CAL_TURMA_FIELDS.filter((k) => k !== "timeZone");
+const CALENDAR_TURMA_EXCEPTIONS_MAX = 100;        // per series
+// Series-window walks + occurrences one capture-candidate index may spend (XERK-2969).
+const CALENDAR_CANDIDATE_WORK_MAX = 20000;
+const calIsoZ = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+const calTurmaSeries = (rec) => (rec && rec.recurrence
+  ? { startMs: rec.startMs, endMs: rec.endMs, timeZone: rec.timeZone, rule: rec.recurrence } : null);
 
 // An IANA zone the runtime knows, in its canonical spelling (so the coerce is a
 // fixed point), else "".
@@ -6025,19 +6035,50 @@ function sanitizeTurmaEvent(v, t) {
   const categories = (Array.isArray(v.categories) ? v.categories.slice(0, 20) : [])
     .map((c) => meetingText(c, 100)).filter(Boolean);
   const url = meetingText(v.joinUrl, 500);
-  return {
+  const out = {
     id, orgs, subject: meetingText(v.subject, 300), start, end, startMs, endMs,
     timeZone: calTimeZone(v.timeZone) || "UTC", allDay: v.allDay === true,
     location: meetingText(v.location, 300), body: meetingText(v.body, CALENDAR_BODY_MAX, true), attendees,
     joinUrl: CAL_URL_RE.test(url) ? url : "", isOnlineMeeting: v.isOnlineMeeting === true,
     busy: typeof v.busy === "string" && CAL_TURMA_BUSY.has(v.busy) ? v.busy : "busy", categories,
     sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
-    // Filled by the recurrence child (XERK-2969); until then every event is single.
-    recurrence: null,
+    // A rule (XERK-2969) only on an event no longer than recurrence.DURATION_MAX_MS.
+    recurrence: endMs - startMs <= recurrence.DURATION_MAX_MS ? recurrence.sanitizeRule(v.recurrence) : null,
+    exceptions: {},
     createdBy: typeof v.createdBy === "string" && CAL_ACTOR_RE.test(v.createdBy) ? v.createdBy : "",
     createdAt: calMs(v.createdAt), updatedAt: calMs(v.updatedAt),
     version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
   };
+  // Exceptions: original start -> {deleted:true} | an override. Kept only while
+  // the key is still an occurrence of the rule, so editing the rule (or moving
+  // the series) drops the ones it no longer lands on. Sorted: a fixed point.
+  const series = calTurmaSeries(out);
+  const raw = series && v.exceptions && typeof v.exceptions === "object" && !Array.isArray(v.exceptions) ? v.exceptions : {};
+  let kept = 0;
+  for (const key of Object.keys(raw).sort()) {
+    if (kept >= CALENDAR_TURMA_EXCEPTIONS_MAX) break;
+    const ex = raw[key];
+    if (!ex || typeof ex !== "object" || Array.isArray(ex) || !recurrence.occurrenceAt(series, key)) continue;
+    const ov = ex.deleted === true ? { deleted: true } : turmaOverride(out, ex, t);
+    if (ov) { out.exceptions[key] = ov; kept++; }
+  }
+  return out;
+}
+// One occurrence's override, re-derived through the record whitelist so each
+// field holds exactly what a series field would; null when nothing is left.
+// start/end ride together (one alone is dropped) and end must not precede start.
+function turmaOverride(base, ex, t) {
+  const picked = {};
+  for (const k of CAL_TURMA_OVERRIDE_FIELDS) if (k in ex) picked[k] = ex[k];
+  if (!("start" in picked && "end" in picked) || !calIso(picked.start) || !calIso(picked.end) ||
+      Date.parse(picked.end) < Date.parse(picked.start)) {
+    delete picked.start;
+    delete picked.end;
+  }
+  const keys = Object.keys(picked);
+  if (!keys.length) return null;
+  const merged = sanitizeTurmaEvent({ ...base, ...picked, recurrence: null, exceptions: null }, t);
+  return merged ? Object.fromEntries(keys.map((k) => [k, merged[k]])) : null;
 }
 function calendarTurmaEventsCoerce(raw) {
   const out = Object.create(null);
@@ -6347,11 +6388,11 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       events.push({ source: "outlook", ...w });
     }
   }
-  const turma = calendarTurmaView(p, from, until, orgFilter, tenir);
-  events = events.concat(tenir.entries, ...tenir.linked.values(), turma);
+  const turmaView = calendarTurmaView(p, from, until, orgFilter, tenir);
+  events = events.concat(tenir.entries, ...tenir.linked.values(), turmaView);
   events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-  const truncated = events.length > CALENDAR_SERVE_MAX;
+  const truncated = events.length > CALENDAR_SERVE_MAX || !!turmaView.truncated;
   if (truncated) events = events.slice(0, CALENDAR_SERVE_MAX);
   return truncated ? { from, until, hosts, events, truncated } : { from, until, hosts, events };
 }
@@ -6424,7 +6465,9 @@ const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
 
 // The served form for principal `p`; `served` = the orgs still decided.
 function turmaEventWire(p, rec, served = rec.orgs) {
-  const out = { source: "turma", host: "", ...rec, orgs: served, org: served[0] || "",
+  const { exceptions, ...fields } = rec;   // a series' exceptions ride its occurrences, never the wire
+  const out = { source: "turma", host: "", ...fields, orgs: served, org: served[0] || "",
+    seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
     editable: calTurmaMayEdit(p, rec) && !calTurmaWithheld(p, rec), meeting: calendarLinkCandidate(rec) };
   if (calTurmaWithheld(p, rec)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "",
@@ -6432,28 +6475,101 @@ function turmaEventWire(p, rec, served = rec.orgs) {
   }
   return out;
 }
+// The record one occurrence `o` ({key, startMs, endMs}) of series `rec` reads as,
+// its exception's override applied.
+function turmaOccurrenceRecord(rec, o, ex) {
+  const occ = { ...rec, ...(ex && !ex.deleted ? ex : {}) };
+  if (!(ex && ex.start)) Object.assign(occ, { start: calIsoZ(o.startMs), end: calIsoZ(o.endMs) });
+  occ.startMs = Date.parse(occ.start);
+  occ.endMs = Date.parse(occ.end);
+  return occ;
+}
+// An occurrence served: the series' id + its original start is its id
+// (`turma:<hex>:<original start>`, the Outlook convention), `seriesId` the series'.
+function turmaOccurrenceWire(p, rec, o, served = rec.orgs) {
+  const ex = rec.exceptions[o.key];
+  return { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served), id: `${rec.id}:${o.key}`,
+    seriesId: rec.id, originalStart: o.key, exception: !!ex };
+}
+const calOverlaps = (e, from, until) => !(e.startMs >= until || e.endMs < from || (e.endMs === from && e.endMs !== e.startMs));
 // The Turma events overlapping [from, until) that `p` may see, filtered on ANY org.
 // With `tenir` (calendarTenirView), each carries its linked captures (`meetings`,
 // XERK-2970) and those captures' own entries are dropped, as for an Outlook event.
+// A series is expanded here, over the served range only, and never past
+// CALENDAR_SERVE_MAX occurrences in all (`truncated` on the list says it was cut).
 function calendarTurmaView(p, from, until, orgFilter, tenir) {
   const out = [];
   const decided = decidedOrgs();
+  let left = CALENDAR_SERVE_MAX + 1;
+  // An event or occurrence (by its own id) carries the captures linked to it.
+  const withMeetings = (w) => {
+    if (tenir) {
+      const lk = `${tenantOfSite(w.orgs[0])}\u0000${w.id}`;
+      w.meetings = tenir.links.get(lk) || [];
+      tenir.linked.delete(lk);
+    }
+    return w;
+  };
   // principalMaySite on each org is the tenant boundary: a record's orgs are all of its tenant.
   for (const bucket of Object.values(calendarTurmaEvents)) {
     for (const rec of Object.values(bucket)) {
-      if (rec.startMs >= until || rec.endMs < from || (rec.endMs === from && rec.endMs !== rec.startMs)) continue;
+      if (left <= 0) { out.truncated = true; return out; }
+      const series = calTurmaSeries(rec);
+      if (!series && !calOverlaps(rec, from, until)) continue;
+      // A series can only overlap once its first instance has begun.
+      if (series && rec.startMs >= until) continue;
       const served = rec.orgs.filter((o) => decided.has(o) && principalMaySite(p, o));
       if (!served.length || (orgFilter && !served.some((o) => orgFilter.has(o)))) continue;
-      const w = turmaEventWire(p, rec, served);
-      if (tenir) {
-        const lk = `${tenantOfSite(rec.orgs[0])}\u0000${rec.id}`;
-        w.meetings = tenir.links.get(lk) || [];
-        tenir.linked.delete(lk);
-      }
-      out.push(w);
+      if (!series) { out.push(withMeetings(turmaEventWire(p, rec, served))); left--; continue; }
+      eachTurmaOccurrence(rec, from, until, (o) => {
+        out.push(withMeetings(turmaOccurrenceWire(p, rec, o, served)));
+        return --left > 0;
+      });
     }
   }
   return out;
+}
+// Calls `each(o)` for every live occurrence of series `rec` overlapping [from,
+// until) as it reads now (deleted ones skipped, moved ones where they moved to —
+// into the range from outside it too), until `each` returns false.
+function eachTurmaOccurrence(rec, from, until, each) {
+  const series = calTurmaSeries(rec);
+  if (!series || rec.startMs >= until) return;
+  const seen = new Set();
+  let go = true;
+  const visit = (o) => {
+    const ex = rec.exceptions[o.key];
+    if (ex && ex.deleted) return;
+    if (!calOverlaps(turmaOccurrenceRecord(rec, o, ex), from, until)) return;
+    go = each(o) !== false;
+  };
+  // Look back by its length (+ a DST hour) for one begun before `from`. No `max`:
+  // deleted and look-back occurrences must not use up a caller's budget; `each`
+  // stops it (callers' ranges are bounded, so the walk is).
+  recurrence.eachOccurrence(series, from - (rec.endMs - rec.startMs) - 36e5 * 2, until, Infinity, (o) => {
+    seen.add(o.key);
+    visit(o);
+    return go;
+  });
+  for (const [key, ex] of Object.entries(rec.exceptions)) {
+    if (!go) return;
+    if (ex.start && !seen.has(key)) {
+      const o = recurrence.occurrenceAt(series, key);
+      if (o) visit(o);
+    }
+  }
+}
+// One occurrence as an event of its own (id `<series>:<original start>`), for the
+// readers that score or list events: the capture matcher and the Daily Brief.
+const turmaInstance = (rec, o) => ({ ...turmaOccurrenceRecord(rec, o, rec.exceptions[o.key]),
+  id: `${rec.id}:${o.key}`, seriesId: rec.id });
+// The Turma occurrence id `id` names in tenant `t` -> its instance, else null.
+function turmaInstanceById(t, id) {
+  const m = typeof id === "string" ? /^(turma:[0-9a-f]{16}):(.+)$/.exec(id) : null;
+  const rec = m && calendarTurmaEvents[t] && Object.hasOwn(calendarTurmaEvents[t], m[1]) ? calendarTurmaEvents[t][m[1]] : null;
+  const o = rec && recurrence.occurrenceAt(calTurmaSeries(rec), m[2]);
+  const ex = o && rec.exceptions[o.key];
+  return o && !(ex && ex.deleted) ? turmaInstance(rec, o) : null;
 }
 
 // A 400 naming the first malformed client field of `b`, or null. Never coerces a
@@ -6494,7 +6610,13 @@ function turmaEventFieldError(b) {
       if ("role" in a && !CAL_TURMA_ROLE.has(a.role)) return "an attendee's role must be required or optional";
     }
   }
-  if ("recurrence" in b && b.recurrence !== null) return "recurring Turma events are not supported yet";
+  if ("recurrence" in b && b.recurrence !== null) {
+    const re = recurrence.ruleError(b.recurrence);
+    if (re) return re;
+  }
+  if ("scope" in b && !["occurrence", "series", "following"].includes(b.scope)) {
+    return "scope must be occurrence, series or following";
+  }
   return null;
 }
 // {status, body} refusing `orgs` for principal `p`, or null when every org may be used.
@@ -6551,6 +6673,17 @@ function calTurmaFind(p, id) {
   }
   return { status: 404, body: { error: "no such Turma event" } };
 }
+// A 400 for a record whose rule the whitelist could not keep or that names no
+// occurrence at all, else null. `wanted` = the write asked for a rule.
+function turmaSeriesError(rec, wanted) {
+  if (wanted && !rec.recurrence) {
+    return `a recurring event lasts at most ${recurrence.DURATION_MAX_MS / 864e5} days`;
+  }
+  if (rec.recurrence && !recurrence.occurrences(calTurmaSeries(rec), rec.startMs, Infinity, 1).length) {
+    return "the recurrence has no occurrence: check its until date, days and start";
+  }
+  return null;
+}
 function createTurmaEvent(p, body, now = Date.now()) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { status: 400, body: { error: "body must be {orgs, subject, start, end, timeZone?, ...}" } };
@@ -6561,23 +6694,64 @@ function createTurmaEvent(p, body, now = Date.now()) {
   const fe = turmaEventFieldError(body);
   if (fe) return { status: 400, body: { error: fe } };
   const t = tenantOfSite(body.orgs[0]);
-  let id;
-  do id = `turma:${crypto.randomBytes(8).toString("hex")}`;
-  while (calendarTurmaEvents[t] && Object.hasOwn(calendarTurmaEvents[t], id));
-  const rec = sanitizeTurmaEvent({ ...calPick(body), id, orgs: body.orgs, createdBy: calTurmaActor(p),
-    createdAt: now, updatedAt: now, version: 1 }, t);
+  const rec = sanitizeTurmaEvent({ ...calPick(body), id: calTurmaMintId(t), orgs: body.orgs,
+    recurrence: body.recurrence || null, createdBy: calTurmaActor(p), createdAt: now, updatedAt: now, version: 1 }, t);
   if (!rec) return { status: 400, body: { error: "end must not be before start" } };
+  const se = turmaSeriesError(rec, !!body.recurrence);
+  if (se) return { status: 400, body: { error: se } };
   const full = turmaEventCapError(t, rec);
   if (full) return full;
   calTurmaStore(t, rec);
   return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
 }
+function calTurmaMintId(t) {
+  let id;
+  do id = `turma:${crypto.randomBytes(8).toString("hex")}`;
+  while (calendarTurmaEvents[t] && Object.hasOwn(calendarTurmaEvents[t], id));
+  return id;
+}
+// The event or occurrence `id` names -> {t, rec, key?, occ?} | {status, body}. An
+// occurrence id is `turma:<hex>:<original start>`; a deleted one is not found.
+function calTurmaTarget(p, id) {
+  const m = typeof id === "string" ? /^(turma:[0-9a-f]{16}):(.+)$/.exec(id) : null;
+  const f = calTurmaFind(p, m ? m[1] : id);
+  if (f.status || !m) return f;
+  const occ = recurrence.occurrenceAt(calTurmaSeries(f.rec), m[2]);
+  const ex = occ && f.rec.exceptions[m[2]];
+  if (!occ || (ex && ex.deleted)) return { status: 404, body: { error: "no such occurrence of this event" } };
+  return { ...f, key: m[2], occ };
+}
+// The scope a write applies to: occurrence (default for an occurrence id) |
+// series (default for an event id) | following (this occurrence and the rest).
+function calTurmaScope(f, scope) {
+  const s = scope === undefined || scope === null ? (f.key ? "occurrence" : "series") : scope;
+  if (!["occurrence", "series", "following"].includes(s)) {
+    return { error: { status: 400, body: { error: "scope must be occurrence, series or following" } } };
+  }
+  if (s !== "series" && !f.key) {
+    return { error: { status: 400, body: { error: `scope ${s} needs an occurrence id (<event id>:<original start>)` } } };
+  }
+  // "This and following" from the first occurrence is the whole series.
+  if (s === "following" && f.occ.startMs === recurrence.occurrences(calTurmaSeries(f.rec), f.rec.startMs, Infinity, 1)[0].startMs) {
+    return { scope: "series" };
+  }
+  return { scope: s };
+}
+// Series `rec` ended just before occurrence `occ`: its rule runs until the day
+// before (a count becomes the occurrences before it).
+function calTurmaEndBefore(rec, occ, t, now) {
+  const { count, until, ...rule } = rec.recurrence;
+  const before = recurrence.occurrences(calTurmaSeries(rec), rec.startMs, occ.startMs, recurrence.COUNT_MAX + 1).length;
+  return sanitizeTurmaEvent({ ...rec, recurrence: count ? { ...rule, count: before } :
+    { ...rule, until: recurrence.localDate(occ.startMs, rec.timeZone, -1) },
+  updatedAt: Math.max(now, rec.updatedAt), version: rec.version + 1 }, t);
+}
 function patchTurmaEvent(p, id, body, now = Date.now()) {
-  const f = calTurmaFind(p, id);
+  const f = calTurmaTarget(p, id);
   if (f.status) return f;
   if (calTurmaWithheld(p, f.rec)) return CAL_TURMA_PRIVATE_REFUSAL;
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return { status: 400, body: { error: "body must be {version, orgs?, ...fields}" } };
+    return { status: 400, body: { error: "body must be {version, scope?, orgs?, ...fields}" } };
   }
   // Hiding someone else's event would lock every other viewer out of it, the one who
   // hid it included, until its owner undid it (XERK-2972 QA).
@@ -6589,35 +6763,154 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   }
   if (body.version !== f.rec.version) {
     return { status: 409, body: { error: "this event was changed since you opened it; reload it and edit again",
-      event: turmaEventWire(p, f.rec) } };
+      event: f.occ ? turmaOccurrenceWire(p, f.rec, f.occ) : turmaEventWire(p, f.rec) } };
+  }
+  const sc = calTurmaScope(f, body.scope);
+  if (sc.error) return sc.error;
+  const fe = turmaEventFieldError(body);
+  if (fe) return { status: 400, body: { error: fe } };
+  // An edit form resends every field: an occurrence edit may carry the series'
+  // own orgs and zone unchanged, never different ones.
+  if (sc.scope === "occurrence") {
+    body = { ...body };
+    // Its served orgs (an undecided one is not served) count as unchanged too.
+    const decided = decidedOrgs();
+    const same = (set) => body.orgs.length === set.length && body.orgs.every((o) => set.includes(o));
+    if ("orgs" in body && Array.isArray(body.orgs) && new Set(body.orgs).size === body.orgs.length &&
+        (same(f.rec.orgs) || same(f.rec.orgs.filter((o) => decided.has(o))))) delete body.orgs;
+    if ("timeZone" in body && calTimeZone(body.timeZone) === f.rec.timeZone) delete body.timeZone;
   }
   if ("orgs" in body) {
+    if (sc.scope === "occurrence") {
+      return { status: 400, body: { error: "an occurrence's orgs are its series': change them on the series" } };
+    }
     const oe = turmaEventOrgsError(p, body.orgs);
     if (oe) return oe;
     if (tenantOfSite(body.orgs[0]) !== f.t) return { status: 404, body: { error: `no host is in org ${body.orgs[0]}` } };
   }
-  const fe = turmaEventFieldError(body);
-  if (fe) return { status: 400, body: { error: fe } };
-  const rec = sanitizeTurmaEvent({ ...f.rec, ...calPick(body), orgs: "orgs" in body ? body.orgs : f.rec.orgs,
+  if (sc.scope === "occurrence") return patchTurmaOccurrence(p, f, body, now);
+  // The occurrence as it reads now (its override applied), which a series
+  // edit's start/end were made against.
+  const shown = f.occ ? turmaOccurrenceRecord(f.rec, f.occ, f.rec.exceptions[f.key]) : null;
+  const fields = calPick(body);
+  if (sc.scope === "series" && shown) {
+    // Moving one occurrence "for the series" moves the series by the same amount.
+    if ("start" in body && calIso(body.start)) fields.start = calIsoZ(f.rec.startMs + Date.parse(body.start) - shown.startMs);
+    if ("end" in body && calIso(body.end)) fields.end = calIsoZ(f.rec.endMs + Date.parse(body.end) - shown.endMs);
+  }
+  // An org no host is decided into is not served, so a client cannot resend it:
+  // an edit keeps it (the 24h grace in calendarTurmaTick decides its fate).
+  const undecided = f.rec.orgs.filter((o) => !decidedOrgs().has(o));
+  const orgs = "orgs" in body ? [...body.orgs, ...undecided.filter((o) => !body.orgs.includes(o))] : f.rec.orgs;
+  if (orgs.length > CALENDAR_TURMA_ORGS_MAX) {
+    return { status: 400, body: { error: `an event belongs to at most ${CALENDAR_TURMA_ORGS_MAX} orgs, counting ` +
+      `${undecided.length} it keeps while no host is in them` } };
+  }
+  if (sc.scope === "series") {
+    const rule = "recurrence" in body ? body.recurrence : f.rec.recurrence;
+    const rec = sanitizeTurmaEvent({ ...f.rec, ...fields, orgs, recurrence: rule,
+      updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
+    if (!rec) return { status: 400, body: { error: "end must not be before start" } };
+    const se = turmaSeriesError(rec, !!rule);
+    if (se) return { status: 400, body: { error: se } };
+    const full = turmaEventCapError(f.t, rec);
+    if (full) return full;
+    calTurmaStore(f.t, rec);
+    return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+  }
+  // following: the series ends before this occurrence and a NEW series starts at
+  // it, carrying the edit and the exceptions from it on.
+  const prev = calTurmaEndBefore(f.rec, f.occ, f.t, now);
+  const { count, freq, byMonthDay, byWeekday } = f.rec.recurrence;
+  // A monthly/yearly rule's day defaults to its anchor's, and the new anchor
+  // may be a CLAMPED one (Apr 30 of "the 31st"): name the old day outright —
+  // unless the edit moves the occurrence to another DATE, which then names the
+  // new series' day (a start or zone resent on the same date does not).
+  const dom = (ms, tz) => Number(recurrence.localDate(ms, tz).slice(8));
+  const newTz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
+  const newStart = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.occ.startMs;
+  const day = (freq === "monthly" || freq === "yearly") && !byMonthDay && !byWeekday &&
+    recurrence.localDate(newStart, newTz) === recurrence.localDate(f.occ.startMs, f.rec.timeZone)
+    ? { byMonthDay: dom(f.rec.startMs, f.rec.timeZone) } : {};
+  const rule = "recurrence" in body ? body.recurrence
+    : { ...f.rec.recurrence, ...day, ...(count ? { count: count - prev.recurrence.count } : {}) };
+  // The new series is anchored at this occurrence's ORIGINAL start, so the
+  // exceptions from it on still land; a start/end in the edit re-times it (and,
+  // like any re-timed series, drops those exceptions). The occurrence's own
+  // override stays, less what the edit sets for the whole new series.
+  const exceptions = Object.fromEntries(Object.entries(f.rec.exceptions).filter(([k]) => k >= f.key));
+  if (exceptions[f.key] && !exceptions[f.key].deleted) {
+    const own = { ...exceptions[f.key] };
+    for (const k of Object.keys(fields)) delete own[k];
+    if ("start" in fields || "end" in fields) { delete own.start; delete own.end; }
+    exceptions[f.key] = own;
+  }
+  const next = sanitizeTurmaEvent({ ...f.rec, start: calIsoZ(f.occ.startMs), end: calIsoZ(f.occ.endMs), ...fields,
+    orgs, recurrence: rule, exceptions, id: calTurmaMintId(f.t), createdAt: now, updatedAt: now, version: 1 }, f.t);
+  if (!next) return { status: 400, body: { error: "end must not be before start" } };
+  const se = turmaSeriesError(next, !!rule);
+  if (se) return { status: 400, body: { error: se } };
+  const full = turmaEventCapError(f.t, prev) || turmaEventCapError(f.t, next);
+  if (full) return full;
+  calTurmaStore(f.t, prev);
+  calTurmaStore(f.t, next);
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, next), previous: turmaEventWire(p, prev) } };
+}
+// One occurrence's edit: its exception's override, merged over any it had.
+function patchTurmaOccurrence(p, f, body, now) {
+  for (const k of ["recurrence", "timeZone"]) {
+    if (k in body) return { status: 400, body: { error: `an occurrence takes no ${k}: change it on the series` } };
+  }
+  const prevEx = f.rec.exceptions[f.key] || {};
+  const shown = turmaOccurrenceRecord(f.rec, f.occ, prevEx);
+  const ex = { ...prevEx, ...Object.fromEntries(CAL_TURMA_OVERRIDE_FIELDS.filter((k) => k in body).map((k) => [k, body[k]])) };
+  // A moved start keeps the occurrence's length; an end alone keeps its start.
+  if ("start" in body && !("end" in body)) ex.end = calIsoZ(Date.parse(body.start) + shown.endMs - shown.startMs);
+  if ("end" in body && !("start" in body)) ex.start = shown.start;
+  if ("start" in ex && Date.parse(ex.end) < Date.parse(ex.start)) {
+    return { status: 400, body: { error: "end must not be before start" } };
+  }
+  if (!Object.hasOwn(f.rec.exceptions, f.key) && Object.keys(f.rec.exceptions).length >= CALENDAR_TURMA_EXCEPTIONS_MAX) {
+    return { status: 409, body: { error: `a series keeps at most ${CALENDAR_TURMA_EXCEPTIONS_MAX} changed or deleted ` +
+      "occurrences; edit the series instead" } };
+  }
+  const rec = sanitizeTurmaEvent({ ...f.rec, exceptions: { ...f.rec.exceptions, [f.key]: ex },
     updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
-  if (!rec) return { status: 400, body: { error: "end must not be before start" } };
   const full = turmaEventCapError(f.t, rec);
   if (full) return full;
   calTurmaStore(f.t, rec);
-  return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+  return { status: 200, body: { ok: true, event: turmaOccurrenceWire(p, rec, f.occ) } };
 }
-function deleteTurmaEvent(p, id) {
-  const f = calTurmaFind(p, id);
+function deleteTurmaEvent(p, id, scope, now = Date.now()) {
+  const f = calTurmaTarget(p, id);
   if (f.status) return f;
   if (calTurmaWithheld(p, f.rec)) return CAL_TURMA_PRIVATE_REFUSAL;
-  delete calendarTurmaEvents[f.t][id];
-  if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
-  persistCalendarTurmaEvents();
-  broadcastCalendarSoon(calTurmaFrameKey(f.t));
-  scheduleCalendarRelink(f.t);  // its auto-linked captures rematch (XERK-2970)
-  return { status: 200, body: { ok: true } };
+  const sc = calTurmaScope(f, scope);
+  if (sc.error) return sc.error;
+  if (sc.scope === "series") {
+    delete calendarTurmaEvents[f.t][f.rec.id];
+    if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
+    persistCalendarTurmaEvents();
+    broadcastCalendarSoon(calTurmaFrameKey(f.t));
+    scheduleCalendarRelink(f.t);  // its auto-linked captures rematch (XERK-2970)
+    return { status: 200, body: { ok: true } };
+  }
+  if (sc.scope === "following") {
+    const rec = calTurmaEndBefore(f.rec, f.occ, f.t, now);
+    calTurmaStore(f.t, rec);
+    return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+  }
+  if (!Object.hasOwn(f.rec.exceptions, f.key) && Object.keys(f.rec.exceptions).length >= CALENDAR_TURMA_EXCEPTIONS_MAX) {
+    return { status: 409, body: { error: `a series keeps at most ${CALENDAR_TURMA_EXCEPTIONS_MAX} changed or deleted ` +
+      "occurrences; edit the series instead" } };
+  }
+  const rec = sanitizeTurmaEvent({ ...f.rec, exceptions: { ...f.rec.exceptions, [f.key]: { deleted: true } },
+    updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
+  calTurmaStore(f.t, rec);
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
 }
 // The Turma-event routes' shared tail (XERK-2968): parse the body, run the logic.
+// A DELETE names its scope in the query (`?scope=`), a PATCH in its body.
 async function turmaEventRoute(req, res, id) {
   let body = null;
   if (req.method !== "DELETE") {
@@ -6630,7 +6923,8 @@ async function turmaEventRoute(req, res, id) {
   }
   const p = requestPrincipal(req);
   const out = req.method === "POST" ? createTurmaEvent(p, body)
-    : req.method === "PATCH" ? patchTurmaEvent(p, id, body) : deleteTurmaEvent(p, id);
+    : req.method === "PATCH" ? patchTurmaEvent(p, id, body)
+      : deleteTurmaEvent(p, id, new URL(req.url, "http://hub").searchParams.get("scope") ?? undefined);
   return json(res, out.status, out.body);
 }
 // An org no host has been decided into for CALENDAR_TURMA_ORG_GRACE_MS leaves
@@ -6730,7 +7024,19 @@ function calendarEventLookup(t) {
     byId.set(ev.id, c);
     copies.set(ev.id, [c]);
   }
-  return { t, byId, copies };
+  // A recurring event's occurrences (XERK-2969) are unbounded, so they are not
+  // listed: an occurrence id resolves on lookup.
+  const occ = (id) => {
+    const ev = turmaInstanceById(t, id);
+    return ev ? { key: "", ev, syncedAt: calendarTurmaEvents[t][ev.seriesId].updatedAt, turma: true } : undefined;
+  };
+  return { t, byId: calLookupMap(byId, occ), copies: calLookupMap(copies, (id) => { const c = occ(id); return c && [c]; }) };
+}
+// A lookup Map whose get() falls back to `resolve` for a key it does not hold.
+function calLookupMap(map, resolve) {
+  const get = map.get.bind(map);
+  map.get = (k) => (map.has(k) ? get(k) : resolve(k));
+  return map;
 }
 // Whether lookup copy `c` counts for org `siteKey`: an Outlook copy by its host's
 // decided org, a Turma event when `siteKey` is one of its orgs (XERK-2970).
@@ -6747,7 +7053,7 @@ function calendarLinkCandidate(ev) {
 }
 // Every event a capture of tenant `t` could link to, with the org it counts for,
 // sorted by start, plus the lookup.
-function calendarCandidateIndex(t) {
+function calendarCandidateIndex(t, captures = []) {
   const list = [];
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t) continue;
@@ -6758,9 +7064,54 @@ function calendarCandidateIndex(t) {
   }
   // A Turma event is a candidate for each of its orgs (XERK-2970); calendarBestMatch
   // scores one id once.
+  // A series is a candidate by its occurrences around the CAPTURES being matched
+  // only (XERK-2969): its occurrences are unbounded, and expanding a fixed window
+  // for every series stalled the loop and starved later series of a shared budget.
+  // The work is bounded in all (CALENDAR_CANDIDATE_WORK_MAX series-window walks
+  // and occurrences) and spent on the NEWEST captures first, every series alike,
+  // so a cut only ever costs the oldest captures a re-match — never a series.
+  const seriesByOrg = Object.create(null);
   for (const ev of Object.values(calendarTurmaEvents[t] || {})) {
-    if (calendarLinkCandidate(ev)) for (const org of ev.orgs) list.push({ key: "", ev, org });
+    const add = (e) => { if (calendarLinkCandidate(e)) for (const org of ev.orgs) list.push({ key: "", ev: e, org }); };
+    if (!ev.recurrence) { add(ev); continue; }
+    // An override can make one occurrence a meeting of a series that is not.
+    if (!calendarLinkCandidate(ev) && !Object.keys(ev.exceptions).length) continue;
+    const s = { ev, add, seen: new Set() };
+    for (const org of ev.orgs) (seriesByOrg[org] || (seriesByOrg[org] = [])).push(s);
   }
+  const wins = [];   // [org, from, until], one per capture window, merged per org
+  for (const m of captures) {
+    if (m && Number.isFinite(m.startedAt) && seriesByOrg[m.site]) {
+      wins.push([m.site, m.startedAt - CALENDAR_LINK_TOLERANCE_MS, Math.max(m.endedAt, m.startedAt) + CALENDAR_LINK_TOLERANCE_MS]);
+    }
+  }
+  wins.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
+  const merged = [];
+  for (const w of wins) {
+    const last = merged[merged.length - 1];
+    if (last && last[0] === w[0] && w[1] <= last[2]) last[2] = Math.max(last[2], w[2]);
+    else merged.push(w.slice());
+  }
+  merged.sort((a, b) => b[2] - a[2]);   // newest first
+  let work = CALENDAR_CANDIDATE_WORK_MAX;
+  const walked = [];   // the merged windows every series was walked in
+  // Whether capture `m` of org `site` was fully indexed: past a cut, a relink must
+  // leave the others as they are (their matcher would see no series at all).
+  const covers = (site, m) => !seriesByOrg[site] || walked.some(([o, from, until]) => o === site &&
+    from <= m.startedAt - CALENDAR_LINK_TOLERANCE_MS && Math.max(m.endedAt, m.startedAt) + CALENDAR_LINK_TOLERANCE_MS <= until);
+  for (const win of merged) {
+    const [org, from, until] = win;
+    for (const s of seriesByOrg[org]) {
+      if (--work < 0) return { ...calendarEventLookup(t), list: list.sort((a, b) => a.ev.startMs - b.ev.startMs), cut: true, covers };
+      eachTurmaOccurrence(s.ev, from, until, (o) => {
+        if (!s.seen.has(o.key)) { s.seen.add(o.key); s.add(turmaInstance(s.ev, o)); }
+        return --work > 0;
+      });
+    }
+    if (work > 0) walked.push(win);
+  }
+  // The budget ran out inside the last walk: as partial as any cut (QA: exact hit).
+  if (work <= 0) return { ...calendarEventLookup(t), list: list.sort((a, b) => a.ev.startMs - b.ev.startMs), cut: true, covers };
   list.sort((a, b) => a.ev.startMs - b.ev.startMs);
   return { ...calendarEventLookup(t), list };
 }
@@ -6884,10 +7235,17 @@ function relinkTenantMeetings(t) {
   let changed = false;
   for (const [site, list] of Object.entries(meetingProposals)) {
     if (tenantOfSite(site) !== t) continue;
-    if (!index) index = calendarCandidateIndex(t);
+    if (!index) {
+      const caps = [];
+      for (const [s2, l2] of Object.entries(meetingProposals)) {
+        if (tenantOfSite(s2) === t) for (const x of l2) if (x.calendarBy !== "operator") caps.push({ ...x, site: s2 });
+      }
+      index = calendarCandidateIndex(t, caps);
+    }
     for (let i = 0; i < list.length; i++) {
       const m = list[i];
       if (m.calendarBy === "operator") continue;
+      if (index.cut && !index.covers(site, m)) continue;   // not indexed: leave it as it is
       const next = sanitizeMeeting({ ...m, ...meetingCalendarLinkFields(site, m, index) });
       if (!next || (next.calendarEventId === m.calendarEventId && next.calendarAmbiguous === m.calendarAmbiguous)) continue;
       list[i] = next;
@@ -6951,7 +7309,7 @@ function setMeetingCalendarLink(siteKey, meetingId, body) {
   const m = Object.hasOwn(meetingProposals, siteKey)
     && meetingProposals[siteKey].find((x) => x.meetingId === meetingId);
   if (!m) return refuse(404, "no such meeting");
-  const index = calendarCandidateIndex(tenantOfSite(siteKey));
+  const index = calendarCandidateIndex(tenantOfSite(siteKey), [{ ...m, site: siteKey }]);
   let fields;
   if (auto) {
     fields = meetingCalendarLinkFields(siteKey, { ...m, calendarBy: undefined, calendarEventId: undefined }, index);
@@ -22526,10 +22884,15 @@ function dailyBriefCalendar(siteKey, from, meetingAt, timeZone) {
         .map((p) => p.name || p.email));
     }
   }
-  for (const ev of Object.values(calendarTurmaEvents[t] || {})) {
-    if (!ev.orgs.includes(siteKey)) continue;
-    const hidden = ev.sensitivity === "private" || ev.sensitivity === "confidential";
-    take(ev, hidden ? "Private event" : ev.subject, hidden ? [] : ev.attendees.map((p) => p.name || p.email));
+  for (const rec of Object.values(calendarTurmaEvents[t] || {})) {
+    if (!rec.orgs.includes(siteKey)) continue;
+    const takeTurma = (ev) => {
+      const hidden = ev.sensitivity === "private" || ev.sensitivity === "confidential";
+      take(ev, hidden ? "Private event" : ev.subject, hidden ? [] : ev.attendees.map((p) => p.name || p.email));
+    };
+    // A series by its occurrences in the window (XERK-2969).
+    if (!rec.recurrence) takeTurma(rec);
+    else eachTurmaOccurrence(rec, from, until, (o) => { takeTurma(turmaInstance(rec, o)); });
   }
   let fmt;
   try {
@@ -22968,7 +23331,7 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
   }
   const daily = meetingDailyOf(siteKey, row);
   const kept = putMeeting(siteKey, { ...row, ...(daily ? { daily } : {}),
-    ...meetingCalendarLinkFields(siteKey, { ...row, daily }, calendarCandidateIndex(tenantOfSite(siteKey))) });
+    ...meetingCalendarLinkFields(siteKey, { ...row, daily }, calendarCandidateIndex(tenantOfSite(siteKey), [{ ...row, site: siteKey }])) });
   if (!kept) return { status: 400, body: { error: "the meeting could not be stored" } };
   saveMeetingTranscript(kept);
   dispatchNextMeeting(siteKey, now);
@@ -30634,7 +30997,7 @@ if (process.env.TURMA_TEST) {
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     // XERK-2968: Turma-created events.
     sanitizeTurmaEvent, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
-    CALENDAR_TURMA_EVENTS_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
+    CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,
