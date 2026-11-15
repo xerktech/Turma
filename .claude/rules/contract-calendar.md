@@ -3,6 +3,8 @@ paths:
   - "turma/server.js"
   - "turma/tenant-scope.js"
   - "turma/holidays.js"
+  - "turma/recurrence.js"
+  - "turma/tests/recurrence.test.js"
   - "turma/public/meetings.js"
   - "agent/hub-agent.py"
   - "agent/hooks/session_cli.py"
@@ -310,7 +312,7 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 - **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
   order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
   timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
-  sensitivity, recurrence, createdBy, createdAt, updatedAt, version}`.
+  sensitivity, recurrence, exceptions, createdBy, createdAt, updatedAt, version}`.
   - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
     `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
   - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.
@@ -318,7 +320,7 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
     meant, which a recurrence needs; `start`/`end` alone fix the instant.
   - Attendee `role` is `required|optional` only (the creator is the organizer); no `response`.
   - `busy` free|tentative|busy|outOfOffice|workingElsewhere (default busy).
-  - `recurrence` is `null` until XERK-2969 defines it.
+  - `recurrence`: a rule (below) or `null` for a single event; `exceptions` its per-occurrence edits.
   - `createdBy`: the creating principal (`user:<id>`, or its kind for open/legacy/break-glass).
   - `version` starts at 1 and every write bumps it.
 - **Caps, refused with a 409 in the hub's words, never a silent drop**: ≤`CALENDAR_TURMA_EVENTS_MAX`
@@ -371,3 +373,82 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 - Tenant purge drops the tenant's bucket; tenant migration moves an untenanted event whose every
   org is movable into the tenant, its orgs re-keyed. Tests: `tenant-migration.test.js`, the
   `XERK-2968:` cases in `server.test.js`.
+
+## Recurring Turma events (XERK-2969, `turma/recurrence.js`)
+
+- **A series is ONE record: its first instance (the anchor's start, end, `timeZone`) + a rule.**
+  Rule (`ruleError` / `sanitizeRule`, the ONE whitelist; fixed key order, a coerce fixed point):
+  `{freq: daily|weekly|monthly|yearly, interval 1..99, byDay?, byMonthDay?, byWeekday?, until? | count?}`.
+  - `byDay` [SU..SA] for daily (a filter: weekdays = daily MO..FR) or weekly (default: the
+    anchor's day). Weeks start Sunday, like the calendar view.
+  - `byMonthDay` 1..31 or `byWeekday {n: 1..4 | -1 (last), day}` for monthly/yearly (default the
+    anchor's day of month; yearly keeps the anchor's month). **A day past a month's end is its
+    last day** (Outlook's rule): "the 31st" is Feb 28, Apr 30. Never RFC 5545's skip.
+  - `until` a date, inclusive, in the event's zone; `count` 1..999; at most one. Neither = unbounded.
+  - The anchor sets the time of day; occurrences are the rule's dates on or after it. A write whose
+    rule names no occurrence at all is a 400; a recurring event lasts ≤31 days (else 400).
+- **Expanded at SERVE time, over the requested range only, in the event's IANA `timeZone`** (Intl,
+  no dependency): every occurrence keeps the anchor's WALL start and length, so DST never moves a
+  9:00. A time a spring-forward skips reads an hour later (old offset), a repeated one is its first.
+  - Unbounded rules are fine: a call skips straight to the range and never walks more than
+    `PERIODS_MAX` periods; the served range is already ≤100 days.
+  - **A `count` series skips ahead too** (its occurrences before a period are counted in O(1)):
+    walking it from its start on every GET and every exception check stalled the hub for tens of
+    seconds (QA). The whitelist checks every exception key on every write's store echo — keep
+    `occurrenceAt` O(1)-ish.
+  - **All Turma occurrences in one answer stop at `CALENDAR_SERVE_MAX`**, and the answer then says
+    `truncated: true` — never expand 1500 series × 100 days first and slice after.
+- **An occurrence's id is `<seriesId>:<original start>`**, the original start as UTC ISO with
+  seconds (`turma:ab…:2026-11-16T14:00:00Z`) — the Outlook reader's own convention, so clients treat
+  both alike. Served as `{...series fields, id, seriesId, recurring:true, originalStart, exception,
+  start, end, startMs, endMs}`; a single event carries `seriesId:""`, `recurring:false`. The series
+  record itself is never served as an event, and `exceptions` never ride the wire.
+- **`exceptions`: `{<original start>: {deleted:true} | {override fields}}`** on the series,
+  ≤`CALENDAR_TURMA_EXCEPTIONS_MAX` (100; past it a 409 in words). Overrides are any client field but
+  `timeZone`, re-derived through the record whitelist; `start`/`end` ride together.
+  - **Kept only while the key is still an occurrence** (checked by the whitelist), so editing the
+    rule — or re-timing the series — drops the ones it no longer lands on.
+  - A moved occurrence is served where it moved to, also into or out of the asked range.
+- **A private event's owner rule (XERK-2972) applies per occurrence too**: a write naming an
+  occurrence made private alone is refused (409) to anyone but the owner, like a private series;
+  an occurrence of a private series is never `editable` to others, even one made public.
+- **Orgs are series-level**: an occurrence cannot change orgs or zone (400), so one series is one
+  org set. An occurrence edit that resends the series' OWN orgs/zone unchanged is accepted (the
+  web form sends every field).
+- **The capture matcher and the Daily Brief read a series by its OCCURRENCES** (XERK-2970 readers):
+  a capture links to `<seriesId>:<original start>`, never the series id, and the brief lists
+  each occurrence in its window. `calendarCandidateIndex(t, captures)` expands a series ONLY in the
+  windows of the captures being matched (each capture ± `CALENDAR_LINK_TOLERANCE_MS`, its own org):
+  a fixed window for every series stalled the loop ~0.4 s per call and starved later series of a
+  shared budget (QA). Every caller passes its captures. Windows merge per org, and the whole index
+  spends ≤`CALENDAR_CANDIDATE_WORK_MAX` walks NEWEST capture first (`cut: true` past it): a cut
+  costs the oldest captures a re-match, never a series; an existing link still resolves by id, and
+  a relink LEAVES a row whose window was not walked (`index.covers`) untouched — else its
+  ambiguous flag was wiped with nothing decided (QA).
+- **`recurrence.wallOf` caches a zone's offset per 15-minute UTC bucket**, validated at both ends
+  (some zones move at 00:01): Intl was the whole cost of expansion (~0.15 ms a call). A bucket
+  holding a transition is computed exactly each call. Checked against Intl at every minute around
+  every transition 1975–2040 in every zone (once); `recurrence.test.js` pins the 00:01 movers. `calendarEventLookup` resolves an
+  occurrence id on `get` (never listed); a deleted occurrence no longer resolves.
+- **An edit keeps a stored org no host is decided into** (it is not served, so no client can
+  resend it); the 24h grace in `calendarTurmaTick` decides it. An occurrence edit resending the
+  SERVED subset of the series' orgs is "unchanged"; a duplicated org never is.
+- **Writes (the XERK-2968 routes) take a `scope`** — PATCH in the body, DELETE as `?scope=`:
+  - `occurrence` (the default for an occurrence id): PATCH merges its override (a start alone keeps
+    its length); DELETE marks it deleted. A deleted occurrence is a 404 after.
+  - `series` (the default, and the only scope, for a series id): PATCH edits the record, `recurrence`
+    included (`null` makes it single). Through an occurrence id a start/end moves the series by the
+    same delta. DELETE removes the whole series.
+  - `following`: the series ends the day before this occurrence (`until`; a `count` becomes the
+    occurrences before it) and PATCH creates a NEW series at it carrying the edit and the
+    exceptions from it on → `{ok, event: <new series>, previous: <old series>}`. DELETE only ends
+    the old one. From the first occurrence it is `series`.
+  - A monthly/yearly rule with an implicit day gets `byMonthDay` = the old anchor's day on the new
+    series: split at Apr 30 of "the 31st", it must stay on the 31st, not move to the 30th. Not
+    when the edit moves the occurrence to another DATE (the local date, not the day number, never on
+    whether `start`/`timeZone` were sent — edit forms resend them): the new start names the day.
+  - `version` is the SERIES' (one version per series; every scope bumps it). Occurrence PATCH
+    answers the occurrence, series PATCH the series record.
+- Tests: `recurrence.test.js` (DST both ways and east of +12, month-end, nth/last weekday,
+  until/count, range cut, bounds); the `XERK-2969:` cases in `server.test.js` (ids, moved/deleted
+  occurrences, rule edit dropping exceptions, the following split, the serve cap).
