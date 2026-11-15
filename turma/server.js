@@ -22440,13 +22440,12 @@ const dailyBriefSent = new Set();
 // `siteKey`'s real meetings (calendarLinkCandidate, not canceled) starting in
 // [from, from + DAILY_BRIEF_CALENDAR_SPAN_MS) — its hosts' Outlook events and the
 // Turma events it is one of the orgs of — less the standup itself (starting
-// in [meetingAt - MEETING_DAILY_BEFORE_MS, meetingAt + 5 min]: a meeting right
-// after it still counts, QA). Times are "HH:MM" in the
+// within 5 min of `meetingAt`: a meeting just before or after it still counts, QA). Times are "HH:MM" in the
 // schedule's zone; a private event is "Private event" with nobody named.
 const DAILY_BRIEF_CALENDAR_SPAN_MS = 12 * 3600e3;
 const DAILY_BRIEF_CALENDAR_MAX = 10;
 const DAILY_BRIEF_CALENDAR_WITH_MAX = 5;
-const DAILY_BRIEF_STANDUP_LATE_MS = 5 * 60e3;   // the standup's own event may start this late
+const DAILY_BRIEF_STANDUP_SLACK_MS = 5 * 60e3;  // the standup's own event starts this near meetingAt
 function dailyBriefCalendar(siteKey, from, meetingAt, timeZone) {
   const until = from + DAILY_BRIEF_CALENDAR_SPAN_MS;
   const t = tenantOfSite(siteKey);
@@ -22454,7 +22453,7 @@ function dailyBriefCalendar(siteKey, from, meetingAt, timeZone) {
   const take = (ev, title, people) => {
     if (picked.has(ev.id) || !calendarLinkCandidate(ev) || ev.canceled) return;
     if (ev.startMs < from || ev.startMs >= until) return;
-    if (ev.startMs >= meetingAt - MEETING_DAILY_BEFORE_MS && ev.startMs <= meetingAt + DAILY_BRIEF_STANDUP_LATE_MS) return;
+    if (Math.abs(ev.startMs - meetingAt) <= DAILY_BRIEF_STANDUP_SLACK_MS) return;
     picked.set(ev.id, { startMs: ev.startMs, endMs: ev.endMs, title,
       with: people.filter(Boolean).slice(0, DAILY_BRIEF_CALENDAR_WITH_MAX) });
   };

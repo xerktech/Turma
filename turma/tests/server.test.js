@@ -33669,6 +33669,9 @@ test("XERK-2970: a meeting right after the standup stays in the brief's calendar
       await turma2968("POST", null, turmaEv2970([A], now + mins * 60e3, 15, { subject }));
     }
     assert.deepEqual(hub.dailyBriefCalendar(A, now + 25 * 60e3, meet, "UTC").map((e) => e.title), ["Right after", "Later"]);
+    // A 30-minute lead: a meeting 15 minutes before the standup is still ahead.
+    await turma2968("POST", null, turmaEv2970([A], now + 15 * 60e3, 10, { subject: "Just before" }));
+    assert.deepEqual(hub.dailyBriefCalendar(A, now, meet, "UTC").map((e) => e.title), ["Just before", "Right after", "Later"]);
   } finally {
     cleanup2968();
     cleanup2395(A, ["dbC2970"]);

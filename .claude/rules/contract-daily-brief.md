@@ -73,8 +73,8 @@ ticket builds to this file; change it here first.
   - `calendar` (XERK-2970, `dailyBriefCalendar`): the org's real meetings (`calendarLinkCandidate`,
     not canceled) STARTING in [until, until+12h), ≤10, earliest first: its hosts' Outlook events
     AND the Turma events whose `orgs` contains the org (a multi-org event is in each org's brief).
-    - Less the standup itself: an event starting in [`meetingAt` − 20 min, `meetingAt` + 5 min]; a
-      meeting right after it still counts (QA).
+    - Less the standup itself: an event starting within 5 min of `meetingAt`; a meeting
+      just before or after it still counts (QA: ±20 min dropped real meetings).
     - The window may cross midnight, so the prompt never calls them today's.
     - Each `{title, start "HH:MM", end "HH:MM", with: [≤5 invitee names]}`, times in the
       schedule's zone. A private event is `"Private event"` with nobody named (Outlook: unless the
