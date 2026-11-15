@@ -141,7 +141,7 @@ def case_name(site, meeting_id):
     """A file name per (org, meeting): readable, plus a hash of both, so two
     meetings never share a file (`m:1` and `m-1` fold alike, and two orgs can
     use one id)."""
-    tag = hashlib.sha1(f"{site}\0{meeting_id}".encode()).hexdigest()[:10]
+    tag = hashlib.sha256(f"{site}\0{meeting_id}".encode()).hexdigest()[:10]
     return re.sub(r"[^A-Za-z0-9._-]+", "-", f"review-{meeting_id}")[:80] + "-" + tag
 
 
