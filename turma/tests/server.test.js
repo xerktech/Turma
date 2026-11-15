@@ -29797,6 +29797,36 @@ test("XERK-2965: Tenir lists the settled meetings with no transcript kept and ba
   assert.equal(gone.status, 404);
   assert.equal(hub.getMeetings()[S].some((m) => m.meetingId === "gone1"), false);
   assert.equal(meetCmds2508("mtBf2965").length, 0, "no read was started");
+  // A pending meeting keeps its own segments: a resend never saves over them (QA m1).
+  const pendBefore = hub.meetingTranscripts.has("wait1", 5);
+  const pr = await postMeeting2508(S, meeting2508("wait1", { segments: [{ text: "resend", startMs: 0, endMs: 1 }] }));
+  assert.deepEqual([pr.status, pr.body.transcriptSaved], [200, undefined]);
+  assert.equal(hub.meetingTranscripts.has("wait1", 5), pendBefore);
+  // A transcript only Postgres holds (a promoted leader's empty disk) is never
+  // overwritten by a resend, and a store that cannot tell saves nothing (QA D1).
+  const realMissing = hub.meetingTranscripts.missing;
+  hub.getMeetings()[S].push(hub.sanitizeMeeting({ meetingId: "pg1", title: "Pg", platform: "zoom",
+    startedAt: 1, endedAt: 2, receivedAt: 9, status: "ok", items: [] }));
+  try {
+    hub.meetingTranscripts.missing = async () => [];
+    const pg = await postMeeting2508(S, meeting2508("pg1", { segments: [{ text: "other", startMs: 0, endMs: 1 }], backfill: true }));
+    assert.deepEqual([pg.status, pg.body.transcriptSaved], [200, undefined]);
+    assert.equal(hub.meetingTranscripts.has("pg1", 9), false);
+    hub.meetingTranscripts.missing = async () => { throw new Error("postgres connection closed"); };
+    const down = await postMeeting2508(S, meeting2508("pg1", { backfill: true }));
+    assert.deepEqual([down.status, down.body.transcriptSaved], [200, undefined]);
+    assert.equal(hub.meetingTranscripts.has("pg1", 9), false);
+    // The list says so rather than reading "all missing" (QA m6).
+    const l = await list(S);
+    assert.equal(l.status, 503);
+    assert.match(l.body.error, /transcript store is unreachable/);
+  } finally {
+    hub.meetingTranscripts.missing = realMissing;
+  }
+  // The read-only list never notes a label miss (QA D3): Tenir asks it daily.
+  assert.equal((await list("nolabel2965")).status, 404);
+  const ag = (await request("GET", "/api/agents", { headers: userHeaders })).body;
+  assert.ok(!("nolabel2965" in (ag.meetingLabelMisses || {})));
   cleanup2508(S, ["mtBf2965"]);
   cleanup2508(O, ["mtBfO2965"]);
 });

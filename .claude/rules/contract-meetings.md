@@ -75,6 +75,8 @@ ticket builds to this file; change it here first.
   and changes nothing (first copy wins), so Tenir retries freely, also after a hub restart.
   - Except the transcript (XERK-2965): a repeat of a SETTLED meeting with no document kept saves
     its segments as that document and answers `transcriptSaved: true`; the row is untouched.
+    - "No document" asks Postgres too (`meetingTranscripts.missing`): a promoted leader's disk is
+      empty, and a local-only check overwrote its cache with a resend (QA). Can't tell = no save.
   - `backfill: true` on the body: a meeting the hub does not hold is 404 "no such meeting",
     never created — a resend for its transcript must not have its work proposed twice.
 - Answers `{ok, meeting}`: the row without its transcript.
@@ -84,11 +86,14 @@ ticket builds to this file; change it here first.
 - `GET /api/orgs/<siteKey>/meetings/missing-transcripts` — Tenir's bearer and org resolution, as
   the POST (`isMeetingsIngest` covers both). Answers `{meetingIds}`: the org's SETTLED rows with no
   document kept, locally nor in Postgres; 503 when Postgres can't tell (never "all missing").
+  - It notes no label miss (`resolveMeetingOrg(…, {note:false})`): Tenir asks under every label
+    it ever delivered to, daily, and an old label must not re-raise the Meetings page banner.
 - Tenir re-POSTs each one it still holds with `backfill: true` (the dup rule above). Why push,
   not a hub pull: the hub holds no Tenir address or credential, and each tenant's Tenir already
   holds its own bearer.
 - Tenir asks at its delivery loop's start and then daily, so a transcript the byte budget evicts
-  is re-sent at most once a day.
+  is re-sent at most once a day. A pass that did not reach every org (hub down, a refusal, an older
+  hub) is retried after 15 min instead.
 - Tests: `XERK-2965:` cases in `server.test.js`; Tenir's `test_turma_delivery.py`.
 
 ## The proposal store (hub, XERK-2508)

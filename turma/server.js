@@ -7014,7 +7014,10 @@ function forgetMeetingLabelMiss(label, t) {
 // The org a Tenir post's URL names, for the token's tenant `t`: {site} (scoped;
 // an org no host is in still reaches the route's own 404) or {error} for a
 // label no org, or more than one, answers to — noted so the operator can map it.
-function resolveMeetingOrg(urlSite, t) {
+// `note: false` (the read-only missing-transcripts GET, XERK-2965) records no
+// miss: Tenir asks it daily under every label it ever delivered to, and an old
+// label after a relabel must not re-raise the Meetings page's banner.
+function resolveMeetingOrg(urlSite, t, { note = true } = {}) {
   const scoped = scopeSite(urlSite, t);
   const orgs = decidedOrgs();
   if (orgs.has(scoped)) return { site: scoped };
@@ -7025,7 +7028,7 @@ function resolveMeetingOrg(urlSite, t) {
     if (forgetMeetingLabelMiss(label, t)) broadcastMeetingLabels();
     return { site: hits[0] };
   }
-  noteMeetingLabelMiss(label, t, hits.length > 1);
+  if (note) noteMeetingLabelMiss(label, t, hits.length > 1);
   return { error: hits.length
     ? `more than one org has the meeting label "${label}" — give one of them its own label on the Meetings page`
     : `no org has the meeting label "${label}" — set it on the Meetings page` };
@@ -22724,6 +22727,18 @@ function sweepMeetingTranscripts(now = Date.now()) {
     .finally(() => { meetingTranscriptSweeping = false; });
 }
 
+// Save a duplicate's segments as the transcript of a settled meeting that has
+// none kept, locally nor in Postgres (XERK-2965). A store that cannot tell saves
+// nothing: never overwrite a kept transcript on a guess.
+async function backfillMeetingTranscript(m) {
+  try {
+    if (!(await meetingTranscripts.missing([m])).length) return false;
+  } catch {
+    return false;
+  }
+  return saveMeetingTranscript(m);
+}
+
 function acceptMeeting(siteKey, body, now = Date.now()) {
   const { row, error } = meetingFromBody(body, now);
   if (error) return { status: 400, body: { error } };
@@ -22733,12 +22748,11 @@ function acceptMeeting(siteKey, body, now = Date.now()) {
     // its document lost) takes it from Tenir's resend (XERK-2965). The row is
     // untouched — first copy wins. A pending row keeps its own segments, which
     // the sweep back-fills from.
-    let transcriptSaved = false;
-    if (!MEETING_PENDING.has(dup.status) && !meetingTranscripts.has(dup.meetingId, dup.receivedAt)) {
-      transcriptSaved = saveMeetingTranscript({ ...dup, participants: row.participants, segments: row.segments });
-    }
-    return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup),
-      ...(transcriptSaved ? { transcriptSaved } : {}) } };
+    // The route (`backfillMeetingTranscript`) checks the store, Postgres
+    // included, before saving: under HA a promoted leader's disk is empty.
+    const backfill = !MEETING_PENDING.has(dup.status)
+      ? { ...dup, participants: row.participants, segments: row.segments } : null;
+    return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup) }, backfill };
   }
   // A resend for a transcript only (`backfill`) never creates a meeting: the
   // hub dropped this one since it listed it, and reading it again would propose
@@ -25104,7 +25118,7 @@ const server = http.createServer(async (req, res) => {
           const t = meetingsTenant(req);
           if (tenantOfSite(site) || t == null) return json(res, 404, { error: "no host is in that org" });
           // A short label (XERK-2638) or, from an older config, the site itself.
-          const org = resolveMeetingOrg(site, t);
+          const org = resolveMeetingOrg(site, t, { note: !isMeetingsMissing });
           if (org.error) return json(res, 404, { error: org.error });
           parts[2] = encodeURIComponent(org.site);
         } else if (!principalMaySite(requestPrincipal(req), site)) {
@@ -29526,6 +29540,7 @@ const server = http.createServer(async (req, res) => {
           limit: MEETING_SEGMENTS_MAX });
       }
       const out = acceptMeeting(siteKey, body);
+      if (out.backfill && await backfillMeetingTranscript(out.backfill)) out.body.transcriptSaved = true;
       return json(res, out.status, out.body);
     }
 
