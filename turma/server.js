@@ -6131,6 +6131,13 @@ function calendarOnBeat(key, prev, next, rows, now = Date.now()) {
   } catch (e) {
     console.error(`calendar ingest failed: ${e && e.message}`);
   }
+  // Every event takes its host's org (XERK-2964), so the host's decided org moving (a
+  // drift, its recovery) moves all of them: clients re-read, and captures linked to them
+  // go back to the matcher, rather than waiting for a sync that happens to change events.
+  if (prev && calendarEvents[key] && decidedOrgOf(prev) !== decidedOrgOf(next)) {
+    broadcastCalendarSoon(key);
+    scheduleCalendarRelink(tenantOfKey(key));
+  }
   if (!calendarCapable(next)) return;
   const wasLive = prev && calendarCapable(prev) && prev.lastSeen && now - prev.lastSeen <= OFFLINE_AFTER_MS;
   if (!wasLive) {
@@ -6464,8 +6471,8 @@ function scheduleCalendarRelink(t, now = Date.now()) {
   calendarRelinkTimers.set(t, timer);
   return false;
 }
-// Re-run the matcher over every meeting of tenant `t` (a calendar sync, or an org
-// rule / host setting that can move an event's org). One write for all changes.
+// Re-run the matcher over every meeting of tenant `t` (a calendar sync, or a host's
+// decided org moving, which moves its events' org). One write for all changes.
 function relinkTenantMeetings(t) {
   let index = null;
   let changed = false;

@@ -32613,7 +32613,7 @@ test("XERK-2896: two orgs meeting at the same time each link their own org's eve
     await postMeeting2508(B, capture2896("b1", T2896, 60, { title: "Weekly sync" }));
     assert.equal(row2896(A, "a1").calendarEventId, "acme");
     assert.equal(row2896(B, "b1").calendarEventId, "beta");
-    // By hand the operator may pick any event of the tenant (an org rule can be wrong),
+    // By hand the operator may pick any event of the tenant,
     // never an id no host of the tenant holds.
     assert.equal((await link2896(B, "b1", { eventId: "nope" })).status, 404);
     // The daily pairing: a daily capture prefers the event at its scheduled time.
@@ -32862,6 +32862,29 @@ test("XERK-2896: a capture links its host's event; an organizer-only block takes
   } finally {
     cleanup2896(S, [D]);
     cleanup2896(S2, [D2]);
+  }
+});
+
+test("XERK-2964: a host leaving the org lets its events' captures go at once; they return when it is back", async () => {
+  const S = "lkM2964.atlassian.net", OTHER = "lkM2964x.atlassian.net", D = "lkM2964d", E = "lkM2964e";
+  cleanup2896(S, [D, E]);
+  try {
+    // Both hosts in S; D's event fits the capture best, E's a little worse.
+    await calHost2896(D, S, [ev2896("dEv", T2896, 30)]);
+    await calHost2896(E, S, [ev2896("eEv", T2896 + 5 * MIN2896, 30)]);
+    await postMeeting2508(S, capture2896("q", T2896, 30));
+    assert.equal(row2896(S, "q").calendarEventId, "dEv");
+    // D drifts (declares another org): its decided org is "", so its event is no
+    // longer S's. No calendar change rides the beat, yet the capture moves to E's.
+    await beat1574(D, OTHER, { calendar: { available: true } });
+    assert.equal(hub.calendarEventOrg(D), "");
+    await waitFor(() => row2896(S, "q").calendarEventId === "eEv");
+    // D back in S: the matcher reruns and the better event wins again.
+    await beat1574(D, S, { calendar: { available: true } });
+    assert.equal(hub.calendarEventOrg(D), S);
+    await waitFor(() => row2896(S, "q").calendarEventId === "dEv");
+  } finally {
+    cleanup2896(S, [D, E]);
   }
 });
 

@@ -127,6 +127,9 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   - The settings route refuses a `defaultOrg`/`series` body (400, in words); an older store's
     `defaultOrg`/`seriesOrgs` are dropped on load; `/data/calendar-org-rules.json` is no longer read.
 - `matchOrg` (XERK-2898) equals `org`; the capture matcher counts an event for that org.
+- **A host's decided org moving (drift, recovery) re-runs the matcher and sends a `calendar`
+  frame at once** (`calendarOnBeat`): it moves every one of its events, and waiting for a sync that
+  changes events left links depending on history (QA). Test: `XERK-2964: a host leaving the org…`.
 
 ## Settings (hub store, operator-authed, tenant-scoped)
 
@@ -202,7 +205,7 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   - `calendarBy`: `auto` (the matcher) | `operator`; `operator` with no id = "never link".
   - `calendarAmbiguous: true` = the matcher found a tie; nothing linked, flagged for the operator.
 - **Matching** (`calendarBestMatch`), on Tenir's POST and again when a sync CHANGES a host's stored
-  events (`scheduleCalendarRelink` → `relinkTenantMeetings`).
+  events or its decided org moves (`scheduleCalendarRelink` → `relinkTenantMeetings`).
   - Relinks run at most once per `CALENDAR_RELINK_MIN_MS` (10s) per tenant, the rest deferred to
     one trailing timer; an error-only or unchanged sync schedules none. Why: one host re-sending
     syncs every beat blocked the shared event loop ~0.55 s a beat at the caps (QA).

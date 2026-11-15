@@ -592,7 +592,7 @@ data class CalRange(
     val err: String = "",
     val truncated: Boolean = false,
     val have: Boolean = false,
-    // Each host's settings row (one that carries `orgs`, XERK-2929), by host key.
+    // Each host's settings row (XERK-2929), by host key.
     val hostRows: Map<String, CalendarHost> = emptyMap(),
 )
 
