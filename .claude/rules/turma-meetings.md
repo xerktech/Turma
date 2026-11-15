@@ -285,5 +285,12 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   (keyed `"" + id`); the hub's `?org=` filter already matches any of its orgs.
 - **A multi-org event counts for EVERY org it is in** (`evOrgs`): the notes review's `upcoming`
   and relink candidates, not just `org` (= `orgs[0]`).
+- **A typed field's `change` never repaints or writes** (QA): it fires on blur, and a repaint then
+  detaches the button the mouse is pressing, so the browser drops the click (Save did nothing).
+  It also fires when a repaint removes the focused attendee input, carrying the text a comma just
+  committed. `input` owns typed drafts; only checkboxes (their change follows their own click)
+  repaint. Unit tests can't see this ordering: drive a real mouse (`fill()` hides it).
+- A skipped DST time takes the offset BEFORE the switch, a repeated one its first pass, east of UTC
+  too (`wallToIso` tries the offsets a day either side).
 - Repeat is a disabled placeholder until XERK-2969.
 - Tests: the `XERK-2971:` cases in `calendar.test.js`.

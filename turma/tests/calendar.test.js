@@ -1431,3 +1431,48 @@ test("XERK-2971: the notes review and relink count a multi-org event for every o
   assert.deepEqual(cal.upcoming("acme").map((e) => e.subject), ["Cross-org sync"]);
   assert.deepEqual(cal.upcoming("initech"), []);
 });
+
+test("XERK-2971 QA: a blur never repaints the editor or brings back a committed attendee; chips are escaped", () => withOrgs(async () => {
+  cal.openEditor({ startMs: at(2027, 5, 5, 9), endMs: at(2027, 5, 5, 10) });
+  const panel = cal._edEls().panel;
+  const fire = (kind, target) => { for (const f of panel.listeners[kind] || []) f({ target, key: target.key, preventDefault() {} }); };
+  const before = panel.innerHTML;
+  // A text field's change (on blur) neither writes nor repaints: a repaint drops the click
+  // the mouse is pressing on Save (QA).
+  fire("input", { dataset: { edField: "subject" }, value: "Standup", tagName: "INPUT", type: "text" });
+  fire("change", { dataset: { edField: "subject" }, value: "Standup", tagName: "INPUT", type: "text" });
+  assert.equal(panel.innerHTML, before, "no repaint on a text field's blur");
+  assert.equal(cal._ed().f.subject, "Standup");
+  // A comma commits the chip; the removed input's late change carries the old text — ignored.
+  const chipIn = { dataset: { edField: "optDraft", edChipin: "optional" }, tagName: "INPUT", type: "text" };
+  fire("input", { ...chipIn, value: "Bob <b>x</b> <bob@x.io>," });
+  fire("change", { ...chipIn, value: "Bob <b>x</b> <bob@x.io>," });
+  assert.deepEqual(cal._ed().f.optional, [{ name: "Bob <b>x</b>", email: "bob@x.io" }]);
+  assert.equal(cal._ed().f.optDraft, "", "the stale text is not written back");
+  assert.match(panel.innerHTML, /Bob &lt;b&gt;x&lt;\/b&gt;<button/, "a chip's name is escaped");
+  assert.ok(!panel.innerHTML.includes("<b>x</b>"));
+  // A trailing separator is never part of the address; a pasted list splits.
+  assert.deepEqual(cal.parseAttendee("bob@x.io,"), { name: "", email: "bob@x.io" });
+  fire("input", { ...chipIn, value: "a@b.co, c@d.co" });
+  fire("keydown", { ...chipIn, key: "Enter", value: "a@b.co, c@d.co" });
+  assert.deepEqual(cal._ed().f.optional.map((a) => a.email), ["bob@x.io", "a@b.co", "c@d.co"]);
+  // Moving the start keeps the length, without a repaint.
+  fire("focusin", {});
+  fire("change", { dataset: { edField: "startTime" }, value: "11:00", tagName: "INPUT", type: "time" });
+  assert.deepEqual([cal._ed().f.endDate, cal._ed().f.endTime], ["2027-05-05", "12:00"]);
+  cal.closeEditor();
+}));
+
+test("XERK-2971 QA: join link case and DST edges match the hub", () => {
+  const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme"], online: true };
+  assert.match(cal.validateForm({ ...f, joinUrl: "HTTPS://meet.example/x" }).joinUrl, /https/, "the hub's CAL_URL_RE is case-sensitive");
+  assert.equal(cal.validateForm({ ...f, joinUrl: "https://meet.example/x" }).joinUrl, undefined);
+  // A skipped hour lands on the instant the OLD offset names, east of UTC as well as west.
+  assert.equal(cal.wallToIso("2027-03-28", "02:30", "Europe/Berlin").iso, "2027-03-28T03:30:00+02:00");
+  assert.equal(cal.wallToIso("2027-10-03", "02:15", "Australia/Lord_Howe").iso, "2027-10-03T02:45:00+11:00");
+  assert.equal(cal.wallToIso("2027-03-14", "02:30", "America/New_York").iso, "2027-03-14T03:30:00-04:00");
+  // A repeated hour is its first pass, east and west.
+  assert.equal(cal.wallToIso("2027-10-31", "02:30", "Europe/Berlin").iso, "2027-10-31T02:30:00+02:00");
+  assert.equal(cal.wallToIso("2027-04-04", "01:45", "Australia/Lord_Howe").iso, "2027-04-04T01:45:00+11:00");
+  assert.equal(cal.wallToIso("0050-06-01", "09:00", "UTC"), null, "no 19xx for a year under 100");
+});

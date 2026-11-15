@@ -1177,6 +1177,8 @@ const BODY_MAX = 4000;                    // CALENDAR_BODY_MAX, code points
 const EMAIL_PART = "[^@\\s/\"<>`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff]+";
 const EMAIL_RE = new RegExp(`^${EMAIL_PART}@${EMAIL_PART}\\.${EMAIL_PART}$`);
 const cps = (s) => [...String(s ?? "")].length;
+// The hub's CAL_URL_RE: case-sensitive, so "HTTPS://" is refused there and here.
+const JOIN_URL_RE = /^https:\/\/[^\s"'<>\\`]+$/;
 // The address as the hub stores it (trimmed, lower-cased), or "" when it would refuse it.
 function normEmail(v) {
   const e = typeof v === "string" ? v.trim().toLowerCase() : "";
@@ -1184,7 +1186,8 @@ function normEmail(v) {
 }
 // "Ann Lee <ann@x.org>" or "ann@x.org" → {name, email}; null when no valid address.
 function parseAttendee(text) {
-  const t = String(text ?? "").trim();
+  // A trailing comma/semicolon ends an address; both regexes would keep it in the address.
+  const t = String(text ?? "").trim().replace(/[,;\s]+$/, "");
   const m = /^(.*?)\s*<([^<>]*)>$/.exec(t);
   const email = normEmail(m ? m[2] : t);
   if (!email) return null;
@@ -1220,12 +1223,17 @@ function wallToIso(date, time, tz) {
   const t = /^(\d{2}):(\d{2})$/.exec(String(time || ""));
   if (!d || !t || +t[1] > 23 || +t[2] > 59) return null;
   const [y, mo, dd] = [+d[1], +d[2], +d[3]];
-  if (mo < 1 || mo > 12 || dd < 1 || dd > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return null;
+  // Date.UTC reads a year under 100 as 19xx; no event is that old.
+  if (y < 1000 || mo < 1 || mo > 12 || dd < 1 || dd > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return null;
   try {
     const guess = Date.UTC(y, mo - 1, dd, +t[1], +t[2]);
-    let ms = guess - zoneOffsetMin(guess, tz) * 60000;
-    const off2 = zoneOffsetMin(ms, tz);
-    if (guess - off2 * 60000 !== ms && zoneOffsetMin(guess - off2 * 60000, tz) === off2) ms = guess - off2 * 60000;
+    // The zone's offset a day before and after: the wall time is guess minus one of them.
+    // Both name it in a repeated (fall-back) hour: the earlier instant, its first pass.
+    // Neither in a skipped (spring) hour: the offset before the switch names it.
+    const before = zoneOffsetMin(guess - DAY_MS, tz), after = zoneOffsetMin(guess + DAY_MS, tz);
+    const names = (off) => { const q = zoneParts(guess - off * 60000, tz); return Date.UTC(q.y, q.mo - 1, q.d, q.h, q.mi) === guess; };
+    const fits = [...new Set([before, after])].filter(names).map((off) => guess - off * 60000);
+    const ms = fits.length ? Math.min(...fits) : guess - before * 60000;
     const p = zoneParts(ms, tz), off = zoneOffsetMin(ms, tz);
     const sign = off < 0 ? "-" : "+", a = Math.abs(off);
     return { ms, iso: `${ymdOf(p)}T${pad(p.h)}:${pad(p.mi)}:00${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}` };
@@ -1290,10 +1298,11 @@ function validateForm(f, pickable = null) {
   if (cps(f.subject) > 300) err.subject = "The title is longer than 300 characters.";
   if (cps(f.location) > 300) err.location = "The location is longer than 300 characters.";
   if (cps(f.body) > BODY_MAX) err.body = `The details are longer than ${BODY_MAX} characters.`;
-  if (f.online && String(f.joinUrl || "").trim() && !safeHttps(String(f.joinUrl).trim())) err.joinUrl = "A join link must be an https:// link.";
+  if (f.online && String(f.joinUrl || "").trim() && !JOIN_URL_RE.test(String(f.joinUrl).trim())) err.joinUrl = "A join link must be an https:// link.";
   else if (f.online && cps(String(f.joinUrl || "").trim()) > 500) err.joinUrl = "The join link is longer than 500 characters.";
   for (const [k, d] of [["required", "reqDraft"], ["optional", "optDraft"]]) {
-    if (String(f[d] || "").trim() && !parseAttendee(f[d])) err[d] = "Not an email address: type name@example.com or Name <name@example.com>.";
+    if (String(f[d] || "").trim() && !parseAttendee(f[d])
+      && !String(f[d]).split(/[,;]/).map((x) => x.trim()).filter(Boolean).every((x) => parseAttendee(x))) err[d] = "Not an email address: type name@example.com or Name <name@example.com>.";
   }
   if (f.required.length + f.optional.length > ATTENDEES_MAX) err.reqDraft = `At most ${ATTENDEES_MAX} attendees.`;
   const cats = categoriesOf(f);
@@ -1478,10 +1487,15 @@ function paintEditor(force = false) {
 // Commit a typed attendee into a chip; false when it is no address.
 function commitChip(role) {
   const d = role === "required" ? "reqDraft" : "optDraft";
-  const a = parseAttendee(ed.f[d]);
-  if (!a) return false;
-  const all = [...ed.f.required, ...ed.f.optional];
-  if (!all.some((x) => x.email === a.email)) ed.f[role].push(a);
+  // One address, or a pasted list ("a@b.co, c@d.co") when every part is one.
+  const one = parseAttendee(ed.f[d]);
+  const parts = String(ed.f[d] || "").split(/[,;]/).map((x) => x.trim()).filter(Boolean);
+  const many = parts.length > 1 ? parts.map(parseAttendee) : [];
+  const got = many.length && many.every(Boolean) ? many : one ? [one] : [];
+  if (!got.length) return false;
+  for (const a of got) {
+    if (![...ed.f.required, ...ed.f.optional].some((x) => x.email === a.email)) ed.f[role].push(a);
+  }
   ed.f[d] = "";
   return true;
 }
@@ -1583,6 +1597,12 @@ function mountEditor() {
       ed.f[d.edFlag] = !!t.checked;
       if (d.edFlag === "allDay" && t.checked && ed.f.endDate < ed.f.startDate) ed.f.endDate = ed.f.startDate;
     } else if (d.edField !== undefined) {
+      // A typed field's draft is `input`'s. Its `change` fires on BLUR, and also when a
+      // repaint removes the still-focused node, with the text it had then: writing that
+      // back resurrected an attendee the comma had just committed (QA). And a text field
+      // never repaints the panel here — a repaint on blur detaches the button the mouse
+      // is pressing, and the browser drops that first click (QA: Save did nothing).
+      if (d.edChipin || t.tagName === "INPUT" && t.type === "text" || t.tagName === "TEXTAREA" || t.type === "url") return;
       ed.f[d.edField] = String(t.value ?? "");
       // Moving the start keeps the length, as Teams does.
       if ((d.edField === "startDate" || d.edField === "startTime") && ed.prevStart) {
@@ -1592,9 +1612,17 @@ function mountEditor() {
           const p = zoneParts(now.startMs + len, ed.f.timeZone);
           ed.f.endDate = ymdOf(p);
           if (!ed.f.allDay) ed.f.endTime = `${pad(p.h)}:${pad(p.mi)}`;
+          // Set in place: a date/time picker's change also lands on blur (see above).
+          for (const k of ["endDate", "endTime"]) {
+            const x = $edPanel.querySelector && $edPanel.querySelector(`[data-ed-field="${k}"]`);
+            if (x) x.value = ed.f[k];
+          }
         }
       }
+      ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
+      return;
     } else return;
+    // A checkbox's change follows its own click, so a repaint here loses nothing.
     ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
     if (ed.tried) ed.errors = validateForm(ed.f);
     paintEditor();
