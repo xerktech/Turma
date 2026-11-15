@@ -1184,6 +1184,18 @@ test("XERK-2954 QA: the grid opens with 8:00 at the top and keeps it while the p
     pane.h = 900;
     cal.setActive(true);  // a repaint
     assert.ok(Math.abs(topAt() - 600) < 1, `resize holds 10:00 at the top (top ${topAt()})`);
+    // QA: scrolling away and back to the pixel the calendar last wrote still counts.
+    const scrollTo = (min) => { scroller.scrollTop = min * ppm(); for (const f of grid.listeners.scroll || []) f({ target: scroller }); };
+    pane.h = 700;
+    cal.setActive(true);                     // writes 10:00 at the new height, arming one event
+    const written = scroller.scrollTop;
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });   // that write's own event
+    scrollTo(780);
+    scroller.scrollTop = written;            // back to the written pixel
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    pane.h = 640;
+    cal.setActive(true);
+    assert.ok(Math.abs(topAt() - 600) < 1, `the operator's return to 10:00 is kept (top ${topAt()})`);
   } finally {
     grid.querySelector = qs;
     cal.setActive(false);

@@ -280,7 +280,12 @@ function holdTop(sc, min) {
   const sig = `${sc.clientHeight}|${sc.scrollHeight}`;
   if (min === undefined && sig === paneSig) return;
   paneSig = sig;
-  if (topMin >= 0) { sc.scrollTop = Math.max(0, topMin * pxPerMin(sc)); wroteTop = sc.scrollTop; }
+  if (topMin < 0) return;
+  const was = sc.scrollTop;
+  sc.scrollTop = Math.max(0, topMin * pxPerMin(sc));
+  // Only a write that moved the pane sends an event; arming for one that did not would
+  // swallow the operator's next scroll to that pixel.
+  if (Math.abs(sc.scrollTop - was) >= 1) wroteTop = sc.scrollTop;
 }
 function zoom(dir) {
   const i = ZOOMS.indexOf(zoomHours) + (dir > 0 ? 1 : -1);
@@ -1295,8 +1300,11 @@ function mount(el, opts = {}) {
   // The operator's own scroll is the new view to hold (scroll does not bubble: capture).
   $grid.addEventListener("scroll", (ev) => {
     const sc = ev.target;
-    if (!sc || sc.id !== "calScroll" || !sc.clientHeight || Math.abs(sc.scrollTop - wroteTop) < 1) return;
-    topMin = sc.scrollTop / pxPerMin(sc);
+    if (!sc || sc.id !== "calScroll" || !sc.clientHeight) return;
+    // One-shot: the first event after a write may be ours; every later one is the operator's.
+    const ours = wroteTop >= 0 && Math.abs(sc.scrollTop - wroteTop) < 1;
+    wroteTop = -1;
+    if (!ours) topMin = sc.scrollTop / pxPerMin(sc);
   }, true);
   // Swipe left/right on the grid moves like › / ‹ (the narrow layout's arrows).
   let touch = null;
