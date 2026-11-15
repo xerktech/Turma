@@ -410,6 +410,10 @@ fun SessionsRoute(
     // transcriptId). Default no-op keeps previews/tests that only drive the
     // terminal path happy.
     onTrajectory: (String, String) -> Unit = { _, _ -> },
+    // Hoisted so a test hands in VMs over its own hub: the screen default can return
+    // one over an earlier test's container in a full-suite run (android.md).
+    fleetVm: FleetViewModel = viewModel(),
+    archiveVm: ArchiveViewModel = viewModel(),
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -489,6 +493,7 @@ fun SessionsRoute(
                     onBack = clear,
                     onResumed = select,
                     showBack = !wide,
+                    fleetVm = fleetVm, archiveVm = archiveVm,
                 )
                 else -> ChatScreen(
                     host = selHost.orEmpty(),
@@ -519,6 +524,7 @@ fun SessionsRoute(
                 SessionsListPane(
                     selectedKey = selKey(selHost, selId) ?: selKey(endHost, endTid),
                     listState = listState, endedOpenState = endedOpen,
+                    vm = fleetVm, archiveVm = archiveVm,
                     onSelect = select,
                     onSelectEnded = selectEnded,
                     query = query, onQuery = { query = it },
@@ -535,6 +541,7 @@ fun SessionsRoute(
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             SessionsListPane(
                 selectedKey = lastKey, listState = listState, endedOpenState = endedOpen,
+                vm = fleetVm, archiveVm = archiveVm,
                 onSelect = select, onSelectEnded = selectEnded,
                 query = query, onQuery = { query = it }, modifier = m,
             )

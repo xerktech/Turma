@@ -13,6 +13,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
+import com.xerktech.turma.vm.ArchiveViewModel
+import com.xerktech.turma.vm.FleetViewModel
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -41,6 +43,18 @@ class SessionsBackPositionTest {
     @get:Rule(order = 2)
     val compose = createAndroidComposeRule<ComponentActivity>()
 
+    // VMs over THIS test's hub — never the screen's viewModel() default (android.md).
+    private fun showRoute() {
+        val fleetVm = main.track(FleetViewModel(hub.app))
+        val archiveVm = main.track(ArchiveViewModel(hub.app))
+        compose.setContent {
+            SessionsRoute(
+                wide = false, onNavigate = {}, onTerminal = { _, _ -> },
+                fleetVm = fleetVm, archiveVm = archiveVm,
+            )
+        }
+    }
+
     private fun name(i: Int) = "Session %02d".format(i)
 
     @Test
@@ -54,7 +68,7 @@ class SessionsBackPositionTest {
                  "repos": [ { "name": "Turma", "lastActivity": "2026-08-12T00:00:00Z" } ],
                  "sessions": [ $sessions ] } ] }"""
         )
-        compose.setContent { SessionsRoute(wide = false, onNavigate = {}, onTerminal = { _, _ -> }) }
+        showRoute()
 
         val list = compose.onNode(hasScrollAction())
         val target = name(30)
@@ -91,7 +105,7 @@ class SessionsBackPositionTest {
                  "repos": [ { "name": "Turma", "lastActivity": "2026-08-12T00:00:00Z" } ],
                  "sessions": [ $running, $ended ] } ] }"""
         )
-        compose.setContent { SessionsRoute(wide = false, onNavigate = {}, onTerminal = { _, _ -> }) }
+        showRoute()
 
         val list = compose.onNode(hasScrollAction())
         list.performScrollToNode(hasText("Ended sessions", substring = true, ignoreCase = true))
