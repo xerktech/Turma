@@ -33429,6 +33429,9 @@ test("XERK-2968: refusals — Outlook ids, empty or unknown orgs, malformed fiel
     assert.equal((await turma2968("DELETE", "040000008200E00074C5B7101A82E008")).status, 400);
     assert.equal((await turma2968("POST", null, ev2968([]))).status, 400, "an event must belong to an org");
     assert.equal((await turma2968("POST", null, ev2968(["nobody2968.atlassian.net"]))).status, 404);
+    const dup = await turma2968("POST", null, ev2968([S2968A, S2968A]));
+    assert.equal(dup.status, 400, "a repeated org is refused, never coerced (XERK-2974)");
+    assert.match(dup.body.error, /must not repeat/);
     for (const bad of [{ start: "2026-11-16T09:00:00" }, { end: iso2968(T2968 - 1) }, { timeZone: "Mars/Olympus" },
       { joinUrl: "http://x.com" }, { busy: "maybe" }, { attendees: [{ email: "not an email" }] },
       { recurrence: { freq: "hourly" } }, { subject: "x".repeat(301) }]) {
@@ -33455,6 +33458,28 @@ test("XERK-2968: refusals — Outlook ids, empty or unknown orgs, malformed fiel
     }
     assert.equal(r.status, 409);
     assert.match(r.body.error, /MiB of Turma events/);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+// XERK-2974 QA: an over-cap body was rethrown to the router's catch, but the route
+// was returned unawaited, so the rejection escaped and exited the hub. Now a 413,
+// for POST and for PATCH (the body is read before the id is looked up), hub alive.
+// The timeout: without the fix the hub process dies and the run HANGS, never fails.
+test("XERK-2974: an oversized Turma-event body is a 413 and the hub stays up", { timeout: 30000 }, async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const fat = ev2968([S2968A], { body: "x".repeat(70 * 1024) });
+    for (const [method, id] of [["POST", null], ["PATCH", "turma:0000000000000000"]]) {
+      const r = await turma2968(method, id, fat);
+      assert.equal(r.status, 413, method);
+      assert.equal(r.body.limit, 64 * 1024, method);
+    }
+    assert.equal((await request("GET", "/healthz")).status, 200, "the hub is still serving");
+    assert.equal((await turma2968("POST", null, ev2968([S2968A]))).status, 200, "and still takes a normal event");
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);

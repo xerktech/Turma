@@ -6656,6 +6656,7 @@ function turmaEventOrgsError(p, orgs) {
     return { status: 400, body: { error: "orgs must be a list of org keys" } };
   }
   if (!orgs.length) return { status: 400, body: { error: "an event must belong to at least one org" } };
+  if (new Set(orgs).size !== orgs.length) return { status: 400, body: { error: "orgs must not repeat an org" } };
   if (orgs.length > CALENDAR_TURMA_ORGS_MAX) {
     return { status: 400, body: { error: `an event belongs to at most ${CALENDAR_TURMA_ORGS_MAX} orgs` } };
   }
@@ -26360,14 +26361,17 @@ const server = http.createServer(async (req, res) => {
     // POST /api/calendar/events, PATCH|DELETE /api/calendar/events/<id> — events
     // made in Turma, in one or more orgs (XERK-2968, contract-calendar.md). The
     // handlers scope by org: the caller must see every org in the body and on the event.
+    // `return await`, never a bare `return`: turmaEventRoute rethrows an oversized or
+    // over-budget body for the catch below to answer 413/503. A returned, unawaited
+    // promise skips that catch, and an unhandled rejection exits the hub (XERK-2974).
     if (req.method === "POST" && url.pathname === "/api/calendar/events") {
-      return turmaEventRoute(req, res, null);
+      return await turmaEventRoute(req, res, null);
     }
     if ((req.method === "PATCH" || req.method === "DELETE") && parts[0] === "api" && parts[1] === "calendar" &&
         parts[2] === "events" && parts.length === 4) {
       let id;
       try { id = decodeURIComponent(parts[3]); } catch { return json(res, 400, { error: "bad event id" }); }
-      return turmaEventRoute(req, res, id);
+      return await turmaEventRoute(req, res, id);
     }
 
 

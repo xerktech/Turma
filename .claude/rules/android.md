@@ -58,7 +58,8 @@ A pure-core/adapter-shell split:
   `turma-board.md`). The phone shows active filters as a badge only — never a second chip row.
 - **Match features and structure, not pixels** (platform-idiomatic controls). A justified platform
   difference (native chat vs ttyd terminal, Hub-URL login field, voice dictation) goes in
-  `android/PARITY.md` — the living gap tracker, updated whenever a gap closes or opens.
+  `android/PARITY.md` — the living gap tracker, updated whenever a gap closes or opens. A new gap
+  goes in `PARITY-open.md`, a closed installment in the newest `PARITY-done-*.md`.
 - **The chat's /history poll is gated on the live feed DELIVERING, never on the socket being open**
   (XERK-2372, `ChatViewModel.liveDelivering` ↔ chat.js `liveDelivering`): open AND the hub's `watch`
   ack said `armed` (or a non-`seed` delta arrived) AND, while the heartbeat says `paneBusy`, a frame
@@ -160,7 +161,8 @@ A pure-core/adapter-shell split:
     day swipe never see it) and TalkBack "Zoom in/out" custom actions stand in for the web's − / +.
     `CalendarViewModel.zoom`, saved once per pinch (prefs `zoom-hours`). Default 10h = 8 AM–6 PM.
   - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact
-    POST/PATCH body), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.
+    POST/PATCH body; `calScopedPayload` for an occurrence-scoped edit), `core/CalendarRepeat.kt`
+    (the Repeat rule, XERK-2973), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.
     - Edit/Delete only when `CalendarEvent.canEdit` (`source:"turma"`, `editable:true`, a
       `version`, NOT `private`): an older hub serves none of them, so its events stay read-only.
       A withheld private event's fields are blanked; editing it would save the blanks (QA).

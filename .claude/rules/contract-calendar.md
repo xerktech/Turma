@@ -308,7 +308,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   `registerExternalStore`, tenant id ("" = untenanted) → eventId → record. Keyed by TENANT, not
   host or org: one event may belong to several orgs of one tenant.
 - **Id `turma:<16 hex>`**, minted by the hub: an Outlook GlobalAppointmentID never starts so.
-  Any other id on these routes is a 400 "Outlook events are read-only".
+  An id without the `turma:` prefix on these routes is a 400 "Outlook events are read-only";
+  a `turma:` id the caller's tenants do not hold (malformed included) is a 404.
 - **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
   order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
   timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
@@ -329,17 +330,19 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 
 ## Turma-created events: routes and serving
 
-- Operator-authed (`filtered` class: the handler scopes by org), JSON body ≤64 KiB:
+- Operator-authed (`filtered` class: the handler scopes by org), JSON body ≤64 KiB
+  (`CALENDAR_TURMA_BODY_MAX`; over it a 413 `{error, limit}`, over the hub's memory budget a 503):
   - `POST /api/calendar/events {orgs, subject, start, end, timeZone?, ...}` → `{ok, event}`.
   - `PATCH /api/calendar/events/<id> {version, orgs?, fields...}` → `{ok, event}`; a `version`
     other than the stored one is a 409 carrying the current `event` (optimistic concurrency).
   - `DELETE /api/calendar/events/<id>` → `{ok}`.
 - **The caller must pass `principalMaySite` for EVERY org in the body AND every org on the stored
-  event**, so nobody strips an org they cannot see. An org no host is decided into, or one the
+  event**, so nobody strips an org they cannot see. Today that check is the tenant boundary
+  (`principalMaySite`), and a record's orgs are all one tenant's. An org no host is decided into, or one the
   caller may not see, is a 404 (never says which tenant holds it); `orgs: []` is a 400 (an event
   must belong to an org); an id the caller's tenants do not hold is a 404.
 - Malformed fields are a 400 naming the field, never coerced into a different event: `start`/`end`
-  must parse with an offset, `end ≥ start`, a given `timeZone` must be a known zone, a given
+  must parse with an offset, `end ≥ start`, `orgs` must not repeat an org, a given `timeZone` must be a known zone, a given
   `joinUrl` https, `busy`/`sensitivity` from their enums.
 - **Served on `GET /api/calendar`** beside the Outlook events, each ONCE (not per org):
   `{source:"turma", host:"", ...record, orgs, org: orgs[0], editable, meeting}`.
@@ -365,7 +368,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   `recurrence` with `scope: occurrence`. The control ⇄ rule mapping is shared by vector file
   (`turma-meetings.md` "Repeat").
 - **Clients send the body Android's `calDraftPayload` builds** (XERK-2972): every field whole
-  (an edit that clears one clears it), `start`/`end` with the offset of the picked `timeZone`,
+  (an edit that clears one clears it) — except an occurrence-scoped edit, which sends only the
+  changed fields (`calScopedPayload` ↔ calendar.js `scopedBody`, `turma-meetings.md`), `start`/`end` with the offset of the picked `timeZone`,
   all-day ending at the midnight after its last day. Edit/Delete only on `editable:true`.
 - **Every write broadcasts the coalesced `calendar` frame** under the tenant-level key
   `turma:events@<tenant>` (plain `turma:events` untenanted). The SSE scoper's `mayHost` passes it
