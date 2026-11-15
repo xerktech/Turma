@@ -357,6 +357,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
     `editable:false`): a client saving the blanked fields back wiped the event (XERK-2972 QA).
     - One no USER made (break-glass/legacy/open, moved in by the tenant migration) is owned by
       that tenant's user (`calTurmaOwner`), or nobody could ever change or delete it.
+    - So is one whose creator `user:<id>` is gone or of another tenant (XERK-2978); untenanted,
+      any admin-role principal owns it (not `legacy`). A disabled creator still counts as live.
     - Only the owner may make an event private/confidential: a non-owner hiding one locked every
       other viewer out, itself included, with no way back. Both refusals carry no `event`.
 - **Clients send the body Android's `calDraftPayload` builds** (XERK-2972): every field whole
