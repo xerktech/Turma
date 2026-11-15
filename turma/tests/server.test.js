@@ -29158,7 +29158,7 @@ test("XERK-2395: a run fires at meeting minus lead, once per meeting, up to 30 m
   const [cmd] = briefCmds2395("dbTimeA");
   assert.deepEqual({ ...cmd, cmdId: undefined, runId: undefined }, { type: "renderDailyBrief",
     siteKey: S, dayFrom: PREV2395, weekFrom: RUN2395 - 7 * 86400e3, until: RUN2395,
-    meetingAt: MEET2395, model: "haiku", runtime: "claude", cmdId: undefined, runId: undefined });
+    meetingAt: MEET2395, model: "haiku", runtime: "claude", calendar: [], cmdId: undefined, runId: undefined });
   assert.match(cmd.runId, /^[0-9a-f]{1,32}$/);
   hub.dailyBriefTick(RUN2395 + 1000);
   assert.equal(briefCmds2395("dbTimeA").length, 1, "one run in flight per org");
@@ -33513,6 +33513,18 @@ test("XERK-2970: editing or deleting a Turma event relinks; an operator's link t
     assert.deepEqual([op.status, op.body.meeting.calendarEventId, op.body.meeting.calendarBy], [200, id, "operator"]);
     assert.equal(op.body.meeting.calendarEvent.subject, "Roadmap review");
     assert.equal((await link2896(B, "d2", { eventId: "turma:0000000000000000" })).status, 404);
+    // An org the event is not in cannot be linked by hand (A was dropped).
+    assert.equal((await link2896(A, "c1", { eventId: id })).status, 404);
+    // Dropping the operator-linked capture's org: kept, served missing, never as B's copy.
+    const opA = await turma2968("POST", null, turmaEv2970([A, B], T2896 + 8 * 60 * MIN2896, 30));
+    await postMeeting2508(A, capture2896("c3", T2896 + 8 * 60 * MIN2896, 30));
+    assert.equal((await link2896(A, "c3", { eventId: opA.body.event.id })).status, 200);
+    assert.equal((await turma2968("PATCH", opA.body.event.id, { version: 1, orgs: [B] })).status, 200);
+    assert.deepEqual([row2896(A, "c3").calendarEventId, row2896(A, "c3").calendarBy], [opA.body.event.id, "operator"]);
+    const c3 = hub.meetingWire(row2896(A, "c3"), A);
+    assert.deepEqual([c3.calendarEventMissing, c3.calendarEvent], [true, undefined]);
+    assert.equal((await view2896()).events.find((e) => e.id === "tenir:c3").calendarEventMissing, true);
+    assert.ok(!(await view2896()).events.find((e) => e.id === opA.body.event.id).meetings.some((m) => m.meetingId === "c3"));
     // Deleted: the auto link leaves it, the operator's is kept and served as missing.
     assert.equal((await turma2968("DELETE", id)).status, 200);
     assert.equal(row2896(B, "d1").calendarEventId, undefined);
@@ -33616,5 +33628,49 @@ test("XERK-2970: the brief's calendar carries the org's Outlook and Turma meetin
     forget2891("dbA2970");
     cleanup2395(A, ["dbA2970"]);
     cleanup2395(B, ["dbB2970"]);
+  }
+});
+
+test("XERK-2970: an org's grace expiry relinks; an Outlook id never takes the turma: prefix", async () => {
+  const A = "lkF2970.atlassian.net", B = "lkG2970.atlassian.net";
+  cleanup2896(A, ["lkF2970"]);
+  cleanup2896(B, ["lkG2970"]);
+  cleanup2968();
+  try {
+    await beat1574("lkF2970", A);
+    await beat1574("lkG2970", B);
+    const id = (await turma2968("POST", null, turmaEv2970([A, B], T2896, 60))).body.event.id;
+    await postMeeting2508(A, capture2896("f1", T2896, 60));
+    assert.equal(row2896(A, "f1").calendarEventId, id);
+    // A's host leaves the org; past the grace the tick drops A and relinks the capture.
+    delete agents.lkF2970;
+    const now = Date.now();
+    hub.calendarTurmaTick(now);
+    hub.calendarTurmaTick(now + hub.CALENDAR_TURMA_ORG_GRACE_MS + 1);
+    assert.deepEqual(hub.getCalendarTurmaEvents()[""][id].orgs, [B]);
+    assert.equal(row2896(A, "f1").calendarEventId, undefined);
+    assert.equal(hub.sanitizeCalendarEvent(ev2896("turma:0123456789abcdef", T2896, 30)), null);
+  } finally {
+    cleanup2968();
+    cleanup2896(A, ["lkF2970"]);
+    cleanup2896(B, ["lkG2970"]);
+  }
+});
+
+test("XERK-2970: a meeting right after the standup stays in the brief's calendar", async () => {
+  const A = "dbC2970.atlassian.net";
+  const now = Math.floor(Date.now() / 3.6e6) * 3.6e6;
+  cleanup2395(A, ["dbC2970"]);
+  cleanup2968();
+  try {
+    await briefHost2395("dbC2970", A);
+    const meet = now + 30 * 60e3;
+    for (const [mins, subject] of [[30, "Standup"], [34, "Late standup copy"], [45, "Right after"], [51, "Later"]]) {
+      await turma2968("POST", null, turmaEv2970([A], now + mins * 60e3, 15, { subject }));
+    }
+    assert.deepEqual(hub.dailyBriefCalendar(A, now + 25 * 60e3, meet, "UTC").map((e) => e.title), ["Right after", "Later"]);
+  } finally {
+    cleanup2968();
+    cleanup2395(A, ["dbC2970"]);
   }
 });

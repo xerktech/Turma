@@ -5853,7 +5853,8 @@ function sanitizeCalendarEvent(v) {
   const id = calId(v.id);
   const start = calIso(v.start);
   const end = calIso(v.end);
-  if (!id || !start || !end) return null;
+  // `turma:` ids are the hub's own events (XERK-2968/2970): an Outlook copy never takes one.
+  if (!id || id.startsWith("turma:") || !start || !end) return null;
   const startMs = Date.parse(start);
   const endMs = Date.parse(end);
   if (endMs < startMs) return null;
@@ -6860,7 +6861,8 @@ function meetingCalendarEventWire(siteKey, m, index) {
   const all = ix.copies.get(m.calendarEventId) || [];
   const c = all.find((x) => calCopyCountsFor(x, siteKey)) || all[0];
   if (!c) return null;
-  if (c.turma) return turmaMeetingEventWire(siteKey, m, c.ev);
+  // A Turma event is in the capture's org or gone for it: never another org's copy.
+  if (c.turma) return c.ev.orgs.includes(siteKey) ? turmaMeetingEventWire(siteKey, m, c.ev) : null;
   const w = calendarEventWire(c.key, c.ev, calendarHostSettings[c.key]);
   const out = { host: c.key, org: w.org, subject: w.subject,
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
@@ -6907,7 +6909,11 @@ function setMeetingCalendarLink(siteKey, meetingId, body) {
   } else if (body.eventId === null) {
     fields = { calendarEventId: undefined, calendarBy: "operator", calendarAmbiguous: undefined };
   } else {
-    if (!index.byId.has(body.eventId)) return refuse(404, "no calendar event of this tenant has that id");
+    const c = index.byId.get(body.eventId);
+    // A Turma event links only captures of its own orgs (XERK-2970).
+    if (!c || (c.turma && !c.ev.orgs.includes(siteKey))) {
+      return refuse(404, "no calendar event of this tenant has that id");
+    }
     fields = { calendarEventId: body.eventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const row = putMeeting(siteKey, { ...m, ...fields });
@@ -6935,7 +6941,8 @@ function calendarTenirView(p, from, until, orgFilter) {
       const title = meetingDisplayTitle(m);
       const endMs = Math.max(m.endedAt, m.startedAt);
       const inRange = !(m.startedAt >= until || endMs < from || (orgFilter && !orgFilter.has(site)));
-      const c = m.calendarEventId && lookup.byId.get(m.calendarEventId);
+      let c = m.calendarEventId && lookup.byId.get(m.calendarEventId);
+      if (c && c.turma && !c.ev.orgs.includes(site)) c = null;  // not this org's: missing (XERK-2970)
       let k = "";
       if (c) {
         k = `${t}\u0000${m.calendarEventId}`;
@@ -22433,18 +22440,21 @@ const dailyBriefSent = new Set();
 // `siteKey`'s real meetings (calendarLinkCandidate, not canceled) starting in
 // [from, from + DAILY_BRIEF_CALENDAR_SPAN_MS) — its hosts' Outlook events and the
 // Turma events it is one of the orgs of — less the standup itself (starting
-// within MEETING_DAILY_BEFORE_MS of `meetingAt`). Times are "HH:MM" in the
+// in [meetingAt - MEETING_DAILY_BEFORE_MS, meetingAt + 5 min]: a meeting right
+// after it still counts, QA). Times are "HH:MM" in the
 // schedule's zone; a private event is "Private event" with nobody named.
 const DAILY_BRIEF_CALENDAR_SPAN_MS = 12 * 3600e3;
 const DAILY_BRIEF_CALENDAR_MAX = 10;
 const DAILY_BRIEF_CALENDAR_WITH_MAX = 5;
+const DAILY_BRIEF_STANDUP_LATE_MS = 5 * 60e3;   // the standup's own event may start this late
 function dailyBriefCalendar(siteKey, from, meetingAt, timeZone) {
   const until = from + DAILY_BRIEF_CALENDAR_SPAN_MS;
   const t = tenantOfSite(siteKey);
   const picked = new Map(); // id -> {startMs, endMs, title, with}
   const take = (ev, title, people) => {
     if (picked.has(ev.id) || !calendarLinkCandidate(ev) || ev.canceled) return;
-    if (ev.startMs < from || ev.startMs >= until || Math.abs(ev.startMs - meetingAt) <= MEETING_DAILY_BEFORE_MS) return;
+    if (ev.startMs < from || ev.startMs >= until) return;
+    if (ev.startMs >= meetingAt - MEETING_DAILY_BEFORE_MS && ev.startMs <= meetingAt + DAILY_BRIEF_STANDUP_LATE_MS) return;
     picked.set(ev.id, { startMs: ev.startMs, endMs: ev.endMs, title,
       with: people.filter(Boolean).slice(0, DAILY_BRIEF_CALENDAR_WITH_MAX) });
   };

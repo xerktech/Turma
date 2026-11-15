@@ -229,14 +229,17 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   it by the margin (a late invite); one whose event left the store (sync, `calendarTick`) or
   now counts for another org rematches. An operator's choice is never touched by the matcher.
   - A Turma event deleted, or the meeting's org dropped from its `orgs`, has left the store for
-    that org: an auto link rematches; an operator link is kept and served `calendarEventMissing`.
+    that org: an auto link rematches; an operator link is kept and served `calendarEventMissing`
+    (never the event as another org's copy: `meetingCalendarEventWire`, `calendarTenirView`).
   - **Every Turma event write (create, edit, delete, org loss in `calendarTurmaTick`) schedules
     `scheduleCalendarRelink` for its tenant**, like a changed Outlook sync.
 - `POST /api/orgs/<site>/meetings/<mid>/calendar` (OPERATOR-authed, `org` class):
   `{eventId}` link | `{eventId: null}` unlink for good | `{auto: true}` back to the matcher.
   Exactly one shape (`auto` with `eventId`, or `auto: false`, is a 400).
   400 body → 404 org no host is decided into / meeting / an id the org's TENANT holds neither on a
-  host nor as a Turma event.
+  host nor as a Turma event; a Turma id is refused (404) unless the org is in its `orgs`.
+  - Outlook ids starting `turma:` are dropped at sync (`sanitizeCalendarEvent`): the prefix is
+    the hub's, so a Turma event can never shadow an Outlook copy.
   Answers `{ok, meeting}` (meetingWire, with `calendarEvent`).
 - **Served on `GET /api/calendar`**: every Outlook event carries `source: "outlook"` and
   `meetings: [{site, meetingId, title}]` (linked captures of orgs the caller may see).
