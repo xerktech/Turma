@@ -34175,6 +34175,26 @@ test("XERK-2969: a relink past the index's work bound leaves the rows it could n
     delete old.calendarEventId;
     hub.relinkTenantMeetings("");
     assert.equal(row2896(A, "c2").calendarAmbiguous, true, "not indexed: left as it was");
+    // An index whose budget runs out EXACTLY inside its last walk is cut too (QA: an
+    // exact hit read as complete). Fillers cost one walk each; the last series has
+    // 3 occurrences in the capture's window, so some filler count ends the budget
+    // between them.
+    const cap = { site: A, startedAt: T2896, endedAt: T2896 + 50 * 3.6e6 };
+    const mk = (i, start) => hub.sanitizeTurmaEvent({ ...turmaEv2970([A], start, 30, { timeZone: "UTC",
+      recurrence: { freq: "daily" } }), id: `turma:${i.toString(16).padStart(16, "0")}`, createdBy: "breakglass",
+    createdAt: 1, updatedAt: 1, version: 1 }, "");
+    const filler = mk(0, T2896 + 100 * 864e5);
+    const target = mk(0xffffff, T2896 - 10 * 864e5 + 3.6e6);
+    for (let nf = hub.CALENDAR_CANDIDATE_WORK_MAX - 6; nf <= hub.CALENDAR_CANDIDATE_WORK_MAX - 2; nf++) {
+      const store = Object.create(null);
+      for (let i = 0; i < nf; i++) store[`turma:${i.toString(16).padStart(16, "0")}`] = { ...filler, id: `turma:${i.toString(16).padStart(16, "0")}` };
+      store[target.id] = target;
+      hub.getCalendarTurmaEvents()[""] = store;
+      const ix = hub.calendarCandidateIndex("", [cap]);
+      const got = ix.list.filter((c) => c.ev.seriesId === target.id).length;
+      if (!ix.cut) assert.equal(got, 3, `nf=${nf}: an uncut index holds all of the target's occurrences`);
+      else assert.equal(ix.covers(A, cap), false, `nf=${nf}: a cut never claims the window`);
+    }
   } finally {
     cleanup2968();
     cleanup2896(A, ["cutA2969"]);
@@ -34193,6 +34213,16 @@ test("XERK-2969: an occurrence made private by its owner is the owner's alone to
     assert.equal(hub.deleteTurmaEvent(other, occ).status, 409);
     // The rest of the series is still everyone's.
     assert.equal(hub.patchTurmaEvent(other, `${s.id}:${key2969(2)}`, { version: 2, subject: "Fine" }).status, 200);
+    // The reverse: a private series with one occurrence its owner made public is
+    // still not editable by others, and the wire says so (QA: editable:true, then 409).
+    const ps = (await turma2968("POST", null, weekly2969({ sensitivity: "private" }))).body.event;
+    const pub = `${ps.id}:${key2969(1)}`;
+    assert.equal((await turma2968("PATCH", pub, { version: 1, sensitivity: "normal", subject: "Open lunch" })).status, 200);
+    const seen = (await occ2969(T2968 - 864e5, T2968 + 5 * W2969, "")).find((e) => e.id === pub);
+    assert.equal(seen.subject, "Open lunch");
+    const asOther = hub.calendarView(other, T2968 - 864e5, T2968 + 5 * W2969, null).events.find((e) => e.id === pub);
+    assert.deepEqual([asOther.subject, asOther.editable], ["Open lunch", false]);
+    assert.equal(hub.patchTurmaEvent(other, pub, { version: 2, subject: "x" }).status, 409);
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);

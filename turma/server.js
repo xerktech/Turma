@@ -6492,8 +6492,12 @@ function turmaOccurrenceRecord(rec, o, ex) {
 // (`turma:<hex>:<original start>`, the Outlook convention), `seriesId` the series'.
 function turmaOccurrenceWire(p, rec, o, served = rec.orgs) {
   const ex = rec.exceptions[o.key];
-  return { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served), id: `${rec.id}:${o.key}`,
+  const w = { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served), id: `${rec.id}:${o.key}`,
     seriesId: rec.id, originalStart: o.key, exception: !!ex };
+  // Writes are refused while the SERIES is withheld (calTurmaHiddenFrom), even on an
+  // occurrence its owner made public: never offer an editor the route refuses.
+  if (calTurmaWithheld(p, rec)) w.editable = false;
+  return w;
 }
 const calOverlaps = (e, from, until) => !(e.startMs >= until || e.endMs < from || (e.endMs === from && e.endMs !== e.startMs));
 // The Turma events overlapping [from, until) that `p` may see, filtered on ANY org.
