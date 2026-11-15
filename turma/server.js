@@ -684,9 +684,8 @@ const MEETING_FOCUS_FILE = process.env.MEETING_FOCUS_FILE || "/data/meeting-focu
 // Each org's holiday catalogs and days off (XERK-2892): siteKey -> {countries, off}.
 const HOLIDAY_SETTINGS_FILE = process.env.HOLIDAY_SETTINGS_FILE || "/data/holiday-settings.json";
 // The Calendar (XERK-2891, contract-calendar.md): each host's Outlook events, and
-// the operator's org-assignment settings.
+// each host's calendar settings (private-event opt-in).
 const CALENDAR_EVENTS_FILE = process.env.CALENDAR_EVENTS_FILE || "/data/calendar-events.json";
-const CALENDAR_ORG_RULES_FILE = process.env.CALENDAR_ORG_RULES_FILE || "/data/calendar-org-rules.json";
 const CALENDAR_HOST_SETTINGS_FILE = process.env.CALENDAR_HOST_SETTINGS_FILE || "/data/calendar-host-settings.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
@@ -5815,8 +5814,6 @@ const CALENDAR_SERVE_MAX = 5000;
 const CALENDAR_SERVE_SPAN_MS = 100 * 86400000;
 const CALENDAR_ONDEMAND_MIN_MS = 60 * 1000;
 const CALENDAR_HOST_RETAIN_MS = 30 * 86400000;
-const CALENDAR_DOMAINS_MAX = 50;
-const CALENDAR_SERIES_MAX = 500;
 const CAL_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere", "unknown"]);
 const CAL_RESPONSE = new Set(["none", "organizer", "tentative", "accepted", "declined", "notResponded", "unknown"]);
 const CAL_ROLE = new Set(["organizer", "required", "optional", "resource", "unknown"]);
@@ -5828,7 +5825,6 @@ const CAL_EMAIL_PART = "[^@\\s/\"<>`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c
 const CAL_EMAIL_RE = new RegExp(`^${CAL_EMAIL_PART}@${CAL_EMAIL_PART}\\.${CAL_EMAIL_PART}$`);
 const CAL_ID_RE = /^[^\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]{1,300}$/;
 const CAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/;
-const CAL_DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
 const CAL_URL_RE = /^https:\/\/[^\s"'<>\\`]+$/;
 
 const calMs = (v) => (Number.isSafeInteger(v) && v > 0 ? v : 0);
@@ -5919,41 +5915,13 @@ const persistCalendarEvents = registerExternalStore({
   coerce: calendarEventsCoerce, read: () => calendarEvents, install: (v) => { calendarEvents = v; },
 });
 
-// Settings: per-org domain rules (siteKey -> {domains}) and per-host settings
-// (hostKey -> {defaultOrg?, showPrivate?, seriesOrgs}). Two stores, so the org
-// one rides TENANT_ORG_STORES' purge + migration like every org-keyed store.
-function calDomains(v) {
-  if (!Array.isArray(v) || v.length > CALENDAR_DOMAINS_MAX) return null;
-  const out = [];
-  for (const d of v) {
-    if (typeof d !== "string") return null;
-    const x = d.trim().toLowerCase().replace(/^@/, "");
-    if (!CAL_DOMAIN_RE.test(x)) return null;
-    if (!out.includes(x)) out.push(x);
-  }
-  return out;
-}
-function calendarOrgRulesCoerce(raw) {
-  const out = Object.create(null);
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  for (const [site, o] of Object.entries(raw).slice(0, 2000)) {
-    const d = site && site.length <= 200 && o && typeof o === "object" ? calDomains(o.domains) : null;
-    if (d && d.length) out[site] = { domains: d };
-  }
-  return out;
-}
+// Settings: per-host (hostKey -> {showPrivate?}). An event's org is never a setting:
+// it is its host's decided org (XERK-2964), so the store holds the private opt-in only.
+// An older store's defaultOrg/seriesOrgs are dropped on load.
 function sanitizeCalendarHostSettings(h) {
   if (!h || typeof h !== "object" || Array.isArray(h)) return null;
   const e = {};
-  if (typeof h.defaultOrg === "string" && h.defaultOrg && h.defaultOrg.length <= 200) e.defaultOrg = h.defaultOrg;
   if (h.showPrivate === true) e.showPrivate = true;
-  const so = Object.create(null);
-  if (h.seriesOrgs && typeof h.seriesOrgs === "object" && !Array.isArray(h.seriesOrgs)) {
-    for (const [id, org] of Object.entries(h.seriesOrgs).slice(-CALENDAR_SERIES_MAX)) {
-      if (calId(id) && typeof org === "string" && org && org.length <= 200) so[id] = org;
-    }
-  }
-  e.seriesOrgs = so;
   return e;
 }
 function calendarHostSettingsCoerce(raw) {
@@ -5965,11 +5933,6 @@ function calendarHostSettingsCoerce(raw) {
   }
   return out;
 }
-let calendarOrgRules = calendarOrgRulesCoerce(readJsonFile(CALENDAR_ORG_RULES_FILE));
-const persistCalendarOrgRules = registerExternalStore({
-  name: "calendarOrgRules", file: CALENDAR_ORG_RULES_FILE,
-  coerce: calendarOrgRulesCoerce, read: () => calendarOrgRules, install: (v) => { calendarOrgRules = v; },
-});
 let calendarHostSettings = calendarHostSettingsCoerce(readJsonFile(CALENDAR_HOST_SETTINGS_FILE));
 const persistCalendarHostSettings = registerExternalStore({
   name: "calendarHostSettings", file: CALENDAR_HOST_SETTINGS_FILE,
@@ -6195,37 +6158,16 @@ function calendarOfflineEdge(key, a, now) {
 }
 
 // ---- serving -------------------------------------------------------------------
-function calendarOrgsOfTenant(t) {
-  return [...decidedOrgs()].filter((s) => tenantOfSite(s) === t);
-}
-function calDomainOf(email) {
-  return email ? email.slice(email.lastIndexOf("@") + 1) : "";
-}
-// An event's org (XERK-2936): every event of a host decided into an org has one. A rule or
-// setting can name another org of the tenant; with none, it is the host's own decided org.
-function calendarEventOrg(key, ev, orgs, hs) {
-  const so = hs && hs.seriesOrgs;
-  const sid = ev.seriesId || ev.id;
-  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) return so[sid];
-  const match = (d) => (d ? orgs.filter((s) => Object.hasOwn(calendarOrgRules, s) &&
-    calendarOrgRules[s].domains.some((x) => d === x || d.endsWith("." + x))) : []);
-  const orgEmail = ev.organizerEmail || (ev.attendees.find((p) => p.role === "organizer") || {}).email || "";
-  const byOrganizer = match(calDomainOf(orgEmail));
-  if (byOrganizer.length === 1) return byOrganizer[0];
-  const hits = new Set();
-  for (const p of ev.attendees) for (const s of match(calDomainOf(p.email))) hits.add(s);
-  if (hits.size === 1) return [...hits][0];
-  if (hs && hs.defaultOrg && orgs.includes(hs.defaultOrg)) return hs.defaultOrg;
+// An event's org (XERK-2964): its host's decided org, always. The agent that read the
+// event is tied to one org, so no rule, default or per-series pick may move it; "" only
+// for a host in no decided org (an older hub let settings choose, XERK-2929).
+function calendarEventOrg(key) {
   return agents[key] ? decidedOrgOf(agents[key]) : "";
 }
-function calendarEventWire(key, ev, orgs, hs) {
+function calendarEventWire(key, ev, hs) {
   // `meeting` (XERK-2936): a real meeting by the matcher's rule, judged BEFORE a private
   // event's attendees and join link are withheld, so clients never re-derive it.
-  const out = { host: key, org: calendarEventOrg(key, ev, orgs, hs), ...ev, meeting: calendarLinkCandidate(ev) };
-  // The operator's per-series pick, so the event panel shows it (XERK-2929) — only a pin
-  // that still counts (calendarEventOrg skips one naming an org no host is in).
-  const so = hs && hs.seriesOrgs, sid = ev.seriesId || ev.id;
-  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) out.seriesOrg = so[sid];
+  const out = { host: key, org: calendarEventOrg(key), ...ev, meeting: calendarLinkCandidate(ev) };
   if ((ev.sensitivity === "private" || ev.sensitivity === "confidential") && !(hs && hs.showPrivate)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", organizer: "",
       organizerEmail: "", attendees: [], joinUrl: "", categories: [], private: true });
@@ -6249,10 +6191,9 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       syncedAt: h ? h.syncedAt : 0, windowFrom: h ? h.windowFrom : 0, windowUntil: h ? h.windowUntil : 0,
       ranges: h ? h.ranges : [] };
     if (h && h.lastError) Object.assign(row, { lastError: h.lastError, lastErrorAt: h.lastErrorAt });
-    // Its settings and the orgs they may name, for the settings UI (XERK-2929).
+    // Its org (every event's, XERK-2964) and private opt-in, for the settings UI.
     const hs0 = calendarHostSettings[key];
-    Object.assign(row, { org: a ? decidedOrgOf(a) : "", orgs: calendarOrgsOfTenant(tenantOfKey(key)).sort(),
-      defaultOrg: (hs0 && hs0.defaultOrg) || "", showPrivate: !!(hs0 && hs0.showPrivate) });
+    Object.assign(row, { org: a ? decidedOrgOf(a) : "", showPrivate: !!(hs0 && hs0.showPrivate) });
     const covered = h && h.ranges.some((r) => r[0] <= from && r[1] >= until);
     if (!covered && row.online && calendarCapable(a)) {
       const queued = (a.commands || []).find((c) => c && c.type === "syncCalendar" && c.from <= from && c.until >= until);
@@ -6265,11 +6206,10 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
     }
     hosts.push(row);
     if (!h) continue;
-    const orgs = calendarOrgsOfTenant(tenantOfKey(key));
     const hs = calendarHostSettings[key];
     for (const ev of h.events) {
       if (ev.startMs >= until || ev.endMs < from || (ev.endMs === from && ev.endMs !== ev.startMs)) continue;
-      const w = calendarEventWire(key, ev, orgs, hs);
+      const w = calendarEventWire(key, ev, hs);
       if (orgFilter && !orgFilter.has(w.org)) continue;
       const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
       w.meetings = tenir.links.get(lk) || [];
@@ -6311,54 +6251,21 @@ function broadcastCalendarSoon(key) {
 }
 
 // ---- settings routes' logic --------------------------------------------------
-function setCalendarOrgRules(siteKey, body) {
-  const d = body && typeof body === "object" && !Array.isArray(body) ? calDomains(body.domains) : null;
-  if (!d) {
-    return { status: 400, body: { error: `domains must be a list of at most ${CALENDAR_DOMAINS_MAX} ` +
-      "email domains, e.g. [\"acme.com\"]" } };
-  }
-  if (d.length) calendarOrgRules[siteKey] = { domains: d };
-  else delete calendarOrgRules[siteKey];
-  persistCalendarOrgRules();
-  invalidateAgentsCache();
-  sseBroadcast("calendarOrgRules", calendarOrgRules);
-  for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
-  scheduleCalendarRelink(tenantOfSite(siteKey));
-  return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
-}
+// A host's calendar settings: the private-event opt-in only. An event's org is its host's
+// (XERK-2964), so an older client's defaultOrg / series pick is refused in words.
 function setCalendarHostSettings(key, body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return { status: 400, body: { error: "body must be {defaultOrg?, showPrivate?, series?: {id, org}}" } };
+  if (body && typeof body === "object" && !Array.isArray(body) && ("defaultOrg" in body || "series" in body)) {
+    return { status: 400, body: { error: "an Outlook event's org is its host's org and cannot be set" } };
   }
-  const orgs = calendarOrgsOfTenant(tenantOfKey(key));
-  const okOrg = (o) => o === null || (typeof o === "string" && orgs.includes(o));
+  if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.showPrivate !== "boolean") {
+    return { status: 400, body: { error: "body must be {showPrivate: true|false}" } };
+  }
   const cur = sanitizeCalendarHostSettings(calendarHostSettings[key] || {});
-  if ("defaultOrg" in body) {
-    if (!okOrg(body.defaultOrg)) return { status: typeof body.defaultOrg === "string" ? 404 : 400, body: { error: "defaultOrg is not an org of this host's tenant that a host is in" } };
-    if (body.defaultOrg === null) delete cur.defaultOrg;
-    else cur.defaultOrg = body.defaultOrg;
-  }
-  if ("showPrivate" in body) {
-    if (typeof body.showPrivate !== "boolean") return { status: 400, body: { error: "showPrivate must be true or false" } };
-    if (body.showPrivate) cur.showPrivate = true;
-    else delete cur.showPrivate;
-  }
-  if ("series" in body) {
-    const s = body.series;
-    if (!s || typeof s !== "object" || !calId(s.id) || !(s.org === null || okOrg(s.org))) {
-      // 404 only for a well-formed series naming an org this tenant lacks; a
-      // non-string org, "" (no org is not an org, XERK-2936) or a bad id is a
-      // malformed body, 400 (rollup XERK-2944).
-      return { status: s && typeof s === "object" && calId(s.id) && typeof s.org === "string" && s.org !== "" ? 404 : 400,
-        body: { error: "series must be {id, org}: org an org of this host's tenant, or null to clear" } };
-    }
-    delete cur.seriesOrgs[s.id];
-    if (s.org !== null) cur.seriesOrgs[s.id] = s.org;
-  }
+  if (body.showPrivate) cur.showPrivate = true;
+  else delete cur.showPrivate;
   calendarHostSettings[key] = sanitizeCalendarHostSettings(cur);
   persistCalendarHostSettings();
   broadcastCalendarSoon(key);
-  scheduleCalendarRelink(tenantOfKey(key));
   return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
 }
 
@@ -6434,12 +6341,11 @@ function calendarLinkCandidate(ev) {
 // sorted by start, plus the lookup.
 function calendarCandidateIndex(t) {
   const list = [];
-  const orgs = calendarOrgsOfTenant(t);
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t) continue;
-    const hs = calendarHostSettings[key];
+    const org = calendarEventOrg(key);
     for (const ev of h.events) {
-      if (calendarLinkCandidate(ev)) list.push({ key, ev, org: calendarEventOrg(key, ev, orgs, hs) });
+      if (calendarLinkCandidate(ev)) list.push({ key, ev, org });
     }
   }
   list.sort((a, b) => a.ev.startMs - b.ev.startMs);
@@ -6520,13 +6426,11 @@ function meetingCalendarLinkFields(siteKey, m, index) {
     return { calendarEventId: m.calendarEventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const keep = { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
-  // The stored copy that still counts for this org. None = the event was
-  // reassigned to another org (rule, default or series override) and the link goes
-  // back to the matcher. Any host's copy counts: one id on two hosts of different
-  // orgs is one meeting (XERK-2896 QA).
-  const orgs = calendarOrgsOfTenant(index.t);
+  // The stored copy that still counts for this org. None = its host left the org and
+  // the link goes back to the matcher. Any host's copy counts: one id on two hosts of
+  // different orgs is one meeting (XERK-2896 QA).
   const cur = m.calendarEventId && (index.copies.get(m.calendarEventId) || [])
-    .find((c) => calendarEventOrg(c.key, c.ev, orgs, calendarHostSettings[c.key]) === siteKey);
+    .find((c) => calendarEventOrg(c.key) === siteKey);
   if (cur) {
     if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
     const hit = calendarBestMatch(siteKey, m, index);
@@ -6589,14 +6493,12 @@ function relinkTenantMeetings(t) {
 const CALENDAR_WIRE_ATTENDEES_MAX = 30;
 function meetingCalendarEventWire(siteKey, m, index) {
   const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
-  const orgs = calendarOrgsOfTenant(ix.t);
   // The copy counting for the capture's org (newest first), else the newest copy.
   const all = ix.copies.get(m.calendarEventId) || [];
-  const c = all.find((x) => calendarEventOrg(x.key, x.ev, orgs, calendarHostSettings[x.key]) === siteKey) || all[0];
+  const c = all.find((x) => calendarEventOrg(x.key) === siteKey) || all[0];
   if (!c) return null;
-  const hs = calendarHostSettings[c.key];
-  const w = calendarEventWire(c.key, c.ev, orgs, hs);
-  const out = { host: c.key, org: calendarEventOrg(c.key, c.ev, orgs, hs), subject: w.subject,
+  const w = calendarEventWire(c.key, c.ev, calendarHostSettings[c.key]);
+  const out = { host: c.key, org: w.org, subject: w.subject,
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
     moved: !calOverlapsCapture(m, w),
     // Who was invited, as Outlook names them (the notes review shows them beside the
@@ -9281,7 +9183,6 @@ const TENANT_ORG_STORES = [
   ["meetingLabelMisses", () => meetingLabelMisses, () => persistMeetingLabelMisses()],
   ["meetingFocus", () => meetingFocus, () => persistMeetingFocus()],
   ["holidaySettings", () => holidaySettings, () => persistHolidaySettings()],
-  ["calendarOrgRules", () => calendarOrgRules, () => persistCalendarOrgRules()],
   ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
   ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
   ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
@@ -9596,12 +9497,6 @@ for (const [name, read, persist] of [
       const moving = Object.keys(map).filter((k) => hostMovable(k, scope));
       for (const k of moving) {
         const v = map[k];
-        if (name === "calendarHostSettings") {
-          if (v.defaultOrg && plainKey(v.defaultOrg)) v.defaultOrg = scopeSite(v.defaultOrg, t);
-          for (const [id, org] of Object.entries(v.seriesOrgs || {})) {
-            if (org && plainKey(org)) v.seriesOrgs[id] = scopeSite(org, t);
-          }
-        }
         const nk = tenantHostKey(k, t);
         if (!Object.hasOwn(map, nk)) map[nk] = v;
         delete map[k];
@@ -10340,8 +10235,6 @@ function buildAgentsCache() {
     // meetings settings list as checkboxes: country -> {name, holidays:[{id, name}]}.
     holidaySettings: holidaySettingsWire(),
     holidayCatalog: holidays.catalogWire(),
-    // Each org's calendar email-domain rules (XERK-2929): siteKey -> {domains}.
-    calendarOrgRules,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -27187,9 +27080,9 @@ const server = http.createServer(async (req, res) => {
     // by the single user check upstream); this is NOT driveable by a bare master
     // holder. Once TURMA_AGENT_STRICT retires the master the whole fleet is
     // already bound, so the button self-hides (tokenBound below).
-    // POST /api/agents/<host>/calendar/settings — the host's calendar org
-    // assignment + private-event opt-in (XERK-2891). Body {defaultOrg?,
-    // showPrivate?, series?: {id, org}}. 404 a host the caller may not drive.
+    // POST /api/agents/<host>/calendar/settings — the host's private-event opt-in
+    // (XERK-2891). Body {showPrivate}; an event's org is its host's (XERK-2964).
+    // 404 a host the caller may not drive.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts.length === 5 && parts[3] === "calendar" && parts[4] === "settings") {
       const key = decodeURIComponent(parts[2]);
@@ -29165,26 +29058,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
-    // POST /api/orgs/<siteKey>/calendar-rules — the email domains whose meetings
-    // are this org's on every host's calendar (XERK-2891). Body {domains: [...]};
-    // [] clears. 404 an org no host is decided into, 400 a malformed body.
-    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
-        parts.length === 4 && parts[3] === "calendar-rules") {
-      const siteKey = decodeURIComponent(parts[2]);
-      if (!decidedOrgs().has(siteKey)) {
-        return json(res, 404, { error: "no host is in that org" });
-      }
-      let body;
-      try {
-        body = JSON.parse((await readBody(req, 16384)) || "null");
-      } catch (e) {
-        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
-        return json(res, 400, { error: "body is not JSON" });
-      }
-      const out = setCalendarOrgRules(siteKey, body);
-      return json(res, out.status, out.body);
-    }
-
     // POST /api/orgs/<siteKey>/meeting-focus — whose work the org's meetings
     // propose (XERK-2514). Body {names: [...], role}; no names and no role clears
     // it. 404 an org no host is decided into, 400 a malformed body.
@@ -30125,7 +29998,6 @@ if (process.env.TURMA_TEST) {
     scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
-    getCalendarOrgRules: () => calendarOrgRules,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,

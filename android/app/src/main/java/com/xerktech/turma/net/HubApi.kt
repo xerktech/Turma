@@ -525,17 +525,8 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): Response<kotlinx.serialization.json.JsonObject>
 
-    // An org's calendar email domains (XERK-2929): {domains: [...]}, [] clears.
-    // Answers {ok, rules | null} or the hub's {error}.
-    @POST("api/orgs/{siteKey}/calendar-rules")
-    suspend fun setCalendarOrgRules(
-        @Path("siteKey") siteKey: String,
-        @Body body: kotlinx.serialization.json.JsonObject,
-    ): Response<kotlinx.serialization.json.JsonObject>
-
-    // A host's calendar settings (XERK-2929): {defaultOrg: site | null} |
-    // {showPrivate} | {series: {id, org: site | "" | null}}. Raw objects: a null
-    // must reach the wire. Answers {ok, settings} or the hub's {error}.
+    // A host's calendar settings (XERK-2929): {showPrivate}. An event's org is its
+    // host's and is not a setting (XERK-2964). Answers {ok, settings} or the hub's {error}.
     @POST("api/agents/{host}/calendar/settings")
     suspend fun setCalendarHostSettings(
         @Path("host") host: String,

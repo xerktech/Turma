@@ -923,13 +923,12 @@ async function saveFocus(site, names, role) {
   return ok;
 }
 
-// ---- Days off + calendar email domains (XERK-2929) --------------------------------------
+// ---- Days off (XERK-2929) ---------------------------------------------------------------
 // Per org: which holiday catalogs it follows and which of their days it takes off
-// (PUT /holidays, saved on each tick), and the email domains whose meetings are its
-// own on every calendar (POST /calendar-rules).
+// (PUT /holidays, saved on each tick). There is no per-org calendar rule: an Outlook
+// event's org is its host's (XERK-2964).
 const calBusy = new Set();       // `${kind}|${site}` with a save in flight
 const calErr = new Map();        // `${kind}|${site}` -> the hub's refusal
-const domainDrafts = new Map();  // site -> the domains being typed
 function setOwn(map, k, v) {
   Object.defineProperty(map, k, { value: v, enumerable: true, writable: true, configurable: true });
 }
@@ -953,20 +952,6 @@ function holidayRowHtml(data, s) {
   }
   const err = calErr.get(`hol|${s}`);
   return parts.join("") + (err ? `<div class="mt-err-inline">${esc(err)}</div>` : "");
-}
-function domainsOf(data, s) {
-  const r = own(data && data.calendarOrgRules, s);
-  return r && Array.isArray(r.domains) ? r.domains.join(", ") : "";
-}
-function domainRowHtml(data, s) {
-  const v = domainDrafts.has(s) ? domainDrafts.get(s) : domainsOf(data, s);
-  const busy = calBusy.has(`dom|${s}`) ? "true" : "false";
-  const err = calErr.get(`dom|${s}`);
-  return `<div class="mt-label-row">`
-    + `<input class="mt-focus-names" data-cal-domains="${esc(s)}" value="${esc(v)}" maxlength="2000" spellcheck="false" autocomplete="off" placeholder="e.g. acme.com, acme.co.uk" aria-label="Email domains whose meetings are this org's">`
-    + `<button class="btn-sm" data-cal-domains-save="${esc(s)}" aria-disabled="${busy}">Save</button>`
-    + (err ? `<span class="mt-err-inline">${esc(err)}</span>` : "")
-    + `</div>`;
 }
 async function saveCal(kind, site, url, method, body, what, apply) {
   const k = `${kind}|${site}`;
@@ -996,15 +981,6 @@ function saveHolidays(site, patch) {
     setOwn(cache.holidaySettings, site, out.settings);
   });
 }
-function saveDomains(site, text) {
-  const domains = String(text || "").split(/[\s,;]+/).map((x) => x.trim().toLowerCase().replace(/^@/, "")).filter(Boolean);
-  return saveCal("dom", site, `/api/orgs/${encodeURIComponent(site)}/calendar-rules`, "POST", { domains }, "Saving the email domains", (out) => {
-    domainDrafts.delete(site);
-    cache.calendarOrgRules = { ...(cache.calendarOrgRules || {}) };
-    if (out && out.rules) setOwn(cache.calendarOrgRules, site, out.rules);
-    else delete cache.calendarOrgRules[site];
-  });
-}
 
 // ---- the settings drawer (one org) ---------------------------------------------------
 function drawerHtml(data, v) {
@@ -1026,8 +1002,6 @@ function drawerHtml(data, v) {
     + (sched ? sec("Daily brief", sched) : "")
     + (own(data.holidaySettings, site) ? sec("Days off", holidayRowHtml(data, site),
       "Ticked holidays are shaded as days off on the Meetings calendar.") : "")
-    + (own(data.holidaySettings, site) ? sec("Calendar email domains", domainRowHtml(data, site),
-      "A meeting organized by (else, with invitees from only) these domains is this org's on every Outlook calendar. Empty clears.") : "")
     + `</aside>`;
 }
 
@@ -1044,7 +1018,7 @@ const editing = () => fieldIn($list);
 // else one of this pane's controls by its data attribute.
 const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "transcript", "archive",
   "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus",
-  "calDomains", "calDomainsSave", "holOff", "holCountry"];
+  "holOff", "holCountry"];
 function focusKey(root = $list) {
   if (root === $list && hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
   const a = document.activeElement;
@@ -1467,7 +1441,7 @@ function onKey(ev) {
 
 function onClick(ev) {
   const b = ev.target && ev.target.closest
-    ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],[data-cal-domains-save],"
+    ? ev.target.closest("[data-act],[data-meta-retry],[data-label-save],[data-label-reset],[data-miss-use],[data-focus-save],[data-focus-clear],"
       + "[data-entry],[data-filter],[data-org-toggle],[data-org-settings],[data-drawer-close],[data-back],[data-show-reviewed],[data-transcript],[data-archive],[data-open-cal]") : null;
   if (!b) return;
   const d = b.dataset;
@@ -1503,11 +1477,6 @@ function onClick(ev) {
   if (d.archive !== undefined) {
     if (b.getAttribute("aria-disabled") === "true") return;
     return void archive(d.archive, d.to === "true");
-  }
-  if (d.calDomainsSave !== undefined) {
-    if (b.getAttribute("aria-disabled") === "true") return;
-    const site = d.calDomainsSave;
-    return void saveDomains(site, domainDrafts.has(site) ? domainDrafts.get(site) : domainsOf(cache, site));
   }
   if (d.focusSave !== undefined || d.focusClear !== undefined) {
     if (b.getAttribute("aria-disabled") === "true") return;
@@ -1546,7 +1515,6 @@ function onInput(ev) {
   // focus), and focus + caret go back to it.
   if (d.search !== undefined) { query = String(t.value || ""); return void repaint(true); }
   if (d.label !== undefined) { labelDrafts.set(d.label, t.value); labelErr.delete(d.label); return; }
-  if (d.calDomains !== undefined) { domainDrafts.set(d.calDomains, t.value); calErr.delete(`dom|${d.calDomains}`); return; }
   if (d.focusNames !== undefined || d.focusRole !== undefined) {
     const site = d.focusNames ?? d.focusRole;
     const v = { ...(focusDrafts.get(site) || focusOf(cache, site)) };

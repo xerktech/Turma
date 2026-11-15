@@ -119,7 +119,6 @@ process.env.MEETING_PROPOSALS_FILE = path.join(scratchDir(), `turma-test-meeting
 process.env.MEETING_FOCUS_FILE = path.join(scratchDir(), `turma-test-meeting-focus-${process.pid}.json`);
 process.env.HOLIDAY_SETTINGS_FILE = path.join(scratchDir(), `turma-test-holiday-settings-${process.pid}.json`);
 process.env.CALENDAR_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-events-${process.pid}.json`);
-process.env.CALENDAR_ORG_RULES_FILE = path.join(scratchDir(), `turma-test-calendar-org-rules-${process.pid}.json`);
 process.env.CALENDAR_HOST_SETTINGS_FILE = path.join(scratchDir(), `turma-test-calendar-host-settings-${process.pid}.json`);
 process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
 process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
@@ -32344,7 +32343,7 @@ test("XERK-2891: sanitizeCalendarEvent is a typed, capped fixed point", () => {
   assert.deepEqual(coerced.h.events, [e]);
 });
 
-test("XERK-2891: events take an org by rule, default or series override; private ones are withheld", async () => {
+test("XERK-2964: every event takes its host's org, which nothing sets; private ones are withheld", async () => {
   const D = "cal2891e", SA = "calA2891.atlassian.net", SB = "calB2891.atlassian.net";
   forget2891(D, "cal2891eb");
   await beat1574("cal2891eb", SB);
@@ -32354,65 +32353,48 @@ test("XERK-2891: events take an org by rule, default or series override; private
   const att = (email) => ({ name: "", email, role: "required", response: "accepted" });
   await calBeat2891(D, { calendarSync: [{ windowFrom: now - H2891, windowUntil: now + 48 * H2891, syncedAt: now, events: [
     ev2891("byOrganizer", now + H2891, { organizerEmail: "ceo@b.example.com", attendees: [att("x@a.example")] }),
-    ev2891("byAttendee", now + 2 * H2891, { attendees: [att("x@a.example"), att("y@gmail.com")] }),
-    ev2891("ambiguous", now + 3 * H2891, { attendees: [att("x@a.example"), att("y@b.example.com")] }),
-    ev2891("pinned", now + 4 * H2891, { seriesId: "ser", attendees: [att("x@a.example")] }),
+    ev2891("pinned", now + 4 * H2891, { seriesId: "ser", recurring: true, attendees: [att("y@b.example.com")] }),
     ev2891("secret", now + 5 * H2891, { sensitivity: "private", body: "salary talk", location: "HR",
       attendees: [att("x@a.example")] }),
   ] }] });
-  const rules = (site, domains, h = userHeaders) => request("POST", `/api/orgs/${site}/calendar-rules`,
-    { headers: { ...h, "content-type": "application/json" }, body: { domains } });
-  assert.equal((await rules(SA, ["not a domain"])).status, 400);
-  assert.equal((await rules("nobody2891.atlassian.net", ["a.example"])).status, 404);
-  assert.equal((await rules(SA, ["A.example"])).status, 200);
-  assert.equal((await rules(SB, ["b.example.com"])).status, 200);
   const settings = (body) => request("POST", `/api/agents/${D}/calendar/settings`,
     { headers: { ...userHeaders, "content-type": "application/json" }, body });
-  let orgs = Object.fromEntries((await calGet2891(now - H2891, now + 48 * H2891)).body.events
-    .filter((e) => e.host === D).map((e) => [e.id, e.org]));
-  // XERK-2936: no rule decides it, so it is the host's own org — never "".
-  assert.deepEqual(orgs, { byOrganizer: SB, byAttendee: SA, ambiguous: SA, pinned: SA, secret: SA });
-  assert.equal((await settings({ defaultOrg: "nobody2891.atlassian.net" })).status, 404);
-  assert.equal((await settings({ defaultOrg: SB })).status, 200);
-  assert.equal((await settings({ series: { id: "ser", org: "" } })).status, 400, "no org is not an org");
-  // A malformed org is a 400, never "not an org of this tenant" (rollup XERK-2944).
-  for (const org of [5, true, {}, [SA], undefined]) {
-    assert.equal((await settings({ series: { id: "ser", org } })).status, 400, `series org ${JSON.stringify(org)}`);
+  // An older client's org choices are refused in the hub's words, and change nothing.
+  for (const body of [{ defaultOrg: SB }, { defaultOrg: null }, { series: { id: "ser", org: SB } }, { showPrivate: true, defaultOrg: SB }]) {
+    const r = await settings(body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.body.error, /org is its host's org/);
   }
-  assert.equal((await settings({ series: { id: "ser", org: "nobody2891.atlassian.net" } })).status, 404);
-  assert.equal((await settings({ defaultOrg: 5 })).status, 400, "a non-string defaultOrg is malformed");
-  assert.equal((await settings({ series: { id: "ser", org: SB } })).status, 200);
+  assert.equal((await settings({})).status, 400, "showPrivate is required");
+  assert.equal((await settings({ showPrivate: "yes" })).status, 400);
+  // The org-rules route is gone (an unclassified route answers 404).
+  assert.equal((await request("POST", `/api/orgs/${SB}/calendar-rules`,
+    { headers: { ...userHeaders, "content-type": "application/json" }, body: { domains: ["b.example.com"] } })).status, 404);
   let view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
-  orgs = Object.fromEntries(view.map((e) => [e.id, e.org]));
-  assert.deepEqual([orgs.ambiguous, orgs.pinned, orgs.byAttendee], [SB, SB, SA], "default org, then the series pin");
-  assert.equal((await settings({ series: { id: "ser", org: SA } })).status, 200);
-  view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
-  assert.ok(view.every((e) => e.org && e.matchOrg === e.org), "every event has an org, served as matchOrg too");
-  assert.equal(view.find((e) => e.id === "pinned").org, SA, "the series pin beats the default");
-  // XERK-2929: the settings UI reads back what it set — the host row, the pin, the rules.
-  assert.equal(view.find((e) => e.id === "pinned").seriesOrg, SA);
-  assert.equal(view.find((e) => e.id === "ambiguous").seriesOrg, undefined);
+  // Organizer and invitees from another org's domain do not move it: the host is in SA.
+  assert.ok(view.length === 3 && view.every((e) => e.org === SA && e.matchOrg === SA), "every event is the host's org");
+  assert.ok(view.every((e) => !("seriesOrg" in e)), "no series pick is served");
   const hostRow = (await calGet2891(now - H2891, now + 48 * H2891)).body.hosts.find((h) => h.host === D);
-  assert.deepEqual([hostRow.org, hostRow.defaultOrg, hostRow.showPrivate, hostRow.orgs.includes(SA) && hostRow.orgs.includes(SB)],
-    [SA, SB, false, true]);
+  assert.deepEqual([hostRow.org, hostRow.showPrivate, "orgs" in hostRow, "defaultOrg" in hostRow], [SA, false, false, false]);
   const fleet = (await request("GET", "/api/agents", { headers: userHeaders })).body;
-  assert.deepEqual(fleet.calendarOrgRules[SA], { domains: ["a.example"] });
+  assert.equal("calendarOrgRules" in fleet, false);
   const secret = view.find((e) => e.id === "secret");
   // XERK-2936: the "real meeting" verdict is judged before the private event is withheld.
   assert.deepEqual([secret.attendees, secret.meeting], [[], true]);
   assert.deepEqual([secret.subject, secret.body, secret.location, secret.attendees, secret.private],
     ["Private event", "", "", [], true]);
-  assert.equal((await settings({ showPrivate: true })).status, 200);
-  const shown = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.find((e) => e.id === "secret");
-  assert.equal(shown.body, "salary talk");
-  // The org filter selects on the event's org.
+  const on = await settings({ showPrivate: true });
+  assert.deepEqual([on.status, on.body.settings], [200, { showPrivate: true }]);
+  view = (await calGet2891(now - H2891, now + 48 * H2891)).body.events.filter((e) => e.host === D);
+  assert.equal(view.find((e) => e.id === "secret").body, "salary talk");
+  // The org filter selects on the event's org: the host's.
   const only = (await calGet2891(now - H2891, now + 48 * H2891, userHeaders, `&org=${SB}`)).body.events
-    .filter((e) => e.host === D).map((e) => e.id);
-  assert.deepEqual(only.sort(), ["ambiguous", "byOrganizer"]);
-  // XERK-2936: a stored "" pin from an older hub is dropped, so the event keeps an org.
-  assert.deepEqual(hub.calendarHostSettingsCoerce({ h: { seriesOrgs: { ser: "" } } }).h.seriesOrgs, Object.create(null));
-  delete hub.getCalendarOrgRules()[SA];
-  delete hub.getCalendarOrgRules()[SB];
+    .filter((e) => e.host === D);
+  assert.deepEqual(only, []);
+  // An older store's org choices are dropped on load; the private opt-in survives.
+  assert.deepEqual(hub.calendarHostSettingsCoerce({ h: { defaultOrg: SB, seriesOrgs: { ser: SB }, showPrivate: true } }).h,
+    { showPrivate: true });
+  assert.equal((await settings({ showPrivate: false })).status, 200);
   forget2891(D, "cal2891eb");
 });
 
@@ -32860,7 +32842,7 @@ test("XERK-2896: relinks are throttled per tenant and skip error-only syncs; an 
   }
 });
 
-test("XERK-2896: an event reassigned to another org drops its capture; an organizer-only block takes none", async () => {
+test("XERK-2896: a capture links its host's event; an organizer-only block takes none", async () => {
   const S = "lkK2896a.atlassian.net", S2 = "lkK2896b.atlassian.net", D = "lkK2896", D2 = "lkK2896o";
   cleanup2896(S, [D]);
   cleanup2896(S2, [D2]);
@@ -32871,9 +32853,10 @@ test("XERK-2896: an event reassigned to another org drops its capture; an organi
         response: "organizer" }] })]);
     await postMeeting2508(S, capture2896("c", T2896, 30));
     assert.equal(row2896(S, "c").calendarEventId, "st");
+    // XERK-2964: the event's org is its host's; no setting can move it (or the capture) to S2.
     assert.equal((await request("POST", `/api/agents/${D}/calendar/settings`, { headers: { ...userHeaders,
-      "content-type": "application/json" }, body: { series: { id: "st", org: S2 } } })).status, 200);
-    assert.equal(row2896(S, "c").calendarEventId, undefined, "now S2's event: S's capture lets go");
+      "content-type": "application/json" }, body: { series: { id: "st", org: S2 } } })).status, 400);
+    assert.equal(row2896(S, "c").calendarEventId, "st");
     await postMeeting2508(S, capture2896("b", T2896 + 3 * 60 * MIN2896 + 10 * MIN2896, 20));
     assert.equal(row2896(S, "b").calendarEventId, undefined, "only the organizer on it: a personal block");
   } finally {
@@ -33018,38 +33001,6 @@ test("XERK-2901: a calendar host going offline and back sends a calendar frame e
   } finally {
     hub.sseClients.delete(res); hub.ssePrincipals.delete(res);
     forget2891(D);
-  }
-});
-
-test("XERK-2929: calendar email-domain rules are each tenant's own, on /api/agents and their SSE frame", async () => {
-  const T = tenants2533();
-  let F, sa, sb;
-  try {
-    F = await fleet2551(T, "t2929");
-    const rules = (site, h, domains) => request("POST", `/api/orgs/${encodeURIComponent(site)}/calendar-rules`,
-      { headers: { ...h, "content-type": "application/json" }, body: { domains } });
-    sa = await sseConnect(T.A.h);
-    sb = await sseConnect(T.B.h);
-    const fa = collectSse(sa.res), fb = collectSse(sb.res);
-    assert.equal((await rules(F.SA, T.B.h, ["evil.example"])).status, 404, "B cannot write A's org");
-    assert.equal((await rules(F.SA, T.A.h, ["a2929.example"])).status, 200);
-    assert.equal((await rules(F.SB, T.B.h, ["b2929.example"])).status, 200);
-    const agentsOf = async (h) => (await request("GET", "/api/agents", { headers: h })).body.calendarOrgRules;
-    const a = await agentsOf(T.A.h), b = await agentsOf(T.B.h);
-    assert.deepEqual([a[F.SA], F.SB in a], [{ domains: ["a2929.example"] }, false]);
-    assert.deepEqual([b[F.SB], F.SA in b], [{ domains: ["b2929.example"] }, false]);
-    // The frame is pushed on each change, scoped per viewer like the payload.
-    await waitFor(() => fa.some((e) => e.event === "calendarOrgRules" && F.SA in JSON.parse(e.data)));
-    await waitFor(() => fb.some((e) => e.event === "calendarOrgRules" && F.SB in JSON.parse(e.data)));
-    assert.ok(!fb.some((e) => e.event === "calendarOrgRules" && e.data.includes("a2929.example")), "B never sees A's rules");
-    assert.ok(!fa.some((e) => e.event === "calendarOrgRules" && e.data.includes("b2929.example")), "A never sees B's rules");
-  } finally {
-    for (const s of [sa, sb]) if (s) { s.req.destroy(); s.res.destroy(); }
-    if (F) {
-      forget2533("t2929", F.ka, F.kb, F.kl);
-      for (const k of [F.SA, F.SB]) delete hub.getCalendarOrgRules()[k];
-    }
-    T.restore();
   }
 });
 

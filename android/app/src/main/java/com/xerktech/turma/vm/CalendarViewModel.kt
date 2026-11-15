@@ -336,19 +336,18 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _setErr = MutableStateFlow<Map<String, String>>(emptyMap())
 
-    /** The hub's refusal per host, shown by its settings row and the event's Org picker. */
+    /** The hub's refusal per host, shown by its settings row. */
     val setErr: StateFlow<Map<String, String>> = _setErr
 
     /**
      * A host's calendar settings (`POST /api/agents/<host>/calendar/settings`,
-     * XERK-2929): `{defaultOrg: site | null}`, `{showPrivate}` or `{series: {id,
-     * org: site | "" | null}}`. A save that held re-reads the shown weeks.
+     * XERK-2929): `{showPrivate}`. A save that held re-reads the shown weeks.
      */
     fun saveHost(host: String, body: JsonObject): Job? {
         if (host in _setBusy.value) return null
         _setBusy.update { it + host }
         _setErr.update { it - host }
-        val what = if ("series" in body) "Setting the meeting's org" else "Saving the calendar settings"
+        val what = "Saving the calendar settings"
         return viewModelScope.launch {
             val err = try {
                 val r = container.client.api.setCalendarHostSettings(host, body)

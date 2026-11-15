@@ -200,11 +200,3 @@ fun meetingsPending(map: Map<String, List<Meeting>>, scoped: Set<String>): Int =
 fun meetingOrgs(map: Map<String, List<Meeting>>, scoped: Set<String>): List<String> =
     map.filter { (k, v) -> v.isNotEmpty() && (scoped.isEmpty() || k in scoped) }.keys.sorted()
 
-private val DOMAIN_SPLIT = Regex("[$JS_WS_NL,;]+")
-
-/**
- * An org's calendar email domains as typed (meetings.js `saveDomains`): split on
- * JS whitespace, commas and semicolons; lowercased, a leading @ dropped.
- */
-fun calendarDomains(text: String): List<String> =
-    text.split(DOMAIN_SPLIT).map { jsTrim(it).lowercase().removePrefix("@") }.filter { it.isNotEmpty() }

@@ -119,36 +119,23 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 
 ## Org assignment (served as `org` on each event)
 
-A host's calendar is one person's Outlook and may span orgs. Decided at serve time, in order:
-1. The host's per-series override (`seriesOrgs[seriesId || id]`).
-2. Domain rules: the org whose `domains` contain the ORGANIZER's email domain; else the one org
-   matching any attendee's domain, only when exactly one org matches (two = ambiguous, skipped).
-3. The host's `defaultOrg`.
-4. The host's decided org (`decidedOrgOf`). "" only for a host in no decided org.
-- **Every meeting of a host in an org has an org** (XERK-2936, operator rule): there is no
-  "pinned unassigned" override — a series pin of "" is a 400, and a stored one is dropped. Before
-  this, events no rule matched served "" and drew grey on every client.
-- Only orgs of the HOST's tenant count (org key tenant == host key tenant), and only orgs some
-  host is decided into; a rule or setting naming another tenant's org is refused at the route.
-- A domain is lowercase `^[a-z0-9.-]{1,253}$` with a dot; `sub.a.com` matches rule `a.com`.
+- **An Outlook event's org is its HOST's decided org (`decidedOrgOf`), always** (XERK-2964,
+  operator rule): the agent that read it is tied to one org, so the org is known and LOCKED.
+  "" only for a host in no decided org (drifted or never bound).
+  - No per-series pick, email-domain rule or host default org. Never re-add one: XERK-2929 had
+    all three and the operator removed them. Clients show the org as text, never a picker.
+  - The settings route refuses a `defaultOrg`/`series` body (400, in words); an older store's
+    `defaultOrg`/`seriesOrgs` are dropped on load; `/data/calendar-org-rules.json` is no longer read.
+- `matchOrg` (XERK-2898) equals `org`; the capture matcher counts an event for that org.
 
 ## Settings (hub store, operator-authed, tenant-scoped)
 
-- Two `registerExternalStore`s: `/data/calendar-org-rules.json` (`CALENDAR_ORG_RULES_FILE`,
-  siteKey → `{domains[]}`, a `TENANT_ORG_STORES` member) and `/data/calendar-host-settings.json`
-  (`CALENDAR_HOST_SETTINGS_FILE`, hostKey → `{defaultOrg?, showPrivate?, seriesOrgs{}}`).
-  Split so each is keyed like its tenant's other stores (org key vs host key).
-- `POST /api/orgs/<site>/calendar-rules {domains: [..]}` (org route: 404 an org no host is
-  decided into; ≤50 domains; `[]` clears).
-- `POST /api/agents/<host>/calendar/settings {defaultOrg?, showPrivate?, series?: {id, org}}`
-  (host route, `principalMayDriveHost`); `defaultOrg`/`series.org` null clears, else must be a
-  decided org of the host's tenant (404). ≤500 series overrides per host (oldest dropped).
-- They answer `{ok, rules}` / `{ok, settings}` and broadcast a `calendar` frame for the host(s) affected.
-- **Read back for the settings UI** (XERK-2929): rules ride `/api/agents` as `calendarOrgRules`
-  (`bySite`) + its own SSE frame; each `/api/calendar` `hosts[]` row carries `org` (decided),
-  `orgs` (what it may pick), `defaultOrg` ("" = none), `showPrivate`; an event the operator
-  pinned carries `seriesOrg` (only a pin that still counts). Web: Meetings drawer (days off, domains), calendar gear (host),
-  event panel (series). Android mirrors all three.
+- `/data/calendar-host-settings.json` (`CALENDAR_HOST_SETTINGS_FILE`, a `registerExternalStore`),
+  hostKey → `{showPrivate?}`.
+- `POST /api/agents/<host>/calendar/settings {showPrivate: bool}` (host route,
+  `principalMayDriveHost`); answers `{ok, settings}` and broadcasts a `calendar` frame for the host.
+- Each `/api/calendar` `hosts[]` row carries `org` (decided, every event's) and `showPrivate`.
+  Web: the calendar gear (host rows); Android mirrors it.
 
 ## The event store
 
@@ -173,8 +160,8 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
     these caps, the meetings store's budget class. Raise the caps only by moving it to Postgres.
 - **Keeps the last good sync per host**: an offline host's calendar is still served (`online:false`
   beside it). A host removed from the registry loses its calendar 30 days after its last sync.
-- Tenant purge + migration step for `calendarEvents`, `calendarHostSettings` (a host's plain
-  org values follow it into the tenant) and `calendarOrgRules`. Tests: `tenant-migration.test.js`.
+- Tenant purge + migration step for `calendarEvents` and `calendarHostSettings`.
+  Tests: `tenant-migration.test.js`.
 
 ## Hub → agent: the `syncCalendar` command
 
@@ -215,7 +202,7 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   - `calendarBy`: `auto` (the matcher) | `operator`; `operator` with no id = "never link".
   - `calendarAmbiguous: true` = the matcher found a tie; nothing linked, flagged for the operator.
 - **Matching** (`calendarBestMatch`), on Tenir's POST and again when a sync CHANGES a host's stored
-  events, an org rule or a host setting (`scheduleCalendarRelink` → `relinkTenantMeetings`).
+  events (`scheduleCalendarRelink` → `relinkTenantMeetings`).
   - Relinks run at most once per `CALENDAR_RELINK_MIN_MS` (10s) per tenant, the rest deferred to
     one trailing timer; an error-only or unchanged sync schedules none. Why: one host re-sending
     syncs every beat blocked the shared event loop ~0.55 s a beat at the caps (QA).

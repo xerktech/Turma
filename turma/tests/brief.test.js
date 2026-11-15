@@ -907,23 +907,17 @@ test("XERK-2897: with the stream down the calendar polls every 60s; up, it does 
   assert.equal(P.calendarRefetches(), 1);
 });
 
-test("XERK-2929: the drawer sets the org's days off and calendar email domains", async () => {
+test("XERK-2929: the drawer sets the org's days off (and, XERK-2964, no calendar email domains)", async () => {
   const P = loadPage((url, init) => {
     if (url.endsWith("/holidays")) {
       const b = JSON.parse(init.body);
       return { ok: true, settings: { countries: b.countries || ["US"], off: b.off || [] } };
     }
-    if (url.endsWith("/calendar-rules")) {
-      const b = JSON.parse(init.body);
-      return b.domains.includes("bad") ? { status: 400, body: { error: "domains must be <email> domains" } }
-        : { ok: true, rules: b.domains.length ? { domains: b.domains } : null };
-    }
     return { ok: true };
   });
   const d = data({ holidaySettings: { [SITE]: { countries: ["US"], off: ["us-july4"] } },
     holidayCatalog: { US: { name: "United States", holidays: [{ id: "us-july4", name: "Independence Day" },
-      { id: "us-thanksgiving", name: "Thanksgiving <Day>" }] } },
-    calendarOrgRules: { [SITE]: { domains: ["acme.com"] } } });
+      { id: "us-thanksgiving", name: "Thanksgiving <Day>" }] } } });
   P.setCache(d);
   P.openDrawer(SITE);
   P.renderBriefs(d, NOW);
@@ -931,10 +925,9 @@ test("XERK-2929: the drawer sets the org's days off and calendar email domains",
   assert.match(h, /Days off/);
   assert.match(h, /data-hol-off="us-july4" data-hol-site="acme\.atlassian\.net" checked> Independence Day/);
   assert.match(h, /data-hol-off="us-thanksgiving" data-hol-site="acme\.atlassian\.net"> Thanksgiving &lt;Day&gt;/, "escaped, unticked");
-  assert.match(h, /data-cal-domains="acme\.atlassian\.net" value="acme\.com"/);
+  // An event's org is its host's (XERK-2964): no per-org email-domain rule to edit.
+  assert.doesNotMatch(h, /Calendar email domains|data-cal-domains/);
   const change = (ds, checked) => { for (const fn of P.els.meetingList.listeners.change) fn({ target: { dataset: ds, checked } }); };
-  const click = (ds) => { for (const fn of P.els.meetingList.listeners.click) fn({ target: { closest: () => ({ dataset: ds, getAttribute: () => null }) } }); };
-  const input = (ds, value) => { for (const fn of P.els.meetingList.listeners.input) fn({ target: { dataset: ds, value } }); };
   // Ticking a day off PUTs the whole list; the answer is what the drawer shows.
   change({ holOff: "us-thanksgiving", holSite: SITE }, true);
   await P.settle();
@@ -946,19 +939,6 @@ test("XERK-2929: the drawer sets the org's days off and calendar email domains",
   await P.settle();
   assert.deepEqual(P.fetches.filter((f) => f.method === "PUT").at(-1).body, { countries: [] });
   assert.doesNotMatch(P.list(), /data-hol-off=/);
-  // Domains: typed, normalised (case, @, separators), saved; a refusal keeps the draft.
-  input({ calDomains: SITE }, "@Acme.com, bad");
-  click({ calDomainsSave: SITE });
-  await P.settle();
-  assert.deepEqual(P.fetches.filter((f) => f.url.endsWith("/calendar-rules")).map((f) => f.body), [{ domains: ["acme.com", "bad"] }]);
-  h = P.list();
-  assert.match(h, /value="@Acme\.com, bad"/);
-  assert.match(h, /Saving the email domains failed — domains must be &lt;email&gt; domains/);
-  input({ calDomains: SITE }, "acme.com  ACME.co.uk");
-  click({ calDomainsSave: SITE });
-  await P.settle();
-  assert.deepEqual(P.fetches.filter((f) => f.url.endsWith("/calendar-rules")).at(-1).body, { domains: ["acme.com", "acme.co.uk"] });
-  assert.match(P.list(), /data-cal-domains="acme\.atlassian\.net" value="acme\.com, acme\.co\.uk"/);
 });
 
 test("XERK-2929: a focused day-off box never holds the drawer stale through an SSE frame", async () => {
