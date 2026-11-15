@@ -164,8 +164,11 @@ A pure-core/adapter-shell split:
     - Edit/Delete only when `CalendarEvent.canEdit` (`source:"turma"`, `editable:true`, a
       `version`, NOT `private`): an older hub serves none of them, so its events stay read-only.
       A withheld private event's fields are blanked; editing it would save the blanks (QA).
-    - The open draft lives in `CalendarViewModel.editor`, never composable state: a rotation or tab
-      switch lost it (QA). A changed draft asks before it is discarded.
+    - The open draft lives in `AppContainer.calendarEditor`, never composable or view-model state:
+      a rotation or bottom-tab switch (the Meetings VM dies with its tab) lost it (QA). A changed
+      draft asks before it is discarded.
+    - It is dropped on any account change (`Config.onChange`: sign-out, hub, user), synchronously:
+      process-lived, it opened and saved one account's draft under the next (QA).
     - Validation ports the hub's own rules (`CAL_EMAIL_PART`, `CAL_URL_RE`, named zones only) and
       refuses a wall time the clocks skip; a name with a comma is written quoted.
     - A multi-org event's org list is `calOrgsOf` (`orgs`, else `org`); every per-org read (upcoming

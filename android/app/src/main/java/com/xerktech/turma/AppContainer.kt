@@ -61,8 +61,18 @@ class AppContainer(context: Context) {
      */
     val modelSwitches = ModelSwitchStore()
 
-    /** The open calendar-event editor (XERK-2972), kept across tab switches and rotation. */
+    /**
+     * The open calendar-event editor (XERK-2972), kept across tab switches and
+     * rotation — and dropped the moment the account changes (sign-out, another hub
+     * or user): one account's draft must never open, or be saved, under the next (QA).
+     */
     val calendarEditor = kotlinx.coroutines.flow.MutableStateFlow<com.xerktech.turma.core.EventEditor?>(null)
+
+    init {
+        // Synchronous, not a collector: a coroutine could run after the next account's
+        // screen already showed the old draft.
+        config.onChange { calendarEditor.value = null }
+    }
 
     /**
      * The in-session chat text size (XERK-144). Here for the same reason as [org]:

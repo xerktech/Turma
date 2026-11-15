@@ -213,4 +213,37 @@ class CalendarTurmaEventsTest {
         compose.onNodeWithTag("cal-editor").assertDoesNotExist()
         assertEquals(null, cvm.editor.value)
     }
+
+    @Test fun `XERK-2972 QA a draft never outlives the account it was typed under`() {
+        seed(outlook)
+        val cvm = show()
+        awaitEvent("Outlook standup")
+        compose.onNodeWithTag("cal-new-event").performClick()
+        compose.onNodeWithTag("cal-ed-title").performTextInput("Account A's draft")
+        assertEquals("Account A's draft", cvm.editor.value?.draft?.subject)
+        hub.app.container.config.clear()   // what sign-out does
+        assertEquals(null, cvm.editor.value)
+        assertEquals(null, hub.app.container.calendarEditor.value)
+    }
+
+    @Test fun `XERK-2972 QA a 409 landing after the editor was discarded leaves it closed`() {
+        seed(turmaEvent())
+        val release = java.util.concurrent.CountDownLatch(1)
+        hub.route("/api/calendar/events/turma:0123456789abcdef") {
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            okhttp3.mockwebserver.MockResponse().setResponseCode(409).setHeader("Content-Type", "application/json")
+                .setBody("""{ "error": "this event was changed since you opened it", "event": ${turmaEvent("Renamed", version = 4)} }""")
+        }
+        val cvm = show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-edit").performScrollTo().performClick()
+        compose.onNodeWithTag("cal-ed-title").performTextReplacement("Mine")
+        compose.onNodeWithTag("cal-editor-save").performClick()
+        hub.findRequest("/api/calendar/events/turma:0123456789abcdef")
+        cvm.closeEditor()                  // discarded while the save is in flight
+        release.countDown()
+        compose.waitUntil(5_000) { !cvm.eventBusy.value }
+        assertEquals(null, cvm.editor.value)
+    }
 }
