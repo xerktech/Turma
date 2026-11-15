@@ -68,7 +68,22 @@ ticket builds to this file; change it here first.
 
 ## Hub → agent: the `renderDailyBrief` command
 
-- `{type:"renderDailyBrief", siteKey, runId, dayFrom, weekFrom, until, meetingAt, model, runtime}`.
+- `{type:"renderDailyBrief", siteKey, runId, dayFrom, weekFrom, until, meetingAt, model, runtime,
+  calendar}`.
+  - `calendar` (XERK-2970, `dailyBriefCalendar`): the org's real meetings (`calendarLinkCandidate`,
+    not canceled) STARTING in [until, until+12h), ≤10, earliest first: its hosts' Outlook events
+    AND the Turma events whose `orgs` contains the org (a multi-org event is in each org's brief).
+    - Less the standup itself: an event starting within 5 min of `meetingAt`; a meeting
+      just before or after it still counts (QA: ±20 min dropped real meetings).
+    - The window may cross midnight, so the prompt never calls them today's.
+    - Each `{title, start "HH:MM", end "HH:MM", with: [≤5 invitee names]}`, times in the
+      schedule's zone. A private event is `"Private event"` with nobody named (Outlook: unless the
+      host opted in; Turma: always — the brief has no viewer).
+    - The agent keeps only well-formed entries (`daily_brief_calendar`); absent (an older hub)
+      or malformed = none, never a failed run. It rides the model input as `calendar`.
+    - Spoken as ONE closing sentence of `stillOpen` (≤3 meetings); the day word budget grows by
+      `DAILY_BRIEF_CALENDAR_WORDS` (20) only when `calendar` is non-empty, and a ticket key in a
+      meeting's title counts as known to the invented-key check.
   - `runId`: hub-minted `^[0-9a-f]{1,32}$`. Times: epoch ms. `model`: concrete (`"haiku"` or
     `"sonnet"`) — the hub resolves `"auto"` before sending. `runtime`: `"claude"|"dsh"|"qwen"`.
   - **`"auto"` resolves to `"haiku"`, whatever the input size** (XERK-2393 eval: Haiku beat Sonnet

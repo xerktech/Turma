@@ -5853,7 +5853,8 @@ function sanitizeCalendarEvent(v) {
   const id = calId(v.id);
   const start = calIso(v.start);
   const end = calIso(v.end);
-  if (!id || !start || !end) return null;
+  // `turma:` ids are the hub's own events (XERK-2968/2970): an Outlook copy never takes one.
+  if (!id || id.startsWith("turma:") || !start || !end) return null;
   const startMs = Date.parse(start);
   const endMs = Date.parse(end);
   if (endMs < startMs) return null;
@@ -6318,7 +6319,8 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       events.push({ source: "outlook", ...w });
     }
   }
-  events = events.concat(tenir.entries, ...tenir.linked.values(), calendarTurmaView(p, from, until, orgFilter));
+  const turma = calendarTurmaView(p, from, until, orgFilter, tenir);
+  events = events.concat(tenir.entries, ...tenir.linked.values(), turma);
   events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const truncated = events.length > CALENDAR_SERVE_MAX;
@@ -6389,7 +6391,9 @@ function turmaEventWire(p, rec, served = rec.orgs) {
   return out;
 }
 // The Turma events overlapping [from, until) that `p` may see, filtered on ANY org.
-function calendarTurmaView(p, from, until, orgFilter) {
+// With `tenir` (calendarTenirView), each carries its linked captures (`meetings`,
+// XERK-2970) and those captures' own entries are dropped, as for an Outlook event.
+function calendarTurmaView(p, from, until, orgFilter, tenir) {
   const out = [];
   const decided = decidedOrgs();
   // principalMaySite on each org is the tenant boundary: a record's orgs are all of its tenant.
@@ -6398,7 +6402,13 @@ function calendarTurmaView(p, from, until, orgFilter) {
       if (rec.startMs >= until || rec.endMs < from || (rec.endMs === from && rec.endMs !== rec.startMs)) continue;
       const served = rec.orgs.filter((o) => decided.has(o) && principalMaySite(p, o));
       if (!served.length || (orgFilter && !served.some((o) => orgFilter.has(o)))) continue;
-      out.push(turmaEventWire(p, rec, served));
+      const w = turmaEventWire(p, rec, served);
+      if (tenir) {
+        const lk = `${tenantOfSite(rec.orgs[0])}\u0000${rec.id}`;
+        w.meetings = tenir.links.get(lk) || [];
+        tenir.linked.delete(lk);
+      }
+      out.push(w);
     }
   }
   return out;
@@ -6487,6 +6497,7 @@ function calTurmaStore(t, rec) {
   calendarTurmaEvents[t][rec.id] = rec;
   persistCalendarTurmaEvents();
   broadcastCalendarSoon(calTurmaFrameKey(t));
+  scheduleCalendarRelink(t);  // captures may now link to it, or leave it (XERK-2970)
 }
 // The event `id` among the tenants `p` may see and edit -> {t, rec} | {status, body}.
 function calTurmaFind(p, id) {
@@ -6554,6 +6565,7 @@ function deleteTurmaEvent(p, id) {
   if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
   persistCalendarTurmaEvents();
   broadcastCalendarSoon(calTurmaFrameKey(f.t));
+  scheduleCalendarRelink(f.t);  // its auto-linked captures rematch (XERK-2970)
   return { status: 200, body: { ok: true } };
 }
 // The Turma-event routes' shared tail (XERK-2968): parse the body, run the logic.
@@ -6598,7 +6610,7 @@ function calendarTurmaTick(now = Date.now()) {
       else delete bucket[id];
     }
     if (!Object.keys(bucket).length) delete calendarTurmaEvents[t];
-    if (touched) broadcastCalendarSoon(calTurmaFrameKey(t));
+    if (touched) { broadcastCalendarSoon(calTurmaFrameKey(t)); scheduleCalendarRelink(t); }
   }
   for (const o of calTurmaOrgGoneAt.keys()) if (!seen.has(o)) calTurmaOrgGoneAt.delete(o);
   if (changed) persistCalendarTurmaEvents();
@@ -6662,8 +6674,18 @@ function calendarEventLookup(t) {
     }
   }
   for (const list of copies.values()) if (list.length > 1) list.sort((a, b) => b.syncedAt - a.syncedAt);
+  // The tenant's Turma-created events (XERK-2970): one copy each, no host. A `turma:`
+  // id never collides with an Outlook one.
+  for (const ev of Object.values(calendarTurmaEvents[t] || {})) {
+    const c = { key: "", ev, syncedAt: ev.updatedAt, turma: true };
+    byId.set(ev.id, c);
+    copies.set(ev.id, [c]);
+  }
   return { t, byId, copies };
 }
+// Whether lookup copy `c` counts for org `siteKey`: an Outlook copy by its host's
+// decided org, a Turma event when `siteKey` is one of its orgs (XERK-2970).
+const calCopyCountsFor = (c, siteKey) => (c.turma ? c.ev.orgs.includes(siteKey) : calendarEventOrg(c.key) === siteKey);
 // A real meeting, not a personal block (Focus time, Lunch, Gym, WFH): someone
 // else is invited or it has a join link; shown busy/tentative; not declined; not
 // all-day; at most CALENDAR_LINK_EVENT_MAX_MS. (XERK-2896 QA: a capture inside
@@ -6684,6 +6706,11 @@ function calendarCandidateIndex(t) {
     for (const ev of h.events) {
       if (calendarLinkCandidate(ev)) list.push({ key, ev, org });
     }
+  }
+  // A Turma event is a candidate for each of its orgs (XERK-2970); calendarBestMatch
+  // scores one id once.
+  for (const ev of Object.values(calendarTurmaEvents[t] || {})) {
+    if (calendarLinkCandidate(ev)) for (const org of ev.orgs) list.push({ key: "", ev, org });
   }
   list.sort((a, b) => a.ev.startMs - b.ev.startMs);
   return { ...calendarEventLookup(t), list };
@@ -6767,7 +6794,7 @@ function meetingCalendarLinkFields(siteKey, m, index) {
   // the link goes back to the matcher. Any host's copy counts: one id on two hosts of
   // different orgs is one meeting (XERK-2896 QA).
   const cur = m.calendarEventId && (index.copies.get(m.calendarEventId) || [])
-    .find((c) => calendarEventOrg(c.key) === siteKey);
+    .find((c) => calCopyCountsFor(c, siteKey));
   if (cur) {
     if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
     const hit = calendarBestMatch(siteKey, m, index);
@@ -6832,8 +6859,10 @@ function meetingCalendarEventWire(siteKey, m, index) {
   const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
   // The copy counting for the capture's org (newest first), else the newest copy.
   const all = ix.copies.get(m.calendarEventId) || [];
-  const c = all.find((x) => calendarEventOrg(x.key) === siteKey) || all[0];
+  const c = all.find((x) => calCopyCountsFor(x, siteKey)) || all[0];
   if (!c) return null;
+  // A Turma event is in the capture's org or gone for it: never another org's copy.
+  if (c.turma) return c.ev.orgs.includes(siteKey) ? turmaMeetingEventWire(siteKey, m, c.ev) : null;
   const w = calendarEventWire(c.key, c.ev, calendarHostSettings[c.key]);
   const out = { host: c.key, org: w.org, subject: w.subject,
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
@@ -6843,6 +6872,18 @@ function meetingCalendarEventWire(siteKey, m, index) {
     attendees: w.attendees.filter((p) => p.role !== "resource").map((p) => p.name || p.email)
       .filter(Boolean).slice(0, CALENDAR_WIRE_ATTENDEES_MAX) };
   if (w.private) out.private = true;
+  return out;
+}
+// A Turma event beside its linked capture (XERK-2970): the same shape, `host` "",
+// `org` the capture's org when the event is in it. Served to every viewer of the
+// org, so a private/confidential event is withheld for all (its creator included).
+function turmaMeetingEventWire(siteKey, m, ev) {
+  const hidden = ev.sensitivity === "private" || ev.sensitivity === "confidential";
+  const out = { host: "", org: ev.orgs.includes(siteKey) ? siteKey : ev.orgs[0], subject: hidden ? "Private event" : ev.subject,
+    start: ev.start, end: ev.end, startMs: ev.startMs, endMs: ev.endMs, canceled: false,
+    moved: !calOverlapsCapture(m, ev),
+    attendees: hidden ? [] : ev.attendees.map((p) => p.name || p.email).filter(Boolean).slice(0, CALENDAR_WIRE_ATTENDEES_MAX) };
+  if (hidden) out.private = true;
   return out;
 }
 // The operator's relink/unlink (POST /api/orgs/<site>/meetings/<mid>/calendar):
@@ -6868,7 +6909,11 @@ function setMeetingCalendarLink(siteKey, meetingId, body) {
   } else if (body.eventId === null) {
     fields = { calendarEventId: undefined, calendarBy: "operator", calendarAmbiguous: undefined };
   } else {
-    if (!index.byId.has(body.eventId)) return refuse(404, "no calendar event of this tenant's hosts has that id");
+    const c = index.byId.get(body.eventId);
+    // A Turma event links only captures of its own orgs (XERK-2970).
+    if (!c || (c.turma && !c.ev.orgs.includes(siteKey))) {
+      return refuse(404, "no calendar event of this tenant has that id");
+    }
     fields = { calendarEventId: body.eventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const row = putMeeting(siteKey, { ...m, ...fields });
@@ -6896,7 +6941,8 @@ function calendarTenirView(p, from, until, orgFilter) {
       const title = meetingDisplayTitle(m);
       const endMs = Math.max(m.endedAt, m.startedAt);
       const inRange = !(m.startedAt >= until || endMs < from || (orgFilter && !orgFilter.has(site)));
-      const c = m.calendarEventId && lookup.byId.get(m.calendarEventId);
+      let c = m.calendarEventId && lookup.byId.get(m.calendarEventId);
+      if (c && c.turma && !c.ev.orgs.includes(site)) c = null;  // not this org's: missing (XERK-2970)
       let k = "";
       if (c) {
         k = `${t}\u0000${m.calendarEventId}`;
@@ -22390,12 +22436,60 @@ function pickDailyBriefHost(siteKey, model, exclude = []) {
 // command (XERK-2398 QA). The tick re-queues each running row once per process;
 // the agent runs a re-delivered runId once.
 const dailyBriefSent = new Set();
+// The brief's calendar section (XERK-2970, contract-daily-brief.md): org
+// `siteKey`'s real meetings (calendarLinkCandidate, not canceled) starting in
+// [from, from + DAILY_BRIEF_CALENDAR_SPAN_MS) — its hosts' Outlook events and the
+// Turma events it is one of the orgs of — less the standup itself (starting
+// within 5 min of `meetingAt`: a meeting just before or after it still
+// counts, QA). Times are "HH:MM" in the
+// schedule's zone; a private event is "Private event" with nobody named.
+const DAILY_BRIEF_CALENDAR_SPAN_MS = 12 * 3600e3;
+const DAILY_BRIEF_CALENDAR_MAX = 10;
+const DAILY_BRIEF_CALENDAR_WITH_MAX = 5;
+const DAILY_BRIEF_STANDUP_SLACK_MS = 5 * 60e3;  // the standup's own event starts this near meetingAt
+function dailyBriefCalendar(siteKey, from, meetingAt, timeZone) {
+  const until = from + DAILY_BRIEF_CALENDAR_SPAN_MS;
+  const t = tenantOfSite(siteKey);
+  const picked = new Map(); // id -> {startMs, endMs, title, with}
+  const take = (ev, title, people) => {
+    if (picked.has(ev.id) || !calendarLinkCandidate(ev) || ev.canceled) return;
+    if (ev.startMs < from || ev.startMs >= until) return;
+    if (Math.abs(ev.startMs - meetingAt) <= DAILY_BRIEF_STANDUP_SLACK_MS) return;
+    picked.set(ev.id, { startMs: ev.startMs, endMs: ev.endMs, title,
+      with: people.filter(Boolean).slice(0, DAILY_BRIEF_CALENDAR_WITH_MAX) });
+  };
+  for (const [key, h] of Object.entries(calendarEvents)) {
+    if (tenantOfKey(key) !== t || calendarEventOrg(key) !== siteKey) continue;
+    const hs = calendarHostSettings[key];
+    for (const ev of h.events) {
+      const w = calendarEventWire(key, ev, hs);
+      take(ev, w.subject, w.attendees.filter((p) => p.role !== "organizer" && p.role !== "resource")
+        .map((p) => p.name || p.email));
+    }
+  }
+  for (const ev of Object.values(calendarTurmaEvents[t] || {})) {
+    if (!ev.orgs.includes(siteKey)) continue;
+    const hidden = ev.sensitivity === "private" || ev.sensitivity === "confidential";
+    take(ev, hidden ? "Private event" : ev.subject, hidden ? [] : ev.attendees.map((p) => p.name || p.email));
+  }
+  let fmt;
+  try {
+    fmt = new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  } catch {
+    fmt = new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  }
+  return [...picked.values()].sort((x, y) => x.startMs - y.startMs || x.endMs - y.endMs)
+    .slice(0, DAILY_BRIEF_CALENDAR_MAX)
+    .map((e) => ({ title: e.title || "Untitled meeting", start: fmt.format(e.startMs), end: fmt.format(e.endMs), with: e.with }));
+}
 function dispatchDailyBrief(siteKey, row, host, now) {
   dailyBriefSent.add(row.runId);
   const runtime = dailyBriefRuntime(agents[host]);
+  const sched = dailyBriefScheduleOf(siteKey);
+  const calendar = dailyBriefCalendar(siteKey, row.until, row.meetingAt, (sched && sched.timeZone) || "UTC");
   const cmdId = queueCommand(host, { type: "renderDailyBrief", siteKey, runId: row.runId,
     dayFrom: row.dayFrom, weekFrom: row.weekFrom, until: row.until, meetingAt: row.meetingAt,
-    model: row.model, runtime });
+    model: row.model, runtime, calendar });
   return { ...row, status: "running", host, cmdId, sentAt: now,
     tried: [...(row.tried || []), host] };
 }
@@ -30432,7 +30526,7 @@ if (process.env.TURMA_TEST) {
     sanitizeCalendarEvent, calendarEventsCoerce, ingestCalendarSync, calendarView, calendarTick,
     calendarEventOrg, calendarHostSettingsCoerce, calendarOnDemandAt, calendarOfflineEdge,
     // XERK-2896: linking captures to calendar events.
-    calendarLinkScore, calendarBestMatch, calendarCandidateIndex, relinkTenantMeetings, setMeetingCalendarLink,
+    calendarLinkScore, calendarBestMatch, calendarCandidateIndex, relinkTenantMeetings, setMeetingCalendarLink, meetingWire, dailyBriefCalendar,
     scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,

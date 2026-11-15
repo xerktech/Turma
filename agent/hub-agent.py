@@ -25511,6 +25511,8 @@ DAILY_BRIEF_DAY_WORDS = 120      # sinceYesterday + stillOpen + upNext, as asked
 DAILY_BRIEF_WEEK_WORDS = 80      # thisWeek, as asked
 DAILY_BRIEF_WORDS_SLACK = 1.25   # the parser's hard ceiling over each budget
 DAILY_BRIEF_NEXT_MAX = 4         # upNext entries (2 when the data offers 2+)
+DAILY_BRIEF_CALENDAR_WORDS = 20  # the day budget's extra for the meetings-ahead sentence
+DAILY_BRIEF_CALENDAR_MAX = 10    # `calendar` entries the hub sends (XERK-2970)
 DAILY_BRIEF_REPLY_TEXT_MAX = 1200  # chars per reply section / entry, a backstop
 # (named apart from the collector's DAILY_BRIEF_TEXT_MAX: one module global)
 DAILY_BRIEF_WIRE_TEXT_MAX = 2000  # each of the result row's day/week/next, joined
@@ -25529,7 +25531,9 @@ DAILY_BRIEF_INSTRUCTION = (
     "sat there); `next` (not-started tickets tied to recent work, best first, with "
     "a `why`); `counts` (the totals to say aloud: take every number from here, never "
     "count the lists yourself; when `countsAreMinimums` is true say \"at least\" "
-    "before each count, never \"more than\").\n"
+    "before each count, never \"more than\"); `calendar` (when present: the "
+    "meetings ahead in the next hours, each with `title`, local `start`/`end` "
+    "times and who is invited in `with`).\n"
     "Reply with ONLY one JSON object, no code fence, no other text:\n"
     "{\"sinceYesterday\": string, \"thisWeek\": string, \"stillOpen\": string, "
     "\"upNext\": [{\"key\": string, \"text\": string}]}\n"
@@ -25541,12 +25545,15 @@ DAILY_BRIEF_INSTRUCTION = (
     f"{DAILY_BRIEF_WEEK_WORDS} words): the week's trend or themes.\n"
     "- stillOpen (at most 35 words): what is in progress; call out "
     "anything blocked or sitting a long time. If nothing is in progress, say so "
-    "in one sentence.\n"
+    "in one sentence. When `calendar` is present, end stillOpen with ONE more "
+    f"sentence (at most {DAILY_BRIEF_CALENDAR_WORDS} more words) naming the meetings "
+    "coming up, at most three, by title and start time (they may run past midnight: "
+    "never call them today's).\n"
     f"- upNext: 2 to {DAILY_BRIEF_NEXT_MAX} entries chosen ONLY from `next` (fewer "
     "only if `next` has fewer; [] if it is empty). `key` is that ticket's key; "
     "`text` (at most 10 words) names the work in plain words with a short reason.\n"
     f"Hard limit: sinceYesterday, stillOpen and every upNext text together at most "
-    f"{DAILY_BRIEF_DAY_WORDS} words. Shorter is better: it is spoken.\n"
+    f"{DAILY_BRIEF_DAY_WORDS} words, plus the meetings sentence. Shorter is better: it is spoken.\n"
     "Rules: plain spoken sentences; no markdown, bullets, headings or emphasis; "
     "say at most three ticket keys in the whole script, and only where a key helps "
     "someone find the ticket; never mention a ticket, person or fact that is not in "
@@ -25671,6 +25678,11 @@ def daily_brief_problems(brief, data):
             if isinstance(r, dict):
                 known.add(r.get("key"))
                 known.update(k for k in r.get("blockedBy") or [] if isinstance(k, str))
+    # A meeting's title may name a ticket ("XERK-12 review"): saying it invents nothing.
+    for c in data.get("calendar") or []:
+        if isinstance(c, dict) and isinstance(c.get("title"), str):
+            t = _DAILY_BRIEF_DASHES_RE.sub("-", unicodedata.normalize("NFKC", c["title"]))
+            known.update(f"{p.upper()}-{n}" for p, n in _DAILY_BRIEF_KEY_RE.findall(t))
     for name, t in texts:
         if len(t) > DAILY_BRIEF_REPLY_TEXT_MAX:
             problems.append(f"{name} is over {DAILY_BRIEF_REPLY_TEXT_MAX} chars")
@@ -25695,8 +25707,9 @@ def daily_brief_problems(brief, data):
             problems.append(f"joined {field} is {size} chars (wire cap {DAILY_BRIEF_WIRE_TEXT_MAX})")
     words = dict((n, _daily_brief_words(t)) for n, t in texts)
     day = sum(w for n, w in words.items() if n != "thisWeek")
-    if day > DAILY_BRIEF_DAY_WORDS * DAILY_BRIEF_WORDS_SLACK:
-        problems.append(f"day sections are {day} words (budget {DAILY_BRIEF_DAY_WORDS})")
+    day_budget = DAILY_BRIEF_DAY_WORDS + (DAILY_BRIEF_CALENDAR_WORDS if data.get("calendar") else 0)
+    if day > day_budget * DAILY_BRIEF_WORDS_SLACK:
+        problems.append(f"day sections are {day} words (budget {day_budget})")
     week = words.get("thisWeek", 0)
     if week > DAILY_BRIEF_WEEK_WORDS * DAILY_BRIEF_WORDS_SLACK:
         problems.append(f"thisWeek is {week} words (budget {DAILY_BRIEF_WEEK_WORDS})")
@@ -25792,7 +25805,36 @@ def validate_daily_brief_command(cmd):
     runtime = cmd.get("runtime")
     if runtime not in DAILY_BRIEF_RUNTIMES_ALL:
         return dict(base, reportable=True), "runtime is not claude, dsh or qwen"
-    return dict(base, model=model, runtime=runtime, **times), None
+    return dict(base, model=model, runtime=runtime, calendar=daily_brief_calendar(cmd.get("calendar")),
+                **times), None
+
+
+_DAILY_BRIEF_HHMM_RE = re.compile(r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")
+
+
+def daily_brief_calendar(v):
+    """The command's `calendar` (XERK-2970: the org's meetings ahead, hub-built)
+    as the model reads it: each entry `{title, start, end, with}` kept only when
+    well formed, at most DAILY_BRIEF_CALENDAR_MAX. Absent (an older hub) or
+    malformed = []. Titles are calendar text anyone invited can write: data,
+    never instructions, like ticket summaries."""
+    out = []
+    for e in (v if isinstance(v, list) else [])[:DAILY_BRIEF_CALENDAR_MAX]:
+        if not isinstance(e, dict):
+            continue
+        title, start, end = e.get("title"), e.get("start"), e.get("end")
+        if not (isinstance(title, str) and title.strip() and isinstance(start, str)
+                and _DAILY_BRIEF_HHMM_RE.fullmatch(start) and isinstance(end, str)
+                and _DAILY_BRIEF_HHMM_RE.fullmatch(end)):
+            continue
+        title = _brief_text(title)
+        if not title:
+            continue
+        # A nameless invitee is sent as its email, which _brief_text masks: no name to say.
+        who = [w for w in (_brief_text(x) for x in (e.get("with") if isinstance(e.get("with"), list) else [])[:5])
+               if w and w != "[email]"]
+        out.append({"title": title, "start": start, "end": end, "with": [w[:100] for w in who]})
+    return out
 
 
 # The model's text is cleaned before it rides the wire, with the SAME fixed-point
@@ -45030,6 +45072,8 @@ class SessionManager:
             return None, f"collecting tickets failed: {_board_error_summary(e)}"
         if data is None:
             return None, "no ticket scope on this host (its board lists no projects)"
+        if job.get("calendar"):
+            data = dict(data, calendar=job["calendar"])
         argv = ["claude", "-p", "--model", job["model"], *ATTENTION_HINT_LOCKDOWN,
                 DAILY_BRIEF_INSTRUCTION + daily_brief_input(data)]
         for attempt in range(1, DAILY_BRIEF_MAX_ATTEMPTS + 1):

@@ -56665,6 +56665,17 @@ class TestDailyBriefPrompt(unittest.TestCase):
         b.update(over)
         return b
 
+    def test_xerk2970_the_calendar_widens_the_day_budget_and_its_keys_are_known(self):
+        cal = [{"title": "XERK-88 design review", "start": "14:00", "end": "15:00", "with": []}]
+        brief = self._brief(stillOpen="XERK-3 waits on XERK-9. Then the XERK-88 design review at 14:00.")
+        self.assertIn("names tickets not in the data: XERK-88", " ".join(ha.daily_brief_problems(brief, self.DATA)))
+        self.assertEqual(ha.daily_brief_problems(brief, dict(self.DATA, calendar=cal)), [])
+        words = int((ha.DAILY_BRIEF_DAY_WORDS + 10) * ha.DAILY_BRIEF_WORDS_SLACK)
+        long = self._brief(sinceYesterday="word " * words)
+        self.assertTrue(ha.daily_brief_problems(long, self.DATA))
+        self.assertEqual(ha.daily_brief_problems(long, dict(self.DATA, calendar=cal)), [])
+        self.assertIn("`calendar`", ha.DAILY_BRIEF_INSTRUCTION)
+
     def test_a_conforming_reply_parses_and_is_flattened(self):
         raw = "```json\n" + json.dumps(self._brief(stillOpen="Two  in\nprogress.")) + "\n```"
         out = ha.parse_daily_brief(raw, self.DATA)
@@ -57386,6 +57397,34 @@ class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):
         self.replies = [self._reply(upNext=[])]
         [row] = self._drain()
         self.assertEqual(row["next"], ha.DAILY_BRIEF_NOTHING_NEXT)
+
+    def test_xerk2970_the_calendar_rides_the_prompt_and_is_validated(self):
+        cal = [{"title": "Roadmap review", "start": "14:00", "end": "15:00", "with": ["Bo Ray", "bo@x.com"]},
+               {"title": "bad time", "start": "2pm", "end": "15:00"}, "junk",
+               {"title": " ", "start": "10:00", "end": "11:00"},
+               {"title": "Design https://evil.example/x sync", "start": "16:00", "end": "16:30", "with": "Ann"}]
+        job, err = ha.validate_daily_brief_command(self._cmd(calendar=cal))
+        self.assertIsNone(err)
+        self.assertEqual(job["calendar"], [
+            {"title": "Roadmap review", "start": "14:00", "end": "15:00", "with": ["Bo Ray"]},
+            {"title": "Design [link] sync", "start": "16:00", "end": "16:30", "with": []}])
+        # An older hub sends none; a malformed one is no calendar, never a failed run.
+        self.assertEqual(ha.validate_daily_brief_command(self._cmd())[0]["calendar"], [])
+        self.assertEqual(ha.validate_daily_brief_command(self._cmd(calendar="x"))[0]["calendar"], [])
+        self.assertEqual(len(ha.validate_daily_brief_command(self._cmd(calendar=[cal[0]] * 30))[0]["calendar"]),
+                         ha.DAILY_BRIEF_CALENDAR_MAX)
+        self.sm._stage_daily_brief(self._cmd(calendar=cal[:1]))
+        self.replies = [self._reply(stillOpen="XERK-3 waits on XERK-9. Roadmap review is at 14:00.")]
+        [row] = self._drain()
+        self.assertEqual(row["status"], "ok")
+        self.assertIn('"calendar":[{"end":"15:00","start":"14:00","title":"Roadmap review","with":["Bo Ray"]}]',
+                      self.argvs[0][-1])
+        # No calendar: the prompt's data carries none.
+        self.argvs.clear()
+        self.sm._stage_daily_brief(self._cmd(runId="ab13"))
+        self.replies = [self._reply()]
+        self._drain()
+        self.assertNotIn('"calendar"', self.argvs[0][-1])
 
     def test_a_malformed_reply_is_retried_then_ok(self):
         self.sm._stage_daily_brief(self._cmd())
