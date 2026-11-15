@@ -299,18 +299,47 @@ test("the live turn is still escaped — markup in it can never reach the DOM", 
 });
 
 // ---- an ended (static) transcript opens at its newest messages (XERK-2956) --
-test("an ended session's transcript opens scrolled to the bottom", () => {
-  const st = makeEl("trScroll");
+// A static scroll that records its listeners so a test can fire scroll/load.
+function staticScroll(id) {
+  const st = makeEl(id);
+  const on = {};
+  st.addEventListener = (t, fn) => { (on[t] = on[t] || []).push(fn); };
+  st.fire = (t) => (on[t] || []).forEach((fn) => fn({ target: {} }));
   st.querySelector = () => null;
-  window.TurmaChat.renderStatic({ entries: [entry("a", "first"), entry("b", "last")], scrollEl: st, transcriptId: "t1" });
+  st.querySelectorAll = () => [];
+  st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
+  return st;
+}
+const twoEntries = () => [entry("a", "first"), entry("b", "last")];
+
+test("an ended session's transcript opens scrolled to the bottom", () => {
+  const st = staticScroll("trScroll");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
   assert.equal(st.scrollTop, st.scrollHeight);
 });
 
+test("an image loading after the paint re-pins a reader parked at the bottom", () => {
+  const st = staticScroll("trScroll2");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
+  st.scrollHeight = 1800; // a lazy image below the fold grew the pane
+  st.fire("load");
+  assert.equal(st.scrollTop, 1800);
+});
+
+test("a reader who scrolled up is not yanked back down by a late image", () => {
+  const st = staticScroll("trScroll3");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
+  st.scrollTop = 100; st.fire("scroll");
+  st.scrollHeight = 1800; st.fire("load");
+  assert.equal(st.scrollTop, 100);
+});
+
 test("a search-hit open still lands on its hit, not the bottom", () => {
-  const st = makeEl("trScroll");
-  st.querySelector = () => null; // hit not found: scroll stays put
+  const st = staticScroll("trScroll4");
   globalThis.CSS = { escape: (s) => s };
   window.TurmaChat.renderStatic({ entries: [entry("a", "x")], scrollEl: st, transcriptId: "t2", scrollUuid: "a" });
+  assert.equal(st.scrollTop, 0);
+  st.scrollHeight = 1800; st.fire("load"); // nor pulled there by a late image
   assert.equal(st.scrollTop, 0);
   delete globalThis.CSS;
 });

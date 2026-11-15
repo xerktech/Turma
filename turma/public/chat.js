@@ -3866,6 +3866,11 @@
   // streaming turn, or /history expand. The two views are mutually exclusive
   // panes, so this reuses the module-level `verbosity`/`detailsOpen` state.
   let stScroll = null, stVerbHost = null, stTranscriptId = null, stEntries = [];
+  // Is the reader parked at the newest messages (XERK-2956)? An open lands
+  // there, and while it holds, anything that grows the pane after the paint —
+  // a lazy image or file preview loading, the pane being un-hidden, a verbosity
+  // re-render — re-pins to the bottom. The reader scrolling up clears it.
+  let stPinned = false;
 
   function loadStaticVerbosity(tid) {
     // Same per-key store as the live view (keyed by transcript id), so a reader's
@@ -3883,12 +3888,34 @@
     try { localStorage.setItem("turma.chat.verbosity." + stTranscriptId, JSON.stringify(verbosity)); } catch {}
   }
   function renderStaticVerbosity() {
-    buildVerbositySeg(stVerbHost, () => { saveStaticVerbosity(); renderStaticVerbosity(); repaintStatic(); });
+    buildVerbositySeg(stVerbHost, () => { saveStaticVerbosity(); renderStaticVerbosity(); repaintStaticKeepPlace(); });
   }
   function repaintStatic() {
     if (!stScroll) return;
     const html = itemsToHtml(buildItems(stEntries));
     stScroll.innerHTML = html || '<div class="tr-empty">This session\'s transcript is empty.</div>';
+  }
+  function pinStaticBottom() {
+    if (stScroll && stPinned) stScroll.scrollTop = stScroll.scrollHeight;
+  }
+  // A verbosity change re-renders the whole pane, which changes every height
+  // above the reader, so a kept pixel offset lands on some other message. Keep
+  // the bottom when parked there; otherwise keep the first message in view at
+  // the same offset (falling back to the pixel offset when the new verbosity
+  // hides that message).
+  function repaintStaticKeepPlace() {
+    if (!stScroll) return;
+    if (stPinned) { repaintStatic(); pinStaticBottom(); return; }
+    const top = stScroll.getBoundingClientRect().top;
+    let uuid = null, off = 0;
+    for (const el of stScroll.querySelectorAll("[data-uuid]")) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > top) { uuid = el.dataset.uuid; off = r.top - top; break; }
+    }
+    repaintStatic();
+    const el = uuid && window.CSS && CSS.escape
+      ? stScroll.querySelector('[data-uuid="' + CSS.escape(uuid) + '"]') : null;
+    if (el) stScroll.scrollTop += (el.getBoundingClientRect().top - top) - off;
   }
   // Scroll the matched entry to the middle of the pane and flash it (a
   // search-result open carries the hit's uuid). Bubbles + cards carry data-uuid.
@@ -3917,14 +3944,15 @@
     repaintStatic();
     // A search-result open lands on its hit; any other open lands on the most
     // recent messages (XERK-2956), like the live chat — not the first prompt.
+    stPinned = !opts.scrollUuid;
     if (opts.scrollUuid) scrollToStaticHit(opts.scrollUuid);
-    else if (stScroll) stScroll.scrollTop = stScroll.scrollHeight;
+    else pinStaticBottom();
     // Wire card expand/collapse persistence for the static scroll too.
     wireStaticDelegation();
   }
   function closeStatic() {
     if (stVerbHost) stVerbHost.innerHTML = "";
-    stScroll = null; stVerbHost = null; stTranscriptId = null; stEntries = [];
+    stScroll = null; stVerbHost = null; stTranscriptId = null; stEntries = []; stPinned = false;
   }
   function wireStaticDelegation() {
     if (!stScroll || stScroll.dataset.wired) return;
@@ -3937,6 +3965,18 @@
       const d = e.target;
       if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) noteDetails(d.dataset.dkey, d.open);
     }, true);
+    // The bottom pin (XERK-2956). Every listener reads the module's CURRENT
+    // stScroll: one element is wired once and reused across opens.
+    const el = stScroll;
+    el.addEventListener("scroll", () => { if (stScroll === el) stPinned = scrolledToBottom(el); });
+    // `load` doesn't bubble; capture it so a lazy image/iframe finishing below
+    // the fold doesn't leave the view short of the last message.
+    el.addEventListener("load", () => { if (stScroll === el) pinStaticBottom(); }, true);
+    // A pane rendered while hidden (Trajectory pressed mid-load) has no height
+    // to scroll; re-pin once it is laid out again.
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(() => { if (stScroll === el) pinStaticBottom(); }).observe(el);
+    }
   }
 
   // ---- public API -----------------------------------------------------------
