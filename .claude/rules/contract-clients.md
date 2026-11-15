@@ -15,6 +15,8 @@ Rules every client (web, Android) must keep with the hub and with each other.
   the same PR** — or add a line to `android/PARITY.md` and say so in the PR. "User-facing" = a
   control, screen, state, chip, interaction or layout a person sees or touches; pure server/agent
   plumbing is exempt. Page → screen map in `android.md`. `PARITY.md` is the living gap tracker.
+- The tracker is split to stay under 40k chars each (CI-gated): `PARITY.md` (map, deliberate
+  differences, Meetings), `PARITY-open.md` (open gaps), `PARITY-done-*.md` (closed installments).
 - **A hub refusal must reach the operator, in the hub's own words** (XERK-264). The hub refuses with a
   status and a JSON `{error}` body (409 org mismatch / unsupported agent, 503 host offline, 404 stale
   attachment, 413 too long, 429 queue full); a client that reads the body and ignores `res.status`

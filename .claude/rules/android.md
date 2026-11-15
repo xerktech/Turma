@@ -58,7 +58,8 @@ A pure-core/adapter-shell split:
   `turma-board.md`). The phone shows active filters as a badge only — never a second chip row.
 - **Match features and structure, not pixels** (platform-idiomatic controls). A justified platform
   difference (native chat vs ttyd terminal, Hub-URL login field, voice dictation) goes in
-  `android/PARITY.md` — the living gap tracker, updated whenever a gap closes or opens.
+  `android/PARITY.md` — the living gap tracker, updated whenever a gap closes or opens. A new gap
+  goes in `PARITY-open.md`, a closed installment in the newest `PARITY-done-*.md`.
 - **The chat's /history poll is gated on the live feed DELIVERING, never on the socket being open**
   (XERK-2372, `ChatViewModel.liveDelivering` ↔ chat.js `liveDelivering`): open AND the hub's `watch`
   ack said `armed` (or a non-`seed` delta arrived) AND, while the heartbeat says `paneBusy`, a frame

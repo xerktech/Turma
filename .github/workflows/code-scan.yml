@@ -287,7 +287,7 @@ jobs:
         run: |
           limit=40000
           fail=0
-          for f in CLAUDE.md .claude/rules/*.md; do
+          for f in CLAUDE.md .claude/rules/*.md android/PARITY*.md; do
             [ -e "$f" ] || continue
             size=$(python3 -c "import sys;print(len(open(sys.argv[1], encoding='utf-8').read()))" "$f")
             echo "${f} is ${size} characters (limit ${limit})"

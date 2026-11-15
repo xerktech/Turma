@@ -1,0 +1,357 @@
+# Android ⇄ Web UI parity — closed gaps (first installment through XERK-246)
+
+Part of the parity tracker; `PARITY.md` is its entry point (map, deliberate differences,
+Meetings tab).
+
+## Done (this pass — first installment)
+
+- **Repo on the Sessions-tab session card (XERK-125).** The live card's meta row read
+  `host · branch`, so the one fact telling several open sessions apart — which repo each works — was
+  missing (the web card, and Android's own queued/ended rows, all carry it). It now reads
+  `host · repo · branch` — the same three facts in the same order as the session header this card
+  opens (`sessionHeaderMeta`) — with the repo from `core/Sessions.kt` `sessionRepoLabel`: a repos-root
+  session says "repos root" rather than the agent's `(root)` sentinel, and drops the branch it has no
+  worktree for, as the Dashboard card does. Tested in `SessionsTest`.
+- **Board "In Review" column.** `core/Board.kt` now carries the 4th category and the review/testing
+  status-name carve-out from `inprogress` (was 3 columns → review tickets mis-bucketed). Columns sort
+  newest-`updated` first. Ports `board.js` `categoryOf`/`ticketSort`. Tested in `BoardTest`.
+- **Drag-and-drop status change (XERK-141).** Long-press a ticket card and drag it onto another column
+  to change its status — the platform-idiomatic form of the web's tap-and-hold drag. The drop POSTs the
+  target COLUMN (the agent resolves it to a real transition/state), and an optimistic `moves` override
+  (`BoardViewModel`) holds the card in its dropped column until the board's own poll catches up, exactly
+  as web `board.html` does. Ports `board.js` `boardColumnOf`/`moveSweepVerdict` into `core/Board.kt`
+  (`MoveState` + the two fns, tested in `BoardTest`); the gesture is `detectDragGesturesAfterLongPress`
+  with a floating ghost card in `ui/BoardScreen.kt`. The pure logic is unit-tested and the app compiles
+  (`assembleDebug`); the gesture itself has no instrumented test (no emulator in CI, like every other
+  Compose interaction here).
+- **Drag edge auto-scroll (XERK-179).** While a card is dragged, holding it near the board's left/right
+  edge scrolls the column strip under the finger, so an off-screen column is reachable — the XERK-141
+  port had skipped web `board.html`'s `edgeScroll` and a phone-width board couldn't drop past the
+  visible columns. A per-frame loop in `ui/BoardScreen.kt` (scrolls while the finger holds still, where
+  the web steps per pointermove) drives `core/Board.kt` `edgeScrollStep` (48dp zones, speed ramping
+  with depth), re-resolving the drop column as the columns move. Tested in `BoardTest`.
+- **On-demand ticket detail loads (XERK-83).** The detail sheet fetched once and returned null on the
+  hub's 202-while-fetching, so a first click spun "Loading details…" forever; it also decoded the
+  `{issue, fetchedAt}` envelope's top level straight into `JiraIssueDetail`, blanking every field on a
+  200. Now `BoardViewModel.fetchIssue` polls with backoff to a 45s deadline and unwraps the nested
+  `issue` (`JiraIssueEnvelope`), surfacing a terminal failure as an error message — a port of
+  board.html `fetchDetail`. `core/Board.kt` `classifyIssueResponse`/`IssueFetch` tested in `BoardTest`.
+- **Sign out.** A ⋮ overflow on the shared `ScreenHeader` (every top-level screen) that unregisters
+  push, clears credentials, and returns to Login — the web has Sign out in its nav on every page.
+- **Move a session to another agent (XERK-101).** The session card ⋯ menu gains "Move to another
+  agent…" opening a target-host picker (online, same-org hosts that have the repo), which posts the
+  `/migrate` command — a port of web sessions.html `moveMenu`/`moveTo`. `core.eligibleMoveTargets`
+  mirrors the web target filter (tested in `SessionsTest`). One deliberate difference: the web stage
+  auto-follows the moved session onto its new host (`advanceMigrationFollow`); Android just lets it
+  reappear in the session list on its new host (no stage to follow on a phone), so the "Moving…" card
+  hint and the follow are web-only. Its refusals — including the 503 when too many moves are in
+  flight (XERK-263) — reach the operator in the hub's own words through `hubErrorMessage`, like
+  every other command (XERK-264).
+- **One Sessions search box, doing both halves (XERK-243).** The web sidebar's single box searches the
+  archive only, hiding the live lists while a query is up. Android's box filters the live/queued/ended
+  lists as you type AND, past two characters, appends an "In history" section of archive full-text
+  matches below them — so one bar answers "which session is this?" whether the session is running or
+  ended years ago. Superseded the previous split (a Search action in the Sessions header opening a
+  separate `ui/ArchiveScreen.kt`, plus an on-page "Filter these sessions" field), which crowded the
+  header; that screen is gone and its search lives in `ui/SessionsScreen.kt` + `core/Search.kt`. The
+  web can adopt the merged box later; nothing was removed from it here. Also dropped with the screen:
+  its browse-all-archived list (`GET /api/archive`) — the Ended sessions section already lists the
+  fleet's ended work, and search reaches the rest.
+- **Dashboard summary tiles.** The six tiles (Hosts online / Running / Waiting on you / Tokens
+  today·week·all-time + dominant model) atop the Fleet screen, from `core/Fleet.kt` (a pure port of
+  index.html's reducers). Tested in `FleetTest`.
+- **Question option preview.** The collapsible preview mockup the TUI shows (`chat.js` `q-prev-wrap`)
+  now renders on each option card.
+- **Split compose bar (XERK-33).** Send now ALWAYS sends (mid-turn it queues); a separate
+  warning-coloured Stop appears beside it while a turn runs, suppressed during a pending question. Was
+  a single button that morphed into Stop — on a phone (no Enter key) that made mid-turn queueing
+  impossible. `ui/ChatScreen.kt`. The terminal screen's input bar carries the same split (XERK-177,
+  web `termComposeStop`); with no live tail of its own its busy read is the heartbeat's `paneBusy`.
+  `ui/TerminalScreen.kt`.
+- **Host "updating" status (XERK-29).** A host in an announced update restart shows an "updating →
+  <version>" pill instead of the outage-looking "offline". `model/Models.kt` + `ui/FleetScreen.kt`.
+- **Kill from the chat/terminal header + New session from the Sessions page (XERK-44).** A shared
+  arm/confirm `KillAction` (`ui/CommonUi.kt`) sits in both the `ChatScreen` and `TerminalScreen` top
+  bars (web `chatKill`/`termKill`): first tap arms "Confirm kill", a second within 3.5s kills the
+  session you're in and leaves the view. The Sessions header gains a "+" that opens a two-step
+  `NewSessionPickerDialog` (online host → repo, the pure `spawnTargets` port of the web's `#spawn`
+  sidebar) feeding the existing `SpawnDialog`. `vm/ChatViewModel.kt` `kill()`;
+  `spawnTargets` tested in `SessionsFlattenTest`.
+- **Per-org auto-start switch (XERK-41).** Flips the hub-only per-org auto-start opt-in
+  (`POST /api/jira/<site>/autostart`). Ports `board.js` `autoStartOn` into `core/Board.kt` (tested in
+  `BoardTest`); `model/Models.kt`, `net/FleetRepository.kt` (payload + `autoStartOrgs` SSE),
+  `net/HubApi.kt`. It rode the board's org chips until XERK-62 moved it onto the header control's
+  org rows, following the web.
+- **Per-org auto-MERGE switch (XERK-550 / closed by XERK-564).** The header org menu carries a second
+  switch beside auto-start that flips the hub's hands-off auto-merge opt-in
+  (`POST /api/jira/<site>/automerge`; the hub then merges a merge-ready PR of an auto-start-eligible
+  ticket, closes the ticket, and frees the slot). `autoMergeOrgs` is typed in `model/Models.kt` +
+  ingested in `net/FleetRepository.kt` (payload + `autoMergeOrgs` SSE), `autoMergeOn` ports the read
+  into `core/Board.kt` (tested in `BoardTest`), and `ui/OrgControl.kt`/`vm/OrgViewModel.kt` render a
+  second toggle (+ its POST via `net/HubApi.kt`) beside auto-start — reading its OWN INDEPENDENT map,
+  never auto-start's. Web source: `turma/public/org.js` (`setAutoMerge`, the `data-org-merge` chip).
+  Both toggles are compact `auto`/`merge` PILLS (dot + label, filled in the org's color when on),
+  mirroring the web's `org-chip-auto`/`org-chip-merge` — a Material `Switch` per toggle overflowed the
+  phone menu row and truncated the org name (XERK-564); the pill keeps both toggles and a readable
+  name on one line. Emulator-verified.
+- **Fleet-wide org filter (XERK-62).** The board's org chip strip is gone; one org control lives in
+  the shared `ScreenHeader` and so is on all four top-level screens, scoping each of them from the one
+  persisted pick — Dashboard hosts + tiles, Sessions lists + new-session host picker, Board tickets,
+  Usage series (both groupings). A host polls exactly one org, so scoping the agent list scopes
+  everything built from it; a host with NO tracker block belongs to no org and shows only under "All
+  orgs". A pick for an org nobody reports any more doesn't apply but is KEPT, so it resumes when that
+  host comes back, and each screen's empty state distinguishes "nothing reported" from "the filter
+  narrowed this to nothing" and points at the header. Ports `turma/public/org.js`: `siteKeyOf` /
+  `filterAgents` / `effectiveOrgs` / `scopedAgents` / `storedOrg` / `ageStr` in `core/Board.kt` (tested
+  in `BoardTest`), the pick hoisted to `data/OrgFilter.kt` + `AppContainer` (migrating the old
+  board-only preference forward, as the web migrates `turma-board-org` → `turma-org`), the control in
+  `ui/OrgControl.kt` + `vm/OrgViewModel.kt`, call sites in `ui/FleetScreen.kt`, `ui/SessionsScreen.kt`,
+  `ui/BoardScreen.kt`, `ui/UsageScreen.kt`. Platform form: a Material dropdown of rows (dot, org name,
+  ticket count, offline/synced note, `Switch` for auto-start) rather than the web's button + popover of
+  divided pills.
+- **Multi-org selection (XERK-222).** The org filter selects a SET of orgs, not one: each menu row is a
+  toggle that stays checked (leading ✓) while selected, the menu stays open across toggles, and "All
+  orgs" clears the selection and closes. The button shows one dot per selected org and a "N orgs"
+  count past one. `data/OrgFilter.kt` persists a string set (`orgFilterSet`, migrating the older
+  single-key prefs to a one-org selection); `core/Board.kt`'s `filterAgents` / `effectiveOrgs` /
+  `scopedAgents` / `filterSites` take the set (each key self-heals independently). Matches the web's
+  checkbox menu rows and JSON-array `turma-org` value.
+- **Ended-session read-only chat review (XERK-70).** Tapping an ended-session card body (not just its
+  Resume button) now opens the conversation read-only, the web ended-session stage's counterpart
+  (`#transcriptPane` in `sessions.html` → `openEndedSession`). `EndedSessionView` in
+  `ui/SessionsScreen.kt` fetches the archived transcript by id (`GET /api/archive/<transcriptId>`, the
+  existing `ArchiveViewModel.openTranscript`) and renders it through the same `buildItems`/`ChatItemView`
+  engine the live chat uses — with a PR-chip + Resume bar and a verbosity control, but deliberately no
+  compose box and no terminal (no live pty). Resume is gated on the host being online; PR chips link out
+  to GitHub. It slots into the adaptive `SessionsRoute` beside the live `ChatScreen` (wide two-pane +
+  narrow full-screen, Back clears it). Needed two `ClosedSessionInfo` fields the agent already emits but
+  Android didn't decode — `transcriptId` and `prs` (`model/Models.kt`); a record lacking `transcriptId`
+  (older agent) stays Resume-only and says "no conversation recorded". Decode covered by `AgentDecodeTest`.
+  (The stopped + `repo.resumable` ended channels and the live-list exclusion landed later — XERK-78.)
+- **Selectable/copyable transcript text (XERK-64).** The web chat relies on native browser text
+  selection to copy session text (and defers repaints to keep a live selection intact). Compose `Text`
+  isn't selectable by default, so the transcript `LazyColumn` in `ui/ChatScreen.kt` and the
+  archived/ended transcript viewer in `ui/ArchiveScreen.kt` are now wrapped in a `SelectionContainer`:
+  long-press selects, the system copy toolbar copies, and taps still toggle the tool/thinking cards.
+
+- **Live working-status bar (XERK-75).** The chat footer now renders the full web
+  `#chatStatus` (chat.js `updateLiveStatus`/`agentsHtml`): a spinner + gerund verb,
+  right-aligned elapsed + ↑/↓ token counters, Claude Code's rotating tip / active-task
+  hint lines (one clipped row each), and the live agent-manager list — "main" a plain
+  marker, each background subagent a tappable row that opens its transcript read-only
+  (new `GET .../subagents/history` endpoint, `SubagentViewModel` + `SubagentView`,
+  reusing the ended-review `buildItems`/`ChatItemView` engine; Back returns to the
+  parent chat, the web's `subagentReturn`). Was a single verb+hint line that, in
+  practice, never showed: `TurnStatus.up/down/elapsed` were typed `Long` but the wire
+  sends display strings ("1.2k"/"12s"/""), so `decodeFromString<TailFrame>` threw and
+  `LiveTail` dropped the whole turn frame — fixed to `String`, plus a new `agents[]`
+  field. `model/Models.kt`, `net/HubApi.kt`, `net/HubClient.kt`, `vm/ChatViewModel.kt`,
+  `vm/SubagentViewModel.kt`, `ui/ChatScreen.kt`, `ui/SessionsScreen.kt`; decode locked
+  in `AgentDecodeTest`.
+  - **The bar is no longer turn-scoped (XERK-245).** Delegating ENDS the session's own
+    turn, so gating it on `status` hid the agent list exactly when it mattered. The rows
+    now ride the frame (`TailFrame.agents` → `LiveEvent.Turn.agents` → `ChatState.liveAgents`),
+    and with no status behind them `BackgroundAgentsBar` renders the web's "Background
+    agents…" row. A `main`-only list raises nothing. Session cards say which is running
+    via `liveStateLabel(state, live)`, matching the web's `agentWorkLabel`.
+  - **Waiting shells are not work (XERK-1570).** `LiveAgent`/`AgentRow` type `kind`
+    (+ `startedAt`/`eta` on `LiveAgent`); `core/Sessions.kt` mirrors the hub's
+    `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "⏳ waiting · Sleep · 12m left" /
+    "⏳ waiting · Watch CI"; a session-CLI sleeper "💤 sleeping until 14:05", XERK-1571) until
+    stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
+  - The Sessions-screen card carries the web's state line (`sessionCardState` in
+    `ui/CommonUi.kt`, web `liveState` + `reviewState`): "stalled · Watch CI" in the error
+    colour, "PR awaiting review", "waiting for your permission", "· terminal offline".
+    **Deliberate gap (operator call):** that colored line is the card's ONE status line — the web's
+    grey `.why` age line, quoted question and permission ask are left off so phone cards stay
+    compact (the chat screen shows the question). **Gap:** the HOLDING dot is a dimmed working
+    colour, not the hollow ring; the `🏠 local` mark on the web card's state row is not shown.
+
+## Done (XERK-78 installment — the P0 sweep)
+
+- **Board per-card Start button + ticket↔session chips + optimistic sweep.** Each ticket card now
+  carries the web's 4-state start control (`ticketStartControl` in `core/Board.kt` ← board.js
+  `ticketStartHtml`): no button without a triaged repo, "⏳ starting…" while a spawn is in flight,
+  "☐ Start session" / "☐ Start (clone first)" (an uncloned repo is a LIVE start — the hub clones on
+  demand, XERK-14; the detail sheet's stale cloned-only gate is gone), compacting to "+" once the
+  ticket has sessions, a failed start's reason parked beside a live retry button. Session chips
+  (`ticketSessionIndex`/`ticketSessionLabel`/`ticketSessionState` ← board.js) read the same three
+  channels the Ended list merges, deduped on host+transcriptId (record wins), branch-first label;
+  a running chip opens the live chat, anything else the read-only ended review (new `ended/` route).
+  The pending paint is synchronous-before-POST and resolves on EVIDENCE via the `startSweepVerdict`
+  port (`BoardViewModel.starts` swept each fleet beat, incl. the `sawCmd` staleness rule). Tested in
+  `BoardTest`.
+- **Board ticket card fields.** Type + age (`ageStr`) on the top row; status pill, priority pill with
+  high/low tinting (`prioClass`), due/overdue chip (`overdueOf`) on the meta row. Tested in `BoardTest`.
+- **Sessions ended list: all three channels (`collectSessions` ← sessions.html `collect`).** Android
+  read only `a.closedSessions`; it now merges stopped (non-running registry records, which also LEAVE
+  the live list), killed, and each repo's `resumable` scan (the durable channel), deduped on
+  `<host>::<transcriptId>` with the record winning, sorted newest-ended first (`endedTs`, XERK-73).
+  Resume dispatches per channel: killed → `resume`, stopped → `start`, resumable → `resumeTranscript`
+  at its origin cwd. `EndedSessionView` now keys on the transcript id alone (web
+  `findEndedByTranscript`) and resolves the entry — and its Resume — from the fleet each beat.
+  `ResumableInfo` was re-shaped to the real wire (`endedTs`/`repo`/`root`/`ticket`/`prs`; the old
+  `ts`/`source` fields decoded nothing). Tested in `SessionsFlattenTest` + `AgentDecodeTest`.
+- **Sessions queued section.** `status:"queued"` records get their own FIFO section above Active
+  (was: mis-bucketed under "Stopped" with live-card actions): reason (`queuedReasonText`) + queued-since,
+  inline arm/confirm Cancel, no attach (no pane yet).
+- **Chat stick-to-bottom + jump-to-latest pill.** Auto-scroll follows the tail only while the reader
+  is AT the tail (was: unconditional scroll-to-end on every new item, fighting the reader); scrolling
+  up unpins, a "↓ Jump to latest" pill re-pins, and a growing live turn keeps the tail
+  in view while pinned (web chat.js `stickBottom`/`#chatJump`).
+- **Dashboard session card detail.** Status badge (queued/error + the optimistic "stopping"), id,
+  worktree/branch (or "repos root (no worktree)"), work-risk line (`core/Sessions.kt workLine` ←
+  index.html, tested in `SessionsTest`), RC name, state/queued-reason + since, question preview,
+  error message, created/stopped/activity + model list, all-time tokens + output (was: today only).
+- **Dashboard queued/stopping + Cancel + optimistic pending.** A queued card's only action is an
+  arm/confirm Cancel; the actions dialog branches on queued and arms/confirms Kill/Restart/Delete
+  (delete warns on dirty files). Every session action paints its busy state synchronously before the
+  POST and clears on the completion signal it actually has (`FleetViewModel.reconcilePending` ←
+  index.html, tested in `FleetPendingTest`): kill/delete → session gone, start → running, resume →
+  reappears, restart → `restartCount` bump, TTL backstop.
+- **Usage 30-day stacked daily chart + persisted legend toggles.** `UsageInfo.days` now decodes (it
+  was silently dropped at the model layer, so no client code could ever chart it);
+  `UsageViewModel.compute` merges per-day buckets per repo (across hosts) and per host
+  (`dateWindow`/`niceMax` ports tested in `UsageViewModelTest`). The screen draws one stacked bar per
+  UTC day for the selected grouping, with a legend that is the filter — per-series + group toggles,
+  persisted (the web's `turma-hidden-sessions`), rescoping chart and rows; paint is assigned by stable
+  order so toggling never repaints survivors. The grouping tab pick persists too (`turma-usage-mode`).
+- **Subscription-limit card name (XERK-541).** Both surfaces title a card by the subscription's
+  `label` when it reports one (`LimitCard.label`), falling back to the hosts on it when it does not.
+  Justified platform difference: the WEB card shows only the name and reveals the agents on it via a
+  hover tooltip on the heading; a phone has no hover, so ANDROID shows the name alone (no host list)
+  on a named card, and still lists hosts on an unnamed one. Fold logic parity-tested in
+  `UsageViewModelTest`.
+
+## Done (XERK-126 — the clone bar)
+
+- **Repo cloning worked on web but was dead on Android.** `GithubInfo` decoded the availability flag
+  as `ok`; the agent's `collect_github()` has always named it **`available`** and sends no `ok` key,
+  so it defaulted to false on EVERY host and the bar rendered its "no GitHub credentials" note —
+  the one thing the operator saw. Renamed to the wire key; a pinned real-payload decode test guards it.
+- **The rest of the bar caught up with `cloneBar`/`cloneBody`** (the old P1 line): collapsible header
+  naming the gh login, search box, multi-select list with the `🔒` private marker and an "already here"
+  row for repos the host has, free-text `owner/repo`, a "Clone N" button firing one POST per spec, and
+  the agent's clone-job rows (cloning / ✓ cloned / ⚠ failed + reason) — which stay visible while the
+  panel is collapsed, since they are the answer to "did my clone work". Offline hosts browse but
+  can't fire. Pure reducers in `core/Clone.kt` (`cloneCandidates`/`cloneSpecs`/`cloneRepoName`/
+  `cloneJobRow`), tested in `CloneTest`.
+- Still open here: the web's optimistic clone row (a spec fired but not yet echoed by the agent) —
+  Android shows a "clone queued" snackbar instead, and the real job row lands a beat later. P2.
+
+## Done (XERK-137 — New ticket)
+
+- **Create a ticket from the board.** The board header gains a **＋ New ticket** action (shown once an
+  org reports) opening a `ModalBottomSheet` create form (`CreateTicketSheet` in `ui/BoardScreen.kt`) —
+  the Android port of the web `board.html` modal, source-agnostic across Jira and Azure DevOps. An
+  org/project/type cascade (project + type metadata fetched on demand with the same 202-poll as the
+  detail sheet — `BoardViewModel.fetchCreateMeta`), a title/description/labels form worded per source
+  (labels vs tags), then a submit that POSTs and polls the outcome (`submitCreate`), ending on a
+  "Ticket created" confirmation with an open-in-tracker link. The created ticket self-assigns to the
+  tracker user (hub-side) so it lands on the board on the next poll.
+- Wire + logic: `source` added to `JiraBlock`/`BoardSite` (`mergeSites` defaults it to jira); the
+  create models + envelopes in `model/Models.kt`; three Retrofit endpoints in `net/HubApi.kt`
+  (`createMeta`/`createTicket`/`createResult`). Pure ports in `core/Board.kt` — `createLabelWord`,
+  `splitLabels` (Jira on whitespace+commas, Azure on commas), and the `classifyCreateMeta`/
+  `classifyCreateResult` 202-poll classifiers — JVM-tested in `BoardTest` against the board.js behaviour.
+
+## Done (XERK-169 — markdown in chat bubbles)
+
+- **Prose objects (tables, code, inline code, links) now render in the chat.** The bubble and thinking
+  trace rendered raw text — a GFM table showed its pipes, a fenced block its backticks, a URL was
+  inert — while the web runs both through `chat.js renderProse`. Ported that pipeline to a pure,
+  JVM-tested parser `core/Prose.kt` (`parseProse` → fenced code lifted out first, then GFM tables, then
+  inline code spans + links, mirroring `renderProse`/`renderTables`/`renderInline`/`linkify` line for
+  line; locked to chat.test.js's vectors in `core/ProseTest.kt`). `ui/TranscriptView.kt` renders the
+  typed tree natively: paragraphs with inline-code chips (mono, tinted) and tappable links
+  (`LinkAnnotation.Url` → external browser), fenced blocks as a bordered mono box that scrolls
+  horizontally, and tables as a bordered equal-column grid (header emphasis, zebra rows, per-column
+  alignment). A bubble carrying a table/code block widens to full width (the web's `:has(.md-code)`
+  widening). Applies everywhere `ChatItemView` renders — live chat, archive, and ended views.
+- **Mobile-idiomatic table difference:** the web scrolls a wide table horizontally inside the bubble;
+  Android uses equal-weight columns that fill the bubble width and wrap long cells, which reads better
+  on a phone than a sideways-scrolling grid.
+
+## Done (XERK-234 — file attachments in the composer)
+
+- **Attach images and documents to a message.** Both sides stage each picked file to the hub
+  immediately (`POST .../sessions/<id>/uploads`, raw bytes) and send the ids with the message, so Send
+  is instant and an over-cap file is refused while there is still a chip to remove. The chips (name +
+  size / "uploading…" / the failure) sit above the input box, each with a ✕; Send lights up for
+  attachments alone; a file still uploading holds the message rather than sending it with the file
+  missing. The control is hidden entirely on a host whose agent doesn't report `uploadMaxBytes`, and
+  disabled while an AskUserQuestion is pending (the draft then answers it, and an answer carries no
+  files). Pure half ported to `core/Uploads.kt`, locked to the hub/agent sanitiser in
+  `core/UploadsTest.kt`.
+- **Web-only entry points:** drag-and-drop onto the transcript and paste-a-screenshot. Both are
+  desktop pointer/clipboard gestures with no phone equivalent — Android's picker
+  (`OpenMultipleDocuments`) covers the same ground, and the system share sheet is the phone's idiom for
+  the drop case. Sharing INTO the app is not wired up (no `ACTION_SEND` intent filter yet) — a
+  reasonable follow-up, tracked below.
+- **Also in the NEW-SESSION composer (XERK-234 spawn attach), both sides.** The spawn dialog stages
+  files HOST-scoped (`POST /api/agents/<host>/uploads` — there is no session id yet) and sends the
+  ready ids as `SpawnRequest.uploadIds`; the agent writes them into the session it mints and prepends
+  their paths onto the initial prompt. Web: 📎 + chip strip + drag/drop/paste in `sessions.html` and
+  `index.html`, gated on `uploadMaxBytes>0`, `startSession` holds while any chip is unready. Android:
+  the same `OpenMultipleDocuments` picker + chip rows in `SpawnDialog`, staged by
+  `FleetViewModel.attachSpawn` (reusing `core/Uploads.kt`), and the **Spawn button is disabled** while
+  any chip is uploading/errored — the phone idiom for web's "hold the start". Web's drag/drop + paste
+  remain desktop-only here too.
+
+## Done (XERK-246 — local-model failover controls)
+
+- **Switch a running session between the subscription and the host's self-hosted model.** A third
+  compose-bar chip beside model and mode ("run: subscription" / "run: <model>") POSTing
+  `.../sessions/<id>/model-source`; the agent relaunches with `--resume`, so the conversation,
+  worktree and branch carry over. The chip paints from a memo until the heartbeat agrees — the
+  relaunch takes several beats, and without it the value springs back and reads as a dead control —
+  and the memo ages out (`ModelSource.SWITCH_SETTLE_MS`) so a switch that never lands can't pin it
+  on a lie. A refused switch (the hub 409s a host with no local model) drops the memo at once and
+  says why.
+- **Start NEW work on the local model**: a "Run against" row in the spawn composer, the web's
+  `sessions.html` field. Without it you could fail existing sessions over from the phone but not
+  begin anything once usage was gone — which is exactly when you need to.
+- Both follow the **host's** `localModel.available`, exactly as the 📎 follows `uploadMaxBytes`; an
+  agent reporting nothing cannot do it, so the control is hidden rather than offered and refused.
+  The compose-bar chip is also shown when the session is already `local`, so one whose host later
+  lost its configuration keeps a visible way back.
+- **The Claude model picker is hidden on a live local session** (a static chip states the model
+  instead), matching the web's `cc-model-fixed`: every alias it could offer — "default" included,
+  since that resolves to the shared login's default — is one the self-hosted endpoint refuses. The
+  **spawn composer keeps its Model row**, also matching the web (`sessions.html` renders and sends
+  it whatever the source): the agent drops `--model` for a local session itself, and the alias is
+  what that session goes back to if it is later switched to the subscription, so discarding it
+  would give an Android-spawned session a different model from a web-spawned one.
+- **XERK-489 — the endpoint's DISCOVERED models are a live dropdown, per session.** Where the host
+  reports a `localModel.models` list, the chat bar's fixed local-model chip becomes a menu (each
+  "id · 128k") posting the chosen endpoint id to `.../sessions/<id>/model`, and the spawn composer
+  reveals a "Self-hosted model" dropdown under "Run against: local" carrying `localModel` on the
+  spawn. With no discovered list (an older agent, or the discovery worker's first pass not yet
+  landed) it falls back to the fixed label. `core/ModelSource.kt` gains
+  `localModels`/`localOptions`/`currentLocalModel`/`servedContextFor`/`currentLocalContext`/`fmtCtx`/
+  `localModelLabel` (`ModelSourceTest.kt`); `LocalModelInfo` gains `models`/`defaultModel` and
+  `SessionInfo` gains `localModelName`/`localModelContext` (`AgentDecodeTest.kt`); the chip and
+  composer are pinned in `ChatModelChipsTest.kt` / `SpawnComposerTest.kt`.
+  - **Deferred (web-only for now): the ADVANCED context-window override.** The web chat footer and
+    spawn composer let an operator SHRINK a local session's `CLAUDE_CODE_MAX_CONTEXT_TOKENS` below
+    the served window (a number field, clamped agent-side). Android auto-applies the model's served
+    window (the common LiteLLM case) but has no shrink field yet. The wire + agent plumbing already
+    carries it (`/model {context}`, spawn `localContext`), so this is a UI-only follow-up; a phone
+    rarely needs to hand-tune a context window.
+  - **XERK-489 Phase 4 — the context-fullness meter is ported.** A thin bar + "N% context"
+    (`ContextMeterBar` in `CommonUi.kt`, pure `core/ContextMeter.kt`) rides the session card
+    (`FleetScreen`) and the chat bar (`ChatScreen`), matching the web's card (`index.html`) + compose
+    footer (`chat.js`): warn ~85%, danger near the ~95% auto-compaction. `SessionInfo` gains
+    `lastTurnContextTokens` (numerator) + `contextWindowTokens` (denominator — EXACT for a local
+    session, Claude Code's 200k assumption "~" for a subscription one), both coerced hub-side.
+    Tests: `ContextMeterTest.kt`, the meter case in `AgentDecodeTest.kt`.
+- The memo lives in `AppContainer.modelSwitches`, not the chat ViewModel, for the same reason
+  `drafts` does — the VM is scoped to the chat's nav entry, so a memo kept there died the moment
+  you walked back to the session list, mid-switch, which is when it is doing its job.
+- Pure half in `core/ModelSource.kt` (`ModelSourceTest.kt`), the state reads in `ChatUiStateTest.kt`;
+  the wire block is locked in `AgentDecodeTest.kt`, including the all-nulls shape an unconfigured
+  host reports and the null `modelSourceAt` every unmoved session carries.
+- **Still open:** the 🏠 mark on live and ended session CARDS (see below) — inside a session the
+  compose-bar chip already names the model. The chip's missing tooltip is a deliberate difference,
+  recorded above.
+
