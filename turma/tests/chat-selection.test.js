@@ -347,28 +347,63 @@ test("a search-hit open still lands on its hit, not the bottom", () => {
   delete window.CSS; delete globalThis.CSS;
 });
 
-test("a verbosity change mid-transcript keeps the first message in view, not a tall group above it", () => {
-  // The pane's top is y=0. A folded thought group starts 2000px above it and
-  // runs into view; the first message whose top is in view is "m21" at +30.
-  const st = staticScroll("trScroll5");
+// A static scroll with a fake laid-out pane (top 0, bottom 400) holding
+// `nodes` — {uuid, cls, rect} — whose rects the re-render can move.
+function laidOutScroll(id, nodes) {
+  const st = staticScroll(id);
   st.scrollHeight = 20000;
-  const rects = { g: { top: -2000, bottom: 380 }, m21: { top: 30, bottom: 90 } };
-  const node = (u) => ({ dataset: { uuid: u }, getBoundingClientRect: () => rects[u] });
-  st.querySelectorAll = () => [node("g"), node("m21")];
-  st.querySelector = (sel) => (sel.includes('"m21"') ? node("m21") : null);
+  st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
+  const el = (n) => ({ dataset: { uuid: n.uuid }, classList: [n.cls], getBoundingClientRect: () => n.rect });
+  st.querySelectorAll = (sel) => {
+    const m = /data-uuid="([^"]*)"/.exec(sel);
+    return nodes.filter((n) => !m || n.uuid === m[1]).map(el);
+  };
+  return st;
+}
+function verbosityHost() {
   const buttons = [];
-  const verb = { set innerHTML(v) {}, querySelectorAll: () => ["concise", "normal", "verbose"].map((n) => {
+  const host = { set innerHTML(v) {}, querySelectorAll: () => ["concise", "normal", "verbose"].map((n) => {
     const b = { getAttribute: () => n, addEventListener: (t, fn) => { b.click = fn; } };
     buttons.push(b); return b;
   }) };
-  window.CSS = globalThis.CSS = { escape: (s) => s }; // chat.js checks window.CSS, then calls CSS.escape
+  host.pick = (name) => buttons.filter((b) => b.getAttribute() === name).pop().click();
+  return host;
+}
+
+test("a verbosity change mid-transcript keeps the message the reader was on in place", () => {
+  // A folded thought group starts 2000px above the pane and runs into view;
+  // the first message whose top is in view is u21's BUBBLE at +30. u21 also
+  // renders a thought group under the same uuid, ahead of its bubble, and u22
+  // sits below — neither may be what the restore lines up.
+  const nodes = [
+    { uuid: "g", cls: "thought", rect: { top: -2000, bottom: 380 } },
+    { uuid: "u21", cls: "thought", rect: { top: -300, bottom: -200 } },
+    { uuid: "u21", cls: "tr-msg", rect: { top: 30, bottom: 90 } },
+    { uuid: "u22", cls: "tr-msg", rect: { top: 120, bottom: 180 } },
+  ];
+  const st = laidOutScroll("trScroll5", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
   window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t5" });
   st.scrollTop = 5000; st.fire("scroll"); // the reader parks mid-transcript
-  // The re-render moves m21 down 700px.
-  Object.defineProperty(st, "innerHTML", { set() { rects.m21 = { top: 730, bottom: 790 }; }, get() { return ""; } });
-  buttons.find((b) => b.getAttribute() === "verbose").click();
-  assert.equal(st.scrollTop, 5700, "m21 is back at +30, not the group's -2000");
+  // The re-render grows everything above u21's bubble by 700px.
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[1].rect = { top: 400, bottom: 500 }; nodes[2].rect = { top: 730, bottom: 790 };
+    nodes[3].rect = { top: 1500, bottom: 1560 }; // u22 moves further (verbose opened its card)
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5700, "u21's bubble is back at +30");
   delete window.CSS; delete globalThis.CSS;
+});
+
+test("a verbosity change at the bottom stays at the bottom", () => {
+  const st = laidOutScroll("trScroll7", [{ uuid: "a", cls: "tr-msg", rect: { top: 30, bottom: 90 } }]);
+  const verb = verbosityHost();
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t7" });
+  assert.equal(st.scrollTop, 20000);
+  st.scrollHeight = 26000; // verbose shows more
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 26000);
 });
 
 test("a pane un-hidden after a hidden render re-pins to the bottom", () => {

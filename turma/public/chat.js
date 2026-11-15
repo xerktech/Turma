@@ -3909,19 +3909,27 @@
     // The anchor is the first message whose TOP is in view. Never merely the
     // first one still visible: a folded thought group is one tall element
     // whose top can sit thousands of px above the pane, and holding that
-    // offset lands the reader a dozen messages away. Only when one element
-    // covers the whole pane does the last one starting above it anchor.
-    const top = stScroll.getBoundingClientRect().top;
-    let uuid = null, off = 0;
+    // offset lands the reader a dozen messages away. When nothing starts in
+    // view (one element covers the whole pane) that covering element anchors.
+    const pane = stScroll.getBoundingClientRect(), top = pane.top;
+    let anchor = null, off = 0;
     for (const el of stScroll.querySelectorAll("[data-uuid]")) {
       const r = el.getBoundingClientRect();
       if (r.bottom <= top) continue;
-      uuid = el.dataset.uuid; off = r.top - top;
+      if (r.top >= pane.bottom && anchor) break;
+      anchor = el; off = r.top - top;
       if (r.top >= top) break;
     }
+    // One entry renders several elements under its uuid (thought group, tool
+    // card, bubble), so find the same KIND of element again, not the first.
+    const uuid = anchor && anchor.dataset.uuid;
+    const kind = anchor && anchor.classList && anchor.classList[0];
     repaintStatic();
-    const el = uuid && window.CSS && CSS.escape
-      ? stScroll.querySelector('[data-uuid="' + CSS.escape(uuid) + '"]') : null;
+    let el = null;
+    if (uuid && window.CSS && CSS.escape) {
+      const same = stScroll.querySelectorAll('[data-uuid="' + CSS.escape(uuid) + '"]');
+      el = Array.from(same).find((n) => n.classList && n.classList[0] === kind) || same[0] || null;
+    }
     if (el) stScroll.scrollTop += (el.getBoundingClientRect().top - top) - off;
   }
   // Scroll the matched entry to the middle of the pane and flash it (a
