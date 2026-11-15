@@ -50,6 +50,9 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -1343,14 +1346,7 @@ internal fun EndedSessionView(
             when {
                 transcriptId.isBlank() -> EndedMessage("No conversation was recorded for this session.")
                 ready != null -> {
-                    val items = buildItems(ready.entries, VerbosityPrefs.forPreset(verbosity))
-                    SelectionContainer(Modifier.fillMaxSize()) {
-                        LazyColumn(
-                            Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) { items(items.size) { i -> ChatItemView(items[i]) } }
-                    }
+                    ReadOnlyTranscript(buildItems(ready.entries, VerbosityPrefs.forPreset(verbosity)), ready.transcriptId)
                 }
                 arch.openLoading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 // The hub's words when it has any: a REFUSED push or closed
@@ -1429,19 +1425,60 @@ private fun SubagentView(
                 // nothing yet, which is an answer and not an error.
                 agents != null -> WorkflowAgentPicker(agents, ui.agentsTruncated, onOpenAgent)
                 ui.entries.isNotEmpty() -> {
-                    val items = buildItems(ui.entries, VerbosityPrefs.forPreset(verbosity))
-                    SelectionContainer(Modifier.fillMaxSize()) {
-                        LazyColumn(
-                            Modifier.fillMaxSize(),
-                            contentPadding = PaddingValues(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp),
-                        ) { items(items.size) { i -> ChatItemView(items[i]) } }
-                    }
+                    ReadOnlyTranscript(
+                        buildItems(ui.entries, VerbosityPrefs.forPreset(verbosity)),
+                        listOf(host, sessionId, type, label, agentId),
+                    )
                 }
                 ui.loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
                 else -> EndedMessage("Agent transcript unavailable.")
             }
         }
+    }
+}
+
+/**
+ * A read-only transcript (ended session, background agent) that opens on its
+ * NEWEST messages, not the first prompt (XERK-2956; web twin: chat.js
+ * `openStatic`). While the reader is parked at the bottom, anything that grows
+ * the list afterwards — an image loading, a verbosity change — re-pins it;
+ * scrolling up releases the pin. [openKey] names the transcript: a new one
+ * starts pinned again.
+ */
+@Composable
+internal fun ReadOnlyTranscript(
+    items: List<com.xerktech.turma.core.ChatItem>,
+    openKey: Any,
+    // Tests pass their own to read where the list landed.
+    listState: LazyListState = remember(openKey) { LazyListState() },
+) {
+    val pinned = remember(openKey) { mutableStateOf(true) }
+    val lastIndex = rememberUpdatedState(items.size - 1)
+    suspend fun pin() {
+        // A huge offset lands on the END of the last item, not its top — a
+        // final message taller than the screen still shows its last line.
+        if (lastIndex.value >= 0) listState.scrollToItem(lastIndex.value, Int.MAX_VALUE)
+    }
+    LaunchedEffect(listState) {
+        // A gesture decides the pin when it settles: at the bottom or not.
+        launch {
+            snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+                if (!scrolling) pinned.value = !listState.canScrollForward
+            }
+        }
+        // The list grew below a pinned reader (first layout, an image, a
+        // verbosity re-render): follow it. Never mid-gesture.
+        snapshotFlow { listState.canScrollForward }.collect { more ->
+            if (more && pinned.value && !listState.isScrollInProgress) pin()
+        }
+    }
+    SelectionContainer(Modifier.fillMaxSize()) {
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            state = listState,
+            contentPadding = PaddingValues(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) { items(items.size) { i -> ChatItemView(items[i]) } }
     }
 }
 

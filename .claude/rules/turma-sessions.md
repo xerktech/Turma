@@ -361,6 +361,18 @@ words its stage "Queued — <reason>", flipping live once provisioned. Tests: `s
   the hub's **archive** (`GET /api/archive/<transcriptId>`), so it works for an offline host; a
   just-killed session hasn't synced yet and says so.
 - PRs are LINKS on the stage bar; the sidebar copy stays an inert `<span>`.
+- **A read-only transcript opens at its NEWEST messages** (XERK-2956; ended, archive, subagent views;
+  web `openStatic`, Android `ReadOnlyTranscript`). A search-hit open lands on its hit instead.
+  - It is a PIN, not a one-shot scroll: lazy images load after the paint, and a pane rendered hidden
+    has no height. Web re-pins on capture-phase `load` + a ResizeObserver; Android on
+    `canScrollForward`. Scrolling up releases it.
+  - Android pins with `scrollToItem(last, Int.MAX_VALUE)` so a tall last message shows its END.
+  - A verbosity change off the bottom keeps the reader's message (`repaintStaticKeepPlace`): the
+    first element whose TOP is in view, found again by `data-dkey` (cards), else uuid + kind + nth
+    (bubbles). One entry renders many elements under one uuid, and Concise keeps file cards only.
+  - **Never anchor on anything inside a closed `<details>`**: a folded thought run lays its hidden
+    bodies out as ~3000px boxes below it, and anchoring on one sent the reader to the top.
+  - Tests: the static-view cases in `chat-selection.test.js`, `ReadOnlyTranscriptTest.kt`.
 - **Resume** dispatches on how it ended: killed → `.../resume` (same id), stopped → `.../start`,
   resumable → `.../transcripts/<id>/resume` (agent re-validates/re-creates the cwd if pruned). List is
   derived, so a resumed session drops out once the agent reports it running; the resumable path comes

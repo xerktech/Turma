@@ -297,3 +297,275 @@ test("the live turn is still escaped — markup in it can never reach the DOM", 
   assert.doesNotMatch(html, /<img|<script/);
   assert.match(html, /&lt;img src=x onerror=/);
 });
+
+// ---- an ended (static) transcript opens at its newest messages (XERK-2956) --
+// A static scroll that records its listeners so a test can fire scroll/load.
+function staticScroll(id) {
+  const st = makeEl(id);
+  const on = {};
+  st.addEventListener = (t, fn) => { (on[t] = on[t] || []).push(fn); };
+  st.fire = (t) => (on[t] || []).forEach((fn) => fn({ target: {} }));
+  st.querySelector = () => null;
+  st.querySelectorAll = () => [];
+  st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
+  return st;
+}
+const twoEntries = () => [entry("a", "first"), entry("b", "last")];
+
+test("an ended session's transcript opens scrolled to the bottom", () => {
+  const st = staticScroll("trScroll");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
+  assert.equal(st.scrollTop, st.scrollHeight);
+});
+
+test("an image loading after the paint re-pins a reader parked at the bottom", () => {
+  const st = staticScroll("trScroll2");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
+  st.scrollHeight = 1800; // a lazy image below the fold grew the pane
+  st.fire("load");
+  assert.equal(st.scrollTop, 1800);
+});
+
+test("a reader who scrolled up is not yanked back down by a late image", () => {
+  const st = staticScroll("trScroll3");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
+  st.scrollTop = 100; st.fire("scroll");
+  st.scrollHeight = 1800; st.fire("load");
+  assert.equal(st.scrollTop, 100);
+});
+
+test("a search-hit open still lands on its hit, not the bottom", () => {
+  const st = staticScroll("trScroll4");
+  window.CSS = globalThis.CSS = { escape: (s) => s }; // chat.js checks window.CSS, then calls CSS.escape
+  // The hit sits 900px down; centring it in the 400px pane scrolls to 725.
+  st.querySelector = () => ({ offsetHeight: 50, getBoundingClientRect: () => ({ top: 900 }),
+    classList: { add() {}, remove() {} } });
+  window.TurmaChat.renderStatic({ entries: [entry("a", "x")], scrollEl: st, transcriptId: "t2", scrollUuid: "a" });
+  assert.equal(st.scrollTop, 725);
+  st.scrollHeight = 1800; st.fire("load"); // nor pulled to the bottom by a late image
+  assert.equal(st.scrollTop, 725);
+  delete window.CSS; delete globalThis.CSS;
+});
+
+// A static scroll with a fake laid-out pane (top 0, bottom 400) holding
+// `nodes` — {uuid, cls, dkey?, rect} — whose rects the re-render can move.
+function laidOutScroll(id, nodes) {
+  const st = staticScroll(id);
+  st.scrollHeight = 20000;
+  st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
+  // `n.hiddenIn` names the node (by dkey) of the closed <details> it sits in.
+  const el = (n) => ({ dataset: { uuid: n.uuid, dkey: n.dkey }, classList: [n.cls],
+    getBoundingClientRect: () => n.rect,
+    parentElement: { closest: () => {
+      const c = n.hiddenIn && nodes.find((x) => x.dkey === n.hiddenIn);
+      return c ? el(c) : null;
+    } } });
+  st.querySelectorAll = (sel) => {
+    const m = /data-uuid="([^"]*)"/.exec(sel);
+    return nodes.filter((n) => !m || n.uuid === m[1]).map(el);
+  };
+  st.querySelector = (sel) => {
+    const m = /data-dkey="([^"]*)"/.exec(sel);
+    const n = m && nodes.find((x) => x.dkey === m[1]);
+    return n ? el(n) : null;
+  };
+  return st;
+}
+function verbosityHost() {
+  const buttons = [];
+  const host = { set innerHTML(v) {}, querySelectorAll: () => ["concise", "normal", "verbose"].map((n) => {
+    const b = { getAttribute: () => n, addEventListener: (t, fn) => { b.click = fn; } };
+    buttons.push(b); return b;
+  }) };
+  host.pick = (name) => buttons.filter((b) => b.getAttribute() === name).pop().click();
+  return host;
+}
+
+test("a verbosity change mid-transcript keeps the message the reader was on in place", () => {
+  // A folded thought group starts 2000px above the pane and runs into view;
+  // the first message whose top is in view is u21's BUBBLE at +30. u21 also
+  // renders a thought group under the same uuid, ahead of its bubble, and u22
+  // sits below — neither may be what the restore lines up.
+  const nodes = [
+    { uuid: "g", cls: "thought", rect: { top: -2000, bottom: 380 } },
+    { uuid: "u21", cls: "thought", rect: { top: -300, bottom: -200 } },
+    { uuid: "u21", cls: "tr-msg", rect: { top: 30, bottom: 90 } },
+    { uuid: "u22", cls: "tr-msg", rect: { top: 120, bottom: 180 } },
+  ];
+  const st = laidOutScroll("trScroll5", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t5" });
+  st.scrollTop = 5000; st.fire("scroll"); // the reader parks mid-transcript
+  // The re-render grows everything above u21's bubble by 700px.
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[1].rect = { top: 400, bottom: 500 }; nodes[2].rect = { top: 730, bottom: 790 };
+    nodes[3].rect = { top: 1500, bottom: 1560 }; // u22 moves further (verbose opened its card)
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5700, "u21's bubble is back at +30");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("an entry with several bubbles restores the one the reader was on", () => {
+  // A dsh/qwen entry renders text parts with tool cards between them under one
+  // uuid; the reader is on the MIDDLE bubble at +40.
+  const nodes = [
+    { uuid: "u5", cls: "tr-msg", rect: { top: -900, bottom: -800 } },
+    { uuid: "u5", cls: "action-card", rect: { top: -700, bottom: -600 } },
+    { uuid: "u5", cls: "tr-msg", rect: { top: 40, bottom: 140 } },
+    { uuid: "u5", cls: "action-card", rect: { top: 200, bottom: 300 } },
+    { uuid: "u5", cls: "tr-msg", rect: { top: 350, bottom: 450 } },
+  ];
+  const st = laidOutScroll("trScroll8", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t8" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[0].rect = { top: -1400, bottom: -1300 }; nodes[1].rect = { top: -1000, bottom: -500 };
+    nodes[2].rect = { top: 540, bottom: 640 }; nodes[3].rect = { top: 900, bottom: 1400 };
+    nodes[4].rect = { top: 1500, bottom: 1600 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5500, "the middle bubble is back at +40");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a card is restored by its own key, not its place among the entry's cards", () => {
+  // Concise shows only the file card, so it is the entry's FIRST card there and
+  // its third under Normal: counting would restore a Bash card instead.
+  const nodes = [
+    { uuid: "u5", cls: "action-card", dkey: "file", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll11", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t11" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes.unshift({ uuid: "u5", cls: "action-card", dkey: "bash1", rect: { top: 40, bottom: 140 } },
+      { uuid: "u5", cls: "action-card", dkey: "bash2", rect: { top: 160, bottom: 260 } });
+    nodes[2].rect = { top: 280, bottom: 380 };
+  }, get() { return ""; } });
+  verb.pick("normal");
+  assert.equal(st.scrollTop, 5240, "the file card is back at +40");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a verbosity change that hides the anchor's kind keeps the entry in place", () => {
+  // The reader is on u9's tool card; Concise drops tool cards, so u9's bubble
+  // (its remaining element) is what stays put.
+  const nodes = [
+    { uuid: "u9", cls: "tr-msg", rect: { top: -200, bottom: -100 } },
+    { uuid: "u9", cls: "tool-card", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll9", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t9" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() { nodes.pop(); nodes[0].rect = { top: 300, bottom: 400 }; },
+    get() { return ""; } });
+  verb.pick("concise");
+  assert.equal(st.scrollTop, 5260);
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a pane covered by one element anchors on it, not on the element below", () => {
+  const nodes = [
+    { uuid: "big", cls: "tr-msg", rect: { top: -100, bottom: 900 } },
+    { uuid: "next", cls: "tr-msg", rect: { top: 920, bottom: 980 } },
+  ];
+  const st = laidOutScroll("trScroll10", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t10" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[0].rect = { top: 100, bottom: 1100 }; nodes[1].rect = { top: 1500, bottom: 1560 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5200, "the covering element is back at -100");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a folded thought run's hidden bodies are never the anchor", () => {
+  // A closed folded group at -100 lays its hidden bodies out below it; one
+  // starts at +200, ahead of the reader's bubble at +300 in document order.
+  // Anchoring on it moved the reader to the top of the transcript.
+  const nodes = [
+    { uuid: "a", cls: "thought", dkey: "thf:a", rect: { top: -100, bottom: -60 } },
+    { uuid: "b", cls: "thought-body", hiddenIn: "thf:a", rect: { top: 200, bottom: 3200 } },
+    { uuid: "c", cls: "tr-msg", rect: { top: 300, bottom: 360 } },
+  ];
+  const st = laidOutScroll("trScroll12", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t12" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[1].rect = { top: -3000, bottom: 0 }; nodes[2].rect = { top: 900, bottom: 960 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5600, "the bubble is back at +300");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a thought that folds into a run lands on the run, not its hidden body", () => {
+  // Verbose shows thought b on its own; Normal folds it into a's closed run.
+  const nodes = [{ uuid: "b", cls: "thought", dkey: "th:b", rect: { top: 40, bottom: 140 } }];
+  const st = laidOutScroll("trScroll13", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t13" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes.length = 0;
+    nodes.push({ uuid: "a", cls: "thought", dkey: "thf:a", rect: { top: 240, bottom: 280 } },
+      { uuid: "b", cls: "thought-body", hiddenIn: "thf:a", rect: { top: 3000, bottom: 6000 } });
+  }, get() { return ""; } });
+  verb.pick("normal");
+  assert.equal(st.scrollTop, 5200, "the run is at +40, not its hidden body");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a card hidden by the new preset keeps its entry in place", () => {
+  // Concise drops a Bash card; its key is gone, so the entry's bubble anchors.
+  const nodes = [
+    { uuid: "u5", cls: "tr-msg", rect: { top: -200, bottom: -100 } },
+    { uuid: "u5", cls: "action-card", dkey: "bash", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll14", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t14" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() { nodes.pop(); nodes[0].rect = { top: 340, bottom: 440 }; },
+    get() { return ""; } });
+  verb.pick("concise");
+  assert.equal(st.scrollTop, 5300);
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a verbosity change at the bottom stays at the bottom", () => {
+  const st = laidOutScroll("trScroll7", [{ uuid: "a", cls: "tr-msg", rect: { top: 30, bottom: 90 } }]);
+  const verb = verbosityHost();
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t7" });
+  assert.equal(st.scrollTop, 20000);
+  st.scrollHeight = 26000; // verbose shows more
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 26000);
+});
+
+test("a pane un-hidden after a hidden render re-pins to the bottom", () => {
+  let observed = null;
+  globalThis.ResizeObserver = class { constructor(cb) { this.cb = cb; } observe() { observed = this.cb; } };
+  const st = staticScroll("trScroll6");
+  st.scrollHeight = 0; // hidden: nothing to scroll
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t6" });
+  st.scrollHeight = 2400; // laid out again
+  observed();
+  assert.equal(st.scrollTop, 2400);
+  delete globalThis.ResizeObserver;
+});

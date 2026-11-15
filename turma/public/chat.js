@@ -3866,6 +3866,11 @@
   // streaming turn, or /history expand. The two views are mutually exclusive
   // panes, so this reuses the module-level `verbosity`/`detailsOpen` state.
   let stScroll = null, stVerbHost = null, stTranscriptId = null, stEntries = [];
+  // Is the reader parked at the newest messages (XERK-2956)? An open lands
+  // there, and while it holds, anything that grows the pane after the paint —
+  // a lazy image or file preview loading, the pane being un-hidden, a verbosity
+  // re-render — re-pins to the bottom. The reader scrolling up clears it.
+  let stPinned = false;
 
   function loadStaticVerbosity(tid) {
     // Same per-key store as the live view (keyed by transcript id), so a reader's
@@ -3883,12 +3888,72 @@
     try { localStorage.setItem("turma.chat.verbosity." + stTranscriptId, JSON.stringify(verbosity)); } catch {}
   }
   function renderStaticVerbosity() {
-    buildVerbositySeg(stVerbHost, () => { saveStaticVerbosity(); renderStaticVerbosity(); repaintStatic(); });
+    buildVerbositySeg(stVerbHost, () => { saveStaticVerbosity(); renderStaticVerbosity(); repaintStaticKeepPlace(); });
   }
   function repaintStatic() {
     if (!stScroll) return;
     const html = itemsToHtml(buildItems(stEntries));
     stScroll.innerHTML = html || '<div class="tr-empty">This session\'s transcript is empty.</div>';
+  }
+  function pinStaticBottom() {
+    if (stScroll && stPinned) stScroll.scrollTop = stScroll.scrollHeight;
+  }
+  // A verbosity change re-renders the whole pane, which changes every height
+  // above the reader, so a kept pixel offset lands on some other message. Keep
+  // the bottom when parked there; otherwise keep the first message in view at
+  // the same offset (falling back to the pixel offset when the new verbosity
+  // hides that message).
+  function repaintStaticKeepPlace() {
+    if (!stScroll) return;
+    if (stPinned) { repaintStatic(); pinStaticBottom(); return; }
+    // The anchor is the first message whose TOP is in view. Never merely the
+    // first one still visible: a folded thought group is one tall element
+    // whose top can sit thousands of px above the pane, and holding that
+    // offset lands the reader a dozen messages away. When nothing starts in
+    // view (one element covers the whole pane) that covering element anchors.
+    const pane = stScroll.getBoundingClientRect(), top = pane.top;
+    // One entry renders several elements under its uuid — a thought group, a
+    // tool card, a bubble, and (dsh/qwen) several text parts and tool cards.
+    // A card carries its own data-dkey, which no preset changes, so it is found
+    // again by that. A bubble has none: it is named by uuid, kind (first class)
+    // and which one of that kind it is (`nth`) — bubbles show in every preset,
+    // so that count holds; a card's would not (Concise keeps file cards only).
+    const kindOf = (n) => (n.classList && n.classList[0]) || "";
+    // What the reader actually sees of an element: itself, or the closed
+    // <details> it sits in. A folded thought group lays its hidden bodies out
+    // as tall boxes stacked below it, so taking one as the anchor sent the
+    // reader to the top of the transcript.
+    const seenAs = (n) => (n.parentElement && n.parentElement.closest &&
+      n.parentElement.closest("details:not([open])")) || n;
+    const seen = new Map();
+    let anchor = null, off = 0, nth = 0;
+    for (const el of stScroll.querySelectorAll("[data-uuid]")) {
+      const key = el.dataset.uuid + "\n" + kindOf(el);
+      const i = seen.get(key) || 0;
+      seen.set(key, i + 1);
+      if (seenAs(el) !== el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom <= top) continue;
+      if (r.top >= pane.bottom && anchor) break;
+      anchor = el; off = r.top - top; nth = i;
+      if (r.top >= top) break;
+    }
+    const uuid = anchor && anchor.dataset.uuid;
+    const kind = anchor && kindOf(anchor);
+    const dkey = anchor && anchor.dataset.dkey;
+    repaintStatic();
+    let el = null;
+    if (dkey && window.CSS && CSS.escape) el = stScroll.querySelector('[data-dkey="' + CSS.escape(dkey) + '"]');
+    if (!el && uuid && window.CSS && CSS.escape) {
+      const same = Array.from(stScroll.querySelectorAll('[data-uuid="' + CSS.escape(uuid) + '"]'));
+      const ofKind = same.filter((n) => kindOf(n) === kind);
+      // The new verbosity may hide that kind (a tool card under Concise):
+      // keep the entry's first element in place instead.
+      el = ofKind[Math.min(nth, ofKind.length - 1)] || same[0] || null;
+      // A thought shown alone in one preset is folded into a run in another.
+      if (el) el = seenAs(el);
+    }
+    if (el) stScroll.scrollTop += (el.getBoundingClientRect().top - top) - off;
   }
   // Scroll the matched entry to the middle of the pane and flash it (a
   // search-result open carries the hit's uuid). Bubbles + cards carry data-uuid.
@@ -3915,13 +3980,17 @@
     loadStaticVerbosity(stTranscriptId);
     renderStaticVerbosity();
     repaintStatic();
+    // A search-result open lands on its hit; any other open lands on the most
+    // recent messages (XERK-2956), like the live chat — not the first prompt.
+    stPinned = !opts.scrollUuid;
     if (opts.scrollUuid) scrollToStaticHit(opts.scrollUuid);
+    else pinStaticBottom();
     // Wire card expand/collapse persistence for the static scroll too.
     wireStaticDelegation();
   }
   function closeStatic() {
     if (stVerbHost) stVerbHost.innerHTML = "";
-    stScroll = null; stVerbHost = null; stTranscriptId = null; stEntries = [];
+    stScroll = null; stVerbHost = null; stTranscriptId = null; stEntries = []; stPinned = false;
   }
   function wireStaticDelegation() {
     if (!stScroll || stScroll.dataset.wired) return;
@@ -3934,6 +4003,18 @@
       const d = e.target;
       if (d && d.tagName === "DETAILS" && d.dataset && d.dataset.dkey) noteDetails(d.dataset.dkey, d.open);
     }, true);
+    // The bottom pin (XERK-2956). Every listener reads the module's CURRENT
+    // stScroll: one element is wired once and reused across opens.
+    const el = stScroll;
+    el.addEventListener("scroll", () => { if (stScroll === el) stPinned = scrolledToBottom(el); });
+    // `load` doesn't bubble; capture it so a lazy image/iframe finishing below
+    // the fold doesn't leave the view short of the last message.
+    el.addEventListener("load", () => { if (stScroll === el) pinStaticBottom(); }, true);
+    // A pane rendered while hidden (Trajectory pressed mid-load) has no height
+    // to scroll; re-pin once it is laid out again.
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(() => { if (stScroll === el) pinStaticBottom(); }).observe(el);
+    }
   }
 
   // ---- public API -----------------------------------------------------------
