@@ -22440,7 +22440,8 @@ const dailyBriefSent = new Set();
 // `siteKey`'s real meetings (calendarLinkCandidate, not canceled) starting in
 // [from, from + DAILY_BRIEF_CALENDAR_SPAN_MS) — its hosts' Outlook events and the
 // Turma events it is one of the orgs of — less the standup itself (starting
-// within 5 min of `meetingAt`: a meeting just before or after it still counts, QA). Times are "HH:MM" in the
+// within 5 min of `meetingAt`: a meeting just before or after it still
+// counts, QA). Times are "HH:MM" in the
 // schedule's zone; a private event is "Private event" with nobody named.
 const DAILY_BRIEF_CALENDAR_SPAN_MS = 12 * 3600e3;
 const DAILY_BRIEF_CALENDAR_MAX = 10;

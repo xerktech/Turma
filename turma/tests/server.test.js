@@ -33665,13 +33665,15 @@ test("XERK-2970: a meeting right after the standup stays in the brief's calendar
   try {
     await briefHost2395("dbC2970", A);
     const meet = now + 30 * 60e3;
-    for (const [mins, subject] of [[30, "Standup"], [34, "Late standup copy"], [45, "Right after"], [51, "Later"]]) {
+    // The standup's own copies within ±5:00 of it are left out; a second past that counts.
+    for (const [mins, subject] of [[27, "Early standup copy"], [25, "Five early"], [30, "Standup"],
+      [34, "Late standup copy"], [35, "Five late"], [35 + 1 / 60, "Just past"], [45, "Right after"], [51, "Later"]]) {
       await turma2968("POST", null, turmaEv2970([A], now + mins * 60e3, 15, { subject }));
     }
-    assert.deepEqual(hub.dailyBriefCalendar(A, now + 25 * 60e3, meet, "UTC").map((e) => e.title), ["Right after", "Later"]);
+    assert.deepEqual(hub.dailyBriefCalendar(A, now + 25 * 60e3, meet, "UTC").map((e) => e.title), ["Just past", "Right after", "Later"]);
     // A 30-minute lead: a meeting 15 minutes before the standup is still ahead.
     await turma2968("POST", null, turmaEv2970([A], now + 15 * 60e3, 10, { subject: "Just before" }));
-    assert.deepEqual(hub.dailyBriefCalendar(A, now, meet, "UTC").map((e) => e.title), ["Just before", "Right after", "Later"]);
+    assert.deepEqual(hub.dailyBriefCalendar(A, now, meet, "UTC").map((e) => e.title), ["Just before", "Just past", "Right after", "Later"]);
   } finally {
     cleanup2968();
     cleanup2395(A, ["dbC2970"]);
