@@ -6464,6 +6464,18 @@ const calTurmaWithheld = (p, rec) => CAL_TURMA_HIDDEN.has(rec.sensitivity) && !c
 const calTurmaHiddenFrom = (p, f) => calTurmaWithheld(p, f.rec) ||
   (!!f.occ && calTurmaWithheld(p, turmaOccurrenceRecord(f.rec, f.occ, f.rec.exceptions[f.key])));
 const CAL_TURMA_PRIVATE_REFUSAL = { status: 409, body: { error: "a private event can be changed only by the one who made it" } };
+// A non-owner's series-level write (re-time, rule edit, "following" split, series or
+// following delete) would drop occurrences the owner made private along with the
+// series: refused, though it names a public occurrence or the series (XERK-2977).
+// True when an occurrence override of `before` withheld from `p` is not kept,
+// unchanged, by any of the records `after` (none = the series deleted).
+function calTurmaDropsPrivate(p, before, ...after) {
+  if (calTurmaOwner(p, before)) return false;
+  return Object.entries(before.exceptions).some(([k, ex]) => !ex.deleted && CAL_TURMA_HIDDEN.has(ex.sensitivity) &&
+    !after.some((r) => r && Object.hasOwn(r.exceptions, k) && JSON.stringify(r.exceptions[k]) === JSON.stringify(ex)));
+}
+const CAL_TURMA_DROP_PRIVATE_REFUSAL = { status: 409, body: { error: "this would remove an occurrence its owner " +
+  "made private; only they can change the whole series" } };
 const CAL_TURMA_MAKE_PRIVATE_REFUSAL = { status: 409, body: { error: "only the one who made an event can make it private" } };
 const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
 
@@ -6821,6 +6833,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     if (!rec) return { status: 400, body: { error: "end must not be before start" } };
     const se = turmaSeriesError(rec, !!rule);
     if (se) return { status: 400, body: { error: se } };
+    if (calTurmaDropsPrivate(p, f.rec, rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
     const full = turmaEventCapError(f.t, rec);
     if (full) return full;
     calTurmaStore(f.t, rec);
@@ -6858,6 +6871,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   if (!next) return { status: 400, body: { error: "end must not be before start" } };
   const se = turmaSeriesError(next, !!rule);
   if (se) return { status: 400, body: { error: se } };
+  if (calTurmaDropsPrivate(p, f.rec, prev, next)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
   const full = turmaEventCapError(f.t, prev) || turmaEventCapError(f.t, next);
   if (full) return full;
   calTurmaStore(f.t, prev);
@@ -6896,6 +6910,7 @@ function deleteTurmaEvent(p, id, scope, now = Date.now()) {
   const sc = calTurmaScope(f, scope);
   if (sc.error) return sc.error;
   if (sc.scope === "series") {
+    if (calTurmaDropsPrivate(p, f.rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
     delete calendarTurmaEvents[f.t][f.rec.id];
     if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
     persistCalendarTurmaEvents();
@@ -6905,6 +6920,7 @@ function deleteTurmaEvent(p, id, scope, now = Date.now()) {
   }
   if (sc.scope === "following") {
     const rec = calTurmaEndBefore(f.rec, f.occ, f.t, now);
+    if (calTurmaDropsPrivate(p, f.rec, rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
     calTurmaStore(f.t, rec);
     return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
   }

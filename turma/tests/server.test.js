@@ -34201,6 +34201,44 @@ test("XERK-2969: a relink past the index's work bound leaves the rows it could n
   }
 });
 
+test("XERK-2977: a non-owner's series-level write never drops an occurrence its owner made private", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const s = (await turma2968("POST", null, weekly2969())).body.event;   // made by break-glass
+    const priv = `${s.id}:${key2969(1)}`;
+    const pub = `${s.id}:${key2969(2)}`;
+    assert.equal((await turma2968("PATCH", priv, { version: 1, sensitivity: "private" })).status, 200);
+    const other = { kind: "legacy", roles: [] };
+    const later = (k, h) => new Date(T2968 + k * W2969 + h * 36e5).toISOString();
+    const refused = (r) => { assert.equal(r.status, 409); assert.match(r.body.error, /made private/); assert.ok(!("event" in r.body)); };
+    // Re-timing the series through a public occurrence, or editing its rule, drops the override: refused.
+    refused(hub.patchTurmaEvent(other, pub, { version: 2, scope: "series", start: later(2, 1), end: later(2, 2) }));
+    refused(hub.patchTurmaEvent(other, s.id, { version: 2, recurrence: { freq: "weekly", interval: 2 } }));
+    // Deleting the series, or "this and following" from before the private one, drops it too.
+    refused(hub.deleteTurmaEvent(other, s.id));
+    refused(hub.deleteTurmaEvent(other, `${s.id}:${key2969(0)}`, "series"));
+    // A "following" edit from a LATER occurrence leaves it on the old series; one that re-times
+    // the split from an earlier occurrence drops it.
+    refused(hub.patchTurmaEvent(other, `${s.id}:${key2969(0)}`, { version: 2, scope: "following", start: later(0, 1), end: later(0, 2) }));
+    // Nothing above changed the series.
+    const still = (await occ2969()).find((e) => e.id === priv);
+    assert.deepEqual([still.sensitivity, still.exception], ["private", true]);
+    // Writes that keep the override still work for a non-owner.
+    assert.equal(hub.patchTurmaEvent(other, s.id, { version: 2, subject: "Renamed" }).status, 200);
+    assert.equal(hub.patchTurmaEvent(other, s.id, { version: 3, recurrence: { freq: "daily" } }).status, 200);
+    assert.equal((await occ2969()).find((e) => e.id === priv).sensitivity, "private");
+    assert.equal(hub.patchTurmaEvent(other, s.id, { version: 4, recurrence: { freq: "weekly" } }).status, 200);
+    const split = hub.patchTurmaEvent(other, `${s.id}:${key2969(3)}`, { version: 5, scope: "following", subject: "Later" });
+    assert.equal(split.status, 200);
+    // The owner may still drop it.
+    assert.equal((await turma2968("DELETE", s.id)).status, 200);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
 test("XERK-2969: an occurrence made private by its owner is the owner's alone to change or delete", async () => {
   cleanup2968(D2968A);
   try {
