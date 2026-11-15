@@ -28,7 +28,7 @@ for (const k of [
   "PERMISSION_POLICIES_FILE", "TRIAGE_ACTIONS_FILE", "PRIORITY_WRITEBACK_ORGS_FILE",
   "DEDUPE_LINK_ORGS_FILE", "AUTOMERGE_ORGS_FILE", "ORG_COLORS_FILE", "REPO_TIERS_FILE",
   "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE", "DECISIONS_FILE", "TENANCY_FILE",
-  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_HOST_SETTINGS_FILE", "MEETING_TOKENS_FILE",
+  "DAILY_BRIEF_SCHEDULES_FILE", "DAILY_BRIEFS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_HOST_SETTINGS_FILE", "CALENDAR_TURMA_EVENTS_FILE", "MEETING_TOKENS_FILE",
   "ARCHIVE_PURGED_TENANTS_FILE", "USAGE_LEDGER_FILE", "PERMISSION_LEDGER_FILE", "OUTCOME_LEDGER_FILE",
 ]) process.env[k] = path.join(DIR, `${k.toLowerCase()}.json`);
 process.env.MIGRATE_SPOOL_DIR = path.join(DIR, "spool");
@@ -141,6 +141,9 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
   // XERK-2891: a host's calendar and its settings.
   hub.getCalendarEvents().gone2554 = { syncedAt: NOW, windowFrom: 1, windowUntil: 2, ranges: [], events: [] };
   hub.getCalendarHostSettings().gone2554 = { showPrivate: true };
+  // XERK-2968: a Turma event in a plain org.
+  hub.getCalendarTurmaEvents()[""] = { "turma:00000000000a2554": hub.sanitizeTurmaEvent({ id: "turma:00000000000a2554",
+    orgs: [SITE], subject: "Plan", start: "2026-11-16T09:00:00Z", end: "2026-11-16T10:00:00Z", version: 1 }, "") };
 
   // Every sampled store is migrated too: one dropped from the list would keep
   // its rows under the old site key.
@@ -280,6 +283,8 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   assert.ok(!hub.getCalendarEvents().gone2554 && hub.getCalendarEvents()[tk("gone2554")]);
   const cs = hub.getCalendarHostSettings()[tk("gone2554")];
   assert.deepEqual(cs, { showPrivate: true });
+  assert.ok(!hub.getCalendarTurmaEvents()[""], "the untenanted Turma event left");
+  assert.deepEqual(hub.getCalendarTurmaEvents()[T]["turma:00000000000a2554"].orgs, [tk(SITE)]);
   assert.deepEqual(hub.outcomeLedger.siteKeys(), [tk(SITE)]);
   const row = archive.listRowOwners().find((x) => x.transcriptId === "t2554");
   assert.equal(row.host, tk("gone2554"));

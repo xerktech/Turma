@@ -120,6 +120,7 @@ process.env.MEETING_FOCUS_FILE = path.join(scratchDir(), `turma-test-meeting-foc
 process.env.HOLIDAY_SETTINGS_FILE = path.join(scratchDir(), `turma-test-holiday-settings-${process.pid}.json`);
 process.env.CALENDAR_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-events-${process.pid}.json`);
 process.env.CALENDAR_HOST_SETTINGS_FILE = path.join(scratchDir(), `turma-test-calendar-host-settings-${process.pid}.json`);
+process.env.CALENDAR_TURMA_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-turma-events-${process.pid}.json`);
 process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
 process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
 process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
@@ -33138,4 +33139,194 @@ test("XERK-2935 QA: files never ride a rejoined file-less create, stay on one ho
   const chat = await requestRaw("POST", `/api/agents/tf3a/sessions/${encodeURIComponent("#ticket")}/uploads?name=x`,
     { body: Buffer.from("x"), headers: userHeaders });
   assert.notEqual(chat.status, 200);
+});
+
+// ---- XERK-2968: Turma-created events, in one or more orgs ------------------------
+const S2968A = "a2968.atlassian.net", S2968B = "b2968.atlassian.net";
+const D2968A = "cal2968a", D2968B = "cal2968b";
+const T2968 = Math.floor(Date.now() / 3.6e6) * 3.6e6 + 864e5;   // on the hour, tomorrow
+const iso2968 = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+const ev2968 = (orgs, extra = {}) => ({ orgs, subject: "Planning", start: iso2968(T2968),
+  end: iso2968(T2968 + 3.6e6), timeZone: "America/New_York", ...extra });
+const turma2968 = (method, id, body, headers = userHeaders) =>
+  request(method, `/api/calendar/events${id ? `/${encodeURIComponent(id)}` : ""}`,
+    { body, headers: { ...headers, "content-type": "application/json" } });
+const served2968 = async (headers = userHeaders, q = "") =>
+  (await calGet2891(T2968 - 864e5, T2968 + 864e5, headers, q)).body.events.filter((e) => e.source === "turma");
+function cleanup2968(...devices) {
+  forget2891(...devices);
+  for (const k of Object.keys(hub.getCalendarTurmaEvents())) delete hub.getCalendarTurmaEvents()[k];
+}
+
+test("XERK-2968: a Turma event round-trips create, edit and delete, and is served once", async () => {
+  cleanup2968(D2968A, D2968B);
+  try {
+    await beat1574(D2968A, S2968A);
+    await beat1574(D2968B, S2968B);
+    const c = await turma2968("POST", null, ev2968([S2968A, S2968B], {
+      attendees: [{ name: "Bo", email: "BO@x.com", role: "optional" }], joinUrl: "https://zoom.us/j/1" }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const e = c.body.event;
+    assert.match(e.id, /^turma:[0-9a-f]{16}$/);
+    assert.deepEqual([e.source, e.org, e.orgs, e.version, e.editable, e.recurrence], ["turma", S2968A, [S2968A, S2968B], 1, true, null]);
+    assert.deepEqual(e.attendees, [{ name: "Bo", email: "bo@x.com", role: "optional" }]);
+    assert.equal(e.createdBy, "breakglass");
+    // Served once, though it is in two orgs.
+    assert.deepEqual((await served2968()).map((x) => x.id), [e.id]);
+    // The stored record is a coerce fixed point.
+    const stored = hub.getCalendarTurmaEvents()[""];
+    assert.equal(JSON.stringify(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]), JSON.stringify(stored));
+    // Edit: optimistic concurrency on `version`.
+    const p = await turma2968("PATCH", e.id, { version: 1, subject: "Planning v2", orgs: [S2968B] });
+    assert.equal(p.status, 200, JSON.stringify(p.body));
+    assert.deepEqual([p.body.event.subject, p.body.event.orgs, p.body.event.version], ["Planning v2", [S2968B], 2]);
+    const stale = await turma2968("PATCH", e.id, { version: 1, subject: "lost update" });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.body.event.subject, "Planning v2", "the 409 carries the current event");
+    assert.equal((await turma2968("PATCH", e.id, { subject: "x" })).status, 400, "version is required");
+    // Delete.
+    assert.equal((await turma2968("DELETE", e.id)).status, 200);
+    assert.deepEqual(await served2968(), []);
+    assert.equal((await turma2968("DELETE", e.id)).status, 404);
+  } finally {
+    cleanup2968(D2968A, D2968B);
+    forget2533(D2968A, D2968B);
+  }
+});
+
+test("XERK-2968: the org filter matches ANY org; adding and removing an org moves it between filters", async () => {
+  cleanup2968(D2968A, D2968B);
+  try {
+    await beat1574(D2968A, S2968A);
+    await beat1574(D2968B, S2968B);
+    const e = (await turma2968("POST", null, ev2968([S2968A]))).body.event;
+    const ids = async (org) => (await served2968(userHeaders, `&org=${encodeURIComponent(org)}`)).map((x) => x.id);
+    assert.deepEqual([await ids(S2968A), await ids(S2968B)], [[e.id], []]);
+    assert.equal((await turma2968("PATCH", e.id, { version: 1, orgs: [S2968A, S2968B] })).status, 200);
+    assert.deepEqual([await ids(S2968A), await ids(S2968B), await ids(`${S2968A},${S2968B}`)], [[e.id], [e.id], [e.id]]);
+    assert.equal((await turma2968("PATCH", e.id, { version: 2, orgs: [S2968B] })).status, 200);
+    assert.deepEqual([await ids(S2968A), await ids(S2968B)], [[], [e.id]]);
+    assert.equal((await served2968(userHeaders, `&org=${S2968B}`))[0].org, S2968B, "org is orgs[0]");
+  } finally {
+    cleanup2968(D2968A, D2968B);
+    forget2533(D2968A, D2968B);
+  }
+});
+
+test("XERK-2968: refusals — Outlook ids, empty or unknown orgs, malformed fields, caps", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const outlook = await turma2968("PATCH", "040000008200E00074C5B7101A82E008", { version: 1 });
+    assert.equal(outlook.status, 400);
+    assert.match(outlook.body.error, /Outlook events are read-only/);
+    assert.equal((await turma2968("DELETE", "040000008200E00074C5B7101A82E008")).status, 400);
+    assert.equal((await turma2968("POST", null, ev2968([]))).status, 400, "an event must belong to an org");
+    assert.equal((await turma2968("POST", null, ev2968(["nobody2968.atlassian.net"]))).status, 404);
+    for (const bad of [{ start: "2026-11-16T09:00:00" }, { end: iso2968(T2968 - 1) }, { timeZone: "Mars/Olympus" },
+      { joinUrl: "http://x.com" }, { busy: "maybe" }, { attendees: [{ email: "not an email" }] },
+      { recurrence: { freq: "weekly" } }, { subject: "x".repeat(301) }]) {
+      const r = await turma2968("POST", null, ev2968([S2968A], bad));
+      assert.equal(r.status, 400, JSON.stringify(bad));
+    }
+    assert.deepEqual(Object.keys(hub.getCalendarTurmaEvents()), [], "no refusal minted anything");
+    // Caps: a full tenant refuses in the hub's words with a 409; nothing is dropped.
+    const b = Object.create(null);
+    for (let i = 0; i < hub.CALENDAR_TURMA_EVENTS_MAX; i++) {
+      const id = `turma:${i.toString(16).padStart(16, "0")}`;
+      b[id] = hub.sanitizeTurmaEvent({ ...ev2968([S2968A]), id, createdBy: "breakglass", createdAt: 1, updatedAt: 1, version: 1 }, "");
+    }
+    hub.getCalendarTurmaEvents()[""] = b;
+    const full = await turma2968("POST", null, ev2968([S2968A]));
+    assert.equal(full.status, 409);
+    assert.match(full.body.error, /at most 1500 Turma events/);
+    assert.equal(Object.keys(hub.getCalendarTurmaEvents()[""]).length, hub.CALENDAR_TURMA_EVENTS_MAX);
+    // Bytes: a few events with long bodies fill 2 MiB.
+    hub.getCalendarTurmaEvents()[""] = Object.create(null);
+    let r;
+    for (let i = 0; i < 200 && (!r || r.status === 200); i++) {
+      r = await turma2968("POST", null, ev2968([S2968A], { body: "\u{1F600}".repeat(4000) }));
+    }
+    assert.equal(r.status, 409);
+    assert.match(r.body.error, /MiB of Turma events/);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2968: an org that stops being decided leaves its events after the grace; orphans are deleted", async () => {
+  cleanup2968(D2968A, D2968B);
+  try {
+    await beat1574(D2968A, S2968A);
+    await beat1574(D2968B, S2968B);
+    const both = (await turma2968("POST", null, ev2968([S2968A, S2968B]))).body.event;
+    const onlyB = (await turma2968("POST", null, ev2968([S2968B]))).body.event;
+    delete agents[D2968B];   // B's only host is gone: org B is no longer decided
+    // Served at once without B; the B-only event is not served.
+    const s = await served2968();
+    assert.deepEqual(s.map((x) => [x.id, x.orgs]), [[both.id, [S2968A]]]);
+    const now = Date.now();
+    assert.equal(hub.calendarTurmaTick(now), 0, "within the grace nothing is dropped");
+    assert.equal(hub.calendarTurmaTick(now + hub.CALENDAR_TURMA_ORG_GRACE_MS), 2);
+    const b = hub.getCalendarTurmaEvents()[""];
+    assert.deepEqual(b[both.id].orgs, [S2968A]);
+    assert.ok(!(onlyB.id in b), "an event left with no org is deleted");
+  } finally {
+    cleanup2968(D2968A, D2968B);
+    forget2533(D2968A, D2968B);
+  }
+});
+
+test("XERK-2968: each tenant sees and edits only its own Turma events; private ones are the creator's", async () => {
+  const T = tenants2533();
+  let F;
+  const frames = [], framesA = [];
+  const res = { write: (f) => frames.push(f) };
+  const resA = { write: (f) => framesA.push(f) };
+  try {
+    F = await fleet2551(T, "t2968");
+    hub.ssePrincipals.set(resA, hub.principalFromToken(hub.issueSessionToken(60_000,
+      { u: T.A.user.id, t: T.A.t, r: ["user"] })));
+    hub.sseClients.add(resA);
+    hub.ssePrincipals.set(res, hub.principalFromToken(hub.issueSessionToken(60_000,
+      { u: T.B.user.id, t: T.B.t, r: ["user"] })));
+    hub.sseClients.add(res);
+    const a = await turma2968("POST", null, ev2968([F.SA], { sensitivity: "private" }), T.A.h);
+    assert.equal(a.status, 200, JSON.stringify(a.body));
+    const id = a.body.event.id;
+    assert.equal(a.body.event.subject, "Planning", "the creator sees its own private event");
+    // B cannot name A's org, see, edit or delete A's event; break-glass reaches no tenant.
+    assert.equal((await turma2968("POST", null, ev2968([F.SA]), T.B.h)).status, 404);
+    assert.equal((await turma2968("POST", null, ev2968([F.SA, F.SB]), T.A.h)).status, 404);
+    assert.deepEqual(await served2968(T.B.h), []);
+    assert.deepEqual(await served2968(userHeaders), []);
+    for (const h of [T.B.h, userHeaders]) {
+      assert.equal((await turma2968("PATCH", id, { version: 1, subject: "x" }, h)).status, 404);
+      assert.equal((await turma2968("DELETE", id, undefined, h)).status, 404);
+    }
+    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [F.SB] }, T.A.h)).status, 404, "never into another tenant");
+    assert.deepEqual((await served2968(T.A.h)).map((x) => x.id), [id]);
+    // Another viewer of tenant A (not the creator) gets it withheld.
+    const other = { kind: "user", userId: "someone-else", tenantId: T.A.t, roles: ["user"] };
+    const v = hub.calendarView(other, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === id);
+    assert.deepEqual([v.subject, v.private, v.editable], ["Private event", true, true]);
+    // Every write announces the tenant-level key; another tenant's viewer never gets it.
+    await new Promise((r) => setTimeout(r, 5));
+    assert.ok(framesA.some((f) => f.includes("event: calendar") && f.includes(`turma:events@${T.A.t}`)), "A's viewer is told");
+    assert.ok(!frames.some((f) => f.includes("turma:events")), "B never sees A's frame");
+    const scope = require("../tenant-scope.js");
+    const key = `turma:events@${T.A.t}`;
+    assert.deepEqual(Object.keys(scope.scopeEvent("calendar", { [key]: {} }, { mayHost: (k) => k.endsWith(T.A.t) })), [key]);
+    // A purge drops the tenant's events.
+    assert.ok(hub.getCalendarTurmaEvents()[T.A.t]);
+    hub.purgeTenantData(T.A.t);
+    assert.ok(!hub.getCalendarTurmaEvents()[T.A.t]);
+  } finally {
+    hub.sseClients.delete(res);
+    hub.sseClients.delete(resA);
+    cleanup2968();
+    if (F) forget2533("t2968", F.ka, F.kb, F.kl);
+    T.restore();
+  }
 });
