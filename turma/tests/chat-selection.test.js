@@ -353,8 +353,13 @@ function laidOutScroll(id, nodes) {
   const st = staticScroll(id);
   st.scrollHeight = 20000;
   st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
+  // `n.hiddenIn` names the node (by dkey) of the closed <details> it sits in.
   const el = (n) => ({ dataset: { uuid: n.uuid, dkey: n.dkey }, classList: [n.cls],
-    getBoundingClientRect: () => n.rect });
+    getBoundingClientRect: () => n.rect,
+    parentElement: { closest: () => {
+      const c = n.hiddenIn && nodes.find((x) => x.dkey === n.hiddenIn);
+      return c ? el(c) : null;
+    } } });
   st.querySelectorAll = (sel) => {
     const m = /data-uuid="([^"]*)"/.exec(sel);
     return nodes.filter((n) => !m || n.uuid === m[1]).map(el);
@@ -482,6 +487,64 @@ test("a pane covered by one element anchors on it, not on the element below", ()
   }, get() { return ""; } });
   verb.pick("verbose");
   assert.equal(st.scrollTop, 5200, "the covering element is back at -100");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a folded thought run's hidden bodies are never the anchor", () => {
+  // A closed folded group at -100 lays its hidden bodies out below it; one
+  // starts at +200, ahead of the reader's bubble at +300 in document order.
+  // Anchoring on it moved the reader to the top of the transcript.
+  const nodes = [
+    { uuid: "a", cls: "thought", dkey: "thf:a", rect: { top: -100, bottom: -60 } },
+    { uuid: "b", cls: "thought-body", hiddenIn: "thf:a", rect: { top: 200, bottom: 3200 } },
+    { uuid: "c", cls: "tr-msg", rect: { top: 300, bottom: 360 } },
+  ];
+  const st = laidOutScroll("trScroll12", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t12" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[1].rect = { top: -3000, bottom: 0 }; nodes[2].rect = { top: 900, bottom: 960 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5600, "the bubble is back at +300");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a thought that folds into a run lands on the run, not its hidden body", () => {
+  // Verbose shows thought b on its own; Normal folds it into a's closed run.
+  const nodes = [{ uuid: "b", cls: "thought", dkey: "th:b", rect: { top: 40, bottom: 140 } }];
+  const st = laidOutScroll("trScroll13", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t13" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes.length = 0;
+    nodes.push({ uuid: "a", cls: "thought", dkey: "thf:a", rect: { top: 240, bottom: 280 } },
+      { uuid: "b", cls: "thought-body", hiddenIn: "thf:a", rect: { top: 3000, bottom: 6000 } });
+  }, get() { return ""; } });
+  verb.pick("normal");
+  assert.equal(st.scrollTop, 5200, "the run is at +40, not its hidden body");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a card hidden by the new preset keeps its entry in place", () => {
+  // Concise drops a Bash card; its key is gone, so the entry's bubble anchors.
+  const nodes = [
+    { uuid: "u5", cls: "tr-msg", rect: { top: -200, bottom: -100 } },
+    { uuid: "u5", cls: "action-card", dkey: "bash", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll14", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t14" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() { nodes.pop(); nodes[0].rect = { top: 340, bottom: 440 }; },
+    get() { return ""; } });
+  verb.pick("concise");
+  assert.equal(st.scrollTop, 5300);
   delete window.CSS; delete globalThis.CSS;
 });
 

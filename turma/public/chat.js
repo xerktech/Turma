@@ -3919,12 +3919,19 @@
     // and which one of that kind it is (`nth`) — bubbles show in every preset,
     // so that count holds; a card's would not (Concise keeps file cards only).
     const kindOf = (n) => (n.classList && n.classList[0]) || "";
+    // What the reader actually sees of an element: itself, or the closed
+    // <details> it sits in. A folded thought group lays its hidden bodies out
+    // as tall boxes stacked below it, so taking one as the anchor sent the
+    // reader to the top of the transcript.
+    const seenAs = (n) => (n.parentElement && n.parentElement.closest &&
+      n.parentElement.closest("details:not([open])")) || n;
     const seen = new Map();
     let anchor = null, off = 0, nth = 0;
     for (const el of stScroll.querySelectorAll("[data-uuid]")) {
       const key = el.dataset.uuid + "\n" + kindOf(el);
       const i = seen.get(key) || 0;
       seen.set(key, i + 1);
+      if (seenAs(el) !== el) continue;
       const r = el.getBoundingClientRect();
       if (r.bottom <= top) continue;
       if (r.top >= pane.bottom && anchor) break;
@@ -3943,6 +3950,8 @@
       // The new verbosity may hide that kind (a tool card under Concise):
       // keep the entry's first element in place instead.
       el = ofKind[Math.min(nth, ofKind.length - 1)] || same[0] || null;
+      // A thought shown alone in one preset is folded into a run in another.
+      if (el) el = seenAs(el);
     }
     if (el) stScroll.scrollTop += (el.getBoundingClientRect().top - top) - off;
   }
