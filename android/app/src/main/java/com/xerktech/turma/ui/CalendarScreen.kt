@@ -5,6 +5,16 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
+import com.xerktech.turma.core.calSlotDp
+import com.xerktech.turma.core.calZoomClamp
+import com.xerktech.turma.core.calZoomStep
+import kotlin.math.roundToInt
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -87,6 +97,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.core.CAL_DAILY_EVENT_MS
+import com.xerktech.turma.core.CAL_OPEN_AT_H
 import com.xerktech.turma.core.CAL_WORK_FROM_H
 import com.xerktech.turma.core.CAL_WORK_UNTIL_H
 import com.xerktech.turma.core.CalMode
@@ -163,9 +174,6 @@ import kotlinx.serialization.json.put
  * Logic: core/Calendar.kt; data: vm/CalendarViewModel.kt.
  */
 
-private val SLOT_DP = 24.dp           // one 30-minute row, as the web's 24px
-private val HOUR_DP = SLOT_DP * 2
-private val DAY_DP = HOUR_DP * 24
 private val SHORT_DP = 34.dp          // shorter than this, a block shows its title alone
 
 /** The neutral colour of an unassigned event (the web's `--muted`). */
@@ -235,6 +243,7 @@ private fun CalendarBody(
     val locale = Locale.getDefault()
     val weeks by cvm.weeks.collectAsStateWithLifecycle()
     val modes by cvm.modes.collectAsStateWithLifecycle()
+    val zoom by cvm.zoom.collectAsStateWithLifecycle()
     var now by remember { mutableStateOf(cvm.now()) }
     // The now-line and "past" dimming move with the clock.
     LaunchedEffect(Unit) { while (true) { delay(60_000); now = cvm.now() } }
@@ -339,6 +348,7 @@ private fun CalendarBody(
             WeekGrid(
                 Modifier.weight(1f), weekly, days, range, now, zone, locale, fleet, keys, names, colors,
                 detailKey = detail?.key, scrollTo = scrollTo, onScrolled = { scrollTo = -1.0 },
+                zoomHours = zoom, onZoom = { h, end -> cvm.setZoom(h, save = end) },
                 onOpen = ::openDetail,
                 onSwipe = { dir -> go(calStep(anchor, mode, dir)) },
             )
@@ -349,7 +359,7 @@ private fun CalendarBody(
             val series = TurmaColors.series()
             CalendarDetail(
                 m, ev, colors[ev.org]?.let { series[it % series.size] },
-                side, now, zone, locale, fleet, names, range.events, range.hostRows[ev.host], cvm, bvm, mvm,
+                side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
             )
         }
@@ -524,6 +534,8 @@ private fun WeekGrid(
     detailKey: String?,
     scrollTo: Double,
     onScrolled: () -> Unit,
+    zoomHours: Float,
+    onZoom: (hours: Float, end: Boolean) -> Unit,
     onOpen: (CalendarEvent) -> Unit,
     onSwipe: (Int) -> Unit,
 ) {
@@ -537,14 +549,6 @@ private fun WeekGrid(
     val colorOf: (String) -> Color? = { org -> colors[org]?.let { series[it % series.size] } }
     val orgLabel: (String) -> String = { s -> if (s.isEmpty()) "No org" else com.xerktech.turma.core.orgName(s, names[s].orEmpty()) }
     val offOf = days.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
-    // The grid opens at working hours (8 AM in view); a reveal scrolls to its event.
-    LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (HOUR_DP * CAL_WORK_FROM_H - 12.dp).roundToPx() }) }
-    LaunchedEffect(scrollTo) {
-        if (scrollTo >= 0) {
-            scroll.animateScrollTo(with(density) { ((SLOT_DP * (scrollTo / 30).toFloat()) - HOUR_DP).roundToPx().coerceAtLeast(0) })
-            onScrolled()
-        }
-    }
     val swipePx = with(density) { 60.dp.toPx() }
     Column(
         modifier.fillMaxWidth().semantics { contentDescription = "Calendar, ${calRangeLabel(days, locale)}" }
@@ -555,6 +559,7 @@ private fun WeekGrid(
                     var last = down.position
                     while (true) {
                         val ev = awaitPointerEvent(PointerEventPass.Initial)
+                        if (ev.changes.count { it.pressed } > 1) break  // a pinch zooms, never swipes
                         val c = ev.changes.firstOrNull { it.id == down.id } ?: break
                         last = c.position
                         if (!c.pressed) {
@@ -639,58 +644,122 @@ private fun WeekGrid(
             }
         }
         // The timed grid: 30-minute rows, working hours unshaded, a red now-line on today.
-        Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(scroll).testTag("cal-scroll")) {
-            Row(Modifier.fillMaxWidth().height(DAY_DP)) {
-                Box(Modifier.width(gutter).fillMaxHeight()) {
-                    for (h in 1 until 24) {
-                        Text(
-                            DateTimeFormatter.ofPattern("h a", locale).format(java.time.LocalTime.of(h, 0)),
-                            Modifier.offset(y = HOUR_DP * h - 7.dp).padding(start = 4.dp),
-                            fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+        // The zoom (XERK-2954) is how many hours fill the pane: a pinch, or TalkBack's actions.
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+            val paneDp = maxHeight.value
+            val slot = calSlotDp(paneDp, zoomHours).dp
+            val hourDp = slot * 2
+            // The grid opens with 8 AM at the top (its label clear); a reveal scrolls to its event.
+            LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (hourDp * CAL_OPEN_AT_H - 8.dp).roundToPx() }) }
+            LaunchedEffect(scrollTo) {
+                if (scrollTo >= 0) {
+                    scroll.animateScrollTo(with(density) { ((slot * (scrollTo / 30).toFloat()) - hourDp).roundToPx().coerceAtLeast(0) })
+                    onScrolled()
+                }
+            }
+            // A zoom holds the minute under the fingers (or the pane's middle) in place; any
+            // other row-height change (the pane resized by a notice, a rotation) holds the
+            // minute at the top. The scroll moves once the new rows are laid out.
+            var hold by remember { mutableStateOf<Pair<Double, Float>?>(null) }
+            var lastSlotPx by remember { mutableStateOf(0f) }
+            LaunchedEffect(slot) {
+                val was = lastSlotPx
+                lastSlotPx = with(density) { slot.toPx() }
+                val (min, y) = hold ?: (if (was > 0f) scroll.value / was * 30.0 to 0f else return@LaunchedEffect)
+                withFrameNanos { }
+                scroll.scrollTo(with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) })
+                hold = null
+            }
+            val hours by rememberUpdatedState(zoomHours)
+            fun zoomTo(h: Float, y: Float, end: Boolean) {
+                val next = calZoomClamp(h)
+                if (next != hours) {
+                    val slotPx = with(density) { calSlotDp(paneDp, hours).dp.toPx() }
+                    hold = (scroll.value + y) / slotPx * 30.0 to y
+                }
+                onZoom(next, end)
+            }
+            val midPx = constraints.maxHeight / 2f
+            Box(
+                Modifier.fillMaxSize()
+                    .pointerInput(paneDp) {
+                        awaitEachGesture {
+                            awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                            var pinched = false
+                            while (true) {
+                                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                                if (ev.changes.none { it.pressed }) break
+                                if (ev.changes.count { it.pressed } < 2) continue
+                                val z = ev.calculateZoom()
+                                if (z != 1f && z > 0f) {
+                                    pinched = true
+                                    zoomTo(hours / z, ev.calculateCentroid(useCurrent = true).y, end = false)
+                                }
+                                ev.changes.forEach { it.consume() }  // the scroll never pans mid-pinch
+                            }
+                            if (pinched) onZoom(hours, true)
+                        }
+                    }
+                    .semantics {
+                        customActions = listOfNotNull(
+                            calZoomStep(zoomHours, 1)?.let { h -> CustomAccessibilityAction("Zoom in") { zoomTo(h, midPx, true); true } },
+                            calZoomStep(zoomHours, -1)?.let { h -> CustomAccessibilityAction("Zoom out") { zoomTo(h, midPx, true); true } },
                         )
                     }
-                }
-                for (d in days) {
-                    val isToday = d == today
-                    val off = offOf[d].orEmpty().isNotEmpty()
-                    val surface = MaterialTheme.colorScheme.surface
-                    BoxWithConstraints(
-                        Modifier.weight(1f).fillMaxHeight()
-                            .drawBehind {
-                                drawRect(offShade)
-                                val hp = HOUR_DP.toPx()
-                                drawRect(surface, Offset(0f, hp * CAL_WORK_FROM_H),
-                                    androidx.compose.ui.geometry.Size(size.width, hp * (CAL_WORK_UNTIL_H - CAL_WORK_FROM_H)))
-                                for (h in 0 until 24) drawLine(outline, Offset(0f, hp * h), Offset(size.width, hp * h), 0.5.dp.toPx())
-                                drawLine(outline, Offset(0f, 0f), Offset(0f, size.height), 0.5.dp.toPx())
-                            }
-                            .then(if (off) Modifier.hatch(offShade) else Modifier)
-                            .testTag("cal-col-${calDayKey(d)}"),
-                    ) {
-                        val w = maxWidth
-                        for (seg in calDaySegments(range.events, d, zone)) {
-                            val ev = seg.ev
-                            val badge = calBadge(ev, fleet.meetingProposals)
-                            val h = SLOT_DP * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp
-                            EventBlock(
-                                segModifier(seg, w, h), ev, now, colorOf(ev.org), badge, short = h < SHORT_DP,
-                                open = ev.key == detailKey,
-                                aria = calAria(ev, d, orgLabel(ev.org), badge, zone, locale),
-                                meta = listOf(calSpan(ev.startMs ?: 0, ev.endMs ?: 0, zone, locale), ev.location)
-                                    .filter { it.isNotEmpty() }.joinToString(" · "),
-                            ) { onOpen(ev) }
-                        }
-                        if (isToday) {
-                            val y = SLOT_DP * (calWallMinutes(now, d, zone) / 30).toFloat()
-                            val red = TurmaColors.critical
-                            Box(
-                                Modifier.fillMaxWidth().height(2.dp).offset(y = y - 1.dp)
-                                    .drawBehind {
-                                        drawRect(red)
-                                        drawCircle(red, 4.dp.toPx(), Offset(0f, size.height / 2))
-                                    }
-                                    .testTag("cal-now").clearAndSetSemantics {},
+                    .verticalScroll(scroll).testTag("cal-scroll"),
+            ) {
+                Row(Modifier.fillMaxWidth().height(hourDp * 24)) {
+                    Box(Modifier.width(gutter).fillMaxHeight()) {
+                        for (h in 1 until 24) {
+                            Text(
+                                DateTimeFormatter.ofPattern("h a", locale).format(java.time.LocalTime.of(h, 0)),
+                                Modifier.offset(y = hourDp * h - 7.dp).padding(start = 4.dp),
+                                fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                        }
+                    }
+                    for (d in days) {
+                        val isToday = d == today
+                        val off = offOf[d].orEmpty().isNotEmpty()
+                        val surface = MaterialTheme.colorScheme.surface
+                        BoxWithConstraints(
+                            Modifier.weight(1f).fillMaxHeight()
+                                .drawBehind {
+                                    drawRect(offShade)
+                                    val hp = hourDp.toPx()
+                                    drawRect(surface, Offset(0f, hp * CAL_WORK_FROM_H),
+                                        androidx.compose.ui.geometry.Size(size.width, hp * (CAL_WORK_UNTIL_H - CAL_WORK_FROM_H)))
+                                    for (h in 0 until 24) drawLine(outline, Offset(0f, hp * h), Offset(size.width, hp * h), 0.5.dp.toPx())
+                                    drawLine(outline, Offset(0f, 0f), Offset(0f, size.height), 0.5.dp.toPx())
+                                }
+                                .then(if (off) Modifier.hatch(offShade) else Modifier)
+                                .testTag("cal-col-${calDayKey(d)}"),
+                        ) {
+                            val w = maxWidth
+                            for (seg in calDaySegments(range.events, d, zone)) {
+                                val ev = seg.ev
+                                val badge = calBadge(ev, fleet.meetingProposals)
+                                val h = slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp
+                                EventBlock(
+                                    segModifier(seg, w, h, slot), ev, now, colorOf(ev.org), badge, short = h < SHORT_DP,
+                                    open = ev.key == detailKey,
+                                    aria = calAria(ev, d, orgLabel(ev.org), badge, zone, locale),
+                                    meta = listOf(calSpan(ev.startMs ?: 0, ev.endMs ?: 0, zone, locale), ev.location)
+                                        .filter { it.isNotEmpty() }.joinToString(" · "),
+                                ) { onOpen(ev) }
+                            }
+                            if (isToday) {
+                                val y = slot * (calWallMinutes(now, d, zone) / 30).toFloat()
+                                val red = TurmaColors.critical
+                                Box(
+                                    Modifier.fillMaxWidth().height(2.dp).offset(y = y - 1.dp)
+                                        .drawBehind {
+                                            drawRect(red)
+                                            drawCircle(red, 4.dp.toPx(), Offset(0f, size.height / 2))
+                                        }
+                                        .testTag("cal-now").clearAndSetSemantics {},
+                                )
+                            }
                         }
                     }
                 }
@@ -699,10 +768,10 @@ private fun WeekGrid(
     }
 }
 
-private fun segModifier(seg: CalSeg, colWidth: Dp, height: Dp): Modifier {
+private fun segModifier(seg: CalSeg, colWidth: Dp, height: Dp, slot: Dp): Modifier {
     val left = colWidth * (seg.col.toFloat() / seg.cols)
     val width = colWidth * (seg.span.toFloat() / seg.cols)
-    return Modifier.offset(x = left + 1.dp, y = SLOT_DP * (seg.top / 30).toFloat())
+    return Modifier.offset(x = left + 1.dp, y = slot * (seg.top / 30).toFloat())
         .width((width - 4.dp).coerceAtLeast(8.dp)).height(height.coerceAtLeast(10.dp))
 }
 
@@ -809,7 +878,6 @@ private fun CalendarDetail(
     fleet: FleetState,
     names: Map<String, String>,
     events: List<CalendarEvent>,
-    hostRow: com.xerktech.turma.model.CalendarHost?,
     cvm: CalendarViewModel,
     bvm: BriefViewModel,
     mvm: MeetingsViewModel,
@@ -856,8 +924,8 @@ private fun CalendarDetail(
                 DetailRow("Moved", "from ${calLongDay(calDay(o, zone), locale)}, ${calTime(o, zone, locale)}")
             }
             if (ev.tenir && ev.moved) DetailRow("Moved", "its Outlook event moved to another time")
-            if (!ev.tenir && hostRow != null && ev.id.isNotEmpty()) SeriesOrgRow(ev, hostRow, orgLabel, cvm)
-            else DetailRow("Org", orgLabel(ev.org))
+            // Locked (XERK-2964): an Outlook event's org is its host's, shown, never picked.
+            DetailRow("Org", orgLabel(ev.org))
             if (ev.recurring) DetailRow("Repeats", "Part of a recurring series")
             DetailRow("Where", ev.location)
             DetailRow(
@@ -959,9 +1027,9 @@ private fun CalendarDetail(
 }
 
 /**
- * Each host's calendar settings (XERK-2929, the web's `hostSettingsHtml`): the org
- * its unmatched meetings take, and whether its private events are shown. Each
- * change saves at once.
+ * Each host's calendar settings (XERK-2929, the web's `hostSettingsHtml`): whether its
+ * private events are shown, saved at once. Its org is shown, never set: every event
+ * takes its host's org (XERK-2964).
  */
 @Composable
 private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost>, names: Map<String, String>, cvm: CalendarViewModel) {
@@ -976,29 +1044,15 @@ private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost
                 Text("No host has synced a calendar yet.", style = MaterialTheme.typography.bodySmall, color = muted)
                 return@Column
             }
-            Text(
-                "A meeting no email-domain rule (Meetings settings) claims takes its host's default org.",
-                style = MaterialTheme.typography.bodySmall, color = muted,
-            )
             for (h in list) {
                 val k = h.host
                 val on = k !in busy
                 HorizontalDivider()
                 Text(h.device.ifEmpty { h.host }, fontWeight = FontWeight.SemiBold)
-                val orgs = h.orgs.orEmpty().filter { it.isNotEmpty() }
-                val own = if (h.org.isNotEmpty()) "Its own org (${orgLabel(h.org)})" else "No org"
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Default org", style = MaterialTheme.typography.bodyMedium)
-                    Picker(
-                        label = if (h.defaultOrg.isNotEmpty()) orgLabel(h.defaultOrg) else own,
-                        options = listOf("" to own) + orgs.map { it to orgLabel(it) },
-                        onPick = { v ->
-                            cvm.saveHost(k, buildJsonObject { put("defaultOrg", if (v.isEmpty()) JsonNull else JsonPrimitive(v)) })
-                        },
-                        modifier = Modifier.testTag("cal-host-default-$k"),
-                        enabled = on,
-                    )
-                }
+                Text(
+                    if (h.org.isNotEmpty()) orgLabel(h.org) else "No org",
+                    Modifier.testTag("cal-host-org-$k"), style = MaterialTheme.typography.bodySmall, color = muted,
+                )
                 CheckRow(
                     "Show private events", h.showPrivate,
                     { cvm.saveHost(k, buildJsonObject { put("showPrivate", it) }) },
@@ -1009,49 +1063,6 @@ private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost
         }
     }
 }
-
-/**
- * The event's org and the operator's per-series pick of it (XERK-2929, the web's
- * `seriesOrgHtml`): "Automatic" leaves it to the domain rules / host default /
- * host org. No "No org" pin: the hub refuses "" (XERK-2936).
- */
-@Composable
-private fun SeriesOrgRow(ev: CalendarEvent, h: com.xerktech.turma.model.CalendarHost, orgLabel: (String) -> String, cvm: CalendarViewModel) {
-    val busy by cvm.setBusy.collectAsStateWithLifecycle()
-    val errs by cvm.setErr.collectAsStateWithLifecycle()
-    val pinned = ev.seriesOrg != null
-    val auto = if (pinned) "Automatic" else "Automatic (${orgLabel(ev.org)})"
-    // Values are "auto" or "=" + the org, so no org key can collide with Automatic.
-    val options = listOf(AUTO_ORG to auto) + h.orgs.orEmpty().filter { it.isNotEmpty() }.map { "=$it" to orgLabel(it) }
-    val cur = ev.seriesOrg?.let { "=$it" } ?: AUTO_ORG
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Org", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Column(Modifier.weight(1f)) {
-            Picker(
-                label = options.firstOrNull { it.first == cur }?.second ?: orgLabel(ev.seriesOrg.orEmpty()),
-                options = options,
-                onPick = { v ->
-                    val id = ev.seriesId.ifEmpty { ev.id }
-                    cvm.saveHost(ev.host, buildJsonObject {
-                        put("series", buildJsonObject {
-                            put("id", id)
-                            put("org", if (v == AUTO_ORG) JsonNull else JsonPrimitive(v.removePrefix("=")))
-                        })
-                    })
-                },
-                modifier = Modifier.testTag("cal-series-org"),
-                enabled = ev.host !in busy,
-            )
-            if (ev.recurring) Text("for the whole series", style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            errs[ev.host]?.let { Text(it, color = TurmaColors.critical, style = MaterialTheme.typography.bodySmall) }
-        }
-    }
-}
-
-// The series picker's "Automatic" value; every other value starts with "=", so an org
-// named "auto" cannot collide with it (QA XERK-2929: a master token can mint any org key).
-private const val AUTO_ORG = "auto"
 
 @Composable
 private fun DetailRow(k: String, v: String) {

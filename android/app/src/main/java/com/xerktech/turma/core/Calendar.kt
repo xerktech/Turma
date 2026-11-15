@@ -27,8 +27,25 @@ import java.util.Locale
 
 const val CAL_DAY_MS = 86_400_000L
 const val CAL_MIN_LAYOUT_MIN = 20          // a shorter (or zero-length) event lays out as 20 minutes
-const val CAL_WORK_FROM_H = 8
+const val CAL_OPEN_AT_H = 8            // the grid opens scrolled here, an hour above the shaded band
+const val CAL_WORK_FROM_H = 9            // shaded working hours 9–17 (web: brief.html .cal-col)
 const val CAL_WORK_UNTIL_H = 17
+
+/** The zoom (XERK-2954, the web's ZOOMS): hours the grid's pane shows, widest first. */
+val CAL_ZOOMS = listOf(24f, 16f, 12f, 10f, 8f, 6f, 4f)
+const val CAL_ZOOM_DEFAULT_H = 10f          // 8 AM - 6 PM fills the pane
+const val CAL_SLOT_MIN_DP = 10f             // a row never shrinks below this (the web's floor)
+
+/** A pinch's hours held to the steps' range; an unreadable value is the default. */
+fun calZoomClamp(h: Float): Float =
+    if (h.isNaN()) CAL_ZOOM_DEFAULT_H else h.coerceIn(CAL_ZOOMS.last(), CAL_ZOOMS.first())
+
+/** The next step from [h]: [dir] > 0 zooms in (fewer hours). Null at that end. */
+fun calZoomStep(h: Float, dir: Int): Float? =
+    if (dir > 0) CAL_ZOOMS.firstOrNull { it < h - 0.01f } else CAL_ZOOMS.lastOrNull { it > h + 0.01f }
+
+/** One 30-minute row's height, in dp, for a [paneDp]-tall pane showing [hours] (the web's `--slot`). */
+fun calSlotDp(paneDp: Float, hours: Float): Float = maxOf(CAL_SLOT_MIN_DP, paneDp / (calZoomClamp(hours) * 2))
 const val CAL_UPCOMING_MS = 7 * CAL_DAY_MS // how far ahead the notes review lists calendar meetings
 const val CAL_DAILY_EVENT_MS = 20 * 60_000L // a daily entry and its calendar occurrence are one meeting
 
@@ -575,7 +592,7 @@ data class CalRange(
     val err: String = "",
     val truncated: Boolean = false,
     val have: Boolean = false,
-    // Each host's settings row (one that carries `orgs`, XERK-2929), by host key.
+    // Each host's settings row (XERK-2929), by host key.
     val hostRows: Map<String, CalendarHost> = emptyMap(),
 )
 
@@ -604,7 +621,7 @@ fun calCollect(days: List<LocalDate>, zone: ZoneId, weekOf: (LocalDate) -> CalWe
         for (n in calHostNotices(cal, from, calDayStartMs(ws.plusDays(7), zone))) {
             if (n.host !in hosts || n.syncing) hosts[n.host] = n
         }
-        for (h in cal.hosts) if (h.host.isNotEmpty() && h.orgs != null) hostRows[h.host] = h
+        for (h in cal.hosts) if (h.host.isNotEmpty()) hostRows[h.host] = h
         for (h in w.hol.orEmpty()) if (h.date.isNotEmpty()) hol["${h.date}\u0000${h.id}"] = h
     }
     val list = evs.values.sortedWith(compareBy<CalendarEvent> { it.startMs }.thenBy { it.endMs })

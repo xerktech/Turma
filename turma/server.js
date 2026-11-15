@@ -684,10 +684,11 @@ const MEETING_FOCUS_FILE = process.env.MEETING_FOCUS_FILE || "/data/meeting-focu
 // Each org's holiday catalogs and days off (XERK-2892): siteKey -> {countries, off}.
 const HOLIDAY_SETTINGS_FILE = process.env.HOLIDAY_SETTINGS_FILE || "/data/holiday-settings.json";
 // The Calendar (XERK-2891, contract-calendar.md): each host's Outlook events, and
-// the operator's org-assignment settings.
+// each host's calendar settings (private-event opt-in).
 const CALENDAR_EVENTS_FILE = process.env.CALENDAR_EVENTS_FILE || "/data/calendar-events.json";
-const CALENDAR_ORG_RULES_FILE = process.env.CALENDAR_ORG_RULES_FILE || "/data/calendar-org-rules.json";
 const CALENDAR_HOST_SETTINGS_FILE = process.env.CALENDAR_HOST_SETTINGS_FILE || "/data/calendar-host-settings.json";
+// Events made in Turma (XERK-2968): tenant -> eventId -> record, each in one or more orgs.
+const CALENDAR_TURMA_EVENTS_FILE = process.env.CALENDAR_TURMA_EVENTS_FILE || "/data/calendar-turma-events.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
@@ -5815,8 +5816,6 @@ const CALENDAR_SERVE_MAX = 5000;
 const CALENDAR_SERVE_SPAN_MS = 100 * 86400000;
 const CALENDAR_ONDEMAND_MIN_MS = 60 * 1000;
 const CALENDAR_HOST_RETAIN_MS = 30 * 86400000;
-const CALENDAR_DOMAINS_MAX = 50;
-const CALENDAR_SERIES_MAX = 500;
 const CAL_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere", "unknown"]);
 const CAL_RESPONSE = new Set(["none", "organizer", "tentative", "accepted", "declined", "notResponded", "unknown"]);
 const CAL_ROLE = new Set(["organizer", "required", "optional", "resource", "unknown"]);
@@ -5828,7 +5827,6 @@ const CAL_EMAIL_PART = "[^@\\s/\"<>`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c
 const CAL_EMAIL_RE = new RegExp(`^${CAL_EMAIL_PART}@${CAL_EMAIL_PART}\\.${CAL_EMAIL_PART}$`);
 const CAL_ID_RE = /^[^\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]{1,300}$/;
 const CAL_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$/;
-const CAL_DOMAIN_RE = /^(?=.{1,253}$)[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
 const CAL_URL_RE = /^https:\/\/[^\s"'<>\\`]+$/;
 
 const calMs = (v) => (Number.isSafeInteger(v) && v > 0 ? v : 0);
@@ -5919,41 +5917,13 @@ const persistCalendarEvents = registerExternalStore({
   coerce: calendarEventsCoerce, read: () => calendarEvents, install: (v) => { calendarEvents = v; },
 });
 
-// Settings: per-org domain rules (siteKey -> {domains}) and per-host settings
-// (hostKey -> {defaultOrg?, showPrivate?, seriesOrgs}). Two stores, so the org
-// one rides TENANT_ORG_STORES' purge + migration like every org-keyed store.
-function calDomains(v) {
-  if (!Array.isArray(v) || v.length > CALENDAR_DOMAINS_MAX) return null;
-  const out = [];
-  for (const d of v) {
-    if (typeof d !== "string") return null;
-    const x = d.trim().toLowerCase().replace(/^@/, "");
-    if (!CAL_DOMAIN_RE.test(x)) return null;
-    if (!out.includes(x)) out.push(x);
-  }
-  return out;
-}
-function calendarOrgRulesCoerce(raw) {
-  const out = Object.create(null);
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
-  for (const [site, o] of Object.entries(raw).slice(0, 2000)) {
-    const d = site && site.length <= 200 && o && typeof o === "object" ? calDomains(o.domains) : null;
-    if (d && d.length) out[site] = { domains: d };
-  }
-  return out;
-}
+// Settings: per-host (hostKey -> {showPrivate?}). An event's org is never a setting:
+// it is its host's decided org (XERK-2964), so the store holds the private opt-in only.
+// An older store's defaultOrg/seriesOrgs are dropped on load.
 function sanitizeCalendarHostSettings(h) {
   if (!h || typeof h !== "object" || Array.isArray(h)) return null;
   const e = {};
-  if (typeof h.defaultOrg === "string" && h.defaultOrg && h.defaultOrg.length <= 200) e.defaultOrg = h.defaultOrg;
   if (h.showPrivate === true) e.showPrivate = true;
-  const so = Object.create(null);
-  if (h.seriesOrgs && typeof h.seriesOrgs === "object" && !Array.isArray(h.seriesOrgs)) {
-    for (const [id, org] of Object.entries(h.seriesOrgs).slice(-CALENDAR_SERIES_MAX)) {
-      if (calId(id) && typeof org === "string" && org && org.length <= 200) so[id] = org;
-    }
-  }
-  e.seriesOrgs = so;
   return e;
 }
 function calendarHostSettingsCoerce(raw) {
@@ -5965,16 +5935,100 @@ function calendarHostSettingsCoerce(raw) {
   }
   return out;
 }
-let calendarOrgRules = calendarOrgRulesCoerce(readJsonFile(CALENDAR_ORG_RULES_FILE));
-const persistCalendarOrgRules = registerExternalStore({
-  name: "calendarOrgRules", file: CALENDAR_ORG_RULES_FILE,
-  coerce: calendarOrgRulesCoerce, read: () => calendarOrgRules, install: (v) => { calendarOrgRules = v; },
-});
 let calendarHostSettings = calendarHostSettingsCoerce(readJsonFile(CALENDAR_HOST_SETTINGS_FILE));
 const persistCalendarHostSettings = registerExternalStore({
   name: "calendarHostSettings", file: CALENDAR_HOST_SETTINGS_FILE,
   coerce: calendarHostSettingsCoerce, read: () => calendarHostSettings,
   install: (v) => { calendarHostSettings = v; },
+});
+
+// ---- Turma-created events (XERK-2968) ------------------------------------------
+// Events made in Turma, owned by the hub and never written to Outlook: tenant id
+// ("" = untenanted) -> eventId -> record. Keyed by TENANT because one event may
+// belong to several orgs of that tenant. Contract: contract-calendar.md
+// ("Turma-created events").
+const CALENDAR_TURMA_EVENTS_MAX = 1500;           // per tenant (a host's Outlook cap)
+const CALENDAR_TURMA_BYTES_MAX = 2 << 20;         // per tenant, JSON bytes
+const CALENDAR_TURMA_ORGS_MAX = 20;
+const CALENDAR_TURMA_BODY_MAX = 64 << 10;         // a route's request body
+const CALENDAR_TURMA_ORG_GRACE_MS = 864e5;        // undecided this long -> dropped from orgs
+const CAL_TURMA_ID_RE = /^turma:[0-9a-f]{16}$/;
+const CAL_TURMA_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere"]);
+const CAL_TURMA_ROLE = new Set(["required", "optional"]);
+const CAL_TENANT_BUCKET_RE = /^(?:[0-9a-f]{32})?$/;
+const CAL_ACTOR_RE = /^[\w.:@-]{1,200}$/;
+// The fields a client writes; everything else on a record is the hub's.
+const CAL_TURMA_FIELDS = ["subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
+  "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity"];
+
+// An IANA zone the runtime knows, in its canonical spelling (so the coerce is a
+// fixed point), else "".
+function calTimeZone(v) {
+  if (typeof v !== "string" || !v || v.length > 64) return "";
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: v }).resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+}
+// The ONE record whitelist (routes, boot restore, HA watch) for tenant `t`'s
+// bucket. Field order is fixed and every value re-derives to itself.
+function sanitizeTurmaEvent(v, t) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const id = typeof v.id === "string" && CAL_TURMA_ID_RE.test(v.id) ? v.id : "";
+  const start = calIso(v.start);
+  const end = calIso(v.end);
+  if (!id || !start || !end) return null;
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  if (endMs < startMs) return null;
+  const orgs = [];
+  for (const o of Array.isArray(v.orgs) ? v.orgs.slice(0, CALENDAR_TURMA_ORGS_MAX) : []) {
+    if (typeof o === "string" && o && o.length <= 200 && tenantOfSite(o) === t && !orgs.includes(o)) orgs.push(o);
+  }
+  if (!orgs.length) return null;
+  const attendees = [];
+  for (const p of Array.isArray(v.attendees) ? v.attendees.slice(0, 100) : []) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) continue;
+    attendees.push({ name: meetingText(p.name, 100), email: calEmail(p.email),
+      role: typeof p.role === "string" && CAL_TURMA_ROLE.has(p.role) ? p.role : "required" });
+  }
+  const categories = (Array.isArray(v.categories) ? v.categories.slice(0, 20) : [])
+    .map((c) => meetingText(c, 100)).filter(Boolean);
+  const url = meetingText(v.joinUrl, 500);
+  return {
+    id, orgs, subject: meetingText(v.subject, 300), start, end, startMs, endMs,
+    timeZone: calTimeZone(v.timeZone) || "UTC", allDay: v.allDay === true,
+    location: meetingText(v.location, 300), body: meetingText(v.body, CALENDAR_BODY_MAX, true), attendees,
+    joinUrl: CAL_URL_RE.test(url) ? url : "", isOnlineMeeting: v.isOnlineMeeting === true,
+    busy: typeof v.busy === "string" && CAL_TURMA_BUSY.has(v.busy) ? v.busy : "busy", categories,
+    sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
+    // Filled by the recurrence child (XERK-2969); until then every event is single.
+    recurrence: null,
+    createdBy: typeof v.createdBy === "string" && CAL_ACTOR_RE.test(v.createdBy) ? v.createdBy : "",
+    createdAt: calMs(v.createdAt), updatedAt: calMs(v.updatedAt),
+    version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
+  };
+}
+function calendarTurmaEventsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [t, bucket] of Object.entries(raw).slice(0, 2000)) {
+    if (!CAL_TENANT_BUCKET_RE.test(t) || !bucket || typeof bucket !== "object" || Array.isArray(bucket)) continue;
+    const b = Object.create(null);
+    for (const [id, rec] of Object.entries(bucket).slice(0, CALENDAR_TURMA_EVENTS_MAX)) {
+      const ev = sanitizeTurmaEvent(rec, t);
+      if (ev && ev.id === id) b[id] = ev;
+    }
+    if (Object.keys(b).length) out[t] = b;
+  }
+  return out;
+}
+let calendarTurmaEvents = calendarTurmaEventsCoerce(readJsonFile(CALENDAR_TURMA_EVENTS_FILE));
+const persistCalendarTurmaEvents = registerExternalStore({
+  name: "calendarTurmaEvents", file: CALENDAR_TURMA_EVENTS_FILE,
+  coerce: calendarTurmaEventsCoerce, read: () => calendarTurmaEvents,
+  install: (v) => { calendarTurmaEvents = v; },
 });
 
 // ---- budget --------------------------------------------------------------------
@@ -6168,6 +6222,13 @@ function calendarOnBeat(key, prev, next, rows, now = Date.now()) {
   } catch (e) {
     console.error(`calendar ingest failed: ${e && e.message}`);
   }
+  // Every event takes its host's org (XERK-2964), so the host's decided org moving (a
+  // drift, its recovery) moves all of them: clients re-read, and captures linked to them
+  // go back to the matcher, rather than waiting for a sync that happens to change events.
+  if (prev && calendarEvents[key] && decidedOrgOf(prev) !== decidedOrgOf(next)) {
+    broadcastCalendarSoon(key);
+    scheduleCalendarRelink(tenantOfKey(key));
+  }
   if (!calendarCapable(next)) return;
   const wasLive = prev && calendarCapable(prev) && prev.lastSeen && now - prev.lastSeen <= OFFLINE_AFTER_MS;
   if (!wasLive) {
@@ -6195,37 +6256,16 @@ function calendarOfflineEdge(key, a, now) {
 }
 
 // ---- serving -------------------------------------------------------------------
-function calendarOrgsOfTenant(t) {
-  return [...decidedOrgs()].filter((s) => tenantOfSite(s) === t);
-}
-function calDomainOf(email) {
-  return email ? email.slice(email.lastIndexOf("@") + 1) : "";
-}
-// An event's org (XERK-2936): every event of a host decided into an org has one. A rule or
-// setting can name another org of the tenant; with none, it is the host's own decided org.
-function calendarEventOrg(key, ev, orgs, hs) {
-  const so = hs && hs.seriesOrgs;
-  const sid = ev.seriesId || ev.id;
-  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) return so[sid];
-  const match = (d) => (d ? orgs.filter((s) => Object.hasOwn(calendarOrgRules, s) &&
-    calendarOrgRules[s].domains.some((x) => d === x || d.endsWith("." + x))) : []);
-  const orgEmail = ev.organizerEmail || (ev.attendees.find((p) => p.role === "organizer") || {}).email || "";
-  const byOrganizer = match(calDomainOf(orgEmail));
-  if (byOrganizer.length === 1) return byOrganizer[0];
-  const hits = new Set();
-  for (const p of ev.attendees) for (const s of match(calDomainOf(p.email))) hits.add(s);
-  if (hits.size === 1) return [...hits][0];
-  if (hs && hs.defaultOrg && orgs.includes(hs.defaultOrg)) return hs.defaultOrg;
+// An event's org (XERK-2964): its host's decided org, always. The agent that read the
+// event is tied to one org, so no rule, default or per-series pick may move it; "" only
+// for a host in no decided org (an older hub let settings choose, XERK-2929).
+function calendarEventOrg(key) {
   return agents[key] ? decidedOrgOf(agents[key]) : "";
 }
-function calendarEventWire(key, ev, orgs, hs) {
+function calendarEventWire(key, ev, hs) {
   // `meeting` (XERK-2936): a real meeting by the matcher's rule, judged BEFORE a private
   // event's attendees and join link are withheld, so clients never re-derive it.
-  const out = { host: key, org: calendarEventOrg(key, ev, orgs, hs), ...ev, meeting: calendarLinkCandidate(ev) };
-  // The operator's per-series pick, so the event panel shows it (XERK-2929) — only a pin
-  // that still counts (calendarEventOrg skips one naming an org no host is in).
-  const so = hs && hs.seriesOrgs, sid = ev.seriesId || ev.id;
-  if (so && Object.hasOwn(so, sid) && orgs.includes(so[sid])) out.seriesOrg = so[sid];
+  const out = { host: key, org: calendarEventOrg(key), ...ev, meeting: calendarLinkCandidate(ev) };
   if ((ev.sensitivity === "private" || ev.sensitivity === "confidential") && !(hs && hs.showPrivate)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", organizer: "",
       organizerEmail: "", attendees: [], joinUrl: "", categories: [], private: true });
@@ -6249,10 +6289,9 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       syncedAt: h ? h.syncedAt : 0, windowFrom: h ? h.windowFrom : 0, windowUntil: h ? h.windowUntil : 0,
       ranges: h ? h.ranges : [] };
     if (h && h.lastError) Object.assign(row, { lastError: h.lastError, lastErrorAt: h.lastErrorAt });
-    // Its settings and the orgs they may name, for the settings UI (XERK-2929).
+    // Its org (every event's, XERK-2964) and private opt-in, for the settings UI.
     const hs0 = calendarHostSettings[key];
-    Object.assign(row, { org: a ? decidedOrgOf(a) : "", orgs: calendarOrgsOfTenant(tenantOfKey(key)).sort(),
-      defaultOrg: (hs0 && hs0.defaultOrg) || "", showPrivate: !!(hs0 && hs0.showPrivate) });
+    Object.assign(row, { org: a ? decidedOrgOf(a) : "", showPrivate: !!(hs0 && hs0.showPrivate) });
     const covered = h && h.ranges.some((r) => r[0] <= from && r[1] >= until);
     if (!covered && row.online && calendarCapable(a)) {
       const queued = (a.commands || []).find((c) => c && c.type === "syncCalendar" && c.from <= from && c.until >= until);
@@ -6265,11 +6304,10 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
     }
     hosts.push(row);
     if (!h) continue;
-    const orgs = calendarOrgsOfTenant(tenantOfKey(key));
     const hs = calendarHostSettings[key];
     for (const ev of h.events) {
       if (ev.startMs >= until || ev.endMs < from || (ev.endMs === from && ev.endMs !== ev.startMs)) continue;
-      const w = calendarEventWire(key, ev, orgs, hs);
+      const w = calendarEventWire(key, ev, hs);
       if (orgFilter && !orgFilter.has(w.org)) continue;
       const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
       w.meetings = tenir.links.get(lk) || [];
@@ -6280,7 +6318,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       events.push({ source: "outlook", ...w });
     }
   }
-  events = events.concat(tenir.entries, ...tenir.linked.values());
+  events = events.concat(tenir.entries, ...tenir.linked.values(), calendarTurmaView(p, from, until, orgFilter));
   events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const truncated = events.length > CALENDAR_SERVE_MAX;
@@ -6311,55 +6349,260 @@ function broadcastCalendarSoon(key) {
 }
 
 // ---- settings routes' logic --------------------------------------------------
-function setCalendarOrgRules(siteKey, body) {
-  const d = body && typeof body === "object" && !Array.isArray(body) ? calDomains(body.domains) : null;
-  if (!d) {
-    return { status: 400, body: { error: `domains must be a list of at most ${CALENDAR_DOMAINS_MAX} ` +
-      "email domains, e.g. [\"acme.com\"]" } };
-  }
-  if (d.length) calendarOrgRules[siteKey] = { domains: d };
-  else delete calendarOrgRules[siteKey];
-  persistCalendarOrgRules();
-  invalidateAgentsCache();
-  sseBroadcast("calendarOrgRules", calendarOrgRules);
-  for (const k of Object.keys(calendarEvents)) if (tenantOfKey(k) === tenantOfSite(siteKey)) broadcastCalendarSoon(k);
-  scheduleCalendarRelink(tenantOfSite(siteKey));
-  return { status: 200, body: { ok: true, rules: d.length ? { domains: d } : null } };
-}
+// A host's calendar settings: the private-event opt-in only. An event's org is its host's
+// (XERK-2964), so an older client's defaultOrg / series pick is refused in words.
 function setCalendarHostSettings(key, body) {
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return { status: 400, body: { error: "body must be {defaultOrg?, showPrivate?, series?: {id, org}}" } };
+  if (body && typeof body === "object" && !Array.isArray(body) && ("defaultOrg" in body || "series" in body)) {
+    return { status: 400, body: { error: "an Outlook event's org is its host's org and cannot be set" } };
   }
-  const orgs = calendarOrgsOfTenant(tenantOfKey(key));
-  const okOrg = (o) => o === null || (typeof o === "string" && orgs.includes(o));
+  if (!body || typeof body !== "object" || Array.isArray(body) || typeof body.showPrivate !== "boolean") {
+    return { status: 400, body: { error: "body must be {showPrivate: true|false}" } };
+  }
   const cur = sanitizeCalendarHostSettings(calendarHostSettings[key] || {});
-  if ("defaultOrg" in body) {
-    if (!okOrg(body.defaultOrg)) return { status: typeof body.defaultOrg === "string" ? 404 : 400, body: { error: "defaultOrg is not an org of this host's tenant that a host is in" } };
-    if (body.defaultOrg === null) delete cur.defaultOrg;
-    else cur.defaultOrg = body.defaultOrg;
-  }
-  if ("showPrivate" in body) {
-    if (typeof body.showPrivate !== "boolean") return { status: 400, body: { error: "showPrivate must be true or false" } };
-    if (body.showPrivate) cur.showPrivate = true;
-    else delete cur.showPrivate;
-  }
-  if ("series" in body) {
-    const s = body.series;
-    if (!s || typeof s !== "object" || !calId(s.id) || !(s.org === null || okOrg(s.org))) {
-      // 404 only for a well-formed series naming an org this tenant lacks; a
-      // non-string org, "" (no org is not an org, XERK-2936) or a bad id is a
-      // malformed body, 400 (rollup XERK-2944).
-      return { status: s && typeof s === "object" && calId(s.id) && typeof s.org === "string" && s.org !== "" ? 404 : 400,
-        body: { error: "series must be {id, org}: org an org of this host's tenant, or null to clear" } };
-    }
-    delete cur.seriesOrgs[s.id];
-    if (s.org !== null) cur.seriesOrgs[s.id] = s.org;
-  }
+  if (body.showPrivate) cur.showPrivate = true;
+  else delete cur.showPrivate;
   calendarHostSettings[key] = sanitizeCalendarHostSettings(cur);
   persistCalendarHostSettings();
   broadcastCalendarSoon(key);
-  scheduleCalendarRelink(tenantOfKey(key));
   return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
+}
+
+// ---- Turma-created events: routes' logic and serving (XERK-2968) ----------------
+// Who made an event, as its record keeps it: a user's id, else the principal kind.
+const calTurmaActor = (p) => (!p ? "" : p.kind === "user" ? `user:${p.userId}` : String(p.kind));
+// The tenant-level `calendar` frame key: the SSE scoper's mayHost passes it to that
+// tenant's viewers only, like a host key of the tenant.
+const calTurmaFrameKey = (t) => tenantHostKey("turma:events", t);
+// The caller may edit an event only when it may see EVERY org on it, so nobody
+// strips an org they cannot see.
+const calTurmaMayEdit = (p, rec) => rec.orgs.every((o) => principalMaySite(p, o));
+const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
+
+// The served form for principal `p`; `served` = the orgs still decided.
+function turmaEventWire(p, rec, served = rec.orgs) {
+  const out = { source: "turma", host: "", ...rec, orgs: served, org: served[0] || "",
+    editable: calTurmaMayEdit(p, rec), meeting: calendarLinkCandidate(rec) };
+  if ((rec.sensitivity === "private" || rec.sensitivity === "confidential") && rec.createdBy !== calTurmaActor(p)) {
+    Object.assign(out, { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "",
+      categories: [], private: true });
+  }
+  return out;
+}
+// The Turma events overlapping [from, until) that `p` may see, filtered on ANY org.
+function calendarTurmaView(p, from, until, orgFilter) {
+  const out = [];
+  const decided = decidedOrgs();
+  // principalMaySite on each org is the tenant boundary: a record's orgs are all of its tenant.
+  for (const bucket of Object.values(calendarTurmaEvents)) {
+    for (const rec of Object.values(bucket)) {
+      if (rec.startMs >= until || rec.endMs < from || (rec.endMs === from && rec.endMs !== rec.startMs)) continue;
+      const served = rec.orgs.filter((o) => decided.has(o) && principalMaySite(p, o));
+      if (!served.length || (orgFilter && !served.some((o) => orgFilter.has(o)))) continue;
+      out.push(turmaEventWire(p, rec, served));
+    }
+  }
+  return out;
+}
+
+// A 400 naming the first malformed client field of `b`, or null. Never coerces a
+// wrong value into a different event.
+function turmaEventFieldError(b) {
+  const cps = (s) => [...s].length;
+  for (const k of ["start", "end"]) {
+    if (k in b && !calIso(b[k])) return `${k} must be an ISO 8601 time with its offset, e.g. 2026-11-16T09:00:00-05:00`;
+  }
+  if ("timeZone" in b && !calTimeZone(b.timeZone)) return "timeZone must be an IANA time zone, e.g. America/New_York";
+  for (const [k, max] of [["subject", 300], ["location", 300], ["body", CALENDAR_BODY_MAX], ["joinUrl", 500]]) {
+    if (!(k in b)) continue;
+    if (typeof b[k] !== "string") return `${k} must be a string`;
+    if (cps(b[k]) > max) return `${k} is longer than ${max} characters`;
+  }
+  if ("joinUrl" in b && b.joinUrl.trim() && !CAL_URL_RE.test(meetingText(b.joinUrl, 500))) {
+    return "joinUrl must be an https:// link";
+  }
+  for (const k of ["allDay", "isOnlineMeeting"]) {
+    if (k in b && typeof b[k] !== "boolean") return `${k} must be true or false`;
+  }
+  if ("busy" in b && !CAL_TURMA_BUSY.has(b.busy)) return `busy must be one of ${[...CAL_TURMA_BUSY].join(", ")}`;
+  if ("sensitivity" in b && !CAL_SENSITIVITY.has(b.sensitivity)) {
+    return `sensitivity must be one of ${[...CAL_SENSITIVITY].join(", ")}`;
+  }
+  if ("categories" in b && (!Array.isArray(b.categories) || b.categories.length > 20 ||
+      !b.categories.every((c) => typeof c === "string" && cps(c) <= 100))) {
+    return "categories must be a list of at most 20 names of at most 100 characters";
+  }
+  if ("attendees" in b) {
+    if (!Array.isArray(b.attendees) || b.attendees.length > 100) return "attendees must be a list of at most 100";
+    for (const a of b.attendees) {
+      if (!a || typeof a !== "object" || Array.isArray(a)) return "each attendee must be {name, email, role}";
+      if ("name" in a && (typeof a.name !== "string" || cps(a.name) > 100)) return "an attendee's name must be a string of at most 100 characters";
+      if ("email" in a && (typeof a.email !== "string" || (a.email.trim() && !calEmail(a.email)))) {
+        return "an attendee's email must be an email address";
+      }
+      if ("role" in a && !CAL_TURMA_ROLE.has(a.role)) return "an attendee's role must be required or optional";
+    }
+  }
+  if ("recurrence" in b && b.recurrence !== null) return "recurring Turma events are not supported yet";
+  return null;
+}
+// {status, body} refusing `orgs` for principal `p`, or null when every org may be used.
+function turmaEventOrgsError(p, orgs) {
+  if (!Array.isArray(orgs) || !orgs.every((o) => typeof o === "string" && o)) {
+    return { status: 400, body: { error: "orgs must be a list of org keys" } };
+  }
+  if (!orgs.length) return { status: 400, body: { error: "an event must belong to at least one org" } };
+  if (orgs.length > CALENDAR_TURMA_ORGS_MAX) {
+    return { status: 400, body: { error: `an event belongs to at most ${CALENDAR_TURMA_ORGS_MAX} orgs` } };
+  }
+  const decided = decidedOrgs();
+  for (const o of orgs) {
+    // Another tenant's org reads as one no host is in: never says it exists.
+    if (!decided.has(o) || !principalMaySite(p, o)) return { status: 404, body: { error: `no host is in org ${o}` } };
+  }
+  if (new Set(orgs.map(tenantOfSite)).size > 1) {
+    return { status: 400, body: { error: "an event's orgs must all belong to one tenant" } };
+  }
+  return null;
+}
+// A 409 when putting `rec` (replacing its id) would take tenant `t` past its caps.
+function turmaEventCapError(t, rec) {
+  const bucket = calendarTurmaEvents[t] || {};
+  const isNew = !Object.hasOwn(bucket, rec.id);
+  const count = Object.keys(bucket).length + (isNew ? 1 : 0);
+  if (isNew && count > CALENDAR_TURMA_EVENTS_MAX) {
+    return { status: 409, body: { error: `the hub keeps at most ${CALENDAR_TURMA_EVENTS_MAX} Turma events per tenant; ` +
+      "delete some before creating more" } };
+  }
+  let bytes = calTurmaBytes(rec);
+  for (const [id, r] of Object.entries(bucket)) if (id !== rec.id) bytes += calTurmaBytes(r);
+  if (bytes > CALENDAR_TURMA_BYTES_MAX) {
+    return { status: 409, body: { error: `the hub keeps at most ${CALENDAR_TURMA_BYTES_MAX >> 20} MiB of Turma events ` +
+      "per tenant; delete some or shorten their descriptions" } };
+  }
+  return null;
+}
+const calPick = (b) => Object.fromEntries(CAL_TURMA_FIELDS.filter((k) => k in b).map((k) => [k, b[k]]));
+function calTurmaStore(t, rec) {
+  if (!calendarTurmaEvents[t]) calendarTurmaEvents[t] = Object.create(null);
+  calendarTurmaEvents[t][rec.id] = rec;
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(t));
+}
+// The event `id` among the tenants `p` may see and edit -> {t, rec} | {status, body}.
+function calTurmaFind(p, id) {
+  if (typeof id !== "string" || !id.startsWith("turma:")) {
+    return { status: 400, body: { error: "Outlook events are read-only: change them in Outlook" } };
+  }
+  for (const [t, bucket] of Object.entries(calendarTurmaEvents)) {
+    if (Object.hasOwn(bucket, id) && calTurmaMayEdit(p, bucket[id])) return { t, rec: bucket[id] };
+  }
+  return { status: 404, body: { error: "no such Turma event" } };
+}
+function createTurmaEvent(p, body, now = Date.now()) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {orgs, subject, start, end, timeZone?, ...}" } };
+  }
+  const oe = turmaEventOrgsError(p, body.orgs);
+  if (oe) return oe;
+  if (!("start" in body) || !("end" in body)) return { status: 400, body: { error: "start and end are required" } };
+  const fe = turmaEventFieldError(body);
+  if (fe) return { status: 400, body: { error: fe } };
+  const t = tenantOfSite(body.orgs[0]);
+  let id;
+  do id = `turma:${crypto.randomBytes(8).toString("hex")}`;
+  while (calendarTurmaEvents[t] && Object.hasOwn(calendarTurmaEvents[t], id));
+  const rec = sanitizeTurmaEvent({ ...calPick(body), id, orgs: body.orgs, createdBy: calTurmaActor(p),
+    createdAt: now, updatedAt: now, version: 1 }, t);
+  if (!rec) return { status: 400, body: { error: "end must not be before start" } };
+  const full = turmaEventCapError(t, rec);
+  if (full) return full;
+  calTurmaStore(t, rec);
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+}
+function patchTurmaEvent(p, id, body, now = Date.now()) {
+  const f = calTurmaFind(p, id);
+  if (f.status) return f;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {version, orgs?, ...fields}" } };
+  }
+  if (!Number.isSafeInteger(body.version)) {
+    return { status: 400, body: { error: "version is required: the event's version this edit was made to" } };
+  }
+  if (body.version !== f.rec.version) {
+    return { status: 409, body: { error: "this event was changed since you opened it; reload it and edit again",
+      event: turmaEventWire(p, f.rec) } };
+  }
+  if ("orgs" in body) {
+    const oe = turmaEventOrgsError(p, body.orgs);
+    if (oe) return oe;
+    if (tenantOfSite(body.orgs[0]) !== f.t) return { status: 404, body: { error: `no host is in org ${body.orgs[0]}` } };
+  }
+  const fe = turmaEventFieldError(body);
+  if (fe) return { status: 400, body: { error: fe } };
+  const rec = sanitizeTurmaEvent({ ...f.rec, ...calPick(body), orgs: "orgs" in body ? body.orgs : f.rec.orgs,
+    updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
+  if (!rec) return { status: 400, body: { error: "end must not be before start" } };
+  const full = turmaEventCapError(f.t, rec);
+  if (full) return full;
+  calTurmaStore(f.t, rec);
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+}
+function deleteTurmaEvent(p, id) {
+  const f = calTurmaFind(p, id);
+  if (f.status) return f;
+  delete calendarTurmaEvents[f.t][id];
+  if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(f.t));
+  return { status: 200, body: { ok: true } };
+}
+// The Turma-event routes' shared tail (XERK-2968): parse the body, run the logic.
+async function turmaEventRoute(req, res, id) {
+  let body = null;
+  if (req.method !== "DELETE") {
+    try {
+      body = JSON.parse((await readBody(req, CALENDAR_TURMA_BODY_MAX)) || "null");
+    } catch (e) {
+      if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+      return json(res, 400, { error: "body is not JSON" });
+    }
+  }
+  const p = requestPrincipal(req);
+  const out = req.method === "POST" ? createTurmaEvent(p, body)
+    : req.method === "PATCH" ? patchTurmaEvent(p, id, body) : deleteTurmaEvent(p, id);
+  return json(res, out.status, out.body);
+}
+// An org no host has been decided into for CALENDAR_TURMA_ORG_GRACE_MS leaves
+// every event's orgs; an event left with none is deleted. In memory: a restart
+// restarts the grace (the safe direction), and a host's brief drift out of its
+// org (decidedOrgOf "") never wipes that org's events. Serving hides it at once.
+const calTurmaOrgGoneAt = new Map();
+function calendarTurmaTick(now = Date.now()) {
+  const decided = decidedOrgs();
+  const seen = new Set();
+  let changed = 0;
+  for (const [t, bucket] of Object.entries(calendarTurmaEvents)) {
+    let touched = false;
+    for (const [id, rec] of Object.entries(bucket)) {
+      const keep = rec.orgs.filter((o) => {
+        if (decided.has(o)) return true;
+        seen.add(o);
+        if (!calTurmaOrgGoneAt.has(o)) calTurmaOrgGoneAt.set(o, now);
+        return now - calTurmaOrgGoneAt.get(o) < CALENDAR_TURMA_ORG_GRACE_MS;
+      });
+      if (keep.length === rec.orgs.length) continue;
+      touched = true;
+      changed++;
+      if (keep.length) bucket[id] = sanitizeTurmaEvent({ ...rec, orgs: keep, updatedAt: Math.max(now, rec.updatedAt),
+        version: rec.version + 1 }, t);
+      else delete bucket[id];
+    }
+    if (!Object.keys(bucket).length) delete calendarTurmaEvents[t];
+    if (touched) broadcastCalendarSoon(calTurmaFrameKey(t));
+  }
+  for (const o of calTurmaOrgGoneAt.keys()) if (!seen.has(o)) calTurmaOrgGoneAt.delete(o);
+  if (changed) persistCalendarTurmaEvents();
+  return changed;
 }
 
 // A host gone from the registry keeps its calendar CALENDAR_HOST_RETAIN_MS past
@@ -6379,6 +6622,7 @@ function calendarTick(now = Date.now()) {
   if (n) { persistCalendarEvents(); persistCalendarHostSettings(); }
   // An auto link to an event that just went has nothing to hold (XERK-2896).
   for (const t of tenants) scheduleCalendarRelink(t);
+  calendarTurmaTick(now);
   return n;
 }
 
@@ -6434,12 +6678,11 @@ function calendarLinkCandidate(ev) {
 // sorted by start, plus the lookup.
 function calendarCandidateIndex(t) {
   const list = [];
-  const orgs = calendarOrgsOfTenant(t);
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t) continue;
-    const hs = calendarHostSettings[key];
+    const org = calendarEventOrg(key);
     for (const ev of h.events) {
-      if (calendarLinkCandidate(ev)) list.push({ key, ev, org: calendarEventOrg(key, ev, orgs, hs) });
+      if (calendarLinkCandidate(ev)) list.push({ key, ev, org });
     }
   }
   list.sort((a, b) => a.ev.startMs - b.ev.startMs);
@@ -6520,13 +6763,11 @@ function meetingCalendarLinkFields(siteKey, m, index) {
     return { calendarEventId: m.calendarEventId, calendarBy: "operator", calendarAmbiguous: undefined };
   }
   const keep = { calendarEventId: m.calendarEventId, calendarBy: "auto", calendarAmbiguous: undefined };
-  // The stored copy that still counts for this org. None = the event was
-  // reassigned to another org (rule, default or series override) and the link goes
-  // back to the matcher. Any host's copy counts: one id on two hosts of different
-  // orgs is one meeting (XERK-2896 QA).
-  const orgs = calendarOrgsOfTenant(index.t);
+  // The stored copy that still counts for this org. None = its host left the org and
+  // the link goes back to the matcher. Any host's copy counts: one id on two hosts of
+  // different orgs is one meeting (XERK-2896 QA).
   const cur = m.calendarEventId && (index.copies.get(m.calendarEventId) || [])
-    .find((c) => calendarEventOrg(c.key, c.ev, orgs, calendarHostSettings[c.key]) === siteKey);
+    .find((c) => calendarEventOrg(c.key) === siteKey);
   if (cur) {
     if (cur.ev.canceled || !calOverlapsCapture(m, cur.ev)) return keep;
     const hit = calendarBestMatch(siteKey, m, index);
@@ -6560,8 +6801,8 @@ function scheduleCalendarRelink(t, now = Date.now()) {
   calendarRelinkTimers.set(t, timer);
   return false;
 }
-// Re-run the matcher over every meeting of tenant `t` (a calendar sync, or an org
-// rule / host setting that can move an event's org). One write for all changes.
+// Re-run the matcher over every meeting of tenant `t` (a calendar sync, or a host's
+// decided org moving, which moves its events' org). One write for all changes.
 function relinkTenantMeetings(t) {
   let index = null;
   let changed = false;
@@ -6589,14 +6830,12 @@ function relinkTenantMeetings(t) {
 const CALENDAR_WIRE_ATTENDEES_MAX = 30;
 function meetingCalendarEventWire(siteKey, m, index) {
   const ix = index && index.t === tenantOfSite(siteKey) ? index : calendarEventLookup(tenantOfSite(siteKey));
-  const orgs = calendarOrgsOfTenant(ix.t);
   // The copy counting for the capture's org (newest first), else the newest copy.
   const all = ix.copies.get(m.calendarEventId) || [];
-  const c = all.find((x) => calendarEventOrg(x.key, x.ev, orgs, calendarHostSettings[x.key]) === siteKey) || all[0];
+  const c = all.find((x) => calendarEventOrg(x.key) === siteKey) || all[0];
   if (!c) return null;
-  const hs = calendarHostSettings[c.key];
-  const w = calendarEventWire(c.key, c.ev, orgs, hs);
-  const out = { host: c.key, org: calendarEventOrg(c.key, c.ev, orgs, hs), subject: w.subject,
+  const w = calendarEventWire(c.key, c.ev, calendarHostSettings[c.key]);
+  const out = { host: c.key, org: w.org, subject: w.subject,
     start: w.start, end: w.end, startMs: w.startMs, endMs: w.endMs, canceled: w.canceled,
     moved: !calOverlapsCapture(m, w),
     // Who was invited, as Outlook names them (the notes review shows them beside the
@@ -6775,7 +7014,10 @@ function forgetMeetingLabelMiss(label, t) {
 // The org a Tenir post's URL names, for the token's tenant `t`: {site} (scoped;
 // an org no host is in still reaches the route's own 404) or {error} for a
 // label no org, or more than one, answers to — noted so the operator can map it.
-function resolveMeetingOrg(urlSite, t) {
+// `note: false` (the read-only missing-transcripts GET, XERK-2965) records no
+// miss: Tenir asks it daily under every label it ever delivered to, and an old
+// label after a relabel must not re-raise the Meetings page's banner.
+function resolveMeetingOrg(urlSite, t, { note = true } = {}) {
   const scoped = scopeSite(urlSite, t);
   const orgs = decidedOrgs();
   if (orgs.has(scoped)) return { site: scoped };
@@ -6786,7 +7028,7 @@ function resolveMeetingOrg(urlSite, t) {
     if (forgetMeetingLabelMiss(label, t)) broadcastMeetingLabels();
     return { site: hits[0] };
   }
-  noteMeetingLabelMiss(label, t, hits.length > 1);
+  if (note) noteMeetingLabelMiss(label, t, hits.length > 1);
   return { error: hits.length
     ? `more than one org has the meeting label "${label}" — give one of them its own label on the Meetings page`
     : `no org has the meeting label "${label}" — set it on the Meetings page` };
@@ -9281,7 +9523,6 @@ const TENANT_ORG_STORES = [
   ["meetingLabelMisses", () => meetingLabelMisses, () => persistMeetingLabelMisses()],
   ["meetingFocus", () => meetingFocus, () => persistMeetingFocus()],
   ["holidaySettings", () => holidaySettings, () => persistHolidaySettings()],
-  ["calendarOrgRules", () => calendarOrgRules, () => persistCalendarOrgRules()],
   ["ticketAgents", () => ticketAgents, () => persistTicketAgents(), siteOfTicketKey],
   ["ticketModels", () => ticketModels, () => persistTicketModels(), siteOfTicketKey],
   ["ticketRuntimes", () => ticketRuntimes, () => persistTicketRuntimes(), siteOfTicketKey],
@@ -9300,6 +9541,14 @@ for (const [name, read, persist, siteOf] of TENANT_ORG_STORES) {
 registerTenantPurge("calendarEvents", (t) => {
   const n = dropTenantKeys(calendarEvents, t);
   if (n) persistCalendarEvents();
+  return n;
+});
+// Turma-created events (XERK-2968) are keyed by tenant.
+registerTenantPurge("calendarTurmaEvents", (t) => {
+  if (!t || !Object.hasOwn(calendarTurmaEvents, t)) return 0;
+  const n = Object.keys(calendarTurmaEvents[t]).length;
+  delete calendarTurmaEvents[t];
+  persistCalendarTurmaEvents();
   return n;
 });
 registerTenantPurge("calendarHostSettings", (t) => {
@@ -9596,12 +9845,6 @@ for (const [name, read, persist] of [
       const moving = Object.keys(map).filter((k) => hostMovable(k, scope));
       for (const k of moving) {
         const v = map[k];
-        if (name === "calendarHostSettings") {
-          if (v.defaultOrg && plainKey(v.defaultOrg)) v.defaultOrg = scopeSite(v.defaultOrg, t);
-          for (const [id, org] of Object.entries(v.seriesOrgs || {})) {
-            if (org && plainKey(org)) v.seriesOrgs[id] = scopeSite(org, t);
-          }
-        }
         const nk = tenantHostKey(k, t);
         if (!Object.hasOwn(map, nk)) map[nk] = v;
         delete map[k];
@@ -9611,6 +9854,27 @@ for (const [name, read, persist] of [
     },
   });
 }
+// An untenanted Turma event (XERK-2968) moves into the tenant when every org on
+// it does, its orgs re-keyed; one also in an org staying behind stays too.
+const calTurmaMovable = (scope) => Object.values(calendarTurmaEvents[""] || {})
+  .filter((r) => r.orgs.every((o) => siteMovable(o, scope)));
+registerTenantMigration({
+  name: "calendarTurmaEvents",
+  count: (t, scope) => calTurmaMovable(scope).length,
+  apply: (t, scope) => {
+    const moving = calTurmaMovable(scope);
+    if (!moving.length) return 0;
+    const src = calendarTurmaEvents[""];
+    const dst = calendarTurmaEvents[t] || (calendarTurmaEvents[t] = Object.create(null));
+    for (const r of moving) {
+      if (!Object.hasOwn(dst, r.id)) dst[r.id] = { ...r, orgs: r.orgs.map((o) => migrateSiteKey(o, t)) };
+      delete src[r.id];
+    }
+    if (!Object.keys(src).length) delete calendarTurmaEvents[""];
+    persistCalendarTurmaEvents();
+    return moving.length;
+  },
+});
 registerTenantMigration({
   name: "epicBuilders",
   count: (t, scope) => Object.values(epicBuilders).filter((r) => r && siteMovable(r.siteKey, scope)).length,
@@ -9877,6 +10141,7 @@ function tenantMigrationSnapshot() {
   for (const [, read, , siteOf = (k) => k] of TENANT_ORG_STORES) {
     for (const k of Object.keys(read())) addSite(siteOf(k));
   }
+  for (const r of Object.values(calendarTurmaEvents[""] || {})) r.orgs.forEach(addSite);
   return { hosts: [...hosts], sites: [...sites] };
 }
 
@@ -10340,8 +10605,6 @@ function buildAgentsCache() {
     // meetings settings list as checkboxes: country -> {name, holidays:[{id, name}]}.
     holidaySettings: holidaySettingsWire(),
     holidayCatalog: holidays.catalogWire(),
-    // Each org's calendar email-domain rules (XERK-2929): siteKey -> {domains}.
-    calendarOrgRules,
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -22464,11 +22727,38 @@ function sweepMeetingTranscripts(now = Date.now()) {
     .finally(() => { meetingTranscriptSweeping = false; });
 }
 
+// Save a duplicate's segments as the transcript of a settled meeting that has
+// none kept, locally nor in Postgres (XERK-2965). A store that cannot tell saves
+// nothing: never overwrite a kept transcript on a guess.
+// -> "saved" | "kept" | "unknown" (the store could not tell; Tenir asks again soon).
+async function backfillMeetingTranscript(m) {
+  try {
+    if (!(await meetingTranscripts.missing([m])).length) return "kept";
+  } catch {
+    return "unknown";
+  }
+  return saveMeetingTranscript(m) ? "saved" : "unknown";
+}
+
 function acceptMeeting(siteKey, body, now = Date.now()) {
   const { row, error } = meetingFromBody(body, now);
   if (error) return { status: 400, body: { error } };
   const dup = (meetingProposals[siteKey] || []).find((m) => m.meetingId === row.meetingId);
-  if (dup) return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup) } };
+  if (dup) {
+    // A settled meeting with no transcript kept (one read before XERK-2941, or
+    // its document lost) takes it from Tenir's resend (XERK-2965). The row is
+    // untouched — first copy wins. A pending row keeps its own segments, which
+    // the sweep back-fills from.
+    // The route (`backfillMeetingTranscript`) checks the store, Postgres
+    // included, before saving: under HA a promoted leader's disk is empty.
+    const backfill = !MEETING_PENDING.has(dup.status)
+      ? { ...dup, participants: row.participants, segments: row.segments } : null;
+    return { status: 200, body: { ok: true, duplicate: true, meeting: meetingTenirWire(dup) }, backfill };
+  }
+  // A resend for a transcript only (`backfill`) never creates a meeting: the
+  // hub dropped this one since it listed it, and reading it again would propose
+  // its work twice (XERK-2965).
+  if (body.backfill === true) return { status: 404, body: { error: "no such meeting" } };
   if (siteKey.length > MEETINGS_SITE_MAX) {
     return { status: 400, body: { error: `org key too long — the limit is ${MEETINGS_SITE_MAX} characters` } };
   }
@@ -24686,9 +24976,14 @@ const server = http.createServer(async (req, res) => {
 
     // Tenir posting a finished meeting (XERK-2508): its own TURMA_MEETINGS_TOKEN
     // bearer, never the trigger token (which starts sessions) nor the login.
+    // Tenir asking which of an org's meetings have no transcript kept, to send
+    // those again (XERK-2965): the same bearer, the same org resolution.
+    const isMeetingsMissing =
+      req.method === "GET" && parts[0] === "api" && parts[1] === "orgs" &&
+      parts[3] === "meetings" && parts[4] === "missing-transcripts" && parts.length === 5;
     const isMeetingsIngest =
-      req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
-      parts[3] === "meetings" && parts.length === 4;
+      (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+       parts[3] === "meetings" && parts.length === 4) || isMeetingsMissing;
 
     if (url.pathname === "/api/heartbeat") {
       // The heartbeat names the host it acts as in its BODY, so it is bound to
@@ -24824,7 +25119,7 @@ const server = http.createServer(async (req, res) => {
           const t = meetingsTenant(req);
           if (tenantOfSite(site) || t == null) return json(res, 404, { error: "no host is in that org" });
           // A short label (XERK-2638) or, from an older config, the site itself.
-          const org = resolveMeetingOrg(site, t);
+          const org = resolveMeetingOrg(site, t, { note: !isMeetingsMissing });
           if (org.error) return json(res, 404, { error: org.error });
           parts[2] = encodeURIComponent(org.site);
         } else if (!principalMaySite(requestPrincipal(req), site)) {
@@ -25457,6 +25752,20 @@ const server = http.createServer(async (req, res) => {
       const orgFilter = orgParam === null ? null : new Set(orgParam.split(",").slice(0, 100));
       return json(res, 200, calendarView(requestPrincipal(req), from, until, orgFilter));
     }
+
+    // POST /api/calendar/events, PATCH|DELETE /api/calendar/events/<id> — events
+    // made in Turma, in one or more orgs (XERK-2968, contract-calendar.md). The
+    // handlers scope by org: the caller must see every org in the body and on the event.
+    if (req.method === "POST" && url.pathname === "/api/calendar/events") {
+      return turmaEventRoute(req, res, null);
+    }
+    if ((req.method === "PATCH" || req.method === "DELETE") && parts[0] === "api" && parts[1] === "calendar" &&
+        parts[2] === "events" && parts.length === 4) {
+      let id;
+      try { id = decodeURIComponent(parts[3]); } catch { return json(res, 400, { error: "bad event id" }); }
+      return turmaEventRoute(req, res, id);
+    }
+
 
     // Who is signed in (XERK-2553): the clients' account label + admin-only screen.
     if (req.method === "GET" && url.pathname === "/api/me") {
@@ -27187,9 +27496,9 @@ const server = http.createServer(async (req, res) => {
     // by the single user check upstream); this is NOT driveable by a bare master
     // holder. Once TURMA_AGENT_STRICT retires the master the whole fleet is
     // already bound, so the button self-hides (tokenBound below).
-    // POST /api/agents/<host>/calendar/settings — the host's calendar org
-    // assignment + private-event opt-in (XERK-2891). Body {defaultOrg?,
-    // showPrivate?, series?: {id, org}}. 404 a host the caller may not drive.
+    // POST /api/agents/<host>/calendar/settings — the host's private-event opt-in
+    // (XERK-2891). Body {showPrivate}; an event's org is its host's (XERK-2964).
+    // 404 a host the caller may not drive.
     if (req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
         parts.length === 5 && parts[3] === "calendar" && parts[4] === "settings") {
       const key = decodeURIComponent(parts[2]);
@@ -29165,26 +29474,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, out.status, out.body);
     }
 
-    // POST /api/orgs/<siteKey>/calendar-rules — the email domains whose meetings
-    // are this org's on every host's calendar (XERK-2891). Body {domains: [...]};
-    // [] clears. 404 an org no host is decided into, 400 a malformed body.
-    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
-        parts.length === 4 && parts[3] === "calendar-rules") {
-      const siteKey = decodeURIComponent(parts[2]);
-      if (!decidedOrgs().has(siteKey)) {
-        return json(res, 404, { error: "no host is in that org" });
-      }
-      let body;
-      try {
-        body = JSON.parse((await readBody(req, 16384)) || "null");
-      } catch (e) {
-        if (e && (e.tooLarge || e.budgetExceeded)) throw e;
-        return json(res, 400, { error: "body is not JSON" });
-      }
-      const out = setCalendarOrgRules(siteKey, body);
-      return json(res, out.status, out.body);
-    }
-
     // POST /api/orgs/<siteKey>/meeting-focus — whose work the org's meetings
     // propose (XERK-2514). Body {names: [...], role}; no names and no role clears
     // it. 404 an org no host is decided into, 400 a malformed body.
@@ -29252,7 +29541,29 @@ const server = http.createServer(async (req, res) => {
           limit: MEETING_SEGMENTS_MAX });
       }
       const out = acceptMeeting(siteKey, body);
+      if (out.backfill) {
+        const r = await backfillMeetingTranscript(out.backfill);
+        if (r === "saved") out.body.transcriptSaved = true;
+        else if (r === "unknown") out.body.transcriptUnknown = true;
+      }
       return json(res, out.status, out.body);
+    }
+
+    // GET /api/orgs/<siteKey>/meetings/missing-transcripts — Tenir asking which of
+    // the org's settled meetings have no transcript kept (XERK-2965), so it can
+    // send those again with `backfill: true`. Tenir's bearer, like the POST.
+    // Answers {meetingIds}; 503 while the store is unreachable.
+    if (req.method === "GET" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 5 && parts[3] === "meetings" && parts[4] === "missing-transcripts") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!decidedOrgs().has(siteKey)) return json(res, 404, { error: "no host is in that org" });
+      const rows = (Object.hasOwn(meetingProposals, siteKey) ? meetingProposals[siteKey] : [])
+        .filter((m) => m && m.meetingId && m.receivedAt && !MEETING_PENDING.has(m.status));
+      let missing;
+      try { missing = await meetingTranscripts.missing(rows); } catch (e) {
+        return json(res, 503, { error: `the transcript store is unreachable (${e && e.message}) — try again shortly` });
+      }
+      return json(res, 200, { meetingIds: missing.map((m) => m.meetingId) });
     }
 
     // POST /api/orgs/<siteKey>/daily-brief/run — "Run now" (XERK-2395): the
@@ -30125,7 +30436,9 @@ if (process.env.TURMA_TEST) {
     scheduleCalendarRelink, calendarRelinkTimers, calendarRelinkAt,
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
-    getCalendarOrgRules: () => calendarOrgRules,
+    // XERK-2968: Turma-created events.
+    sanitizeTurmaEvent, calendarTurmaEventsCoerce, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
+    CALENDAR_TURMA_EVENTS_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,

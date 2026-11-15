@@ -15,14 +15,16 @@
 // Loaded after org.js; in server.js's HASHED_ASSETS. Tests: tests/calendar.test.js.
 (() => {
 const DAY_MS = 86400000;
-const SLOT_PX = 24;                 // one 30-minute row
-const HOUR_PX = SLOT_PX * 2;
-// A length of `n` 30-minute rows. The grid stretches its rows to fill a pane
-// taller than the day (XERK-2937): `--slot` is SLOT_PX until the day fits, then
-// grows (brief.html, .cal-body). Scroll math stays in SLOT_PX: a stretched day
-// never scrolls.
+const SLOT_PX = 24;                 // one 30-minute row where the browser cannot size it (no cqh)
+// A length of `n` 30-minute rows. The zoom (XERK-2954) is how many hours fill the
+// pane: brief.html sizes `--slot` from `--hours` and the pane's height. Scroll
+// math reads the rendered row height back (pxPerMin), never assumes SLOT_PX.
 const slots = (n, minus = 0) => `calc(var(--slot, ${SLOT_PX}px) * ${n}${minus ? ` - ${minus}px` : ""})`;
-const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid opens at 8:00
+const OPEN_AT_H = 8;  // the grid opens with 8:00 at the top, an hour above the 9–17 shaded working hours (brief.html .cal-col)
+// The zoom steps, as hours the pane shows; the default fits 8 AM - 6 PM (XERK-2954).
+const ZOOMS = [24, 16, 12, 10, 8, 6, 4];
+const ZOOM_DEFAULT = 10;
+const ZOOM_KEY = "turma-calendar-zoom";
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
 const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case its frame is missed
@@ -259,6 +261,41 @@ let upcomingWanted = false;       // the notes review reads the upcoming weeks (
 let revealing = null;             // {eventId?, site?, meetingId?} to select once its week is read (reveal())
 let revealFocus = false;          // the revealed event's panel takes focus on the next paint
 let scrollToMin = -1;             // the grid scrolls to this wall minute on the next paint
+let zoomHours = ((z) => (ZOOMS.includes(z) ? z : ZOOM_DEFAULT))(loadStore(ZOOM_KEY, ZOOM_DEFAULT));
+let zoomAnchor = -1;              // the wall minute held at the pane's middle across a zoom
+// Rendered px per minute: the body is 24h tall. A fake scroller (tests) has no height.
+const pxPerMin = (sc) => (sc.scrollHeight > 0 ? sc.scrollHeight / 1440 : SLOT_PX / 30);
+// 8:00 at the top, its label clear of the edge (in minutes, so a pane resize keeps it).
+const openMin = (sc) => Math.max(0, OPEN_AT_H * 60 - 8 / pxPerMin(sc));
+// The rows follow the pane's height, so a height change (the loading notice going, a
+// host notice, a window resize) would slide the view to another time: the wall minute
+// at the pane's top is held instead (QA XERK-2954). The operator's scroll moves it.
+let topMin = -1;
+let paneSig = "";
+// The scrollTop holdTop last wrote: its scroll event can arrive after the pane has
+// grown (the notice gone), and read as the operator's it moved the view (QA).
+let wroteTop = -1;
+function holdTop(sc, min) {
+  if (min !== undefined) topMin = min;
+  const sig = `${sc.clientHeight}|${sc.scrollHeight}`;
+  if (min === undefined && sig === paneSig) return;
+  paneSig = sig;
+  if (topMin < 0) return;
+  const was = sc.scrollTop;
+  sc.scrollTop = Math.max(0, topMin * pxPerMin(sc));
+  // Only a write that moved the pane sends an event; arming for one that did not would
+  // swallow the operator's next scroll to that pixel.
+  if (Math.abs(sc.scrollTop - was) >= 1) wroteTop = sc.scrollTop;
+}
+function zoom(dir) {
+  const i = ZOOMS.indexOf(zoomHours) + (dir > 0 ? 1 : -1);
+  if (i < 0 || i >= ZOOMS.length) return;
+  const sc = $grid && $grid.querySelector && $grid.querySelector("#calScroll");
+  if (sc && sc.clientHeight) zoomAnchor = (sc.scrollTop + sc.clientHeight / 2) / pxPerMin(sc);
+  zoomHours = ZOOMS[i];
+  saveStore(ZOOM_KEY, zoomHours);
+  paint();
+}
 
 const wideMode = () => (modes && (modes.wide === "week" || modes.wide === "work") ? modes.wide : "work");
 const narrowMode = () => (modes && (modes.narrow === "three" || modes.narrow === "day") ? modes.narrow : "day");
@@ -443,7 +480,7 @@ function collect(days) {
     }
     for (const n of hostNotices(w.cal, ws)) if (!hosts.has(n.host) || n.syncing) hosts.set(n.host, n);
     for (const h of (Array.isArray(w.cal.hosts) ? w.cal.hosts : [])) {
-      if (h && typeof h.host === "string" && Array.isArray(h.orgs)) hostRows.set(h.host, h);
+      if (h && typeof h.host === "string") hostRows.set(h.host, h);
     }
     for (const h of w.hol || []) if (h && typeof h.date === "string") hol.set(`${h.date}\u0000${h.id}`, h);
   }
@@ -533,7 +570,6 @@ function evStyle(ev, colors) {
 }
 function timedHtml(seg, day, colors, now) {
   const ev = seg.ev;
-  const h = ((seg.bottom - seg.top) / 30) * SLOT_PX - 2;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
   // Whether the time line fits is the block's DRAWN height, not this one: a tall
   // pane stretches the rows, so brief.html decides it with a container query.
@@ -692,9 +728,8 @@ function detailHtml(ev, now, hasPanel = false) {
   row("When", whenText(ev));
   if (moved) row("Moved", `from ${fmtWhenLong(orig)}`);
   if (tenir && ev.moved === true) row("Moved", "its Outlook event moved to another time");
-  const hrow = !tenir && lastGot && lastGot.hostRows ? lastGot.hostRows.get(ev.host) : null;
-  if (hrow && typeof ev.id === "string" && ev.id) rows.push(seriesOrgHtml(ev, hrow));
-  else row("Org", orgLabel(ev.org));
+  // Locked (XERK-2964): an Outlook event's org is its host's, so it is shown, never picked.
+  row("Org", orgLabel(ev.org));
   if (ev.recurring === true) row("Repeats", "Part of a recurring series");
   row("Where", ev.location ? String(ev.location) : "");
   const org = ev.organizer ? String(ev.organizer) : "";
@@ -748,70 +783,28 @@ function detailHtml(ev, now, hasPanel = false) {
     + (caps.length ? caps.map((c) => captureLinkHtml(ev, c)).join("") : "")
     + (!tenir && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "");
 }
-// The event's org, and the operator's per-series pick of it (XERK-2929): "Automatic"
-// leaves it to the domain rules / host default / host org. There is no "No org" pin
-// (XERK-2936: every meeting of a host in an org has one; the hub refuses "").
-function seriesOrgHtml(ev, hrow) {
-  const k = String(ev.host);
-  const pinned = typeof ev.seriesOrg === "string";
-  // Values are "auto" or "=" + the org: no org key can collide with Automatic.
-  const cur = pinned ? `=${ev.seriesOrg}` : "auto";
-  const orgs = hrow.orgs.filter((o) => typeof o === "string" && o);
-  const opt = (v, label) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(label)}</option>`;
-  // aria-disabled, never disabled: a disabled control drops focus to <body> (turma-meetings.md).
-  const dis = setBusy.has(k) ? ' aria-disabled="true"' : "";
-  const what = ev.recurring === true ? "every meeting in this series" : "this event";
-  return `<div class="cal-drow"><span class="k">Org</span><span class="v">`
-    + `<select data-series-org="${esc(evDomKey(ev))}" aria-label="Org for ${esc(what)}"${dis}>`
-    + opt("auto", pinned ? "Automatic" : `Automatic (${orgLabel(ev.org)})`)
-    + orgs.map((o) => opt(`=${o}`, orgLabel(o))).join("") + `</select>`
-    + (ev.recurring === true ? ` <span class="cal-dnote">for the whole series</span>` : "")
-    + (setErr.has(k) ? `<span class="mt-err">${esc(setErr.get(k))}</span>` : "")
-    + `</span></div>`;
-}
-// Each host's calendar settings (XERK-2929): the org its unmatched meetings take,
-// and whether its private events are shown.
+// Each host's calendar settings (XERK-2929): whether its private events are shown.
+// Its org is shown, never set: every event takes its host's org (XERK-2964).
 function hostSettingsHtml(rows) {
   const list = [...rows.values()].sort((a, b) => String(a.device || a.host).localeCompare(String(b.device || b.host)));
   if (!list.length) return `<div class="cal-hostset"><p class="cal-dnote">No host has synced a calendar yet.</p></div>`;
   return `<div class="cal-hostset" role="group" aria-label="Calendar settings">`
-    + `<p class="cal-dnote">A meeting no email-domain rule (Meetings settings) claims takes its host's default org.</p>`
     + list.map((h) => {
       const k = String(h.host);
       const name = String(h.device || h.host);
       const dis = setBusy.has(k) ? ' aria-disabled="true"' : "";
-      const own = typeof h.org === "string" && h.org ? `Its own org (${orgLabel(h.org)})` : "No org";
-      const opts = `<option value=""${h.defaultOrg ? "" : " selected"}>${esc(own)}</option>`
-        + h.orgs.filter((o) => typeof o === "string" && o)
-          .map((o) => `<option value="${esc(o)}"${o === h.defaultOrg ? " selected" : ""}>${esc(orgLabel(o))}</option>`).join("");
-      return `<div class="cal-hostrow"><b>${esc(name)}</b>`
-        + `<label>Default org <select data-host-default="${esc(k)}"${dis}>${opts}</select></label>`
+      const org = typeof h.org === "string" && h.org ? orgLabel(h.org) : "No org";
+      return `<div class="cal-hostrow"><b>${esc(name)}</b><span class="cal-dnote">${esc(org)}</span>`
         + `<label><input type="checkbox" data-host-private="${esc(k)}"${h.showPrivate === true ? " checked" : ""}${dis}> Show private events</label>`
         + (setErr.has(k) ? `<span class="mt-err">${esc(setErr.get(k))}</span>` : "")
         + `</div>`;
     }).join("") + `</div>`;
 }
 // POST /api/agents/<host>/calendar/settings; the hub's `calendar` frame re-reads too.
-// A series pick is applied to the read events first (undone on a refusal): the save's
-// repaints are forced into a FOCUSED select, and the refetch's paint is held while it
-// keeps focus, so without this the select showed the previous pick (QA XERK-2929).
-function pinSeries(host, s) {
-  const undo = [];
-  for (const w of weeks.values()) {
-    for (const ev of (w.cal && Array.isArray(w.cal.events) ? w.cal.events : [])) {
-      if (!ev || ev.host !== host || ev.source === "tenir" || (ev.seriesId || ev.id) !== s.id) continue;
-      undo.push([ev, Object.prototype.hasOwnProperty.call(ev, "seriesOrg"), ev.seriesOrg]);
-      if (s.org === null) delete ev.seriesOrg; else ev.seriesOrg = s.org;
-    }
-  }
-  // Reversed: one event object held by two week entries is recorded twice.
-  return () => { for (const [ev, had, v] of undo.reverse()) { if (had) ev.seriesOrg = v; else delete ev.seriesOrg; } };
-}
 async function saveHost(host, body) {
   if (setBusy.has(host)) return;
   setBusy.add(host);
   setErr.delete(host);
-  const undo = body.series ? pinSeries(host, body.series) : null;
   paint(true);
   paintDetail(true);
   let res = null, out = {};
@@ -822,14 +815,13 @@ async function saveHost(host, body) {
   } catch { res = null; }
   setBusy.delete(host);
   const T = typeof TurmaNav !== "undefined" ? TurmaNav : null;
-  const what = body.series ? "Setting the meeting's org" : "Saving the calendar settings";
+  const what = "Saving the calendar settings";
   if (res && res.status === 401) { location.href = "/login"; return; }
   if (!res || !res.ok) {
     const text = res ? (T && T.refusalText ? T.refusalText(what, res.status, out)
       : `${what} failed — ${(out && out.error) || `the hub answered HTTP ${res.status}`}`) : `${what} failed — the hub is unreachable`;
     setErr.set(host, text);
     if (T && T.toast) T.toast(text);
-    if (undo) undo();
   } else refetch();
   paint(true);
   paintDetail(true);
@@ -843,6 +835,9 @@ function panelSpec(ev) {
   return { site, meetingIds: caps.filter((c) => c.site === site).map((c) => c.meetingId),
     dailyAt: ev.source === "tenir" ? 0 : ev.startMs };
 }
+// aria-disabled, not disabled: the focused button keeps focus at the last step.
+const zoomBtn = (dir, label, glyph, end) => `<button type="button" class="cal-ic" data-zoom="${dir}" aria-label="${label}"`
+  + ` title="${label}${end ? "" : ` (${dir > 0 ? "fewer" : "more"} hours)`}"${end ? ' aria-disabled="true"' : ""}>${glyph}</button>`;
 function headerHtml(days) {
   const m = mode();
   const opts = narrow ? [["day", "Day"], ["three", "3 days"]] : [["work", "Work week"], ["week", "Week"]];
@@ -856,6 +851,9 @@ function headerHtml(days) {
     + (picker !== null ? pickerHtml(days, nowFn()) : "") + `</span>`
     + `<span class="sp"></span><span class="cal-modes" role="group" aria-label="View">`
     + opts.map(([k, l]) => `<button type="button" class="tri-chip${k === m ? " on" : ""}" data-mode="${k}" aria-pressed="${k === m}">${l}</button>`).join("")
+    + `</span><span class="cal-zoom" role="group" aria-label="Zoom">`
+    + zoomBtn(-1, "Zoom out", "−", zoomHours === ZOOMS[0])
+    + zoomBtn(1, "Zoom in", "+", zoomHours === ZOOMS[ZOOMS.length - 1])
     + `</span><button type="button" class="cal-ic" data-host-settings aria-expanded="${hostSetOpen}" aria-label="Calendar settings" title="Calendar settings">⚙</button></div>`;
 }
 function calendarHtml() {
@@ -922,7 +920,7 @@ function calendarHtml() {
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
-    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${slots(48)}">`
+    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};--hours:${zoomHours};height:${slots(48)}">`
     + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 
@@ -932,8 +930,8 @@ function focusSig() {
   if (!a || !$root || !$root.contains || !$root.contains(a)) return null;
   const d = a.dataset || {};
   if (d.ev !== undefined) { const ev = shown[Number(d.ev)]; return ev ? { ev: `${ev.host}\u0000${ev.id}`, day: d.day } : null; }
-  for (const k of ["step", "mode", "pick", "pmonth"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
-  for (const k of ["hostDefault", "hostPrivate"]) if (d[k] !== undefined) return { attr: k, v: d[k] };
+  for (const k of ["step", "mode", "pick", "pmonth", "zoom"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
+  for (const k of ["hostPrivate"]) if (d[k] !== undefined) return { attr: k, v: d[k] };
   for (const k of ["calToday", "openPicker", "closeDetail", "hostSettings"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
   return null;
 }
@@ -962,15 +960,17 @@ function paint(force = false) {
     restoreFocusSig(sig);
     const sc = $grid.querySelector && $grid.querySelector("#calScroll");
     revealed = !!(sc && scrollToMin >= 0);
-    if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
-    else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
+    if (sc && scrollToMin >= 0) { holdTop(sc, Math.max(0, scrollToMin - 60)); scrolled = true; }
+    else if (sc && zoomAnchor >= 0) { holdTop(sc, Math.max(0, zoomAnchor - sc.clientHeight / 2 / pxPerMin(sc))); revealed = true; }
+    else if (sc && !scrolled) { holdTop(sc, openMin(sc)); scrolled = true; }
     scrollToMin = -1;
+    zoomAnchor = -1;
   }
   refit(revealed);
   paintDetail(force);
   if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
 }
-// A stretched day (the pane taller than 24h) has nothing to scroll, so its
+// Also holds the top minute across a pane-size change (holdTop). A stretched day has nothing to scroll, so its
 // scrollTop is 0; once a resize makes the pane scroll again, open it at 8 AM like
 // a fresh paint instead of leaving it stuck at midnight (XERK-2937).
 let fitWas = false;
@@ -980,7 +980,8 @@ function refit(keep = false) {
   const sc = active && $grid && $grid.querySelector && $grid.querySelector("#calScroll");
   if (!sc || !sc.clientHeight) return;
   const fits = sc.scrollHeight <= sc.clientHeight + 1;
-  if (fitWas && !fits && !keep) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
+  if (fitWas && !fits && !keep) holdTop(sc, openMin(sc));
+  else holdTop(sc);
   fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's
@@ -988,10 +989,6 @@ function refit(keep = false) {
 // meetings.js paints the capture part into `$mt` itself, with its own hold.
 const fieldFocused = (el) => {
   const a = typeof document !== "undefined" ? document.activeElement : null;
-  // The series Org select saves on change and holds no draft: holding its repaint left
-  // it showing a stale read (a frame landing mid-save) until blur (QA XERK-2929).
-  // paintDetail puts focus back on it by its data key.
-  if (a && a.dataset && a.dataset.seriesOrg !== undefined) return false;
   return !!a && !!el && !!el.contains && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
 };
 let lastDetail = "";
@@ -1020,7 +1017,7 @@ function paintDetail(force = false) {
   lastDetail = html;
   const a = typeof document !== "undefined" ? document.activeElement : null;
   const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
-  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail", "seriesOrg"].find((x) => ds[x] !== undefined);
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail"].find((x) => ds[x] !== undefined);
   $info.innerHTML = html;
   if (k && $info.querySelectorAll) {
     const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
@@ -1160,19 +1157,12 @@ function mount(el, opts = {}) {
   $root.addEventListener("change", (ev) => {
     const t = ev.target, d = t && t.dataset;
     if (!d) return;
-    const host = d.hostDefault ?? d.hostPrivate;
+    const host = d.hostPrivate;
     // A change while that host's save is in flight is put back by the repaint.
     if ((host !== undefined && setBusy.has(host)) || (t.getAttribute && t.getAttribute("aria-disabled") === "true")) {
       return void (paint(true), paintDetail(true));
     }
-    if (d.hostDefault !== undefined) return void saveHost(d.hostDefault, { defaultOrg: t.value || null });
     if (d.hostPrivate !== undefined) return void saveHost(d.hostPrivate, { showPrivate: !!t.checked });
-    if (d.seriesOrg !== undefined) {
-      const e = ((lastGot && lastGot.events) || []).find((x) => evDomKey(x) === d.seriesOrg);
-      if (!e) return;
-      const id = typeof e.seriesId === "string" && e.seriesId ? e.seriesId : e.id;
-      return void saveHost(String(e.host), { series: { id, org: t.value === "auto" ? null : String(t.value).replace(/^=/, "") } });
-    }
     if (d.linkPick === undefined) return;
     if (t.value) linkPick.set(d.linkPick, t.value); else linkPick.delete(d.linkPick);
     paintDetail(true);
@@ -1184,7 +1174,7 @@ function mount(el, opts = {}) {
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings]") : null;
+        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -1213,6 +1203,10 @@ function mount(el, opts = {}) {
       if (target) relink(d.linkGo, { eventId: target.id }, target);
       return;
     }
+    if (d.zoom !== undefined) {
+      if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
+      return void zoom(Number(d.zoom));
+    }
     if (d.step !== undefined) return void go(stepAnchor(anchor, mode(), Number(d.step) < 0 ? -1 : 1));
     if (d.calToday !== undefined) return void go(nowFn());
     if (d.mode !== undefined) { revealWeek = false; revealing = null; setMode(d.mode); return void paint(true); }
@@ -1232,6 +1226,31 @@ function mount(el, opts = {}) {
   // On the document, so Esc closes the picker / panel after a click elsewhere;
   // arrows act only on a focused event button (onKey checks the target).
   (typeof document !== "undefined" && document.addEventListener ? document : $root).addEventListener("keydown", onKey);
+  // Ctrl/⌘ + wheel over the grid zooms (a trackpad pinch arrives as this); one step per notch.
+  // A pause or a turn of direction starts a new gesture: a leftover never zooms later.
+  let wheelAcc = 0, wheelAt = 0;
+  $root.addEventListener("wheel", (ev) => {
+    if (!(ev.ctrlKey || ev.metaKey) || !(ev.target && ev.target.closest && ev.target.closest(".cal-grid"))) return;
+    ev.preventDefault();
+    const t = Date.now();
+    // A line-mode wheel (Firefox) reports ~3 per notch: count it as pixels.
+    const dy = ev.deltaMode === 1 ? ev.deltaY * 40 : ev.deltaMode === 2 ? ev.deltaY * 400 : ev.deltaY;
+    if (t - wheelAt > 400 || Math.sign(dy) !== Math.sign(wheelAcc)) wheelAcc = 0;
+    wheelAt = t;
+    wheelAcc += dy;
+    if (Math.abs(wheelAcc) < 40) return;
+    zoom(wheelAcc < 0 ? 1 : -1);
+    wheelAcc = 0;
+  }, { passive: false });
+  // The operator's own scroll is the new view to hold (scroll does not bubble: capture).
+  $grid.addEventListener("scroll", (ev) => {
+    const sc = ev.target;
+    if (!sc || sc.id !== "calScroll" || !sc.clientHeight) return;
+    // One-shot: the first event after a write may be ours; every later one is the operator's.
+    const ours = wroteTop >= 0 && Math.abs(sc.scrollTop - wroteTop) < 1;
+    wroteTop = -1;
+    if (!ours) topMin = sc.scrollTop / pxPerMin(sc);
+  }, true);
   // Swipe left/right on the grid moves like › / ‹ (the narrow layout's arrows).
   let touch = null;
   $root.addEventListener("touchstart", (ev) => {
@@ -1266,7 +1285,9 @@ const api = {
   wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
   detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost,
-  _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),
+  _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
+  _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
+  _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },

@@ -264,22 +264,18 @@ class MeetingsWiringTest {
         assertEquals("beta", fleet.state.value.meetingLabels.getValue(site).label)
     }
 
-    @Test fun `days off and calendar email domains ride the poll and their own SSE frames`() {
+    @Test fun `days off ride the poll and their own SSE frame`() {
         hub.seedFleet("""{ "now": 1, "agents": [ $host ],
             "holidaySettings": { "$site": { "countries": ["us"], "off": [] }, "bad": 7 },
-            "holidayCatalog": { "us": { "name": "United States", "holidays": [ { "id": "us-new-year", "name": "New Year's Day" } ] } },
-            "calendarOrgRules": { "$site": { "domains": ["acme.com"] } } }""")
+            "holidayCatalog": { "us": { "name": "United States", "holidays": [ { "id": "us-new-year", "name": "New Year's Day" } ] } } }""")
         val fleet = hub.container.fleet
         assertEquals(setOf(site), fleet.state.value.holidaySettings.keys)   // a malformed org drops alone
         assertEquals("New Year's Day", fleet.state.value.holidayCatalog.getValue("us").holidays.single().name)
-        assertEquals(listOf("acme.com"), fleet.state.value.calendarOrgRules.getValue(site).domains)
         val frames = fleet.calendarFrames.value
         fleet.onSseEvent("holidaySettings", """{ "$site": { "countries": ["us"], "off": ["us-new-year"] } }""")
-        fleet.onSseEvent("calendarOrgRules", "{}")
         assertEquals(listOf("us-new-year"), fleet.state.value.holidaySettings.getValue(site).off)
-        assertTrue(fleet.state.value.calendarOrgRules.isEmpty())
-        // Both re-read the calendar (the web's calendarSoon).
-        assertEquals(frames + 2, fleet.calendarFrames.value)
+        // It re-reads the calendar (the web's calendarSoon).
+        assertEquals(frames + 1, fleet.calendarFrames.value)
     }
 
     @Test fun `an archive answer is patched in at once`() {

@@ -967,10 +967,10 @@ test("XERK-2934: a 24h+ timed event's band button aria-label names both ends", a
   assert.match(html, /aria-label="Holiday,[^"]*Thursday, November 12, all day/);
 });
 
-test("XERK-2929: per-host settings and the per-series org control post the hub's settings route", async () => {
+test("XERK-2964: an Outlook event's org is shown, never picked; host settings set private events only", async () => {
   const D = at(2027, 9, 14);
   const hostRow = { host: "h1", device: "Box <1>", online: true, syncedAt: NOW, ranges: [[0, 4e12]],
-    org: "acme", orgs: ["acme", "auto", "beta"], defaultOrg: "", showPrivate: false };
+    org: "acme", showPrivate: false };
   const ev = { host: "h1", id: "G1:x", seriesId: "G1", recurring: true, org: "acme", source: "outlook", subject: "Weekly",
     startMs: at(2027, 9, 14, 10), endMs: at(2027, 9, 14, 11), meetings: [] };
   let answer = { ok: true, settings: {} };
@@ -982,67 +982,26 @@ test("XERK-2929: per-host settings and the per-series org control post the hub's
     assert.match(h, /data-host-settings aria-expanded="false"/);
     fire("click", { hostSettings: "" });
     h = cal.calendarHtml();
-    assert.match(h, /<b>Box &lt;1&gt;<\/b>/);
-    assert.match(h, /<option value="" selected>Its own org \(acme\)<\/option><option value="acme">acme<\/option><option value="auto">auto<\/option><option value="beta">beta<\/option>/);
+    // Each host names its org as text; there is no Default org pick.
+    assert.match(h, /<b>Box &lt;1&gt;<\/b><span class="cal-dnote">acme<\/span>/);
+    assert.doesNotMatch(h, /Default org|data-host-default|<select/);
+    assert.doesNotMatch(h, /email-domain rule/);
     posts.length = 0;
-    fire("change", { hostDefault: "h1" }, { value: "beta" });
-    for (let i = 0; i < 6; i++) await tick();
     fire("change", { hostPrivate: "h1" }, { checked: true });
     for (let i = 0; i < 6; i++) await tick();
-    fire("change", { hostDefault: "h1" }, { value: "" });
-    for (let i = 0; i < 6; i++) await tick();
-    assert.deepEqual(posts.map((p) => [p.url, p.body]), [["/api/agents/h1/calendar/settings", { defaultOrg: "beta" }],
-      ["/api/agents/h1/calendar/settings", { showPrivate: true }], ["/api/agents/h1/calendar/settings", { defaultOrg: null }]]);
-    // The event panel: Automatic names the served org; a pick pins the whole series.
+    assert.deepEqual(posts.map((p) => [p.url, p.body]), [["/api/agents/h1/calendar/settings", { showPrivate: true }]]);
+    // The event panel names the org as plain text: no select, no "whole series" note.
     h = cal.detailHtml(ev, D);
-    assert.match(h, /data-series-org="h1\/G1%3Ax"/);
-    assert.match(h, /<option value="auto" selected>Automatic \(acme\)<\/option><option value="=acme">acme<\/option>/);
-    assert.doesNotMatch(h, /No org/, "no pinned-unassigned choice (XERK-2936)");
-    assert.match(h, /for the whole series/);
-    assert.match(cal.detailHtml({ ...ev, seriesOrg: "beta" }, D), /<option value="=beta" selected>beta/);
-    posts.length = 0;
-    fire("change", { seriesOrg: "h1/G1%3Ax" }, { value: "=beta" });
-    for (let i = 0; i < 6; i++) await tick();
-    fire("change", { seriesOrg: "h1/G1%3Ax" }, { value: "auto" });
-    for (let i = 0; i < 6; i++) await tick();
-    fire("change", { seriesOrg: "h1/G1%3Ax" }, { value: "=auto" });
-    for (let i = 0; i < 6; i++) await tick();
-    assert.deepEqual(posts.map((p) => p.body), [{ series: { id: "G1", org: "beta" } }, { series: { id: "G1", org: null } },
-      { series: { id: "G1", org: "auto" } }], "an org keyed \"auto\" is not the Automatic choice (QA)");
-    // An org keyed like the sentinel never collides with it.
-    const odd = cal.detailHtml(ev, D).replace(/\n/g, "");
-    assert.equal((odd.match(/ selected/g) || []).length, 1);
+    assert.match(h, /<span class="k">Org<\/span><span class="v">acme<\/span>/);
+    assert.doesNotMatch(h, /data-series-org|<select|for the whole series/);
+    assert.match(h, /Part of a recurring series/);
     // Busy controls are aria-disabled, never disabled (focus would fall to <body>).
     assert.doesNotMatch(cal.calendarHtml() + cal.detailHtml(ev, D), / disabled[ >]/);
-    // The pick shows at once, before the re-read (a focused select is not repainted by it).
-    await openEvent(D, "Weekly");
-    replies["/api/agents/"] = () => new Promise((r) => setTimeout(() => r({ ok: true, settings: {} }), 30));
-    const saving = cal.saveHost("h1", { series: { id: "G1", org: "beta" } });
-    assert.match(cal._els().info.innerHTML, /<option value="=beta" selected>/);
-    await saving;
-    assert.match(cal._els().info.innerHTML, /<option value="=beta" selected>/);
-    // A read landing while the select keeps focus still repaints it (it holds no draft).
-    globalThis.document = { activeElement: { tagName: "SELECT", inside: true, dataset: { seriesOrg: "h1/G1%3Ax" } } };
-    try {
-      const stale = (await (replies["/api/calendar"])()).events[0];
-      replies["/api/calendar"] = () => ({ hosts: [hostRow], events: [{ ...stale, seriesOrg: "acme" }] });
-      cal.refetch();
-      for (let i = 0; i < 6; i++) await tick();
-      assert.match(cal._els().info.innerHTML, /<option value="=acme" selected>/);
-      replies["/api/calendar"] = () => ({ hosts: [hostRow], events: [stale] });
-      cal.refetch();
-      for (let i = 0; i < 6; i++) await tick();
-    } finally { delete globalThis.document; }
-    // A refused pick is undone.
-    replies["/api/agents/"] = () => ({ status: 404, body: { error: "nope" } });
-    await cal.saveHost("h1", { series: { id: "G1", org: "acme" } });
-    assert.match(cal._els().info.innerHTML, /<option value="=beta" selected>/);
-    replies["/api/agents/"] = () => answer;
     // A refusal is the hub's words, escaped, on the host's row.
-    answer = { status: 404, body: { error: "defaultOrg is not an <org>" } };
-    fire("change", { hostDefault: "h1" }, { value: "beta" });
+    answer = { status: 400, body: { error: "body must be <showPrivate>" } };
+    fire("change", { hostPrivate: "h1" }, { checked: false });
     for (let i = 0; i < 6; i++) await tick();
-    assert.match(cal.calendarHtml(), /Saving the calendar settings failed — defaultOrg is not an &lt;org&gt;/);
+    assert.match(cal.calendarHtml(), /Saving the calendar settings failed — body must be &lt;showPrivate&gt;/);
   } finally { fire("click", { hostSettings: "" }); click({ closeDetail: "" }); }
 });
 
@@ -1103,4 +1062,132 @@ test("XERK-2939: the detail panel's tint is exactly the session card's mix", () 
   const card = mix(read("sessions.html"), "\\.s-card");
   assert.equal(mix(read("app.css"), "\\.kanban-card"), card);
   assert.equal(mix(read("brief.html"), "\\.cal-detail"), card, "the panel matches the session card (operator's rule)");
+});
+
+test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  replies = { "/api/calendar": () => ({ hosts: [], events: [] }) };
+  const [grid] = root.children;
+  // A 600px pane: rows are max(10px, 600 / (hours * 2)), so the day is 48 rows of that.
+  const scroller = { scrollTop: 0, clientHeight: 600,
+    get scrollHeight() { return 48 * Math.max(10, 600 / (cal._state().zoomHours * 2)); } };
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  try {
+    cal._go(at(2026, 11, 12));
+    cal.setActive(true);
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(cal._state().zoomHours, 10, "opens showing 10 hours");
+    assert.match(cal.calendarHtml(), /--hours:10;/);
+    const ppm = () => scroller.scrollHeight / 1440;
+    const mid = () => (scroller.scrollTop + 300) / ppm();
+    scroller.scrollTop = 500;
+    const before = mid();
+    click({ zoom: "1" });
+    assert.equal(cal._state().zoomHours, 8);
+    assert.match(cal.calendarHtml(), /--hours:8;/);
+    assert.ok(Math.abs(mid() - before) < 1e-6, "the middle minute stays put");
+    for (let i = 0; i < 9; i++) click({ zoom: "1" });
+    assert.equal(cal._state().zoomHours, cal.ZOOMS[cal.ZOOMS.length - 1], "zoom in stops at the last step");
+    assert.match(cal.calendarHtml(), /data-zoom="1" aria-label="Zoom in" title="Zoom in" aria-disabled="true"/);
+    for (let i = 0; i < 9; i++) click({ zoom: "-1" });
+    assert.equal(cal._state().zoomHours, 24, "zoom out stops at the whole day");
+    assert.match(cal.calendarHtml(), /data-zoom="-1" aria-label="Zoom out" title="Zoom out" aria-disabled="true"/);
+    assert.match(cal.calendarHtml(), /data-zoom="1" aria-label="Zoom in" title="Zoom in \(fewer hours\)">/);
+  } finally {
+    while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
+    grid.querySelector = qs;
+    cal.setActive(false);
+  }
+});
+
+test("XERK-2954: brief.html sizes the rows from --hours over the pane's height", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "public", "brief.html"), "utf8");
+  assert.match(html, /\.cal-body \{ position: relative; --hours: 10; --slot: calc\(240px \/ var\(--hours\)\); \}/);
+  assert.match(html, /--slot: max\(10px, 100cqh \/ \(var\(--hours\) \* 2\)\)/);
+});
+
+test("XERK-2954 QA: the grid opens with 8:00 at the top and keeps it while the pane changes height", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  let hold;
+  replies = { "/api/calendar": () => new Promise((r) => { hold = r; }) };
+  const [grid] = root.children;
+  // The loading notice takes 26px off the pane until the week lands (QA: 597 -> 623px).
+  const pane = { h: 597 };
+  const slotPx = () => Math.max(10, pane.h / (cal._state().zoomHours * 2));
+  const scroller = { id: "calScroll", scrollTop: 0, get clientHeight() { return pane.h; },
+    get scrollHeight() { return 48 * slotPx(); } };
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  // In px off the line: the open leaves 8px above 8:00 so its label is not cut.
+  const ppm = () => scroller.scrollHeight / 1440;
+  const topOff = (min) => min * ppm() - scroller.scrollTop;
+  const topAt = () => scroller.scrollTop / ppm();
+  try {
+    cal._reopen();
+    cal.refetch();
+    cal._go(at(2026, 11, 12));
+    cal.setActive(true);
+    for (let i = 0; i < 4; i++) await tick();
+    assert.ok(Math.abs(topOff(480) - 8) < 0.5, `opens at 8:00 (8:00 is ${topOff(480)}px down)`);
+    pane.h = 623;
+    // The open's own scroll event lands after the pane grew (QA): it is not the operator's.
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    hold({ hosts: [], events: [{ host: "h1", id: "z1", org: "", subject: "Late", startMs: at(2026, 11, 12, 9), endMs: at(2026, 11, 12, 10) }] });
+    for (let i = 0; i < 8; i++) await tick();
+    assert.ok(Math.abs(topOff(480) - 8) < 0.5, `still 8:00 once the notice goes (${topOff(480)}px down)`);
+    assert.ok(Math.abs(topOff(1080) - pane.h - 8) < 0.5, "and 6 PM at the bottom, 8px past it");
+    // A window resize keeps the operator's place, not the pixel offset.
+    scroller.scrollTop = 600 * (scroller.scrollHeight / 1440);
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    pane.h = 900;
+    cal.setActive(true);  // a repaint
+    assert.ok(Math.abs(topAt() - 600) < 1, `resize holds 10:00 at the top (top ${topAt()})`);
+    // QA: scrolling away and back to the pixel the calendar last wrote still counts.
+    const scrollTo = (min) => { scroller.scrollTop = min * ppm(); for (const f of grid.listeners.scroll || []) f({ target: scroller }); };
+    pane.h = 700;
+    cal.setActive(true);                     // writes 10:00 at the new height, arming one event
+    const written = scroller.scrollTop;
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });   // that write's own event
+    scrollTo(780);
+    scroller.scrollTop = written;            // back to the written pixel
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    pane.h = 640;
+    cal.setActive(true);
+    assert.ok(Math.abs(topAt() - 600) < 1, `the operator's return to 10:00 is kept (top ${topAt()})`);
+  } finally {
+    grid.querySelector = qs;
+    cal.setActive(false);
+  }
+});
+
+test("XERK-2954 QA: Ctrl+wheel zooms one step per notch, a stale leftover never fires, the pick is saved", () => {
+  const saved = {};
+  globalThis.localStorage = { getItem: (k) => saved[k] ?? null, setItem: (k, v) => { saved[k] = v; } };
+  const inGrid = { closest: (sel) => (sel === ".cal-grid" ? {} : null) };
+  const wheel = (deltaY, extra = {}) => { for (const f of root.listeners.wheel) f({ ctrlKey: true, deltaY, target: inGrid, preventDefault() {}, ...extra }); };
+  const realNow = Date.now;
+  let t = 1e6;
+  Date.now = () => t;
+  try {
+    assert.equal(cal._state().zoomHours, 10);
+    wheel(-100);
+    assert.equal(cal._state().zoomHours, 8, "wheel up zooms in");
+    assert.equal(saved["turma-calendar-zoom"], "8", "kept per viewer");
+    wheel(12); wheel(12); wheel(12);
+    assert.equal(cal._state().zoomHours, 8, "small deltas gather");
+    t += 2000;
+    wheel(12);
+    assert.equal(cal._state().zoomHours, 8, "a pause drops the leftover");
+    wheel(-30); wheel(30);
+    assert.equal(cal._state().zoomHours, 8, "a turn of direction drops the leftover");
+    wheel(3, { deltaMode: 1 });
+    assert.equal(cal._state().zoomHours, 10, "one line-mode notch zooms out");
+    wheel(-100, { ctrlKey: false });
+    assert.equal(cal._state().zoomHours, 10, "a plain wheel only scrolls");
+  } finally {
+    Date.now = realNow;
+    delete globalThis.localStorage;
+    while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
+  }
 });

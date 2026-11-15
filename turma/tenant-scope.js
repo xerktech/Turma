@@ -60,6 +60,7 @@ const ROUTES = [
   // automation
   ["POST", "/api/trigger", "automation"],
   ["POST", "/api/orgs/:site/meetings", "automation"],
+  ["GET", "/api/orgs/:site/meetings/missing-transcripts", "automation"],
   // pages (static shells: the data they show comes from the scoped routes)
   ["GET", "/", "signed-in"], ["GET", "/index.html", "signed-in"],
   ["GET", "/usage", "signed-in"], ["GET", "/usage.html", "signed-in"],
@@ -87,6 +88,8 @@ const ROUTES = [
   ["POST", "/api/jira/refresh", "filtered"],
   // The caller's hosts' calendars (XERK-2891): calendarView keeps only hosts it may drive.
   ["GET", "/api/calendar", "filtered"],
+  // Turma-created events (XERK-2968): the handlers check every org in the body and on the event.
+  ["POST", "/api/calendar/events", "filtered"], ["PATCH DELETE", "/api/calendar/events/:id", "filtered"],
   // per host (the operator commands)
   ["POST", "/api/agents/:host/clone", "host"],
   ["POST", "/api/agents/:host/repos/:repo/prune", "host"],
@@ -135,7 +138,6 @@ const ROUTES = [
   ["POST", "/api/orgs/:site/meeting-label", "org"],
   ["POST", "/api/orgs/:site/meeting-focus", "org"],
   ["PUT", "/api/orgs/:site/holidays", "org"],
-  ["POST", "/api/orgs/:site/calendar-rules", "org"],
   ["POST", "/api/orgs/:site/decisions", "org"],
   ["POST", "/api/orgs/:site/daily-brief/run", "org"],
   ["GET PUT", "/api/orgs/:site/daily-brief/schedule", "org"],
@@ -243,7 +245,7 @@ const SCOPERS = {
   autoStartOrgs: bySite, autoMergeOrgs: bySite, priorityWriteBackOrgs: bySite,
   dedupeLinkOrgs: bySite, orgColors: bySite, triagePolicies: bySite,
   decisions: bySite, decisionCounts: bySite, dailyBriefSchedules: bySite,
-  dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite, meetingFocus: bySite, calendarOrgRules: bySite,
+  dailyBriefs: bySite, meetingProposals: bySite, meetingLabels: bySite, meetingLabelMisses: bySite, meetingFocus: bySite,
   holidaySettings: bySite,
   ticketModels: byTicket, ticketRuntimes: byTicket, ticketPlatforms: byTicket,
   ticketTriageActions: byTicket, epicRuns: byTicket,

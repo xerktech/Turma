@@ -105,7 +105,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   press released on pointerup/pointercancel/contextmenu and the WINDOW's blur only (never a
   capture blur). The search's own paint is forced and gives focus + caret back.
 - **A control that saves on change and holds no draft is exempt from the focus hold** (the
-  day-off boxes, the calendar's series Org select, XERK-2929): held, it showed a stale read until
+  day-off boxes, XERK-2929): held, it showed a stale read until
   blur. Its busy state is `aria-disabled` too, and focus is restored by its data key.
 - Buttons go `aria-disabled` while busy, never `disabled`; `busy` / `archBusy` / `labelBusy` /
   `focusBusy` are the guard. Busy from the first await (XERK-2511: a Reject must not overtake an
@@ -170,13 +170,21 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     opens a mini-month (month ‹ ›, year « »). Narrow (<760px): Day / 3 days, arrows + swipe.
   - **The calendar fills the page** (XERK-2937): a flex chain down to `.cal-scroll`, never a
     `100vh - N` guess (a wrapped notice broke it). The Calendar view alone widens to `--wrap-board`.
-    Rows stretch past 24px only when the pane is taller than the day (`--slot`, `100cqh / 48` on
-    the `container-type: size` pane), so every top/height goes through `slots()`, never px.
-    Scroll math stays in `SLOT_PX`: a stretched day never scrolls.
-  - 30-min rows (24px), working hours 8–17 shaded white, the grid opens scrolled to 8:00, a red
+    Every top/height goes through `slots()`, never px: `--slot` is sized by CSS on the
+    `container-type: size` pane, so JS cannot know it.
+  - **Zoom = how many hours fill the pane** (XERK-2954): `--hours` on `.cal-body` (steps `ZOOMS`
+    24…4, default 10 = 8 AM–6 PM), `--slot: max(10px, 100cqh / (hours × 2))`. − / + in the bar
+    (`aria-disabled` at the ends), Ctrl/⌘+wheel over the grid (a trackpad pinch); kept per viewer
+    (`turma-calendar-zoom`). A zoom holds the pane's middle minute (`zoomAnchor`).
+    - **Any other pane-height change holds the TOP minute** (`holdTop`/`topMin`, run by `refit`
+      after every paint and on resize; the operator's scroll moves it): rows follow the pane, so
+      the loading notice leaving opened the day at 7:34, not 8:00 (QA). Android does the same.
+    - **Scroll math reads the drawn row height back** (`pxPerMin` = `scrollHeight / 1440`), never
+      `SLOT_PX` — that is only the no-cqh fallback (10h). A fake scroller in tests has no height.
+  - 30-min rows, working hours 9–17 shaded white, the grid opens with 8:00 at the top, a red
     now-line with a dot on today, today's header in the accent with a top bar.
-  - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event an
-    org (XERK-2936, its host's when no rule decides); neutral only for a host in no org;
+  - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event its
+    host's org (XERK-2964; the panel shows it as text, never a picker); neutral only for a host in no org;
     overlaps share the width and widen into free columns to the right (`layoutDay`).
   - Tentative / not responded = hatched; free / declined = outlined; canceled = "Canceled: " +
     strikethrough (kept, as Teams keeps them); past = dimmed; Tenir-only (`source:"tenir"`) = a

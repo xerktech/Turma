@@ -16,7 +16,7 @@
      meetings and daily briefs, painted by meetings.js; the brief block and the
      schedule editor are this page's (mount hooks). Tokens/base/nav live in app.css.
      Android's Meetings tab is its counterpart (android/PARITY.md). */
-  .wrap.tri-wrap { --tri-wrap: 1280px; max-width: var(--tri-wrap); padding-top: 16px; }
+  .wrap.tri-wrap { --tri-wrap: 1280px; max-width: var(--tri-wrap); }
   .mt-list button[aria-disabled="true"], .mt-list button[aria-disabled="true"]:hover {
     opacity: 0.5; cursor: default; border-color: var(--border); }
   .pane-note { color: var(--muted); font-size: 12px; margin: 16px 0 0; }
@@ -238,7 +238,7 @@
   /* ---- the view switch + the Calendar view (calendar.js, XERK-2897) ---- */
   /* Held at the header's content column (--wrap less its 20px padding) in both views,
      so the switch never jumps sideways when the calendar widens (XERK-2937). */
-  .mt-views { display: flex; gap: 6px; margin: 0 auto 12px; width: min(100%, calc(var(--wrap) - 40px)); }
+  .mt-views { display: flex; gap: 6px; margin: 2px auto 12px; width: min(100%, calc(var(--wrap) - 40px)); }
   button.tri-chip[aria-pressed="true"] { color: var(--accent-text); border-color: var(--accent); background: var(--accent-soft); }
   .cal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 10px 12px 12px; min-width: 0; }
   /* The shown calendar fills the page's height, and widens to the board's
@@ -256,7 +256,8 @@
   .cal-grid > .cal-scroll { flex: 1 1 0; }
   .cal-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
   .cal-bar .sp { flex: 1 1 auto; }
-  .cal-modes { display: inline-flex; gap: 6px; }
+  .cal-modes, .cal-zoom { display: inline-flex; gap: 6px; }
+  button.cal-ic[aria-disabled="true"] { opacity: .45; cursor: default; }
   button.cal-ic { min-width: 30px; height: 30px; padding: 0 6px; font-size: 18px; line-height: 1; }
   .cal-range-wrap { position: relative; }
   button.cal-range { border: 0; background: none; font-family: var(--font-display); font-size: 17px; font-weight: 600; color: var(--ink); padding: 4px 6px; }
@@ -291,10 +292,10 @@
   .cal-hol { font-size: 11.5px; padding: 2px 6px; border-radius: 3px; background: var(--hairline); color: var(--ink-2);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cal-scroll { min-height: 360px; container-type: size; overflow-y: auto; overscroll-behavior: contain; }
-  /* 48 rows fill the pane once it is taller than 48 x 24px (XERK-2937). */
-  .cal-body { position: relative; --slot: 24px; }
+  /* The zoom (XERK-2954): --hours (calendar.js, default 10 = 8 AM-6 PM) fill the pane. */
+  .cal-body { position: relative; --hours: 10; --slot: calc(240px / var(--hours)); }
   /* Gated: a browser without cqh would hold an invalid --slot and lose every row. */
-  @supports (height: 1cqh) { .cal-body { --slot: max(24px, 100cqh / 48); } }
+  @supports (height: 1cqh) { .cal-body { --slot: max(10px, 100cqh / (var(--hours) * 2)); } }
   .cal-gutter { position: relative; }
   .cal-hr { position: absolute; right: 6px; transform: translateY(-50%); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
   .cal-col { position: relative; border-left: 1px solid var(--hairline);
@@ -302,7 +303,7 @@
     background:
       repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px calc(var(--slot) * 2)),
       repeating-linear-gradient(to bottom, transparent 0 var(--slot), color-mix(in srgb, var(--hairline) 45%, transparent) var(--slot) calc(var(--slot) + 1px), transparent calc(var(--slot) + 1px) calc(var(--slot) * 2)),
-      linear-gradient(to bottom, var(--page) 0 calc(var(--slot) * 16), transparent calc(var(--slot) * 16) calc(var(--slot) * 34), var(--page) calc(var(--slot) * 34)); }
+      linear-gradient(to bottom, var(--page) 0 calc(var(--slot) * 18), transparent calc(var(--slot) * 18) calc(var(--slot) * 34), var(--page) calc(var(--slot) * 34)); }
   .cal-col.off, .cal-band-day.off, .cal-dh.off { background-color: color-mix(in srgb, var(--muted) 10%, transparent); }
   .cal-col.off { background-image:
       repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px calc(var(--slot) * 2)),
@@ -374,9 +375,10 @@
   .cal-hostset { border: 1px solid var(--hairline); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; font-size: 13px; }
   .cal-hostset .cal-dnote { margin: 0 0 6px; }
   .cal-hostrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 0; border-top: 1px solid var(--hairline); min-width: 0; }
+  .cal-hostrow:first-child { border-top: 0; }
   .cal-hostrow b { overflow-wrap: anywhere; min-width: 0; }
+  .cal-hostrow .cal-dnote { margin: 0; overflow-wrap: anywhere; min-width: 0; }
   .cal-hostrow label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-  .cal-hostrow select { max-width: 100%; min-width: 0; }
   .cal-drow .v { min-width: 0; overflow-wrap: anywhere; }
   .cal-drow a { color: var(--accent-text); }
   .cal-dnote { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
@@ -952,7 +954,6 @@ async function refresh() {
       body.meetingLabelMisses = cache.meetingLabelMisses;
       body.meetingFocus = cache.meetingFocus;
       body.holidaySettings = cache.holidaySettings;
-      body.calendarOrgRules = cache.calendarOrgRules;
     }
     cache = body;
     if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
@@ -1007,8 +1008,8 @@ function connectSSE() {
   });
   // Each org's Tenir label and the labels no org has (XERK-2638), and whose
   // work its meetings propose (XERK-2514).
-  // Each org's days off and calendar email domains, which its drawer edits (XERK-2929).
-  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus", "holidaySettings", "calendarOrgRules"]) {
+  // Each org's days off, which its drawer edits (XERK-2929).
+  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus", "holidaySettings"]) {
     es.addEventListener(ev, (e) => {
       let d;
       try { d = JSON.parse(e.data); } catch { return; }
@@ -1016,7 +1017,7 @@ function connectSSE() {
       labelsClock++;
       cache[ev] = d;
       renderBriefs(cache, Date.now());
-      if (ev === "holidaySettings" || ev === "calendarOrgRules") calendarSoon();
+      if (ev === "holidaySettings") calendarSoon();
     });
   }
   // The calendar reads its own routes; these frames only say what changed.

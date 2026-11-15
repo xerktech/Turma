@@ -119,36 +119,26 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 
 ## Org assignment (served as `org` on each event)
 
-A host's calendar is one person's Outlook and may span orgs. Decided at serve time, in order:
-1. The host's per-series override (`seriesOrgs[seriesId || id]`).
-2. Domain rules: the org whose `domains` contain the ORGANIZER's email domain; else the one org
-   matching any attendee's domain, only when exactly one org matches (two = ambiguous, skipped).
-3. The host's `defaultOrg`.
-4. The host's decided org (`decidedOrgOf`). "" only for a host in no decided org.
-- **Every meeting of a host in an org has an org** (XERK-2936, operator rule): there is no
-  "pinned unassigned" override — a series pin of "" is a 400, and a stored one is dropped. Before
-  this, events no rule matched served "" and drew grey on every client.
-- Only orgs of the HOST's tenant count (org key tenant == host key tenant), and only orgs some
-  host is decided into; a rule or setting naming another tenant's org is refused at the route.
-- A domain is lowercase `^[a-z0-9.-]{1,253}$` with a dot; `sub.a.com` matches rule `a.com`.
+- **An Outlook event's org is its HOST's decided org (`decidedOrgOf`), always** (XERK-2964,
+  operator rule): the agent that read it is tied to one org, so the org is known and LOCKED.
+  "" only for a host in no decided org (drifted or never bound).
+  - No per-series pick, email-domain rule or host default org. Never re-add one: XERK-2929 had
+    all three and the operator removed them. Clients show the org as text, never a picker.
+  - The settings route refuses a `defaultOrg`/`series` body (400, in words); an older store's
+    `defaultOrg`/`seriesOrgs` are dropped on load; `/data/calendar-org-rules.json` is no longer read.
+- `matchOrg` (XERK-2898) equals `org`; the capture matcher counts an event for that org.
+- **A host's decided org moving (drift, recovery) re-runs the matcher and sends a `calendar`
+  frame at once** (`calendarOnBeat`): it moves every one of its events, and waiting for a sync that
+  changes events left links depending on history (QA). Test: `XERK-2964: a host leaving the org…`.
 
 ## Settings (hub store, operator-authed, tenant-scoped)
 
-- Two `registerExternalStore`s: `/data/calendar-org-rules.json` (`CALENDAR_ORG_RULES_FILE`,
-  siteKey → `{domains[]}`, a `TENANT_ORG_STORES` member) and `/data/calendar-host-settings.json`
-  (`CALENDAR_HOST_SETTINGS_FILE`, hostKey → `{defaultOrg?, showPrivate?, seriesOrgs{}}`).
-  Split so each is keyed like its tenant's other stores (org key vs host key).
-- `POST /api/orgs/<site>/calendar-rules {domains: [..]}` (org route: 404 an org no host is
-  decided into; ≤50 domains; `[]` clears).
-- `POST /api/agents/<host>/calendar/settings {defaultOrg?, showPrivate?, series?: {id, org}}`
-  (host route, `principalMayDriveHost`); `defaultOrg`/`series.org` null clears, else must be a
-  decided org of the host's tenant (404). ≤500 series overrides per host (oldest dropped).
-- They answer `{ok, rules}` / `{ok, settings}` and broadcast a `calendar` frame for the host(s) affected.
-- **Read back for the settings UI** (XERK-2929): rules ride `/api/agents` as `calendarOrgRules`
-  (`bySite`) + its own SSE frame; each `/api/calendar` `hosts[]` row carries `org` (decided),
-  `orgs` (what it may pick), `defaultOrg` ("" = none), `showPrivate`; an event the operator
-  pinned carries `seriesOrg` (only a pin that still counts). Web: Meetings drawer (days off, domains), calendar gear (host),
-  event panel (series). Android mirrors all three.
+- `/data/calendar-host-settings.json` (`CALENDAR_HOST_SETTINGS_FILE`, a `registerExternalStore`),
+  hostKey → `{showPrivate?}`.
+- `POST /api/agents/<host>/calendar/settings {showPrivate: bool}` (host route,
+  `principalMayDriveHost`); answers `{ok, settings}` and broadcasts a `calendar` frame for the host.
+- Each `/api/calendar` `hosts[]` row carries `org` (decided, every event's) and `showPrivate`.
+  Web: the calendar gear (host rows); Android mirrors it.
 
 ## The event store
 
@@ -173,8 +163,8 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
     these caps, the meetings store's budget class. Raise the caps only by moving it to Postgres.
 - **Keeps the last good sync per host**: an offline host's calendar is still served (`online:false`
   beside it). A host removed from the registry loses its calendar 30 days after its last sync.
-- Tenant purge + migration step for `calendarEvents`, `calendarHostSettings` (a host's plain
-  org values follow it into the tenant) and `calendarOrgRules`. Tests: `tenant-migration.test.js`.
+- Tenant purge + migration step for `calendarEvents` and `calendarHostSettings`.
+  Tests: `tenant-migration.test.js`.
 
 ## Hub → agent: the `syncCalendar` command
 
@@ -215,7 +205,7 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
   - `calendarBy`: `auto` (the matcher) | `operator`; `operator` with no id = "never link".
   - `calendarAmbiguous: true` = the matcher found a tie; nothing linked, flagged for the operator.
 - **Matching** (`calendarBestMatch`), on Tenir's POST and again when a sync CHANGES a host's stored
-  events, an org rule or a host setting (`scheduleCalendarRelink` → `relinkTenantMeetings`).
+  events or its decided org moves (`scheduleCalendarRelink` → `relinkTenantMeetings`).
   - Relinks run at most once per `CALENDAR_RELINK_MIN_MS` (10s) per tenant, the rest deferred to
     one trailing timer; an error-only or unchanged sync schedules none. Why: one host re-sending
     syncs every beat blocked the shared event loop ~0.55 s a beat at the caps (QA).
@@ -297,3 +287,64 @@ A host's calendar is one person's Outlook and may span orgs. Decided at serve ti
     orgs (`principalMaySite`), so another tenant's org never appears.
 - Tests: `holidays.test.js` (rules over several years), the `XERK-2892:` cases in
   `server.test.js` (round-trip, SSE, tenant isolation pinned by mutation, purge).
+
+## Turma-created events (hub, epic XERK-2967; store + routes XERK-2968)
+
+Events made IN Turma, owned by the hub, never written to Outlook. Every child of the epic
+(recurrence XERK-2969, matching + brief XERK-2970, web XERK-2971, Android XERK-2972) builds here.
+- **Store**: `/data/calendar-turma-events.json` (`CALENDAR_TURMA_EVENTS_FILE`),
+  `registerExternalStore`, tenant id ("" = untenanted) → eventId → record. Keyed by TENANT, not
+  host or org: one event may belong to several orgs of one tenant.
+- **Id `turma:<16 hex>`**, minted by the hub: an Outlook GlobalAppointmentID never starts so.
+  Any other id on these routes is a 400 "Outlook events are read-only".
+- **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
+  order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
+  timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
+  sensitivity, recurrence, createdBy, createdAt, updatedAt, version}`.
+  - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
+    `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
+  - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.
+  - `timeZone` an IANA zone the hub's Intl knows (≤64, else "UTC"): the wall clock the creator
+    meant, which a recurrence needs; `start`/`end` alone fix the instant.
+  - Attendee `role` is `required|optional` only (the creator is the organizer); no `response`.
+  - `busy` free|tentative|busy|outOfOffice|workingElsewhere (default busy).
+  - `recurrence` is `null` until XERK-2969 defines it.
+  - `createdBy`: the creating principal (`user:<id>`, or its kind for open/legacy/break-glass).
+  - `version` starts at 1 and every write bumps it.
+- **Caps, refused with a 409 in the hub's words, never a silent drop**: ≤`CALENDAR_TURMA_EVENTS_MAX`
+  (1500) events and ≤`CALENDAR_TURMA_BYTES_MAX` (2 MiB of JSON) per tenant — the Outlook
+  store's budget class (a host's 1500 / 1.5 MiB).
+
+## Turma-created events: routes and serving
+
+- Operator-authed (`filtered` class: the handler scopes by org), JSON body ≤64 KiB:
+  - `POST /api/calendar/events {orgs, subject, start, end, timeZone?, ...}` → `{ok, event}`.
+  - `PATCH /api/calendar/events/<id> {version, orgs?, fields...}` → `{ok, event}`; a `version`
+    other than the stored one is a 409 carrying the current `event` (optimistic concurrency).
+  - `DELETE /api/calendar/events/<id>` → `{ok}`.
+- **The caller must pass `principalMaySite` for EVERY org in the body AND every org on the stored
+  event**, so nobody strips an org they cannot see. An org no host is decided into, or one the
+  caller may not see, is a 404 (never says which tenant holds it); `orgs: []` is a 400 (an event
+  must belong to an org); an id the caller's tenants do not hold is a 404.
+- Malformed fields are a 400 naming the field, never coerced into a different event: `start`/`end`
+  must parse with an offset, `end ≥ start`, a given `timeZone` must be a known zone, a given
+  `joinUrl` https, `busy`/`sensitivity` from their enums.
+- **Served on `GET /api/calendar`** beside the Outlook events, each ONCE (not per org):
+  `{source:"turma", host:"", ...record, orgs, org: orgs[0], editable, meeting}`.
+  - `orgs` served = the stored ones still decided in the record's tenant; none left = not served.
+  - `org = orgs[0]` keeps older clients' colour; the `?org=` filter matches when ANY of `orgs` is in it.
+  - `editable` = the caller passes the route check above; `meeting` = `calendarLinkCandidate`.
+  - Only events of tenants the caller may see (`principalMaySite` on the record's orgs).
+  - A private/confidential event is withheld exactly like an Outlook one for every viewer but its
+    creator (`createdBy`).
+- **Every write broadcasts the coalesced `calendar` frame** under the tenant-level key
+  `turma:events@<tenant>` (plain `turma:events` untenanted). The SSE scoper's `mayHost` passes it
+  only to that tenant's viewers; clients refetch on any frame, so no client change is needed.
+- **Lifecycle**: an org no host has been decided into for `CALENDAR_TURMA_ORG_GRACE_MS` (24h,
+  tracked in memory, so a hub restart restarts it — the safe direction) is dropped from `orgs`
+  by `calendarTick`; an event left with no org is deleted. The grace is why a host's brief
+  drift out of its org (`decidedOrgOf` = "") never wipes that org's events; serving hides the
+  org at once.
+- Tenant purge drops the tenant's bucket; tenant migration moves an untenanted event whose every
+  org is movable into the tenant, its orgs re-keyed. Tests: `tenant-migration.test.js`, the
+  `XERK-2968:` cases in `server.test.js`.
