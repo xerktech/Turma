@@ -16,6 +16,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,6 +44,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateListOf
@@ -51,6 +54,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -405,6 +410,10 @@ fun SessionsRoute(
     // transcriptId). Default no-op keeps previews/tests that only drive the
     // terminal path happy.
     onTrajectory: (String, String) -> Unit = { _, _ -> },
+    // Hoisted so a test hands in VMs over its own hub: the screen default can return
+    // one over an earlier test's container in a full-suite run (android.md).
+    fleetVm: FleetViewModel = viewModel(),
+    archiveVm: ArchiveViewModel = viewModel(),
 ) {
     var selHost by rememberSaveable { mutableStateOf<String?>(null) }
     var selId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -429,6 +438,19 @@ fun SessionsRoute(
     // empty box after reading the first result. Searching means trying results
     // in turn, so it has to survive the round trip.
     var query by rememberSaveable { mutableStateOf("") }
+    // The list's scroll position, hoisted HERE for the same reason as the query
+    // (XERK-2955): narrow mode disposes the list pane while a session is open, so
+    // a state remembered inside it came back at the top on every Back. Saveable,
+    // so it also survives a terminal/trajectory round trip and a fold/unfold.
+    val listState = rememberLazyListState()
+    // Whether the Ended section is expanded — hoisted for the same reason: an ended
+    // session opened from it must come back to an open section, or its row (and the
+    // scroll anchor on it) is gone on Back.
+    val endedOpen = rememberSaveable { mutableStateOf(false) }
+    // The session last backed out of in narrow mode (XERK-2955), so the list
+    // marks where the operator just was — the wide pane marks its live selection
+    // the same way. Replaced by the next pick.
+    var lastKey by rememberSaveable { mutableStateOf<String?>(null) }
     val select: (String, String) -> Unit = { h, s ->
         endHost = null; endTid = null; subType = null; subLabel = null; subAgentId = ""
         selHost = h; selId = s
@@ -443,6 +465,7 @@ fun SessionsRoute(
         if (subAgentId.isNotEmpty()) subAgentId = "" else { subType = null; subLabel = null }
     }
     val clear: () -> Unit = {
+        lastKey = selKey(selHost, selId) ?: selKey(endHost, endTid) ?: lastKey
         selHost = null; selId = null; endHost = null; endTid = null
         subType = null; subLabel = null; subAgentId = ""
     }
@@ -470,6 +493,7 @@ fun SessionsRoute(
                     onBack = clear,
                     onResumed = select,
                     showBack = !wide,
+                    fleetVm = fleetVm, archiveVm = archiveVm,
                 )
                 else -> ChatScreen(
                     host = selHost.orEmpty(),
@@ -499,6 +523,8 @@ fun SessionsRoute(
             Row(m.fillMaxSize()) {
                 SessionsListPane(
                     selectedKey = selKey(selHost, selId) ?: selKey(endHost, endTid),
+                    listState = listState, endedOpenState = endedOpen,
+                    vm = fleetVm, archiveVm = archiveVm,
                     onSelect = select,
                     onSelectEnded = selectEnded,
                     query = query, onQuery = { query = it },
@@ -514,7 +540,9 @@ fun SessionsRoute(
         // Narrow, nothing picked: just the list.
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             SessionsListPane(
-                selectedKey = null, onSelect = select, onSelectEnded = selectEnded,
+                selectedKey = lastKey, listState = listState, endedOpenState = endedOpen,
+                vm = fleetVm, archiveVm = archiveVm,
+                onSelect = select, onSelectEnded = selectEnded,
                 query = query, onQuery = { query = it }, modifier = m,
             )
         }
@@ -538,6 +566,8 @@ private fun DetailEmpty() {
 fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
+    endedOpenState: MutableState<Boolean> = rememberSaveable { mutableStateOf(false) },
     onSelectEnded: (String, String) -> Unit = { _, _ -> },
     query: String = "",
     onQuery: (String) -> Unit = {},
@@ -590,7 +620,7 @@ fun SessionsListPane(
     val (review, active, idle, sleeping) = groups
     val queued = lists.queued
     val ended = lists.ended
-    var endedOpen by rememberSaveable { mutableStateOf(false) }
+    var endedOpen by endedOpenState
     // A filtered Ended list is a search RESULT, so searching opens the section —
     // a match hiding behind a collapsed header reads as "nothing matched". Only
     // on the edge into searching, so it stays collapsible while a query is up.
@@ -617,6 +647,10 @@ fun SessionsListPane(
         )
         LazyColumn(
             Modifier.fillMaxSize(),
+            // A fleet still loading (a restore after process death) would measure the
+            // saved position against an empty list and clamp it to the top, so the
+            // hoisted state is attached only once there is something to scroll.
+            state = if (fleet.loading && fleet.agents.isEmpty()) rememberLazyListState() else listState,
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -907,7 +941,7 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel:
 private fun EndedSessionRow(
     e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit,
 ) {
-    val cardMod = Modifier.fillMaxWidth().then(
+    val cardMod = Modifier.fillMaxWidth().semantics { this.selected = selected }.then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
         else Modifier,
@@ -1047,7 +1081,7 @@ private fun SessionListCard(
     onMove: (String) -> Unit,
     onClick: () -> Unit,
 ) {
-    val cardMod = Modifier.fillMaxWidth().then(
+    val cardMod = Modifier.fillMaxWidth().semantics { this.selected = selected }.then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
         else Modifier,
