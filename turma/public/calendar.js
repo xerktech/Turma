@@ -1682,8 +1682,9 @@ function repeatRowsHtml(f, one) {
       + opt("day", `On day ${Number.isSafeInteger(r.monthDay) ? r.monthDay : a.d}`, r.monthMode)
       + opt("weekday", `On ${rNthText(nth)}`, r.monthMode) + `</select></div>`;
   }
-  h += `<div class="cal-ed-row"><span class="k">Ends</span><div class="cal-ed-when"><select data-ed-rep="end" aria-label="Repeat ends">`
-    + opt("never", "Never", r.end) + opt("until", "On date", r.end) + opt("count", "After", r.end) + `</select>`
+  // No "Ends" label: the event's own end sits just above (screenshot review).
+  h += `<div class="cal-ed-row"><span class="k"></span><div class="cal-ed-when"><select data-ed-rep="end" aria-label="Repeat ends">`
+    + opt("never", "Never ends", r.end) + opt("until", "Ends on", r.end) + opt("count", "Ends after", r.end) + `</select>`
     + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(f.startDate)}" value="${esc(r.until)}">` : "")
     + (r.end === "count" ? `<input type="number" class="cal-ed-num" data-ed-rep="count" min="1" max="${R_COUNT_MAX}" step="1" aria-label="Number of occurrences" value="${esc(r.count)}"> occurrences` : "")
     + `</div></div>`;

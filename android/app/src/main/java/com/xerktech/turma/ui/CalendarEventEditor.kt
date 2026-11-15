@@ -371,8 +371,8 @@ private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pi
         }
     }
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-        label("Ends")
-        val ends = listOf("never" to "Never", "until" to "On date", "count" to "After")
+        label("")   // the event's own "Ends" sits just above: the options say it
+        val ends = listOf("never" to "Never ends", "until" to "Ends on", "count" to "Ends after")
         Picker(ends.first { it.first == r.end }.second, ends, { put(r.copy(end = it)) }, Modifier.testTag("cal-ed-rep-end"))
         when (r.end) {
             "until" -> GhostButton(r.until?.let { calLongDay(it, locale) } ?: "Pick a date", { pick("until") }, Modifier.testTag("cal-ed-rep-until"))
