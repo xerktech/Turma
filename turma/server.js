@@ -22730,13 +22730,14 @@ function sweepMeetingTranscripts(now = Date.now()) {
 // Save a duplicate's segments as the transcript of a settled meeting that has
 // none kept, locally nor in Postgres (XERK-2965). A store that cannot tell saves
 // nothing: never overwrite a kept transcript on a guess.
+// -> "saved" | "kept" | "unknown" (the store could not tell; Tenir asks again soon).
 async function backfillMeetingTranscript(m) {
   try {
-    if (!(await meetingTranscripts.missing([m])).length) return false;
+    if (!(await meetingTranscripts.missing([m])).length) return "kept";
   } catch {
-    return false;
+    return "unknown";
   }
-  return saveMeetingTranscript(m);
+  return saveMeetingTranscript(m) ? "saved" : "unknown";
 }
 
 function acceptMeeting(siteKey, body, now = Date.now()) {
@@ -29540,7 +29541,11 @@ const server = http.createServer(async (req, res) => {
           limit: MEETING_SEGMENTS_MAX });
       }
       const out = acceptMeeting(siteKey, body);
-      if (out.backfill && await backfillMeetingTranscript(out.backfill)) out.body.transcriptSaved = true;
+      if (out.backfill) {
+        const r = await backfillMeetingTranscript(out.backfill);
+        if (r === "saved") out.body.transcriptSaved = true;
+        else if (r === "unknown") out.body.transcriptUnknown = true;
+      }
       return json(res, out.status, out.body);
     }
 

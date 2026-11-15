@@ -29814,7 +29814,7 @@ test("XERK-2965: Tenir lists the settled meetings with no transcript kept and ba
     assert.equal(hub.meetingTranscripts.has("pg1", 9), false);
     hub.meetingTranscripts.missing = async () => { throw new Error("postgres connection closed"); };
     const down = await postMeeting2508(S, meeting2508("pg1", { backfill: true }));
-    assert.deepEqual([down.status, down.body.transcriptSaved], [200, undefined]);
+    assert.deepEqual([down.status, down.body.transcriptSaved, down.body.transcriptUnknown], [200, undefined, true]);
     assert.equal(hub.meetingTranscripts.has("pg1", 9), false);
     // The list says so rather than reading "all missing" (QA m6).
     const l = await list(S);
