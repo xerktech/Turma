@@ -173,7 +173,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     Rows stretch past 24px only when the pane is taller than the day (`--slot`, `100cqh / 48` on
     the `container-type: size` pane), so every top/height goes through `slots()`, never px.
     Scroll math stays in `SLOT_PX`: a stretched day never scrolls.
-  - 30-min rows (24px), working hours 8–17 shaded white, the grid opens scrolled to 8:00, a red
+  - 30-min rows (24px), working hours 9–17 shaded white, the grid opens scrolled to 8:00, a red
     now-line with a dot on today, today's header in the accent with a top bar.
   - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event an
     org (XERK-2936, its host's when no rule decides); neutral only for a host in no org;

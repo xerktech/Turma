@@ -22,7 +22,7 @@ const HOUR_PX = SLOT_PX * 2;
 // grows (brief.html, .cal-body). Scroll math stays in SLOT_PX: a stretched day
 // never scrolls.
 const slots = (n, minus = 0) => `calc(var(--slot, ${SLOT_PX}px) * ${n}${minus ? ` - ${minus}px` : ""})`;
-const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid opens at 8:00
+const OPEN_AT_H = 8;  // the grid opens scrolled to 8:00, an hour above the 9–17 shaded working hours (brief.html .cal-col)
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
 const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case its frame is missed
@@ -963,7 +963,7 @@ function paint(force = false) {
     const sc = $grid.querySelector && $grid.querySelector("#calScroll");
     revealed = !!(sc && scrollToMin >= 0);
     if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
-    else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
+    else if (sc && !scrolled) { sc.scrollTop = OPEN_AT_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
     scrollToMin = -1;
   }
   refit(revealed);
@@ -980,7 +980,7 @@ function refit(keep = false) {
   const sc = active && $grid && $grid.querySelector && $grid.querySelector("#calScroll");
   if (!sc || !sc.clientHeight) return;
   const fits = sc.scrollHeight <= sc.clientHeight + 1;
-  if (fitWas && !fits && !keep) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
+  if (fitWas && !fits && !keep) sc.scrollTop = OPEN_AT_H * HOUR_PX - 12;
   fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's

@@ -87,6 +87,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.core.CAL_DAILY_EVENT_MS
+import com.xerktech.turma.core.CAL_OPEN_AT_H
 import com.xerktech.turma.core.CAL_WORK_FROM_H
 import com.xerktech.turma.core.CAL_WORK_UNTIL_H
 import com.xerktech.turma.core.CalMode
@@ -538,7 +539,7 @@ private fun WeekGrid(
     val orgLabel: (String) -> String = { s -> if (s.isEmpty()) "No org" else com.xerktech.turma.core.orgName(s, names[s].orEmpty()) }
     val offOf = days.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
     // The grid opens at working hours (8 AM in view); a reveal scrolls to its event.
-    LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (HOUR_DP * CAL_WORK_FROM_H - 12.dp).roundToPx() }) }
+    LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (HOUR_DP * CAL_OPEN_AT_H - 12.dp).roundToPx() }) }
     LaunchedEffect(scrollTo) {
         if (scrollTo >= 0) {
             scroll.animateScrollTo(with(density) { ((SLOT_DP * (scrollTo / 30).toFloat()) - HOUR_DP).roundToPx().coerceAtLeast(0) })
