@@ -448,6 +448,7 @@ fun calAria(ev: CalendarEvent, day: LocalDate, orgLabel: String, badge: CalBadge
     if (ev.myResponse == "declined") bits += "declined"
     if (ev.tenir) bits += "captured by Tenir, not on Outlook"
     if (ev.turma) bits += "Turma event, not on Outlook"
+    if (ev.recurring) bits += "repeats"
     calBadgeText(badge).takeIf { it.isNotEmpty() }?.let { bits += it }
     return bits.joinToString(", ")
 }

@@ -63,8 +63,15 @@ data class TurmaEventDraft(
     // The stored sensitivity, so un-ticking Private on a confidential event keeps it.
     val sensitivity: String = "normal",
     val orgs: Set<String> = emptySet(),
+    // XERK-2973: how it repeats, and for an occurrence of a series which events the
+    // edit is for ("occurrence" | "following" | "series"; "" = a plain event / a new one).
+    val repeat: RepeatForm = RepeatForm(),
+    val scope: String = "",
 ) {
     val editing: Boolean get() = id.isNotEmpty()
+
+    /** This one occurrence alone: its orgs, zone and rule are the series'. */
+    val oneOccurrence: Boolean get() = scope == "occurrence"
 }
 
 /**
@@ -136,7 +143,18 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
         categories = ev.categories.joinToString(", "),
         private = ev.sensitivity == "private", sensitivity = ev.sensitivity.ifEmpty { "normal" },
         orgs = calOrgsOf(ev).toSet(),
+        repeat = calRepeatOf(calRuleOf(ev.recurrence)),
     )
+}
+
+/**
+ * The day a served occurrence's rule is read from: its ORIGINAL start (a moved
+ * one keeps its series' day) in the zone it was made in.
+ */
+fun calAnchorDay(ev: CalendarEvent, fallback: ZoneId): LocalDate {
+    val zone = calZoneOrNull(ev.timeZone) ?: fallback
+    val ms = runCatching { java.time.Instant.parse(ev.originalStart).toEpochMilli() }.getOrNull() ?: ev.startMs ?: 0
+    return java.time.Instant.ofEpochMilli(ms).atZone(zone).toLocalDate()
 }
 
 // A name with a separator or quote in it is written quoted ("Smith, John"), so a
@@ -283,6 +301,7 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
     if (d.body.codePointCount() > CAL_BODY_MAX) add("The details are longer than $CAL_BODY_MAX characters.")
     val cats = calCategories(d.categories)
     if (cats.size > 20 || cats.any { it.codePointCount() > 100 }) add("At most 20 categories of at most 100 characters.")
+    if (!d.oneOccurrence) calRepeatError(d.repeat, d.startDate).takeIf { it.isNotEmpty() }?.let { add(it) }
     if (d.orgs.isEmpty()) add("Pick at least one org.")
     if (d.orgs.size > CAL_TURMA_ORGS_MAX) add("An event belongs to at most $CAL_TURMA_ORGS_MAX orgs.")
 }
@@ -325,5 +344,8 @@ fun calDraftPayload(d: TurmaEventDraft, orgsOrder: List<String> = emptyList()): 
         put("busy", d.busy)
         put("categories", JsonArray(calCategories(d.categories).map { JsonPrimitive(it) }))
         put("sensitivity", if (d.private) "private" else d.sensitivity.takeIf { it != "private" } ?: "normal")
+        // One occurrence takes no rule (the hub refuses it): the series' stands (XERK-2973).
+        if (!d.oneOccurrence) put("recurrence", calRuleJson(calRuleOfRepeat(d.repeat, d.startDate)))
+        if (d.scope.isNotEmpty()) put("scope", d.scope)
     }
 }

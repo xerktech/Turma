@@ -96,6 +96,11 @@ data class CalendarEvent(
     val editable: Boolean? = null,
     val version: Long? = null,
     val timeZone: String = "",
+    // A Turma series' rule (XERK-2973), read by core/CalendarRepeat.kt's calRuleOf; raw, so
+    // a shape this build cannot read degrades to "no rule" rather than failing the decode.
+    val recurrence: kotlinx.serialization.json.JsonElement? = null,
+    // An occurrence's original start (UTC ISO), the day its series' rule is read from.
+    val originalStart: String = "",
 ) {
     val tenir: Boolean get() = source == "tenir"
 
@@ -108,6 +113,9 @@ data class CalendarEvent(
      * blanked, so saving them back would wipe the creator's event (XERK-2972 QA).
      */
     val canEdit: Boolean get() = turma && editable == true && version != null && !private
+
+    /** One occurrence of a Turma series (XERK-2973): an Edit / Delete first asks which events. */
+    val turmaOccurrence: Boolean get() = turma && recurring && seriesId.isNotEmpty()
 
     /** Host + id: one meeting on two hosts is two rows of the answer (the web's `evKey`). */
     val key: String get() = "$host\u0000$id"

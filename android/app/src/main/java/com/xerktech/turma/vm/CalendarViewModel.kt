@@ -413,7 +413,8 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
                 is EventResult.Saved, EventResult.Deleted -> if (_editor.value?.base == ed.base) _editor.value = null
                 is EventResult.Conflict -> if (_editor.value?.base == ed.base) {
                     // Only into the editor this save came from: one discarded meanwhile stays closed.
-                    val fresh = com.xerktech.turma.core.calDraftOf(r.event, zone)
+                    // The scope it was opened for stays: the reload is the same edit, redone.
+                    val fresh = com.xerktech.turma.core.calDraftOf(r.event, zone).copy(scope = ed.draft.scope)
                     _editor.value = EventEditor(fresh, fresh, fresh.orgs.toList(), r.message)
                 }
                 is EventResult.Failed -> _editor.update { it?.copy(error = r.message) }
@@ -455,14 +456,17 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Delete a Turma event (`DELETE /api/calendar/events/<id>`). */
-    fun deleteEvent(id: String, done: (EventResult) -> Unit = {}): Job? {
+    /**
+     * Delete a Turma event (`DELETE /api/calendar/events/<id>`); for an occurrence of a
+     * series, [scope] names which events go (occurrence | following | series, XERK-2973).
+     */
+    fun deleteEvent(id: String, scope: String? = null, done: (EventResult) -> Unit = {}): Job? {
         if (_eventBusy.value) return null
         _eventBusy.value = true
         val what = "Deleting the event"
         return viewModelScope.launch {
             val out = try {
-                eventResult(container.client.api.deleteTurmaEvent(id), what) { EventResult.Deleted }
+                eventResult(container.client.api.deleteTurmaEvent(id, scope), what) { EventResult.Deleted }
             } catch (e: CancellationException) {
                 _eventBusy.value = false
                 throw e

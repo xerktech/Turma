@@ -1,6 +1,8 @@
 package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -132,7 +134,7 @@ class CalendarTurmaEventsTest {
         awaitEvent("Outlook standup")
         compose.onNodeWithTag("cal-new-event").performClick()
         compose.onNodeWithTag("cal-editor").assertExists()
-        compose.onNodeWithText("Does not repeat").assertExists()
+        compose.onNodeWithText("Does not repeat", substring = true).assertExists()
         compose.onNodeWithTag("cal-ed-title").performTextInput("Kickoff")
         compose.onNodeWithTag("cal-ed-required").performTextInput("Ann <ann@x.com>")
         // Two orgs and no header pick: none is chosen for the operator, so Save says so.
@@ -249,5 +251,70 @@ class CalendarTurmaEventsTest {
         release.countDown()
         compose.waitUntil(5_000) { !cvm.eventBusy.value }
         assertEquals(null, cvm.editor.value)
+    }
+
+    // ---- XERK-2973: an occurrence of a series asks which events --------------------------
+    private val occId = "turma:0123456789abcdef:2026-01-01T15:00:00Z"
+    private fun occurrence() = turmaEvent(extra = """, "recurring": true, "seriesId": "turma:0123456789abcdef",
+        "originalStart": "2026-01-01T15:00:00Z", "recurrence": { "freq": "weekly", "interval": 2, "byDay": ["TU", "TH"] }""")
+        .replace("\"id\": \"turma:0123456789abcdef\"", "\"id\": \"$occId\"")
+
+    @Test fun `XERK-2973 a repeating event wears the glyph and its panel says the rule`() {
+        seed(occurrence())
+        show()
+        awaitEvent("repeats")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-repeats").performScrollTo().assertTextContains("Every 2 weeks on Tue, Thu", substring = true)
+    }
+
+    @Test fun `XERK-2973 Edit on an occurrence asks which events, and This event locks the series' fields`() {
+        seed(occurrence())
+        hub.json("/api/calendar/events/$occId", """{ "ok": true, "event": ${occurrence()} }""")
+        show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-edit").performScrollTo().performClick()
+        compose.onNodeWithText("Edit which events?").assertExists()
+        compose.onNodeWithTag("cal-scope-occurrence").performClick()
+        compose.onNodeWithText("Edit this event").assertExists()
+        compose.onNodeWithTag("cal-ed-tz").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithText("A series' orgs apply to every event in it", substring = true).performScrollTo().assertExists()
+        compose.onNodeWithTag("cal-ed-org-$a").performScrollTo().assertIsNotEnabled()
+        compose.onNodeWithTag("cal-ed-repeat").performScrollTo().assertTextContains("Every 2 weeks on Tue, Thu", substring = true)
+        compose.onNodeWithTag("cal-editor-save").performClick()
+        val sent = body("/api/calendar/events/$occId")
+        assertEquals("occurrence", sent["scope"]!!.jsonPrimitive.content)
+        assertEquals(false, "recurrence" in sent)
+    }
+
+    @Test fun `XERK-2973 This and following sends the scope and the rule`() {
+        seed(occurrence())
+        hub.json("/api/calendar/events/$occId", """{ "ok": true, "event": ${occurrence()} }""")
+        show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-edit").performScrollTo().performClick()
+        compose.onNodeWithTag("cal-scope-following").performClick()
+        compose.onNodeWithText("Edit this and following events").assertExists()
+        compose.onNodeWithTag("cal-ed-rep-summary").performScrollTo().assertTextContains("Every 2 weeks on Tue, Thu", substring = true)
+        compose.onNodeWithTag("cal-editor-save").performClick()
+        val sent = body("/api/calendar/events/$occId")
+        assertEquals("following", sent["scope"]!!.jsonPrimitive.content)
+        assertEquals(TurmaJson.parseToJsonElement("""{"freq":"weekly","interval":2,"byDay":["TU","TH"]}"""), sent["recurrence"])
+    }
+
+    @Test fun `XERK-2973 Delete on an occurrence asks which events and sends the scope`() {
+        seed(occurrence())
+        hub.json("/api/calendar/events/$occId", """{ "ok": true }""")
+        show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-delete").performScrollTo().performClick()
+        compose.onNodeWithText("Delete which events?").assertExists()
+        compose.onNodeWithTag("cal-scope-following").performClick()
+        val sent = hub.findRequest("/api/calendar/events/$occId")
+        assertEquals("DELETE", sent.method)
+        assertEquals("following", sent.requestUrl!!.queryParameter("scope"))
+        compose.waitUntil(5_000) { compose.onAllNodes(hasTestTag("cal-detail")).fetchSemanticsNodes().isEmpty() }
     }
 }

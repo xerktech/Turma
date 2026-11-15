@@ -510,7 +510,11 @@ interface HubApi {
     ): Response<com.xerktech.turma.model.TurmaEventResponse>
 
     @retrofit2.http.DELETE("api/calendar/events/{id}")
-    suspend fun deleteTurmaEvent(@Path("id") id: String): Response<kotlinx.serialization.json.JsonObject>
+    suspend fun deleteTurmaEvent(
+        @Path("id") id: String,
+        // Which events of a series an occurrence's delete removes (XERK-2973); null = the hub's default.
+        @retrofit2.http.Query("scope") scope: String?,
+    ): Response<kotlinx.serialization.json.JsonObject>
 
     // An org's meeting settings (XERK-2858's panel): whose work ({names, role},
     // XERK-2514), its Tenir label ({label: "<label>"|null}, XERK-2638) and its

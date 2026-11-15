@@ -361,6 +361,9 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
       any admin-role principal owns it (not `legacy`). A disabled creator still counts as live.
     - Only the owner may make an event private/confidential: a non-owner hiding one locked every
       other viewer out, itself included, with no way back. Both refusals carry no `event`.
+- **Clients send `recurrence` (the rule, or null) and an occurrence's `scope`** (XERK-2973): never a
+  `recurrence` with `scope: occurrence`. The control ⇄ rule mapping is shared by vector file
+  (`turma-meetings.md` "Repeat").
 - **Clients send the body Android's `calDraftPayload` builds** (XERK-2972): every field whole
   (an edit that clears one clears it), `start`/`end` with the offset of the picked `timeZone`,
   all-day ending at the midnight after its last day. Edit/Delete only on `editable:true`.
