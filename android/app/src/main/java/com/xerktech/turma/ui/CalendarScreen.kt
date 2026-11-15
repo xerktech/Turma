@@ -609,33 +609,52 @@ private fun WeekGrid(
     fun Modifier.shown(d: LocalDate, tag: String? = null): Modifier =
         if (d !in shownDays) clearAndSetSemantics {} else if (tag != null) testTag(tag) else this
     val offOf = strip.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
-    // How far the days are dragged, in px: read only when placing them, so a drag relayouts
-    // the strip and never recomposes the grid.
-    var shift by remember { mutableFloatStateOf(0f) }
+    // How far the days are dragged, in px, and the first day of the strip it was dragged on. Read
+    // only when placing them, so a drag relayouts the strip and never recomposes the grid. Keyed by
+    // that day so a settle can leave it at its end: the new days, a frame later, ignore it. Zeroing
+    // it in the settle instead placed the OLD days unshifted for a frame (a flash, QA).
+    var shift by remember { mutableStateOf(0L to 0f) }
+    val firstDay = days.first().toEpochDay()
+    val stripFirst by rememberUpdatedState(firstDay)
+    fun shiftNow(): Float = shift.let { (d, px) -> if (d == stripFirst) px else 0f }
+    // Once the new days are on screen, forget the old strip's offset: ‹ back to that day later
+    // must not find it again.
+    LaunchedEffect(firstDay) { if (shift.first != firstDay) shift = firstDay to 0f }
     var gridW by remember { mutableIntStateOf(0) }
     val colPx = (gridW - with(density) { gutter.toPx() }).coerceAtLeast(0f) / days.size
     val reach by rememberUpdatedState(before.size * colPx to after.size * colPx)
     val swipeTo by rememberUpdatedState(onSwipe)
     val scope = rememberCoroutineScope()
     var settling by remember { mutableStateOf<Job?>(null) }
+    // The step a running settle will take once it lands; a new touch lands it at once.
+    var landing by remember { mutableStateOf<(() -> Unit)?>(null) }
     val flingPx = with(density) { 400.dp.toPx() }
     // Released: on to the next / previous days past a third of the step or on a fling, else back.
-    fun settle(vx: Float) {
+    // [step] false (a pinch took over) always goes back.
+    fun settle(vx: Float, step: Boolean = true) {
         val (back, on) = reach
+        val from = shiftNow()
         val dir = when {
+            !step -> 0
             kotlin.math.abs(vx) > flingPx -> if (vx < 0) 1 else -1
-            shift < 0 && -shift > on / 3 -> 1
-            shift > 0 && shift > back / 3 -> -1
+            from < 0 && -from > on / 3 -> 1
+            from > 0 && from > back / 3 -> -1
             else -> 0
         }
         val target = when (dir) { 1 -> -on; -1 -> back; else -> 0f }
+        val day = stripFirst
+        // Steps only if the days are still the ones dragged: ‹ › or a mode pick mid-settle wins.
+        val land = {
+            landing = null
+            if (stripFirst == day) { if (dir != 0) swipeTo(dir); shift = day to target }
+        }
+        landing = land
         settling = scope.launch {
-            animate(shift, target, animationSpec = tween(220, easing = FastOutSlowInEasing)) { v, _ -> shift = v }
-            // The new days and the reset land in the same frame, so the grid never jumps.
-            if (dir != 0) { swipeTo(dir); shift = 0f }
+            animate(from, target, animationSpec = tween(220, easing = FastOutSlowInEasing)) { v, _ -> if (stripFirst == day) shift = day to v }
+            land()
         }
     }
-    Column(
+        Column(
         modifier.fillMaxWidth().semantics { contentDescription = "Calendar, ${calRangeLabel(days, locale)}" }
             .onSizeChanged { gridW = it.width }
             // The days follow a horizontal drag (XERK-2980); a drag never also opens the event
@@ -643,7 +662,9 @@ private fun WeekGrid(
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                    if (settling?.isActive == true) return@awaitEachGesture
+                    // A touch mid-settle lands it now, so a quick second swipe or a tap acts on
+                    // the days it lands on, never on days still moving.
+                    if (settling?.isActive == true) { settling?.cancel(); landing?.invoke() }
                     val velocity = VelocityTracker().apply { addPosition(down.uptimeMillis, down.position) }
                     val slop = viewConfiguration.touchSlop
                     var dragging = false
@@ -651,7 +672,7 @@ private fun WeekGrid(
                         val ev = awaitPointerEvent(PointerEventPass.Initial)
                         val c = ev.changes.firstOrNull { it.id == down.id }
                         if (c == null || ev.changes.count { it.pressed } > 1) {
-                            if (dragging) settle(0f)
+                            if (dragging) settle(0f, step = false)   // a pinch zooms, never swipes
                             break
                         }
                         velocity.addPosition(c.uptimeMillis, c.position)
@@ -664,7 +685,7 @@ private fun WeekGrid(
                         if (dragging) {
                             c.consume()
                             val (back, on) = reach
-                            shift = dx.coerceIn(-on, back)
+                            shift = stripFirst to dx.coerceIn(-on, back)
                         }
                         if (!c.pressed) {
                             if (dragging) settle(velocity.calculateVelocity().x)
@@ -677,7 +698,7 @@ private fun WeekGrid(
         // Day headers: date + weekday; today in the accent with a top bar; a day off says so.
         Row(Modifier.fillMaxWidth()) {
             Spacer(Modifier.width(gutter))
-            DayStrip(Modifier.weight(1f), strip, before.size, days.size, { shift }) { d ->
+            DayStrip(Modifier.weight(1f), strip, before.size, days.size, { shiftNow() }) { d ->
                 val isToday = d == today
                 val off = offOf[d].orEmpty()
                 Column(
@@ -716,7 +737,7 @@ private fun WeekGrid(
                 "All day", Modifier.width(gutter).padding(4.dp), fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            DayStrip(Modifier.weight(1f), strip, before.size, days.size, { shift }) { d ->
+            DayStrip(Modifier.weight(1f), strip, before.size, days.size, { shiftNow() }) { d ->
                 Column(
                     Modifier.shown(d).then(if (offOf[d].orEmpty().isNotEmpty()) Modifier.hatch(offShade) else Modifier)
                         .padding(1.dp),
@@ -816,7 +837,7 @@ private fun WeekGrid(
                             )
                         }
                     }
-                    DayStrip(Modifier.weight(1f).fillMaxHeight(), strip, before.size, days.size, { shift }) { d ->
+                    DayStrip(Modifier.weight(1f).fillMaxHeight(), strip, before.size, days.size, { shiftNow() }) { d ->
                         val isToday = d == today
                         val off = offOf[d].orEmpty().isNotEmpty()
                         val surface = MaterialTheme.colorScheme.surface
@@ -892,7 +913,9 @@ private fun DayStrip(
             val w = ((i - lead + 1) * col).roundToInt() - x0
             x0 to m.measure(Constraints(w, w, c.minHeight, c.maxHeight))
         }
-        val h = (cells.maxOfOrNull { it.second.height } ?: 0).coerceIn(c.minHeight, c.maxHeight)
+        // Only the shown days size the row: an off-screen day's all-day chips must not grow it.
+        val h = (cells.subList(lead, lead + shown).maxOfOrNull { it.second.height } ?: 0)
+            .coerceIn(c.minHeight, c.maxHeight)
         layout(c.maxWidth, h) {
             val dx = shift().roundToInt()
             for ((x, p) in cells) p.placeRelative(x + dx, 0)

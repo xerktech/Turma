@@ -163,8 +163,13 @@ A pure-core/adapter-shell split:
   - **The swipe follows the finger** (XERK-2980): the grid draws the days a swipe slides in
     off-screen either side (`calSwipeNeighbours`, a `DayStrip` per row), shifted in placement
     only. Day / 3 days swipe ONE day (`calSwipeStep`); ‹ › still page by what is shown.
-    - The settle's last frame steps the anchor AND zeroes the shift together: split, the grid
-      jumps a step and back. The off-screen cells carry no test tags and no semantics.
+    - The shift is keyed by the strip's first day and left at its end when a settle steps: the
+      new days need a recomposition (next frame) but the shift is read in placement (this frame),
+      so zeroing it in the settle drew the old days unshifted for a frame (QA flash).
+    - A second finger always settles back; a touch mid-settle lands it first; ‹ › mid-settle wins.
+    - Only the shown days size a row: an off-screen day's all-day chips grew the band (QA).
+    - The off-screen cells carry no test tags and no semantics (`clearAndSetSemantics`).
+    - Tests touching the grid aim at on-screen points: `cal-scroll`'s node spans all 24 hours.
   - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact
     POST/PATCH body; `calScopedPayload` for an occurrence-scoped edit), `core/CalendarRepeat.kt`
     (the Repeat rule, XERK-2973), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.

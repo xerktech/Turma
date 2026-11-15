@@ -16,6 +16,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.onRoot
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
 import com.xerktech.turma.harness.HubHarness
@@ -266,6 +268,100 @@ class CalendarScreenTest {
         compose.waitForIdle()
         compose.onNodeWithTag("cal-dh-$today").assertExists()
         compose.onNodeWithTag("cal-dh-${today.plusDays(3)}").assertDoesNotExist()
+    }
+
+    private fun shown(tag: String) = compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
+    private fun xOf(tag: String) = compose.onAllNodesWithTag(tag).fetchSemanticsNodes().first().positionInRoot.x
+    private fun colW() = compose.onAllNodesWithTag("cal-col-$today").fetchSemanticsNodes().first().size.width.toFloat()
+
+    private fun threeDays(): CalendarViewModel {
+        seed()
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        compose.onNodeWithTag("cal-mode-THREE").performClick()
+        compose.waitForIdle()
+        return cvm
+    }
+
+    @Test fun `a settle slides the days to their place and never flashes the old ones (XERK-2980)`() {
+        threeDays()
+        val tag = "cal-dh-${today.plusDays(1)}"
+        val start = xOf(tag)
+        val col = colW()
+        compose.mainClock.autoAdvance = false
+        compose.onNodeWithTag("cal-scroll").performTouchInput {
+            down(center)
+            repeat(10) { moveBy(Offset(-col * 0.05f, 0f), delayMillis = 60) }
+            up()
+        }
+        // Tomorrow moves left, frame by frame, from its column to the first one, never back.
+        var last = xOf(tag)
+        repeat(25) {
+            compose.mainClock.advanceTimeByFrame()
+            val x = xOf(tag)
+            assertTrue("frame $it: $x after $last", x <= last + 1f)
+            last = x
+        }
+        compose.mainClock.autoAdvance = true
+        compose.waitForIdle()
+        assertEquals(start - col, xOf(tag), 2f)
+        assertTrue(shown("cal-dh-${today.plusDays(3)}"))
+    }
+
+    @Test fun `a pinch that interrupts a drag zooms and never moves the day (XERK-2980)`() {
+        val cvm = threeDays()
+        val col = colW()
+        // On the root, so both fingers land on the visible grid (the scroll node spans 24 hours).
+        compose.onRoot().performTouchInput {
+            val p = Offset(width * 0.5f, height * 0.75f)
+            down(0, p)
+            repeat(4) { moveBy(0, Offset(-col * 0.45f / 4, 0f), delayMillis = 30) }
+            down(1, p + Offset(0f, height * 0.12f))
+            repeat(6) { moveBy(1, Offset(0f, 20f), delayMillis = 20) }
+            up(1); up(0)
+        }
+        compose.waitForIdle()
+        assertTrue(shown("cal-dh-$today"))
+        assertTrue(!shown("cal-dh-${today.plusDays(3)}"))
+        assertTrue("the pinch zoomed", cvm.zoom.value < 10f)
+    }
+
+    @Test fun `a swipe during a settle lands it and moves on again (XERK-2980)`() {
+        threeDays()
+        compose.mainClock.autoAdvance = false
+        compose.onNodeWithTag("cal-scroll").performTouchInput { swipeLeft(durationMillis = 100) }
+        compose.mainClock.advanceTimeBy(80)
+        compose.onNodeWithTag("cal-scroll").performTouchInput { swipeLeft(durationMillis = 100) }
+        compose.mainClock.autoAdvance = true
+        compose.waitForIdle()
+        assertTrue(shown("cal-dh-${today.plusDays(4)}"))
+        assertTrue(!shown("cal-dh-${today.plusDays(1)}"))
+    }
+
+    @Test fun `a drag on an event never opens it, and off-screen days are silent (XERK-2980)`() {
+        seed()
+        show(calendarVm())
+        awaitEvent(subject)
+        // Tomorrow's Planning is drawn off-screen beside Day view, but TalkBack never reaches it.
+        assertTrue(compose.onAllNodes(event("Planning")).fetchSemanticsNodes().isEmpty())
+        compose.onAllNodes(event(subject))[0].performScrollTo().performTouchInput {
+            down(center); repeat(4) { moveBy(Offset(-12f, 0f), delayMillis = 16) }; up()
+        }
+        compose.waitForIdle()
+        compose.onNodeWithTag("cal-detail").assertDoesNotExist()
+    }
+
+    @Test fun `an off-screen day's all-day chips never grow the band (XERK-2980)`() {
+        seed()   // today holds a holiday chip
+        show(calendarVm())
+        awaitEvent(subject)
+        compose.onNodeWithTag("cal-next").performClick()   // tomorrow: today is off-screen to its left
+        compose.waitForIdle()
+        val y1 = compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().positionInRoot.y
+        compose.onNodeWithTag("cal-next").performClick()   // no holiday on either side
+        compose.waitForIdle()
+        assertEquals(y1, compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().positionInRoot.y, 1f)
     }
 
     @Test fun `the view switch is kept on this phone and a push opens the notes review`() {
