@@ -1434,7 +1434,18 @@ function repeatSummary(rule, ymd) {
 // edited (QA: its own day dropped a kept "day 31", read a moved Wednesday as the series' day and
 // refused a valid until), else the start the form shows (a new or single event's). A rule sent
 // for "following" is re-anchored at the split by the hub (month day pinned, count shared out).
-const repDay = (f) => (f && f.seriesDate) || f.startDate;
+// A date MOVE re-anchors it as the hub does (QA): "following" starts the new series on the new
+// day; "All events" shifts the whole series by the move. "This event" shows the series' rule.
+function repDay(f) {
+  if (!f || !f.seriesDate || !f.openDate || f.startDate === f.openDate || f.repScope === "occurrence") {
+    return (f && f.seriesDate) || f.startDate;
+  }
+  if (f.repScope === "following") return f.startDate;
+  const days = Math.round((Date.parse(`${f.startDate}T00:00:00Z`) - Date.parse(`${f.openDate}T00:00:00Z`)) / 864e5);
+  return Number.isFinite(days) ? addYmd(f.seriesDate, days) : f.seriesDate;
+}
+// The first day a "following" split's until may name: the day the new series starts.
+const splitDay = (f) => (f && f.repScope === "following" ? f.startDate : undefined);
 // The Repeat menu, Teams' presets named for the start day ("Weekly on Tuesday").
 // `r` (the control) names a weekly rule's own days in its preset.
 function repeatPresets(ymd, r) {
@@ -1479,7 +1490,7 @@ function validateForm(f, pickable = null) {
   if (cats.length > 20 || cats.some((c) => cps(c) > 100)) err.category = "At most 20 categories of at most 100 characters.";
   const t = formTimes(f);
   if (t.error) Object.assign(err, t.error);
-  const re = repeatError(f.repeat, repDay(f), f.splitDate);
+  const re = repeatError(f.repeat, repDay(f), splitDay(f));
   if (re) err.repeat = re;
   return err;
 }
@@ -1595,8 +1606,7 @@ function openEditor(opts = {}) {
     // A series' rule reads off its first day in every scope (QA: from a clamped Apr 30 or a
     // moved occurrence the editor read "day 30" / "Wed" while the series runs on the 31st /
     // Tuesdays); a "following" split starts at this occurrence, so its until may not end before it.
-    if (scope) f.seriesDate = evAnchorYmd(opts.event);
-    if (scope === "following") f.splitDate = f.startDate;
+    if (scope) Object.assign(f, { seriesDate: evAnchorYmd(opts.event), openDate: f.startDate, repScope: scope });
     ed = { mode: "edit", id: String(opts.event.id), version: opts.event.version, scope, f, errors: {}, err: "", busy: false, tried: false };
     // A scoped edit sends only what changed (scopedBody): the form as opened is the base.
     if (scope) ed.base = formPayload(f, undefined, scope);
@@ -1726,7 +1736,7 @@ function repeatRowsHtml(f, one) {
   // No "Ends" label: the event's own end sits just above (screenshot review).
   h += `<div class="cal-ed-row"><span class="k"></span><div class="cal-ed-when"><select data-ed-rep="end" aria-label="Repeat ends">`
     + opt("never", "Never ends", r.end) + opt("until", "Ends on", r.end) + opt("count", "Ends after", r.end) + `</select>`
-    + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(f.splitDate || repDay(f))}" value="${esc(r.until)}">` : "")
+    + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(splitDay(f) || repDay(f))}" value="${esc(r.until)}">` : "")
     + (r.end === "count" ? `<input type="number" class="cal-ed-num" data-ed-rep="count" min="1" max="${R_COUNT_MAX}" step="1" aria-label="Number of occurrences" value="${esc(r.count)}"> occurrences` : "")
     + `</div></div>`;
   return h + `<div class="cal-ed-row"><span class="k"></span><span class="cal-ed-sum" data-ed-rep-summary aria-live="polite">${RECUR_SVG}${esc(summary)}</span></div>`;
@@ -1826,8 +1836,7 @@ async function saveEditor() {
     if (r.res && r.res.status === 409 && r.out && r.out.event && typeof r.out.event === "object" && cur.mode === "edit") {
       const fresh = { source: "turma", ...r.out.event, orgs: Array.isArray(r.out.event.orgs) ? r.out.event.orgs : cur.f.orgs };
       cur.f = formFromEvent(fresh);
-      if (cur.scope) cur.f.seriesDate = evAnchorYmd(fresh);
-      if (cur.scope === "following") cur.f.splitDate = cur.f.startDate;
+      if (cur.scope) Object.assign(cur.f, { seriesDate: evAnchorYmd(fresh), openDate: cur.f.startDate, repScope: cur.scope });
       if (cur.scope) cur.base = formPayload(cur.f, undefined, cur.scope);
       cur.version = r.out.event.version;
       cur.tried = false;

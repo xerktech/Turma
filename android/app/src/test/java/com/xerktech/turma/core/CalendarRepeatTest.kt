@@ -169,4 +169,17 @@ class CalendarRepeatTest {
         val four = f.copy(repeat = f.repeat.copy(end = "count", count = "4"))
         assertEquals(TurmaJson.parseToJsonElement("""{"freq":"monthly","interval":1,"count":4}"""), calDraftPayload(four)["recurrence"])
     }
+
+    @Test fun `QA a scoped edit that moves the date re-anchors the repeat as the hub does`() {
+        val tue = TurmaJson.decodeFromString(CalendarEvent.serializer(), """{ "source": "turma", "id": "turma:0123456789abcdef:2027-01-26T15:00:00Z",
+            "seriesId": "turma:0123456789abcdef", "recurring": true, "originalStart": "2027-01-26T15:00:00Z", "seriesStart": "2027-01-05T10:00:00-05:00",
+            "start": "2027-01-26T10:00:00-05:00", "end": "2027-01-26T11:00:00-05:00", "startMs": 1, "endMs": 2,
+            "timeZone": "America/New_York", "orgs": ["acme"], "editable": true, "version": 4, "recurrence": { "freq": "weekly", "interval": 1, "count": 8 } }""")
+        fun moved(scope: String) = calDraftFor(tue, zone, scope).let { it.copy(startDate = LocalDate.of(2027, 1, 27), endDate = LocalDate.of(2027, 1, 27)) }
+        fun sum(d: TurmaEventDraft) = calRepeatSummary(calRuleOfRepeat(d.repeat, calRepeatDay(d)), calRepeatDay(d))
+        assertEquals("Every week on Tue, 8 times", sum(calDraftFor(tue, zone, "following")))
+        assertEquals("Every week on Wed, 8 times", sum(moved("following")))
+        assertEquals("Every week on Wed, 8 times", sum(moved("series")))
+        assertEquals("Every week on Tue, 8 times", sum(moved("occurrence")))
+    }
 }

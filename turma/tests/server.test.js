@@ -34100,6 +34100,10 @@ test("XERK-2969: 'following' splits the series into two; a count is shared out; 
     assert.equal(ws.status, 200, JSON.stringify(ws.body));
     assert.deepEqual([ws.body.previous.recurrence.count, ws.body.event.recurrence], [5, { freq: "weekly", interval: 2, count: 5 }],
       "the series' count resent is what is left of it, never a fresh 10");
+    const w12 = (await turma2968("POST", null, weekly2969({ recurrence: { freq: "weekly", count: 12 } }))).body.event;
+    const wd = await turma2968("PATCH", `${w12.id}:${key2969(2)}`, { version: 1, scope: "following",
+      recurrence: { freq: "weekly", interval: 1, count: 3 } });
+    assert.equal(wd.body.event.recurrence.count, 3, "a count other than the series' own is the new series'");
     // 'following' from the first occurrence is the whole series.
     const whole = await turma2968("PATCH", `${next.id}:${key2969(2)}`, { version: 1, scope: "following", subject: "All" });
     assert.equal(whole.body.event.id, next.id);

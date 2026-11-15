@@ -69,8 +69,8 @@ data class TurmaEventDraft(
     val scope: String = "",
     // An occurrence's series' first day, which its rule reads off in every scope (XERK-2973 QA).
     val seriesDate: LocalDate? = null,
-    // "This and following": the split's day, the first an until may name.
-    val splitDate: LocalDate? = null,
+    // The start day the occurrence was opened on: a date MOVE re-anchors its repeat (QA).
+    val openDate: LocalDate? = null,
 ) {
     val editing: Boolean get() = id.isNotEmpty()
 
@@ -157,7 +157,7 @@ fun calDraftFor(ev: CalendarEvent, fallback: ZoneId, scope: String): TurmaEventD
         d.copy(
             scope = scope,
             seriesDate = if (scope.isNotEmpty()) calAnchorDay(ev, fallback) else null,
-            splitDate = if (scope == "following") d.startDate else null,
+            openDate = if (scope.isNotEmpty()) d.startDate else null,
         )
     }
 
@@ -165,7 +165,18 @@ fun calDraftFor(ev: CalendarEvent, fallback: ZoneId, scope: String): TurmaEventD
  * The day the draft's repeat is read against: an occurrence's series' first day (a rule sent for
  * "following" is re-anchored at the split by the hub), else the draft's own start.
  */
-fun calRepeatDay(d: TurmaEventDraft): LocalDate = d.seriesDate ?: d.startDate
+fun calRepeatDay(d: TurmaEventDraft): LocalDate {
+    val series = d.seriesDate ?: return d.startDate
+    val opened = d.openDate ?: return series
+    // A date MOVE re-anchors it as the hub does: "following" starts the new series on the new
+    // day, "All events" shifts the series by the move; "This event" shows the series' rule.
+    if (d.startDate == opened || d.scope == "occurrence") return series
+    if (d.scope == "following") return d.startDate
+    return series.plusDays(java.time.temporal.ChronoUnit.DAYS.between(opened, d.startDate))
+}
+
+/** The first day a "following" split's until may name: the day the new series starts. */
+fun calSplitDay(d: TurmaEventDraft): LocalDate? = if (d.scope == "following") d.startDate else null
 
 /**
  * An occurrence's scoped edit (the web's `scopedBody`): only the fields that differ from the
@@ -343,7 +354,7 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
     if (d.body.codePointCount() > CAL_BODY_MAX) add("The details are longer than $CAL_BODY_MAX characters.")
     val cats = calCategories(d.categories)
     if (cats.size > 20 || cats.any { it.codePointCount() > 100 }) add("At most 20 categories of at most 100 characters.")
-    if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d), d.splitDate ?: calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
+    if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d), calSplitDay(d) ?: calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
     if (d.orgs.isEmpty()) add("Pick at least one org.")
     if (d.orgs.size > CAL_TURMA_ORGS_MAX) add("An event belongs to at most $CAL_TURMA_ORGS_MAX orgs.")
 }

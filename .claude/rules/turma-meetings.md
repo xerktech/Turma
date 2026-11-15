@@ -316,8 +316,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     a resent rule re-grew a count and dropped the hub's month-end day on "This and following", a
     resent start dragged the series, and "This event" pinned every field into its override.
   - Every scoped editor reads the repeat off the series' first day (`seriesStart` → `f.seriesDate`,
-    `repDay`), never the opened occurrence's (a clamped Apr 30 or a moved Wednesday). A "following"
-    until may not end before the split (`f.splitDate`).
+    `repDay`), never the opened occurrence's (a clamped Apr 30 or a moved Wednesday). A date MOVE
+    re-anchors it as the hub does: "following" on the new day, "All events" shifted by the move.
+    A "following" until may not end before the split (`splitDay`).
   - A rule sent for "following" is the SERIES' rule as changed; the hub re-anchors it at the split
     (implicit month day pinned, the series' own count shared out) — `contract-calendar.md`.
   - "This event" disables the orgs and zone (with a note) and sends no `recurrence`: the hub refuses
