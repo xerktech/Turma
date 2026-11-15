@@ -6452,11 +6452,22 @@ const calTurmaMayEdit = (p, rec) => rec.orgs.every((o) => principalMaySite(p, o)
 // back would wipe the owner's event (XERK-2972 QA). The owner is its creator — and,
 // for an event no USER made (break-glass, legacy, open: what the pre-tenancy migration
 // moves into a tenant), that tenant's user, or it would be nobody's for good.
+// A creator `user:<id>` that no longer owns it — the user was deleted, or is not of the
+// event's tenant (a migrated event) — leaves it owner-less too (XERK-2978): the tenant's
+// user takes it, or for an untenanted event any principal with the admin role (break-glass,
+// an admin user) — not a role-less legacy cookie.
 const CAL_TURMA_HIDDEN = new Set(["private", "confidential"]);
 function calTurmaOwner(p, rec) {
+  if (!p) return false;
   if (rec.createdBy === calTurmaActor(p)) return true;
   const t = tenantOfSite(rec.orgs[0] || "");
-  return !!t && p?.kind === "user" && p.tenantId === t && !String(rec.createdBy).startsWith("user:");
+  const by = String(rec.createdBy);
+  if (!by.startsWith("user:")) return !!t && p.kind === "user" && p.tenantId === t;
+  const uid = by.slice(5);
+  const creator = Object.hasOwn(tenancyState.users, uid) ? tenancyState.users[uid] : null;
+  if (creator && (!t || creator.tenantId === t)) return false;   // a live owner
+  if (t) return p.kind === "user" && p.tenantId === t;
+  return Array.isArray(p.roles) && p.roles.includes("admin");
 }
 const calTurmaWithheld = (p, rec) => CAL_TURMA_HIDDEN.has(rec.sensitivity) && !calTurmaOwner(p, rec);
 // A write target withheld from `p`: the series, or the one occurrence it names

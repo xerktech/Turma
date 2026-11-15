@@ -33538,6 +33538,76 @@ test("XERK-2972: a tenant's own user owns a private event another principal left
   }
 });
 
+test("XERK-2978: a private event whose creator user is gone or of another tenant is the tenant's user's", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    F = await fleet2551(T, "t2978");
+    const userA = { kind: "user", userId: T.A.user.id, tenantId: T.A.t, roles: ["user"] };
+    const userB = { kind: "user", userId: T.B.user.id, tenantId: T.B.t, roles: ["user"] };
+    const bg = { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] };
+    for (const by of ["user:ghost", `user:${T.B.user.id}`]) {
+      const c = hub.createTurmaEvent(userA, ev2968([F.SA], { sensitivity: "private",
+        recurrence: { freq: "weekly" } }));
+      assert.equal(c.status, 200, JSON.stringify(c.body));
+      const id = c.body.event.id;
+      hub.getCalendarTurmaEvents()[T.A.t][id].createdBy = by;   // deleted / migrated creator
+      const v = hub.calendarView(userA, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.seriesId === id);
+      assert.deepEqual([v.subject, v.editable], ["Planning", true], by);
+      assert.equal(hub.patchTurmaEvent(userA, id, { version: 1, subject: "Mine" }).status, 200, by);
+      // Owning it gives nobody outside the tenant anything.
+      assert.equal(hub.deleteTurmaEvent(userB, id).status, 404, by);
+      assert.equal(hub.deleteTurmaEvent(bg, id).status, 404, by);
+      assert.equal(hub.deleteTurmaEvent(userA, id).status, 200, by);
+    }
+    // A live creator of the tenant keeps it: nobody else inherits it.
+    const live = hub.createTurmaEvent(userA, ev2968([F.SA], { sensitivity: "private" }));
+    const imp = { kind: "user", userId: "someone-else", tenantId: T.A.t, roles: ["user"] };
+    assert.equal(hub.patchTurmaEvent(imp, live.body.event.id, { version: 1, subject: "x" }).status, 409);
+  } finally {
+    cleanup2968();
+    if (F) forget2533("t2978", F.ka, F.kb, F.kl);
+    T.restore();
+  }
+});
+
+test("XERK-2978: an untenanted private series whose creator user is gone is the operators'", async () => {
+  const D = "cal2978";
+  try {
+    await beat1574(D, S2968A);
+    const bg = { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] };
+    const legacy = { kind: "legacy", userId: null, tenantId: null, roles: [] };
+    const mk = (createdBy) => {
+      const c = hub.createTurmaEvent(legacy, ev2968([S2968A], { recurrence: { freq: "weekly", count: 6 } }));
+      assert.equal(c.status, 200, JSON.stringify(c.body));
+      const rec = hub.getCalendarTurmaEvents()[""][c.body.event.id];
+      rec.createdBy = createdBy;
+      rec.sensitivity = "private";
+      return rec.id;
+    };
+    const ghost = mk("user:ghost");
+    const served = hub.calendarView(bg, T2968 - 864e5, T2968 + 40 * 864e5, null).events.filter((x) => x.seriesId === ghost);
+    assert.ok(served.length > 1 && served.every((x) => x.editable && x.subject === "Planning"));
+    assert.equal(hub.deleteTurmaEvent(legacy, ghost).status, 409, "no admin role: not an operator");
+    assert.equal(hub.patchTurmaEvent(bg, ghost, { version: 1, subject: "Re-timed" }).status, 200);
+    assert.equal(hub.deleteTurmaEvent(bg, ghost).status, 200);
+    // A creator that still exists keeps it, even from break-glass.
+    const tenancy = require("../tenancy.js");
+    const saved = hub.tenancyState();
+    const r = tenancy.createLocalUser(saved, { username: "adm2978",
+      passwordHash: tenancy.hashPasswordSync("pw-2978-long-enough"), groups: ["turma-admins"] });
+    hub.__setTenancy(r.state);
+    try {
+      const kept = mk(`user:${r.user.id}`);
+      assert.equal(hub.deleteTurmaEvent(bg, kept).status, 409);
+    } finally {
+      hub.__setTenancy(saved);
+    }
+  } finally {
+    cleanup2968(D);
+  }
+});
+
 test("XERK-2968: each tenant sees and edits only its own Turma events; private ones are the creator's", async () => {
   const T = tenants2533();
   let F;
