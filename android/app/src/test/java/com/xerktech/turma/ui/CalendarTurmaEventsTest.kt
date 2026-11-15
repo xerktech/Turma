@@ -335,4 +335,15 @@ class CalendarTurmaEventsTest {
         compose.waitUntil(5_000) { cvm.editor.value == null }
         assertEquals(null, hub.findRequestOrNull("/api/calendar/events/$occId"))
     }
+
+    @Test fun `XERK-2973 QA a split count series' editor says the count is the whole series'`() {
+        seed(occurrence().replace("\"byDay\": [\"TU\", \"TH\"]", "\"byDay\": [\"TU\", \"TH\"], \"count\": 8"))
+        show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-edit").performScrollTo().performClick()
+        compose.onNodeWithTag("cal-scope-following").performClick()
+        compose.onNodeWithTag("cal-ed-rep-summary").performScrollTo().assertTextContains("8 times in the whole series", substring = true)
+        compose.onNodeWithText("occurrences in the whole series").performScrollTo().assertExists()
+    }
 }

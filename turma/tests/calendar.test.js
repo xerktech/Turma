@@ -1809,3 +1809,34 @@ test("XERK-2973 QA: a split's move on a clamped day, its until, a 409 reload's a
   assert.match(label(), /^Every month on day 29/);
   cal.closeEditor();
 }));
+
+test("XERK-2973 QA: the whole-series count is said visibly, only on a split, kept across a 409, and live while typing", () => withOrgs(async () => {
+  const w8 = occ({ recurrence: { freq: "weekly", interval: 1, count: 8 } });
+  const visible = () => cal._edEls().panel.innerHTML.replace(/aria-label="[^"]*"/g, "");
+  cal.openEditor({ event: w8, scope: "following" });
+  assert.match(visible(), /> occurrences in the whole series/, "the text, not just the aria-label");
+  assert.match(visible(), /8 times in the whole series/);
+  // Live while typing: the in-place refresh says it too.
+  const sum = { innerHTML: "" };
+  const panel = cal._edEls().panel;
+  panel.querySelector = (sel) => (sel === "[data-ed-rep-summary]" ? sum : null);
+  panel.querySelectorAll = () => [];
+  try {
+    for (const f of panel.listeners.input) f({ target: { dataset: { edRep: "count" }, value: "10" } });
+    assert.match(sum.innerHTML, /10 times in the whole series$/);
+  } finally { delete panel.querySelector; delete panel.querySelectorAll; }
+  cal.closeEditor();
+  // "All events" and "This event" count only the series itself: no suffix.
+  for (const scope of ["series", "occurrence"]) {
+    cal.openEditor({ event: w8, scope });
+    assert.doesNotMatch(visible(), /in the whole series/, scope);
+    cal.closeEditor();
+  }
+  // A 409 reload keeps saying it.
+  replies = { "/api/calendar/events/": () => ({ status: 409, body: { error: "changed", event: { ...w8, subject: "Theirs", version: 3 } } }) };
+  cal.openEditor({ event: w8, scope: "following" });
+  editorFill({ subject: "Mine" });
+  await cal.saveEditor();
+  assert.match(visible(), /8 times in the whole series/);
+  cal.closeEditor();
+}));
