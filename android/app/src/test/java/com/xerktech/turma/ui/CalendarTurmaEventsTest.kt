@@ -322,4 +322,17 @@ class CalendarTurmaEventsTest {
         assertEquals("following", sent.requestUrl!!.queryParameter("scope"))
         compose.waitUntil(5_000) { compose.onAllNodes(hasTestTag("cal-detail")).fetchSemanticsNodes().isEmpty() }
     }
+
+    @Test fun `XERK-2973 QA an unchanged scoped save sends nothing and closes the editor`() {
+        seed(occurrence())
+        hub.json("/api/calendar/events/$occId", """{ "ok": true, "event": ${occurrence()} }""")
+        val cvm = show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithTag("cal-edit").performScrollTo().performClick()
+        compose.onNodeWithTag("cal-scope-series").performClick()
+        compose.onNodeWithTag("cal-editor-save").performClick()
+        compose.waitUntil(5_000) { cvm.editor.value == null }
+        assertEquals(null, hub.findRequestOrNull("/api/calendar/events/$occId"))
+    }
 }

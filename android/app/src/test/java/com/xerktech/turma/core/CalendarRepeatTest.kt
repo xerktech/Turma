@@ -153,4 +153,20 @@ class CalendarRepeatTest {
         val r = calRepeatOf(calRuleOf(TurmaJson.parseToJsonElement("""{"freq":"weekly","interval":1,"byDay":["MO","WE","FR"]}""")))
         assertEquals("Weekly on Mon, Wed, Fri", calRepeatPresets(LocalDate.of(2026, 11, 17), r).toMap()["weekly"])
     }
+
+    @Test fun `QA every scoped draft reads the series' rule off its first day, a split's until starts at the split`() {
+        val apr = TurmaJson.decodeFromString(CalendarEvent.serializer(), """{ "source": "turma", "id": "turma:0123456789abcdef:2027-04-30T14:00:00Z",
+            "seriesId": "turma:0123456789abcdef", "recurring": true, "originalStart": "2027-04-30T14:00:00Z", "seriesStart": "2027-01-31T10:00:00-05:00",
+            "start": "2027-04-30T10:00:00-04:00", "end": "2027-04-30T11:00:00-04:00", "startMs": 1, "endMs": 2,
+            "timeZone": "America/New_York", "orgs": ["acme"], "editable": true, "version": 4, "recurrence": { "freq": "monthly", "interval": 1 } }""")
+        for (scope in listOf("occurrence", "following", "series")) {
+            val d = calDraftFor(apr, zone, scope)
+            assertEquals(scope, "Every month on day 31", calRepeatSummary(calRuleOfRepeat(d.repeat, calRepeatDay(d)), calRepeatDay(d)))
+        }
+        val f = calDraftFor(apr, zone, "following")
+        val early = f.copy(repeat = f.repeat.copy(end = "until", until = LocalDate.of(2027, 3, 31)))
+        assert("It must repeat until a day on or after its start." in calDraftErrors(early))
+        val four = f.copy(repeat = f.repeat.copy(end = "count", count = "4"))
+        assertEquals(TurmaJson.parseToJsonElement("""{"freq":"monthly","interval":1,"count":4}"""), calDraftPayload(four)["recurrence"])
+    }
 }

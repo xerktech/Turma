@@ -1395,13 +1395,15 @@ function ruleFromRepeat(r, ymd) {
   return out;
 }
 // What keeps the control from saving, or "" (the hub's own rule checks, said first).
-function repeatError(r, ymd) {
+// `from`: the first day an until may name (a "following" split's day), else `ymd`.
+function repeatError(r, ymd, from) {
   if (!r || r.kind === "none") return "";
   const n = Number(r.interval);
   if (r.kind === "custom" && !(Number.isSafeInteger(n) && n >= 1 && n <= R_INTERVAL_MAX)) return `Repeat every 1 to ${R_INTERVAL_MAX}.`;
   if (r.end === "until") {
     if (!rAnchor(r.until)) return "Pick the date it repeats until.";
-    if (rAnchor(ymd) && String(r.until) < String(ymd)) return "It must repeat until a day on or after its start.";
+    const first = rAnchor(from) ? from : ymd;
+    if (rAnchor(first) && String(r.until) < String(first)) return "It must repeat until a day on or after its start.";
   }
   const c = Number(r.count);
   if (r.end === "count" && !(Number.isSafeInteger(c) && c >= 1 && c <= R_COUNT_MAX)) return `End after 1 to ${R_COUNT_MAX} occurrences.`;
@@ -1428,9 +1430,10 @@ function repeatSummary(rule, ymd) {
   else if (Number.isSafeInteger(rule.count)) s += `, ${rule.count} time${rule.count === 1 ? "" : "s"}`;
   return s;
 }
-// The day the editor's repeat is read against: the series' first day when "All events" is
-// edited from a later occurrence (QA: its own day dropped a kept "day 31" and refused a valid
-// until), else the start the form shows — a new event's, or the series a "following" edit starts.
+// The day the editor's repeat is read against: the series' first day when an occurrence is
+// edited (QA: its own day dropped a kept "day 31", read a moved Wednesday as the series' day and
+// refused a valid until), else the start the form shows (a new or single event's). A rule sent
+// for "following" is re-anchored at the split by the hub (month day pinned, count shared out).
 const repDay = (f) => (f && f.seriesDate) || f.startDate;
 // The Repeat menu, Teams' presets named for the start day ("Weekly on Tuesday").
 // `r` (the control) names a weekly rule's own days in its preset.
@@ -1476,7 +1479,7 @@ function validateForm(f, pickable = null) {
   if (cats.length > 20 || cats.some((c) => cps(c) > 100)) err.category = "At most 20 categories of at most 100 characters.";
   const t = formTimes(f);
   if (t.error) Object.assign(err, t.error);
-  const re = repeatError(f.repeat, repDay(f));
+  const re = repeatError(f.repeat, repDay(f), f.splitDate);
   if (re) err.repeat = re;
   return err;
 }
@@ -1589,7 +1592,11 @@ function openEditor(opts = {}) {
     f = formFromEvent(opts.event);
     // An occurrence of a series is edited for the events its scope names (XERK-2973).
     const scope = isTurmaOccurrence(opts.event) && SCOPES.some(([s]) => s === opts.scope) ? opts.scope : undefined;
-    if (scope === "series") f.seriesDate = evAnchorYmd(opts.event);
+    // A series' rule reads off its first day in every scope (QA: from a clamped Apr 30 or a
+    // moved occurrence the editor read "day 30" / "Wed" while the series runs on the 31st /
+    // Tuesdays); a "following" split starts at this occurrence, so its until may not end before it.
+    if (scope) f.seriesDate = evAnchorYmd(opts.event);
+    if (scope === "following") f.splitDate = f.startDate;
     ed = { mode: "edit", id: String(opts.event.id), version: opts.event.version, scope, f, errors: {}, err: "", busy: false, tried: false };
     // A scoped edit sends only what changed (scopedBody): the form as opened is the base.
     if (scope) ed.base = formPayload(f, undefined, scope);
@@ -1719,7 +1726,7 @@ function repeatRowsHtml(f, one) {
   // No "Ends" label: the event's own end sits just above (screenshot review).
   h += `<div class="cal-ed-row"><span class="k"></span><div class="cal-ed-when"><select data-ed-rep="end" aria-label="Repeat ends">`
     + opt("never", "Never ends", r.end) + opt("until", "Ends on", r.end) + opt("count", "Ends after", r.end) + `</select>`
-    + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(repDay(f))}" value="${esc(r.until)}">` : "")
+    + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(f.splitDate || repDay(f))}" value="${esc(r.until)}">` : "")
     + (r.end === "count" ? `<input type="number" class="cal-ed-num" data-ed-rep="count" min="1" max="${R_COUNT_MAX}" step="1" aria-label="Number of occurrences" value="${esc(r.count)}"> occurrences` : "")
     + `</div></div>`;
   return h + `<div class="cal-ed-row"><span class="k"></span><span class="cal-ed-sum" data-ed-rep-summary aria-live="polite">${RECUR_SVG}${esc(summary)}</span></div>`;
@@ -1819,7 +1826,8 @@ async function saveEditor() {
     if (r.res && r.res.status === 409 && r.out && r.out.event && typeof r.out.event === "object" && cur.mode === "edit") {
       const fresh = { source: "turma", ...r.out.event, orgs: Array.isArray(r.out.event.orgs) ? r.out.event.orgs : cur.f.orgs };
       cur.f = formFromEvent(fresh);
-      if (cur.scope === "series") cur.f.seriesDate = evAnchorYmd(fresh);
+      if (cur.scope) cur.f.seriesDate = evAnchorYmd(fresh);
+      if (cur.scope === "following") cur.f.splitDate = cur.f.startDate;
       if (cur.scope) cur.base = formPayload(cur.f, undefined, cur.scope);
       cur.version = r.out.event.version;
       cur.tried = false;
@@ -2053,7 +2061,11 @@ function mount(el, opts = {}) {
         // The prompt replaced the pressed button: focus its first answer (Cancel for a delete).
         return void focusInfo(scopeAsk === "edit" ? '[data-ev-scope="occurrence"]' : "[data-ev-scope-no]");
       }
-      if (d.evScopeNo !== undefined) { scopeAsk = null; paintDetail(true); return void focusInfo("[data-ev-edit]"); }
+      if (d.evScopeNo !== undefined) {
+        const was = scopeAsk;
+        scopeAsk = null; paintDetail(true);
+        return void focusInfo(was === "delete" ? "[data-ev-delete]" : "[data-ev-edit]");
+      }
       if (d.evScope !== undefined) {
         const scope = SCOPES.some(([s]) => s === d.evScope) ? d.evScope : null;
         if (!scope || !scopeAsk) return;

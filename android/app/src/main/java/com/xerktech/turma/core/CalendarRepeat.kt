@@ -158,13 +158,14 @@ fun calRuleOfRepeat(r: RepeatForm, start: LocalDate): CalRule? {
 }
 
 /** What keeps the control from saving, or "" — the web's wording. */
-fun calRepeatError(r: RepeatForm, start: LocalDate): String {
+/** [from]: the first day an until may name (a "following" split's day). */
+fun calRepeatError(r: RepeatForm, start: LocalDate, from: LocalDate = start): String {
     if (r.kind == "none") return ""
     val n = r.interval.trim().toIntOrNull()
     if (r.kind == "custom" && (n == null || n < 1 || n > CAL_REPEAT_INTERVAL_MAX)) return "Repeat every 1 to $CAL_REPEAT_INTERVAL_MAX."
     if (r.end == "until") {
         val u = r.until ?: return "Pick the date it repeats until."
-        if (u.isBefore(start)) return "It must repeat until a day on or after its start."
+        if (u.isBefore(from)) return "It must repeat until a day on or after its start."
     }
     val c = r.count.trim().toIntOrNull()
     if (r.end == "count" && (c == null || c < 1 || c > CAL_REPEAT_COUNT_MAX)) return "End after 1 to $CAL_REPEAT_COUNT_MAX occurrences."

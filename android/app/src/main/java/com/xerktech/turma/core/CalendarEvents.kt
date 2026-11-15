@@ -67,8 +67,10 @@ data class TurmaEventDraft(
     // edit is for ("occurrence" | "following" | "series"; "" = a plain event / a new one).
     val repeat: RepeatForm = RepeatForm(),
     val scope: String = "",
-    // "All events" opened from a later occurrence: the series' first day, which its rule reads off.
+    // An occurrence's series' first day, which its rule reads off in every scope (XERK-2973 QA).
     val seriesDate: LocalDate? = null,
+    // "This and following": the split's day, the first an until may name.
+    val splitDate: LocalDate? = null,
 ) {
     val editing: Boolean get() = id.isNotEmpty()
 
@@ -151,9 +153,18 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
 
 /** The editor's draft for [ev], opened for [scope] (XERK-2973; "" = a plain event). */
 fun calDraftFor(ev: CalendarEvent, fallback: ZoneId, scope: String): TurmaEventDraft =
-    calDraftOf(ev, fallback).copy(scope = scope, seriesDate = if (scope == "series") calAnchorDay(ev, fallback) else null)
+    calDraftOf(ev, fallback).let { d ->
+        d.copy(
+            scope = scope,
+            seriesDate = if (scope.isNotEmpty()) calAnchorDay(ev, fallback) else null,
+            splitDate = if (scope == "following") d.startDate else null,
+        )
+    }
 
-/** The day the draft's repeat is read against: the series' first day for "All events", else its start. */
+/**
+ * The day the draft's repeat is read against: an occurrence's series' first day (a rule sent for
+ * "following" is re-anchored at the split by the hub), else the draft's own start.
+ */
 fun calRepeatDay(d: TurmaEventDraft): LocalDate = d.seriesDate ?: d.startDate
 
 /**
@@ -332,7 +343,7 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
     if (d.body.codePointCount() > CAL_BODY_MAX) add("The details are longer than $CAL_BODY_MAX characters.")
     val cats = calCategories(d.categories)
     if (cats.size > 20 || cats.any { it.codePointCount() > 100 }) add("At most 20 categories of at most 100 characters.")
-    if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
+    if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d), d.splitDate ?: calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
     if (d.orgs.isEmpty()) add("Pick at least one org.")
     if (d.orgs.size > CAL_TURMA_ORGS_MAX) add("An event belongs to at most $CAL_TURMA_ORGS_MAX orgs.")
 }

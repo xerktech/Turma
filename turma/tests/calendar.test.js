@@ -1702,3 +1702,22 @@ test("XERK-2973 QA: a stored weekly rule's preset names its own days", () => {
   const r = cal.repeatFromRule({ freq: "weekly", interval: 1, byDay: ["MO", "WE", "FR"] });
   assert.equal(new Map(cal.repeatPresets("2026-11-17", r)).get("weekly"), "Weekly on Mon, Wed, Fri");
 });
+
+test("XERK-2973 QA: every scoped editor reads the series' rule off its first day; a split's until starts at the split", () => withOrgs(async () => {
+  const apr = occ({ id: "turma:0123456789abcdef:2027-04-30T14:00:00Z", originalStart: "2027-04-30T14:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-04-30T10:00:00-04:00", end: "2027-04-30T11:00:00-04:00",
+    startMs: Date.parse("2027-04-30T14:00:00Z"), endMs: Date.parse("2027-04-30T15:00:00Z"), recurrence: { freq: "monthly", interval: 1 } });
+  for (const scope of ["occurrence", "following", "series"]) {
+    cal.openEditor({ event: apr, scope });
+    assert.match(cal._edEls().panel.innerHTML, /Every month on day 31/, scope);
+    cal.closeEditor();
+  }
+  cal.openEditor({ event: apr, scope: "following" });
+  const f = cal._ed().f;
+  f.repeat = { ...f.repeat, end: "until", until: "2027-03-31" };
+  assert.equal(cal.validateForm(f).repeat, "It must repeat until a day on or after its start.", "the new series starts Apr 30");
+  f.repeat = { ...f.repeat, end: "count", count: 4 };
+  // Sent implicit: the hub pins the 31st at the split (server.test.js XERK-2973).
+  assert.deepEqual(cal.formPayload(f, 2, "following").recurrence, { freq: "monthly", interval: 1, count: 4 });
+  cal.closeEditor();
+}));
