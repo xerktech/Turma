@@ -3906,11 +3906,18 @@
   function repaintStaticKeepPlace() {
     if (!stScroll) return;
     if (stPinned) { repaintStatic(); pinStaticBottom(); return; }
+    // The anchor is the first message whose TOP is in view. Never merely the
+    // first one still visible: a folded thought group is one tall element
+    // whose top can sit thousands of px above the pane, and holding that
+    // offset lands the reader a dozen messages away. Only when one element
+    // covers the whole pane does the last one starting above it anchor.
     const top = stScroll.getBoundingClientRect().top;
     let uuid = null, off = 0;
     for (const el of stScroll.querySelectorAll("[data-uuid]")) {
       const r = el.getBoundingClientRect();
-      if (r.bottom > top) { uuid = el.dataset.uuid; off = r.top - top; break; }
+      if (r.bottom <= top) continue;
+      uuid = el.dataset.uuid; off = r.top - top;
+      if (r.top >= top) break;
     }
     repaintStatic();
     const el = uuid && window.CSS && CSS.escape

@@ -1413,8 +1413,12 @@ private fun SubagentView(
  * starts pinned again.
  */
 @Composable
-internal fun ReadOnlyTranscript(items: List<com.xerktech.turma.core.ChatItem>, openKey: Any) {
-    val listState = remember(openKey) { LazyListState() }
+internal fun ReadOnlyTranscript(
+    items: List<com.xerktech.turma.core.ChatItem>,
+    openKey: Any,
+    // Tests pass their own to read where the list landed.
+    listState: LazyListState = remember(openKey) { LazyListState() },
+) {
     val pinned = remember(openKey) { mutableStateOf(true) }
     val lastIndex = rememberUpdatedState(items.size - 1)
     suspend fun pin() {

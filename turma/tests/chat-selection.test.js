@@ -336,10 +336,49 @@ test("a reader who scrolled up is not yanked back down by a late image", () => {
 
 test("a search-hit open still lands on its hit, not the bottom", () => {
   const st = staticScroll("trScroll4");
-  globalThis.CSS = { escape: (s) => s };
+  window.CSS = globalThis.CSS = { escape: (s) => s }; // chat.js checks window.CSS, then calls CSS.escape
+  // The hit sits 900px down; centring it in the 400px pane scrolls to 725.
+  st.querySelector = () => ({ offsetHeight: 50, getBoundingClientRect: () => ({ top: 900 }),
+    classList: { add() {}, remove() {} } });
   window.TurmaChat.renderStatic({ entries: [entry("a", "x")], scrollEl: st, transcriptId: "t2", scrollUuid: "a" });
-  assert.equal(st.scrollTop, 0);
-  st.scrollHeight = 1800; st.fire("load"); // nor pulled there by a late image
-  assert.equal(st.scrollTop, 0);
-  delete globalThis.CSS;
+  assert.equal(st.scrollTop, 725);
+  st.scrollHeight = 1800; st.fire("load"); // nor pulled to the bottom by a late image
+  assert.equal(st.scrollTop, 725);
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a verbosity change mid-transcript keeps the first message in view, not a tall group above it", () => {
+  // The pane's top is y=0. A folded thought group starts 2000px above it and
+  // runs into view; the first message whose top is in view is "m21" at +30.
+  const st = staticScroll("trScroll5");
+  st.scrollHeight = 20000;
+  const rects = { g: { top: -2000, bottom: 380 }, m21: { top: 30, bottom: 90 } };
+  const node = (u) => ({ dataset: { uuid: u }, getBoundingClientRect: () => rects[u] });
+  st.querySelectorAll = () => [node("g"), node("m21")];
+  st.querySelector = (sel) => (sel.includes('"m21"') ? node("m21") : null);
+  const buttons = [];
+  const verb = { set innerHTML(v) {}, querySelectorAll: () => ["concise", "normal", "verbose"].map((n) => {
+    const b = { getAttribute: () => n, addEventListener: (t, fn) => { b.click = fn; } };
+    buttons.push(b); return b;
+  }) };
+  window.CSS = globalThis.CSS = { escape: (s) => s }; // chat.js checks window.CSS, then calls CSS.escape
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t5" });
+  st.scrollTop = 5000; st.fire("scroll"); // the reader parks mid-transcript
+  // The re-render moves m21 down 700px.
+  Object.defineProperty(st, "innerHTML", { set() { rects.m21 = { top: 730, bottom: 790 }; }, get() { return ""; } });
+  buttons.find((b) => b.getAttribute() === "verbose").click();
+  assert.equal(st.scrollTop, 5700, "m21 is back at +30, not the group's -2000");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a pane un-hidden after a hidden render re-pins to the bottom", () => {
+  let observed = null;
+  globalThis.ResizeObserver = class { constructor(cb) { this.cb = cb; } observe() { observed = this.cb; } };
+  const st = staticScroll("trScroll6");
+  st.scrollHeight = 0; // hidden: nothing to scroll
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t6" });
+  st.scrollHeight = 2400; // laid out again
+  observed();
+  assert.equal(st.scrollTop, 2400);
+  delete globalThis.ResizeObserver;
 });

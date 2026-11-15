@@ -50,4 +50,13 @@ class ReadOnlyTranscriptTest {
         compose.onNodeWithText("message 0").assertIsDisplayed()
         compose.onNodeWithText("message 80").assertDoesNotExist()
     }
+
+    @Test fun `a final message taller than the screen opens on its last line`() {
+        val tall = (1..400).joinToString("\n") { "line $it" }
+        val items = bubbles(5) + ChatItem.Bubble("tall", "assistant", tall)
+        val state = androidx.compose.foundation.lazy.LazyListState()
+        compose.setContent { ReadOnlyTranscript(items, "t1", state) }
+        compose.waitForIdle()
+        assert(!state.canScrollForward) { "the view stopped above the end of the last message" }
+    }
 }
