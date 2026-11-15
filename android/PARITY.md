@@ -44,6 +44,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   No Android analog: the phone board is already a horizontally scroll-snapping strip of 300dp
   columns sized to the device, with no separate centred header column to hold in place. Web-only
   responsive/desktop layout; nothing for the phone to match.
+- **Meetings page toolbar spacing (XERK-2962).** The web Meetings page's Calendar / Notes review
+  chips sit as close under the site header as the board's toolbar. Pixel spacing only; the phone's
+  Meetings tab lays its own view switch out platform-idiomatically, so nothing changes there.
 - **On-screen-keyboard composer docking** — same behaviour, platform-idiomatic mechanism on each
   side. Web (`sessions.html`) pins its app-shell height to `window.visualViewport` so the composer
   docks just above the keyboard on tablets/foldables where `100dvh` over-shrinks. Android drives it
