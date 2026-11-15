@@ -412,6 +412,11 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 - **A private event's owner rule (XERK-2972) applies per occurrence too**: a write naming an
   occurrence made private alone is refused (409) to anyone but the owner, like a private series;
   an occurrence of a private series is never `editable` to others, even one made public.
+- **A non-owner's series-level write never drops a private occurrence** (XERK-2977): a
+  re-time, rule edit, `following` split or series/following DELETE that would lose or change an
+  override its owner made private is a 409 in words (`calTurmaDropsPrivate`), even through a
+  public occurrence or the series id. Writes that keep it (a subject, a rule it still lands on)
+  pass. Why: the per-id rule alone let any viewer delete the owner's private meeting.
 - **Orgs are series-level**: an occurrence cannot change orgs or zone (400), so one series is one
   org set. An occurrence edit that resends the series' OWN orgs/zone unchanged is accepted (the
   web form sends every field).
