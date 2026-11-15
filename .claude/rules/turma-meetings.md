@@ -176,6 +176,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     24…4, default 10 = 8 AM–6 PM), `--slot: max(10px, 100cqh / (hours × 2))`. − / + in the bar
     (`aria-disabled` at the ends), Ctrl/⌘+wheel over the grid (a trackpad pinch); kept per viewer
     (`turma-calendar-zoom`). A zoom holds the pane's middle minute (`zoomAnchor`).
+    - **Any other pane-height change holds the TOP minute** (`holdTop`/`topMin`, run by `refit`
+      after every paint and on resize; the operator's scroll moves it): rows follow the pane, so
+      the loading notice leaving opened the day at 7:34, not 8:00 (QA). Android does the same.
     - **Scroll math reads the drawn row height back** (`pxPerMin` = `scrollHeight / 1440`), never
       `SLOT_PX` — that is only the no-cqh fallback (10h). A fake scroller in tests has no height.
   - 30-min rows, working hours 8–17 shaded white, the grid opens with 8:00 at the top, a red

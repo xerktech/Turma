@@ -656,11 +656,15 @@ private fun WeekGrid(
                     onScrolled()
                 }
             }
-            // A zoom holds the minute under the fingers (or the pane's middle) in place: the
-            // scroll moves once the new rows are laid out.
+            // A zoom holds the minute under the fingers (or the pane's middle) in place; any
+            // other row-height change (the pane resized by a notice, a rotation) holds the
+            // minute at the top. The scroll moves once the new rows are laid out.
             var hold by remember { mutableStateOf<Pair<Double, Float>?>(null) }
+            var lastSlotPx by remember { mutableStateOf(0f) }
             LaunchedEffect(slot) {
-                val (min, y) = hold ?: return@LaunchedEffect
+                val was = lastSlotPx
+                lastSlotPx = with(density) { slot.toPx() }
+                val (min, y) = hold ?: (if (was > 0f) scroll.value / was * 30.0 to 0f else return@LaunchedEffect)
                 withFrameNanos { }
                 scroll.scrollTo(with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) })
                 hold = null

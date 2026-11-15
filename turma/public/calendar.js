@@ -265,8 +265,20 @@ let zoomHours = ((z) => (ZOOMS.includes(z) ? z : ZOOM_DEFAULT))(loadStore(ZOOM_K
 let zoomAnchor = -1;              // the wall minute held at the pane's middle across a zoom
 // Rendered px per minute: the body is 24h tall. A fake scroller (tests) has no height.
 const pxPerMin = (sc) => (sc.scrollHeight > 0 ? sc.scrollHeight / 1440 : SLOT_PX / 30);
-// 8:00 at the top, its label clear of the edge.
-const openAt = (sc) => Math.max(0, WORK_FROM_H * 60 * pxPerMin(sc) - 8);
+// 8:00 at the top, its label clear of the edge (in minutes, so a pane resize keeps it).
+const openMin = (sc) => Math.max(0, WORK_FROM_H * 60 - 8 / pxPerMin(sc));
+// The rows follow the pane's height, so a height change (the loading notice going, a
+// host notice, a window resize) would slide the view to another time: the wall minute
+// at the pane's top is held instead (QA XERK-2954). The operator's scroll moves it.
+let topMin = -1;
+let paneSig = "";
+function holdTop(sc, min) {
+  if (min !== undefined) topMin = min;
+  const sig = `${sc.clientHeight}|${sc.scrollHeight}`;
+  if (min === undefined && sig === paneSig) return;
+  paneSig = sig;
+  if (topMin >= 0) sc.scrollTop = Math.max(0, topMin * pxPerMin(sc));
+}
 function zoom(dir) {
   const i = ZOOMS.indexOf(zoomHours) + (dir > 0 ? 1 : -1);
   if (i < 0 || i >= ZOOMS.length) return;
@@ -984,9 +996,9 @@ function paint(force = false) {
     restoreFocusSig(sig);
     const sc = $grid.querySelector && $grid.querySelector("#calScroll");
     revealed = !!(sc && scrollToMin >= 0);
-    if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin - 60) * pxPerMin(sc)); scrolled = true; }
-    else if (sc && zoomAnchor >= 0) { sc.scrollTop = Math.max(0, zoomAnchor * pxPerMin(sc) - sc.clientHeight / 2); revealed = true; }
-    else if (sc && !scrolled) { sc.scrollTop = openAt(sc); scrolled = true; }
+    if (sc && scrollToMin >= 0) { holdTop(sc, Math.max(0, scrollToMin - 60)); scrolled = true; }
+    else if (sc && zoomAnchor >= 0) { holdTop(sc, Math.max(0, zoomAnchor - sc.clientHeight / 2 / pxPerMin(sc))); revealed = true; }
+    else if (sc && !scrolled) { holdTop(sc, openMin(sc)); scrolled = true; }
     scrollToMin = -1;
     zoomAnchor = -1;
   }
@@ -994,7 +1006,7 @@ function paint(force = false) {
   paintDetail(force);
   if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
 }
-// A stretched day (the pane taller than 24h) has nothing to scroll, so its
+// Also holds the top minute across a pane-size change (holdTop). A stretched day has nothing to scroll, so its
 // scrollTop is 0; once a resize makes the pane scroll again, open it at 8 AM like
 // a fresh paint instead of leaving it stuck at midnight (XERK-2937).
 let fitWas = false;
@@ -1004,7 +1016,8 @@ function refit(keep = false) {
   const sc = active && $grid && $grid.querySelector && $grid.querySelector("#calScroll");
   if (!sc || !sc.clientHeight) return;
   const fits = sc.scrollHeight <= sc.clientHeight + 1;
-  if (fitWas && !fits && !keep) sc.scrollTop = openAt(sc);
+  if (fitWas && !fits && !keep) holdTop(sc, openMin(sc));
+  else holdTop(sc);
   fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's
@@ -1261,15 +1274,26 @@ function mount(el, opts = {}) {
   // arrows act only on a focused event button (onKey checks the target).
   (typeof document !== "undefined" && document.addEventListener ? document : $root).addEventListener("keydown", onKey);
   // Ctrl/⌘ + wheel over the grid zooms (a trackpad pinch arrives as this); one step per notch.
-  let wheelAcc = 0;
+  // A pause or a turn of direction starts a new gesture: a leftover never zooms later.
+  let wheelAcc = 0, wheelAt = 0;
   $root.addEventListener("wheel", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey) || !(ev.target && ev.target.closest && ev.target.closest(".cal-grid"))) return;
     ev.preventDefault();
-    wheelAcc += ev.deltaY;
+    const t = Date.now();
+    // A line-mode wheel (Firefox) reports ~3 per notch: count it as pixels.
+    const dy = ev.deltaMode === 1 ? ev.deltaY * 40 : ev.deltaMode === 2 ? ev.deltaY * 400 : ev.deltaY;
+    if (t - wheelAt > 400 || Math.sign(dy) !== Math.sign(wheelAcc)) wheelAcc = 0;
+    wheelAt = t;
+    wheelAcc += dy;
     if (Math.abs(wheelAcc) < 40) return;
     zoom(wheelAcc < 0 ? 1 : -1);
     wheelAcc = 0;
   }, { passive: false });
+  // The operator's own scroll is the new view to hold (scroll does not bubble: capture).
+  $grid.addEventListener("scroll", (ev) => {
+    const sc = ev.target;
+    if (sc && sc.id === "calScroll" && sc.clientHeight) topMin = sc.scrollTop / pxPerMin(sc);
+  }, true);
   // Swipe left/right on the grid moves like › / ‹ (the narrow layout's arrows).
   let touch = null;
   $root.addEventListener("touchstart", (ev) => {
@@ -1306,6 +1330,7 @@ const api = {
   detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
   _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
+  _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; },
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
