@@ -351,7 +351,12 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
     (the meetings frame has no principal).
   - Only events of tenants the caller may see (`principalMaySite` on the record's orgs).
   - A private/confidential event is withheld exactly like an Outlook one for every viewer but its
-    creator (`createdBy`).
+    creator (`createdBy`), and only the creator may PATCH/DELETE it (409 otherwise; served
+    `editable:false`): a client saving the blanked fields back wiped the event (XERK-2972 QA).
+    - One no USER made (break-glass/legacy/open, moved in by the tenant migration) is owned by
+      that tenant's user (`calTurmaOwner`), or nobody could ever change or delete it.
+    - Only the owner may make an event private/confidential: a non-owner hiding one locked every
+      other viewer out, itself included, with no way back. Both refusals carry no `event`.
 - **Every write broadcasts the coalesced `calendar` frame** under the tenant-level key
   `turma:events@<tenant>` (plain `turma:events` untenanted). The SSE scoper's `mayHost` passes it
   only to that tenant's viewers; clients refetch on any frame, so no client change is needed.
