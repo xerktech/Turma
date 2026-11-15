@@ -148,6 +148,10 @@ A pure-core/adapter-shell split:
   - Calendar rows (events, hosts) strip control/bidi chars at decode (`cleanCalendarJson`, the
     hub's `meetingText` class) EXCEPT the id keys (`CALENDAR_ID_KEYS`): ids round-trip to the hub,
     whose `CAL_ID_RE` accepts zero-width marks. Defence against an older/forwarding hub (XERK-2921).
+  - **Zoom** (XERK-2954, web's `--hours`): `calSlotDp(paneDp, hours)` from the grid's own
+    `BoxWithConstraints`; pinch on the grid (consumed in the Initial pass so the scroll and the
+    day swipe never see it) and TalkBack "Zoom in/out" custom actions stand in for the web's − / +.
+    `CalendarViewModel.zoom`, saved once per pinch (prefs `zoom-hours`). Default 10h = 8 AM–6 PM.
   - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`.
 
 ## Images (rollup XERK-2109)

@@ -1104,3 +1104,46 @@ test("XERK-2939: the detail panel's tint is exactly the session card's mix", () 
   assert.equal(mix(read("app.css"), "\\.kanban-card"), card);
   assert.equal(mix(read("brief.html"), "\\.cal-detail"), card, "the panel matches the session card (operator's rule)");
 });
+
+test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  replies = { "/api/calendar": () => ({ hosts: [], events: [] }) };
+  const [grid] = root.children;
+  // A 600px pane: rows are max(10px, 600 / (hours * 2)), so the day is 48 rows of that.
+  const scroller = { scrollTop: 0, clientHeight: 600,
+    get scrollHeight() { return 48 * Math.max(10, 600 / (cal._state().zoomHours * 2)); } };
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  try {
+    cal._go(at(2026, 11, 12));
+    cal.setActive(true);
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(cal._state().zoomHours, 10, "opens showing 10 hours");
+    assert.match(cal.calendarHtml(), /--hours:10;/);
+    const ppm = () => scroller.scrollHeight / 1440;
+    const mid = () => (scroller.scrollTop + 300) / ppm();
+    scroller.scrollTop = 500;
+    const before = mid();
+    click({ zoom: "1" });
+    assert.equal(cal._state().zoomHours, 8);
+    assert.match(cal.calendarHtml(), /--hours:8;/);
+    assert.ok(Math.abs(mid() - before) < 1e-6, "the middle minute stays put");
+    for (let i = 0; i < 9; i++) click({ zoom: "1" });
+    assert.equal(cal._state().zoomHours, cal.ZOOMS[cal.ZOOMS.length - 1], "zoom in stops at the last step");
+    assert.match(cal.calendarHtml(), /data-zoom="1" aria-label="Zoom in" title="Zoom in" aria-disabled="true"/);
+    for (let i = 0; i < 9; i++) click({ zoom: "-1" });
+    assert.equal(cal._state().zoomHours, 24, "zoom out stops at the whole day");
+    assert.match(cal.calendarHtml(), /data-zoom="-1" aria-label="Zoom out" title="Zoom out" aria-disabled="true"/);
+    assert.match(cal.calendarHtml(), /data-zoom="1" aria-label="Zoom in" title="Zoom in \(fewer hours\)">/);
+  } finally {
+    while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
+    grid.querySelector = qs;
+    cal.setActive(false);
+  }
+});
+
+test("XERK-2954: brief.html sizes the rows from --hours over the pane's height", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "public", "brief.html"), "utf8");
+  assert.match(html, /\.cal-body \{ position: relative; --hours: 10; --slot: calc\(240px \/ var\(--hours\)\); \}/);
+  assert.match(html, /--slot: max\(10px, 100cqh \/ \(var\(--hours\) \* 2\)\)/);
+});

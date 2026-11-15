@@ -5,6 +5,7 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.CAL_ZOOM_DEFAULT_H
 import com.xerktech.turma.core.CalMode
 import com.xerktech.turma.core.CalWeek
 import com.xerktech.turma.core.calDay
@@ -12,6 +13,7 @@ import com.xerktech.turma.core.calDayStartMs
 import com.xerktech.turma.core.calHostNotices
 import com.xerktech.turma.core.calUpcomingWeeks
 import com.xerktech.turma.core.calWantedWeeks
+import com.xerktech.turma.core.calZoomClamp
 import com.xerktech.turma.model.CalendarAnswer
 import com.xerktech.turma.model.LenientHolidaysSerializer
 import com.xerktech.turma.model.TurmaJson
@@ -96,6 +98,19 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The mode picked per layout (wide: Work week / Week; narrow: Day / 3 days). */
     val modes: StateFlow<Map<Boolean, CalMode>> = _modes
+
+    private val _zoom = MutableStateFlow(
+        calZoomClamp(runCatching { prefs.getFloat(ZOOM_KEY, CAL_ZOOM_DEFAULT_H) }.getOrDefault(CAL_ZOOM_DEFAULT_H)),
+    )
+
+    /** The hours the grid's pane shows (XERK-2954), remembered on this phone. */
+    val zoom: StateFlow<Float> = _zoom
+
+    /** A pinch moves [zoom] every frame; [save] (its end) writes it to the phone once. */
+    fun setZoom(h: Float, save: Boolean = true) {
+        _zoom.value = calZoomClamp(h)
+        if (save) runCatching { prefs.edit().putFloat(ZOOM_KEY, _zoom.value).apply() }
+    }
 
     init {
         viewModelScope.launch {
@@ -374,6 +389,7 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         private const val VIEW_KEY = "view"
         private const val MODE_WIDE = "mode-wide"
         private const val MODE_NARROW = "mode-narrow"
+        private const val ZOOM_KEY = "zoom-hours"
         private const val FRAME_COALESCE_MS = 1_000L
         private const val STREAM_DOWN_POLL_MS = 60_000L
         private const val RETRY_MS = 20_000L
