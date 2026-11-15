@@ -1172,6 +1172,8 @@ test("XERK-2954 QA: the grid opens with 8:00 at the top and keeps it while the p
     for (let i = 0; i < 4; i++) await tick();
     assert.ok(Math.abs(topOff(480) - 8) < 0.5, `opens at 8:00 (8:00 is ${topOff(480)}px down)`);
     pane.h = 623;
+    // The open's own scroll event lands after the pane grew (QA): it is not the operator's.
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
     hold({ hosts: [], events: [{ host: "h1", id: "z1", org: "", subject: "Late", startMs: at(2026, 11, 12, 9), endMs: at(2026, 11, 12, 10) }] });
     for (let i = 0; i < 8; i++) await tick();
     assert.ok(Math.abs(topOff(480) - 8) < 0.5, `still 8:00 once the notice goes (${topOff(480)}px down)`);

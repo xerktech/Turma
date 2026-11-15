@@ -272,12 +272,15 @@ const openMin = (sc) => Math.max(0, WORK_FROM_H * 60 - 8 / pxPerMin(sc));
 // at the pane's top is held instead (QA XERK-2954). The operator's scroll moves it.
 let topMin = -1;
 let paneSig = "";
+// The scrollTop holdTop last wrote: its scroll event can arrive after the pane has
+// grown (the notice gone), and read as the operator's it moved the view (QA).
+let wroteTop = -1;
 function holdTop(sc, min) {
   if (min !== undefined) topMin = min;
   const sig = `${sc.clientHeight}|${sc.scrollHeight}`;
   if (min === undefined && sig === paneSig) return;
   paneSig = sig;
-  if (topMin >= 0) sc.scrollTop = Math.max(0, topMin * pxPerMin(sc));
+  if (topMin >= 0) { sc.scrollTop = Math.max(0, topMin * pxPerMin(sc)); wroteTop = sc.scrollTop; }
 }
 function zoom(dir) {
   const i = ZOOMS.indexOf(zoomHours) + (dir > 0 ? 1 : -1);
@@ -1292,7 +1295,8 @@ function mount(el, opts = {}) {
   // The operator's own scroll is the new view to hold (scroll does not bubble: capture).
   $grid.addEventListener("scroll", (ev) => {
     const sc = ev.target;
-    if (sc && sc.id === "calScroll" && sc.clientHeight) topMin = sc.scrollTop / pxPerMin(sc);
+    if (!sc || sc.id !== "calScroll" || !sc.clientHeight || Math.abs(sc.scrollTop - wroteTop) < 1) return;
+    topMin = sc.scrollTop / pxPerMin(sc);
   }, true);
   // Swipe left/right on the grid moves like › / ‹ (the narrow layout's arrows).
   let touch = null;
@@ -1330,7 +1334,7 @@ const api = {
   detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
   _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
-  _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; },
+  _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
