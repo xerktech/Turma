@@ -160,6 +160,11 @@ A pure-core/adapter-shell split:
     `BoxWithConstraints`; pinch on the grid (consumed in the Initial pass so the scroll and the
     day swipe never see it) and TalkBack "Zoom in/out" custom actions stand in for the web's − / +.
     `CalendarViewModel.zoom`, saved once per pinch (prefs `zoom-hours`). Default 10h = 8 AM–6 PM.
+  - **The swipe follows the finger** (XERK-2980): the grid draws the days a swipe slides in
+    off-screen either side (`calSwipeNeighbours`, a `DayStrip` per row), shifted in placement
+    only. Day / 3 days swipe ONE day (`calSwipeStep`); ‹ › still page by what is shown.
+    - The settle's last frame steps the anchor AND zeroes the shift together: split, the grid
+      jumps a step and back. The off-screen cells carry no test tags and no semantics.
   - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact
     POST/PATCH body; `calScopedPayload` for an occurrence-scoped edit), `core/CalendarRepeat.kt`
     (the Repeat rule, XERK-2973), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.

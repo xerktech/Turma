@@ -59,6 +59,25 @@ class CalendarTest {
         assertEquals((14..16).map { LocalDate.of(2026, 11, it) }, calVisibleDays(sat, CalMode.THREE))
     }
 
+    @Test fun `a swipe moves one day on a phone and a week in the week modes (XERK-2980)`() {
+        val d = LocalDate.of(2026, 12, 31)
+        assertEquals(LocalDate.of(2027, 1, 1), calSwipeStep(d, CalMode.THREE, 1))
+        assertEquals(LocalDate.of(2026, 12, 30), calSwipeStep(d, CalMode.DAY, -1))
+        assertEquals(LocalDate.of(2027, 1, 7), calSwipeStep(d, CalMode.WORK, 1))
+        // 3 days slides in one day either side; Day one; the week modes a whole page.
+        assertEquals(
+            listOf(LocalDate.of(2026, 12, 30)) to listOf(LocalDate.of(2027, 1, 3)),
+            calSwipeNeighbours(d, CalMode.THREE),
+        )
+        assertEquals(
+            listOf(LocalDate.of(2026, 12, 30)) to listOf(LocalDate.of(2027, 1, 1)),
+            calSwipeNeighbours(d, CalMode.DAY),
+        )
+        val (before, after) = calSwipeNeighbours(d, CalMode.WORK)
+        assertEquals((21..25).map { LocalDate.of(2026, 12, it) }, before)
+        assertEquals((4..8).map { LocalDate.of(2027, 1, it) }, after)
+    }
+
     @Test fun `arrows move a week in the week modes, else by what is shown, across the year`() {
         val d = LocalDate.of(2026, 12, 30)
         assertEquals(LocalDate.of(2027, 1, 6), calStep(d, CalMode.WORK, 1))

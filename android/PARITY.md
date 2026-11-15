@@ -208,6 +208,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     automatically; the daily meeting's brief; Open in notes review.
   - Notes review: upcoming calendar meetings (org bar, Join), a linked capture named by its
     Outlook subject with its time + invitees, Impromptu, Open in calendar.
+  - Android's swipe slides the days with the finger and settles with an animation; in Day / 3 days
+    it moves ONE day (XERK-2980), while ‹ › still page by what is shown. The web's narrow swipe
+    still jumps a page (a touch gesture the operator asked for on the phone only).
   - Platform differences: no keyboard walking (←/→/↑/↓, Esc) and no A/S/E/R/J/K in the panel;
     the date picker is Material's, not the web's mini-month.
   - The grid fills the screen on both (XERK-2937); the web widens the Calendar view to the

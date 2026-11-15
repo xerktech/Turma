@@ -15,6 +15,9 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeLeft
+import androidx.compose.ui.test.swipeRight
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.TurmaJson
@@ -244,6 +247,25 @@ class CalendarScreenTest {
         compose.onNodeWithTag("cal-dh-$first").assertExists()
         // Kept on this phone: a fresh ViewModel reads it back.
         assertEquals(com.xerktech.turma.core.CalMode.THREE, calendarVm().modes.value[false])
+    }
+
+    @Test fun `a swipe slides 3 days one day at a time (XERK-2980)`() {
+        seed()
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        compose.onNodeWithTag("cal-mode-THREE").performClick()
+        compose.onNodeWithTag("cal-dh-${today.plusDays(2)}").assertExists()
+        compose.onNodeWithTag("cal-scroll").performTouchInput { swipeLeft() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("cal-dh-${today.plusDays(3)}").assertExists()
+        compose.onNodeWithTag("cal-dh-${today.plusDays(1)}").assertExists()
+        // The day slid off is drawn off-screen for the next swipe back, but untagged and silent.
+        compose.onNodeWithTag("cal-dh-$today").assertDoesNotExist()
+        compose.onNodeWithTag("cal-scroll").performTouchInput { swipeRight() }
+        compose.waitForIdle()
+        compose.onNodeWithTag("cal-dh-$today").assertExists()
+        compose.onNodeWithTag("cal-dh-${today.plusDays(3)}").assertDoesNotExist()
     }
 
     @Test fun `the view switch is kept on this phone and a push opens the notes review`() {
