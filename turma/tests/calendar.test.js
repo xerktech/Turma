@@ -1191,3 +1191,243 @@ test("XERK-2954 QA: Ctrl+wheel zooms one step per notch, a stale leftover never 
     while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
   }
 });
+
+// ---- XERK-2971: Turma-made events — create, edit, delete, multi-org ----------------
+function withOrgs(fn) {
+  const board = globalThis.TurmaBoard;
+  globalThis.TurmaBoard = { ...board,
+    mergeSites: () => [{ siteKey: "acme" }, { siteKey: "globex" }],
+    orgColorMap: () => new Map([["acme", "var(--s3)"], ["globex", "var(--s5)"]]) };
+  cal.update({ agents: [] });
+  return Promise.resolve().then(fn).finally(() => { globalThis.TurmaBoard = board; cal.update(null); });
+}
+const tev = (over = {}) => ({ source: "turma", host: "", id: "turma:0123456789abcdef", orgs: ["acme", "globex"], org: "acme",
+  subject: "Joint planning", start: "2027-05-04T10:00:00-04:00", end: "2027-05-04T11:30:00-04:00",
+  startMs: at(2027, 5, 4, 10), endMs: at(2027, 5, 4, 11, 30), timeZone: "America/New_York", allDay: false,
+  location: "Room 4", body: "", attendees: [{ name: "Ann", email: "ann@acme.com", role: "required" }, { name: "", email: "bob@globex.com", role: "optional" }],
+  joinUrl: "", isOnlineMeeting: false, busy: "busy", categories: [], sensitivity: "normal", version: 2, editable: true, ...over });
+const editorFill = (f) => Object.assign(cal._ed().f, f);
+
+test("XERK-2971: form validation mirrors the hub — orgs, emails, times, https link, lengths", () => {
+  const f = cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 9, 30));
+  assert.equal(f.timeZone, "America/New_York");
+  assert.deepEqual([f.startDate, f.startTime, f.endDate, f.endTime], ["2027-05-04", "09:00", "2027-05-04", "09:30"]);
+  assert.deepEqual(Object.keys(cal.validateForm(f)), ["orgs"], "an event must belong to an org");
+  f.orgs = ["acme"];
+  assert.deepEqual(cal.validateForm(f), {});
+  assert.deepEqual(Object.keys(cal.validateForm({ ...f, orgs: ["other"] }, ["acme"])), ["orgs"], "only pickable orgs");
+  assert.match(cal.validateForm({ ...f, endTime: "08:00" }).end, /before the start/);
+  assert.match(cal.validateForm({ ...f, startDate: "2027-02-30" }).start, /start/);
+  assert.match(cal.validateForm({ ...f, reqDraft: "not-an-email" }).reqDraft, /Not an email/);
+  assert.match(cal.validateForm({ ...f, optDraft: "a b@x.org" }).optDraft, /Not an email/);
+  assert.match(cal.validateForm({ ...f, online: true, joinUrl: "http://x.org" }).joinUrl, /https/);
+  assert.equal(cal.validateForm({ ...f, online: false, joinUrl: "http://x.org" }).joinUrl, undefined, "a link only counts online");
+  assert.match(cal.validateForm({ ...f, subject: "x".repeat(301) }).subject, /300/);
+  assert.match(cal.validateForm({ ...f, body: "😀".repeat(4001) }).body, /4000/, "code points, like the hub");
+  assert.equal(cal.validateForm({ ...f, body: "😀".repeat(4000) }).body, undefined);
+  assert.match(cal.validateForm({ ...f, timeZone: "Mars/Olympus" }).timeZone, /time zone/);
+  // The hub's email rule: one @, a dot after it, nothing that breaks markup.
+  assert.deepEqual(cal.parseAttendee("Ann Lee <Ann@Acme.COM>"), { name: "Ann Lee", email: "ann@acme.com" });
+  assert.deepEqual(cal.parseAttendee(" o'brien@x.org "), { name: "", email: "o'brien@x.org" });
+  for (const bad of ["a@b", "a@@b.c", "a\"b@c.d", "a<b@c.d", "a​b@c.d", "a/b@c.d", `${"a".repeat(200)}@b.c`]) {
+    assert.equal(cal.parseAttendee(bad), null, bad);
+  }
+});
+
+test("XERK-2971: the payload is the route's shape — ISO with offset, all-day exclusive end, roles, privacy", () => {
+  const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme", "globex"], subject: "  Plan  ",
+    required: [{ name: "Ann", email: "ann@acme.com" }], optional: [{ name: "", email: "bob@globex.com" }],
+    online: false, joinUrl: "https://meet.example/x", category: "Ops, ops2, Ops", priv: true, location: " R4 " };
+  const b = cal.formPayload(f);
+  assert.deepEqual(Object.keys(b), ["orgs", "subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
+    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity"]);
+  assert.deepEqual([b.subject, b.start, b.end, b.timeZone, b.location], ["Plan", "2027-05-04T09:00:00-04:00", "2027-05-04T10:00:00-04:00", "America/New_York", "R4"]);
+  assert.deepEqual(b.attendees, [{ name: "Ann", email: "ann@acme.com", role: "required" }, { name: "", email: "bob@globex.com", role: "optional" }]);
+  assert.equal(b.joinUrl, "", "no link without the online toggle");
+  assert.deepEqual(b.categories, ["Ops", "ops2"]);
+  assert.equal(b.sensitivity, "private");
+  assert.equal(cal.formPayload({ ...f, priv: false }).sensitivity, "normal");
+  assert.equal(cal.formPayload({ ...f, priv: true, sensitivity: "confidential" }).sensitivity, "confidential", "a stricter label is kept");
+  assert.equal(cal.formPayload(f, 7).version, 7, "an edit carries its version");
+  const all = cal.formPayload({ ...f, allDay: true, endDate: "2027-05-05" });
+  assert.deepEqual([all.start, all.end, all.allDay], ["2027-05-04T00:00:00-04:00", "2027-05-06T00:00:00-04:00", true]);
+  // Another zone keeps the creator's wall clock.
+  assert.equal(cal.formPayload({ ...f, timeZone: "Asia/Kolkata" }).start, "2027-05-04T09:00:00+05:30");
+  // DST: a fall-back time is its first pass; a skipped spring time lands on a real instant.
+  assert.equal(cal.wallToIso("2026-11-01", "01:30", "America/New_York").iso, "2026-11-01T01:30:00-04:00");
+  const gap = cal.wallToIso("2027-03-14", "02:30", "America/New_York");
+  assert.equal(Date.parse(gap.iso), gap.ms, "the ISO parses back to its instant");
+  // An event the hub served reads back into the same form.
+  const back = cal.formFromEvent(tev({ isOnlineMeeting: true, joinUrl: "https://m.example/1", sensitivity: "private", categories: ["A", "B"] }));
+  assert.deepEqual([back.startDate, back.startTime, back.endTime, back.timeZone, back.online, back.joinUrl, back.priv, back.category],
+    ["2027-05-04", "10:00", "11:30", "America/New_York", true, "https://m.example/1", true, "A, B"]);
+  assert.deepEqual(back.required, [{ name: "Ann", email: "ann@acme.com" }]);
+  assert.deepEqual(back.optional, [{ name: "", email: "bob@globex.com" }]);
+  assert.equal(cal.formFromEvent(tev({ allDay: true, startMs: at(2027, 5, 4), endMs: at(2027, 5, 6) })).endDate, "2027-05-05", "the last day, inclusive");
+});
+
+test("XERK-2971: a multi-org event renders once, with every org's color, and shows under an org filter", () => withOrgs(async () => {
+  const asked = [];
+  replies = { "/api/calendar": (url) => { asked.push(url); return { hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [tev()] : [] }; } };
+  cal.refetch();
+  let html = await show(at(2027, 5, 4));
+  assert.equal((html.match(/aria-label="Joint planning,/g) || []).length, 1, "once, not once per org");
+  assert.match(html, /class="cal-ev turma multi"/);
+  assert.match(html, /class="cal-orgbar"[^>]*linear-gradient\(to bottom,var\(--s3\) 0\.00% 50\.00%,var\(--s5\) 50\.00% 100\.00%\)/);
+  assert.match(html, /aria-label="Joint planning,[^"]*orgs acme, globex[^"]*Turma event"/);
+  // Under a filter on its SECOND org the hub serves it (any of its orgs) and it still shows once.
+  orgKeys = ["globex"];
+  try {
+    cal.refetch();
+    html = await show(at(2027, 5, 4));
+    assert.ok(asked.some((u) => u.includes("&org=globex")));
+    assert.equal((html.match(/aria-label="Joint planning,/g) || []).length, 1);
+  } finally { orgKeys = []; }
+  // A single-org Turma event keeps a plain org bar; an Outlook event is never "turma".
+  assert.deepEqual(cal.styleOf(tev({ orgs: ["acme"] }), 0), ["turma"]);
+  assert.deepEqual(cal.styleOf({ source: "outlook", org: "acme", orgs: ["acme", "globex"] }, 0), []);
+  // The panel lists every org, escaped, each with its color.
+  const h = cal.detailHtml(tev({ subject: "<img src=x>" }), NOW);
+  assert.match(h, /Orgs<\/span><span class="v"><span class="cal-orgchip"><span class="cal-orgdot" style="--org:var\(--s3\)"[^>]*><\/span>acme<\/span><span class="cal-orgchip">[^]*globex/);
+  assert.match(h, /Made in Turma — not on Outlook/);
+  assert.ok(!h.includes("<img"));
+}));
+
+test("XERK-2971: Edit and Delete only on an editable Turma event; Outlook keeps its read-only panel", () => {
+  const outlook = { host: "h1", id: "o1", source: "outlook", org: "acme", subject: "Sync", startMs: at(2027, 5, 4, 9), endMs: at(2027, 5, 4, 10), editable: true };
+  assert.ok(!/data-ev-edit|data-ev-delete/.test(cal.detailHtml(outlook, NOW)), "an Outlook event never offers Edit/Delete");
+  assert.ok(!/data-ev-edit|data-ev-delete/.test(cal.detailHtml({ ...tev(), editable: false }, NOW)));
+  assert.match(cal.detailHtml({ ...tev(), editable: false }, NOW), /Only someone who can see every org/);
+  const h = cal.detailHtml(tev(), NOW);
+  assert.match(h, /data-ev-edit/);
+  assert.match(h, /data-ev-delete/);
+});
+
+test("XERK-2971: create — New event opens the editor pre-filled with the filtered org; Save posts the payload", () => withOrgs(async () => {
+  orgKeys = ["globex"];
+  replies = { "/api/calendar/events": () => ({ ok: true, event: tev({ id: "turma:aaaaaaaaaaaaaaaa", orgs: ["globex"] }) }) };
+  try {
+    await show(at(2027, 5, 4));
+    click({ calNew: "" });
+    const e = cal._ed();
+    assert.equal(e.mode, "new");
+    assert.deepEqual(e.f.orgs, ["globex"], "the header's org pick pre-fills");
+    assert.equal(cal._edEls().back.hidden, false);
+    const html = cal._edEls().panel.innerHTML;
+    assert.match(html, /data-ed-org="acme"/);
+    assert.match(html, /data-ed-org="globex" checked/);
+    assert.match(html, /Does not repeat/);
+    editorFill({ subject: "Plan <b>", startDate: "2027-05-05", startTime: "13:00", endDate: "2027-05-05", endTime: "14:00", reqDraft: "Ann <ann@acme.com>" });
+    posts.length = 0;
+    await cal.saveEditor();
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url, "/api/calendar/events");
+    assert.deepEqual(posts[0].body.orgs, ["globex"]);
+    assert.equal(posts[0].body.start, "2027-05-05T13:00:00-04:00");
+    assert.deepEqual(posts[0].body.attendees, [{ name: "Ann", email: "ann@acme.com", role: "required" }], "a typed address is committed on Save");
+    assert.equal(posts[0].body.version, undefined);
+    assert.equal(cal._ed(), null, "closed on success");
+    assert.equal(cal._edEls().back.hidden, true);
+    // An invalid form never reaches the hub, and says why next to the field.
+    cal.openEditor({ startMs: at(2027, 5, 5, 9), endMs: at(2027, 5, 5, 9, 30) });
+    editorFill({ orgs: [], optDraft: "nope" });
+    posts.length = 0;
+    await cal.saveEditor();
+    assert.equal(posts.length, 0);
+    assert.match(cal._edEls().panel.innerHTML, /Pick at least one org\.[^]*Not an email address/);
+    assert.match(cal._edEls().panel.innerHTML, /data-ed-field="optDraft"[^>]*aria-invalid="true"/);
+    cal.closeEditor();
+  } finally { orgKeys = []; }
+}));
+
+test("XERK-2971: an edit that lost a race gets the 409 in the hub's words and reloads the current event", () => withOrgs(async () => {
+  // The specific route first: the fake fetch takes the first key the URL starts with.
+  replies = {
+    "/api/calendar/events/": () => ({ status: 409, body: { error: "this event was changed since you opened it; reload it and edit again",
+      event: tev({ subject: "Theirs", version: 3 }) } }),
+    "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [tev()] : [] }),
+  };
+  cal.refetch();
+  await openEvent(at(2027, 5, 4), "Joint planning");
+  click({ evEdit: "" });
+  assert.equal(cal._ed().mode, "edit");
+  assert.equal(cal._ed().version, 2);
+  editorFill({ subject: "Mine" });
+  posts.length = 0;
+  await cal.saveEditor();
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, `/api/calendar/events/${encodeURIComponent("turma:0123456789abcdef")}`);
+  assert.equal(posts[0].body.version, 2, "the edit names the version it was made to");
+  const e = cal._ed();
+  assert.ok(e, "the editor stays open");
+  assert.equal(e.err, "Saving the event failed — this event was changed since you opened it; reload it and edit again");
+  assert.equal(e.f.subject, "Theirs", "reloaded from the hub's current copy");
+  assert.equal(e.version, 3);
+  assert.match(cal._edEls().panel.innerHTML, /role="alert">Saving the event failed — this event was changed/);
+  cal.closeEditor();
+  click({ closeDetail: "" });
+}));
+
+test("XERK-2971: delete asks first, sends DELETE, closes the panel; a refusal shows the hub's words", () => withOrgs(async () => {
+  let refuse = true;
+  replies = {
+    "/api/calendar/events/": () => (refuse ? { status: 404, body: { error: "no such Turma event" } } : { ok: true }),
+    "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [tev()] : [] }),
+  };
+  cal.refetch();
+  await openEvent(at(2027, 5, 4), "Joint planning");
+  posts.length = 0;
+  click({ evDelete: "" });
+  assert.equal(posts.length, 0, "the first press only asks");
+  assert.match(cal._els().info.innerHTML, /Delete this event for every org\?[^]*data-ev-delete-yes/);
+  click({ evDeleteNo: "" });
+  assert.match(cal._els().info.innerHTML, /data-ev-edit/);
+  click({ evDelete: "" });
+  click({ evDeleteYes: "" });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.equal(posts[0].url, `/api/calendar/events/${encodeURIComponent("turma:0123456789abcdef")}`);
+  assert.match(cal._els().info.innerHTML, /Deleting the event failed — no such Turma event/);
+  refuse = false;
+  replies["/api/calendar"] = () => ({ hosts: [], events: [] });
+  click({ evDelete: "" });
+  click({ evDeleteYes: "" });
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(cal._els().side.hidden, true, "the panel closes once the event is gone");
+}));
+
+test("XERK-2971: a click or drag on an empty slot opens the editor on that span; a touch swipe does not", () => withOrgs(async () => {
+  replies = {};
+  await show(at(2027, 5, 4));
+  const grid = cal._els().grid;
+  const day = cal.dayStart(at(2027, 5, 4));
+  const col = { dataset: { col: String(day) }, getBoundingClientRect: () => ({ top: 0, height: 1440 }) };
+  const target = { closest: (sel) => (sel === ".cal-col" ? col : null) };
+  const press = (y, extra = {}) => { for (const f of grid.listeners.pointerdown) f({ button: 0, target, clientX: 10, clientY: y, ...extra }); };
+  const lift = (y, extra = {}) => { for (const f of grid.listeners.pointerup) f({ target, clientX: 10, clientY: y, ...extra }); };
+  press(600); lift(600);                                    // 10:00, one row
+  assert.deepEqual([cal._ed().f.startTime, cal._ed().f.endTime], ["10:00", "10:30"]);
+  cal.closeEditor();
+  press(840); lift(605);                                    // dragged up 14:00 → 10:00
+  assert.deepEqual([cal._ed().f.startTime, cal._ed().f.endTime], ["10:00", "14:30"]);
+  cal.closeEditor();
+  press(600, { pointerType: "touch" }); lift(600, { pointerType: "touch", clientX: 120 });
+  assert.equal(cal._ed(), null, "a swipe is not a create");
+  const onEvent = { closest: (sel) => (sel === ".cal-col" ? col : sel === ".cal-ev" ? {} : null) };
+  for (const f of grid.listeners.pointerdown) f({ button: 0, target: onEvent, clientY: 600 });
+  lift(600);
+  assert.equal(cal._ed(), null, "a press on an event opens the event, not the editor");
+  assert.equal(cal.slotMinAt(col, 1439), 1410);
+}));
+
+test("XERK-2971: the notes review and relink count a multi-org event for every org it is in", async () => {
+  NOW = at(2026, 11, 11, 10, 30);
+  const ev = tev({ id: "turma:1111111111111111", subject: "Cross-org sync", meeting: true,
+    startMs: at(2026, 11, 12, 15), endMs: at(2026, 11, 12, 16) });
+  replies = { "/api/calendar": () => ({ hosts: [], events: [ev] }) };
+  cal.refetch();
+  cal.upcoming("globex");
+  for (let i = 0; i < 6; i++) await tick();
+  assert.deepEqual(cal.upcoming("globex").map((e) => e.subject), ["Cross-org sync"]);
+  assert.deepEqual(cal.upcoming("acme").map((e) => e.subject), ["Cross-org sync"]);
+  assert.deepEqual(cal.upcoming("initech"), []);
+});

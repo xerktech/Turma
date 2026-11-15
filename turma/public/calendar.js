@@ -6,11 +6,12 @@
 // A shared module like meetings.js: brief.html mounts it, hands it the fleet
 // snapshot (update) and tells it when the hub's `calendar` / `holidaySettings`
 // SSE frames land (refetch). It reads the calendar routes itself — the events
-// are too big for the snapshot (contract-calendar.md). Read-only: no drag, no
-// create, no edit. A click opens the event's detail panel (XERK-2898): Outlook's
+// are too big for the snapshot (contract-calendar.md). Outlook events are
+// read-only. A click opens the event's detail panel (XERK-2898): Outlook's
 // details, and a linked Tenir capture's summary + proposals, reviewed in place by
-// meetings.js (TurmaMeetings.showPanel), which this module never forks; the one
-// write here is relinking a capture to another event.
+// meetings.js (TurmaMeetings.showPanel), which this module never forks. The
+// writes here: relinking a capture to another event, and creating / editing /
+// deleting Turma's own events in one or many orgs (XERK-2971, the editor below).
 // Rules + the Teams decisions: .claude/rules/turma-meetings.md.
 // Loaded after org.js; in server.js's HASHED_ASSETS. Tests: tests/calendar.test.js.
 (() => {
@@ -144,6 +145,8 @@ function styleOf(ev, now) {
   else if (ev.busy === "free" || ev.myResponse === "declined") c.push("free");
   if (ev.busy === "outOfOffice") c.push("ooo");
   if (ev.source === "tenir") c.push("tenir");
+  if (ev.source === "turma") c.push("turma");
+  if (evOrgs(ev).length > 1) c.push("multi");
   return c;
 }
 // A meeting the notes review lists as upcoming (XERK-2899): an Outlook event that is
@@ -176,6 +179,14 @@ function notesTarget(ev, now) {
   const m = Array.isArray(ev.meetings) ? ev.meetings.find((x) => x && typeof x.site === "string" && typeof x.meetingId === "string") : null;
   if (m) return { site: m.site, meetingId: m.meetingId };
   return isUpcomingMeeting(ev, now) ? { site: ev.org, eventId: String(ev.id) } : null;
+}
+// The orgs an event belongs to: a Turma event's served `orgs` (XERK-2971), else its one `org`.
+function evOrgs(ev) {
+  if (ev && ev.source === "turma" && Array.isArray(ev.orgs)) {
+    const out = ev.orgs.filter((o) => typeof o === "string" && o);
+    if (out.length) return [...new Set(out)];
+  }
+  return ev && typeof ev.org === "string" && ev.org ? [ev.org] : [];
 }
 const titleOf = (ev) => {
   const s = String(ev.subject || "").trim() || "(no title)";
@@ -430,7 +441,7 @@ function upcoming(site) {
     const w = weekEntry(ws);
     if ((!w.cal || w.err) && !w.loading && !w.retry) loadWeek(ws);
     for (const ev of (w.cal && Array.isArray(w.cal.events) ? w.cal.events : [])) {
-      if (!ev || typeof ev !== "object" || !num(ev.startMs) || ev.org !== site || !isUpcomingMeeting(ev, now)) continue;
+      if (!ev || typeof ev !== "object" || !num(ev.startMs) || !evOrgs(ev).includes(site) || !isUpcomingMeeting(ev, now)) continue;
       if (!byId.has(String(ev.id))) byId.set(String(ev.id), ev);   // one meeting on two hosts of a tenant
     }
   }
@@ -523,12 +534,14 @@ function ariaOf(ev, day) {
   // A timed event of 24h+ sits in the all-day band but keeps its times (XERK-2934).
   bits.push(ev.allDay === true ? `${fmtLongDay(day)}, all day` : fmtLongSpan(ev.startMs, ev.endMs));
   if (ev.location) bits.push(String(ev.location));
-  bits.push(orgLabel(ev.org));
+  const orgs = evOrgs(ev);
+  bits.push(orgs.length > 1 ? `orgs ${orgs.map(orgLabel).join(", ")}` : orgLabel(ev.org));
   if (ev.busy === "tentative" || ev.myResponse === "tentative") bits.push("tentative");
   else if (ev.myResponse === "notResponded") bits.push("not responded");
   else if (ev.busy === "free") bits.push("free");
   if (ev.myResponse === "declined") bits.push("declined");
   if (ev.source === "tenir") bits.push("captured by Tenir, not on Outlook");
+  if (ev.source === "turma") bits.push("Turma event");
   return bits.join(", ");
 }
 // A capture's review state on its event block (XERK-2898): proposals still
@@ -568,6 +581,15 @@ function evStyle(ev, colors) {
   const c = safeColor(ev.org ? colors.get(ev.org) : "");
   return c ? `--org:${c};` : "";
 }
+// A Turma event in several orgs (XERK-2971): its left bar is split into each org's
+// color, top to bottom, in its orgs' order. Only palette slots are inlined (safeColor).
+function orgBarHtml(ev, colors) {
+  const orgs = evOrgs(ev);
+  if (orgs.length < 2) return "";
+  const cs = orgs.map((o) => safeColor(colors.get(o)) || "var(--muted)");
+  const stops = cs.map((c, i) => `${c} ${((i / cs.length) * 100).toFixed(2)}% ${(((i + 1) / cs.length) * 100).toFixed(2)}%`).join(",");
+  return `<span class="cal-orgbar" aria-hidden="true" style="background:linear-gradient(to bottom,${stops})"></span>`;
+}
 function timedHtml(seg, day, colors, now) {
   const ev = seg.ev;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
@@ -579,7 +601,7 @@ function timedHtml(seg, day, colors, now) {
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
     + ` style="${evStyle(ev, colors)}top:${slots(seg.top / 30)};height:${slots((seg.bottom - seg.top) / 30, 2)};left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
     + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-    + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
+    + orgBarHtml(ev, colors) + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span>`
     + `<span class="m">${esc(meta)}</span></span></button>`;
 }
 function bandHtml(day, events, holidays, colors, now) {
@@ -595,7 +617,7 @@ function bandHtml(day, events, holidays, colors, now) {
     const b = badgeOf(ev);
     bits.push(`<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="-1"`
       + ` style="${evStyle(ev, colors)}" aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-      + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span></button>`);
+      + orgBarHtml(ev, colors) + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${badgeHtml(b)}</span></button>`);
   }
   return bits.join("");
 }
@@ -650,6 +672,7 @@ function hostOrg(host) {
 const eventOrg = (ev) => (typeof ev.matchOrg === "string" ? ev.matchOrg
   : ev.org || (ev.source === "tenir" ? "" : hostOrg(ev.host)));
 const capKey = (c) => [c.site, c.meetingId].map(encodeURIComponent).join("/");
+const SHOW_AS = { free: "Free", tentative: "Tentative", busy: "Busy", outOfOffice: "Out of office", workingElsewhere: "Working elsewhere" };
 const RESPONSE = { organizer: "Organizer", accepted: "Accepted", tentative: "Tentative", declined: "Declined",
   notResponded: "Not responded", none: "No response needed" };
 const MY_RESPONSE = { organizer: "You organized it", accepted: "Accepted", tentative: "Tentative",
@@ -693,7 +716,8 @@ function linkCandidates(c, at, skip) {
   const day = dayStart(at);
   return ((lastGot && lastGot.events) || [])
     .filter((e) => e.source !== "tenir" && e.canceled !== true && !inBand(e) && evKey(e) !== skip
-      && dayStart(e.startMs) === day && eventOrg(e) === c.site && typeof e.id === "string" && e.id)
+      && dayStart(e.startMs) === day && (e.source === "turma" ? evOrgs(e).includes(c.site) : eventOrg(e) === c.site)
+      && typeof e.id === "string" && e.id)
     .sort((x, y) => Math.abs(x.startMs - at) - Math.abs(y.startMs - at)).slice(0, 20);
 }
 function captureLinkHtml(ev, c) {
@@ -728,8 +752,17 @@ function detailHtml(ev, now, hasPanel = false) {
   row("When", whenText(ev));
   if (moved) row("Moved", `from ${fmtWhenLong(orig)}`);
   if (tenir && ev.moved === true) row("Moved", "its Outlook event moved to another time");
+  const turma = ev.source === "turma";
   // Locked (XERK-2964): an Outlook event's org is its host's, so it is shown, never picked.
-  row("Org", orgLabel(ev.org));
+  // A Turma event lists every org it belongs to, each with its color (XERK-2971).
+  const orgs = evOrgs(ev);
+  if (turma && orgs.length) {
+    const colors = colorMap();
+    row(orgs.length > 1 ? "Orgs" : "Org", orgs.map((o) => {
+      const c = safeColor(colors.get(o));
+      return `<span class="cal-orgchip"><span class="cal-orgdot"${c ? ` style="--org:${c}"` : ""} aria-hidden="true"></span>${esc(orgLabel(o))}</span>`;
+    }).join(""), true);
+  } else row("Org", orgLabel(ev.org));
   if (ev.recurring === true) row("Repeats", "Part of a recurring series");
   row("Where", ev.location ? String(ev.location) : "");
   const org = ev.organizer ? String(ev.organizer) : "";
@@ -738,8 +771,9 @@ function detailHtml(ev, now, hasPanel = false) {
   if (ev.busy === "tentative" && ev.myResponse !== "tentative") state.push("Tentative");
   if (ev.busy === "free") state.push("Free");
   if (ev.busy === "outOfOffice") state.push("Out of office");
+  if (turma && ev.busy === "workingElsewhere") state.push("Working elsewhere");
   const host = ev.host ? (typeof TurmaBoard !== "undefined" && TurmaBoard.hostName ? TurmaBoard.hostName(ev.host) : String(ev.host)) : "";
-  row("Calendar", tenir ? "Captured by Tenir — not on Outlook" : host ? `Outlook on ${host}` : "");
+  row("Calendar", tenir ? "Captured by Tenir — not on Outlook" : turma ? "Made in Turma — not on Outlook" : host ? `Outlook on ${host}` : "");
   const cats = (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string" && c);
   if (cats.length) row("Categories", cats.map((c) => `<span class="cal-cat">${esc(c)}</span>`).join(""), true);
   const join = safeHttps(ev.joinUrl);
@@ -781,7 +815,8 @@ function detailHtml(ev, now, hasPanel = false) {
       + `${descOpen ? "▾" : "▸"} Description</button>${descOpen ? `<div class="cal-dbody">${descHtml}</div>` : ""}</div>` : "")
     + capture
     + (caps.length ? caps.map((c) => captureLinkHtml(ev, c)).join("") : "")
-    + (!tenir && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "");
+    + (!tenir && !turma && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "")
+    + (turma ? turmaActionsHtml(ev) : "");
 }
 // Each host's calendar settings (XERK-2929): whether its private events are shown.
 // Its org is shown, never set: every event takes its host's org (XERK-2964).
@@ -843,6 +878,7 @@ function headerHtml(days) {
   const opts = narrow ? [["day", "Day"], ["three", "3 days"]] : [["work", "Work week"], ["week", "Week"]];
   const unit = m === "work" || m === "week" ? "week" : m === "three" ? "3 days" : "day";
   return `<div class="cal-bar">`
+    + `<button type="button" class="primary cal-new" data-cal-new>+ New event</button>`
     + `<button type="button" data-cal-today>Today</button>`
     + `<button type="button" class="cal-ic" data-step="-1" aria-label="Previous ${unit}">‹</button>`
     + `<button type="button" class="cal-ic" data-step="1" aria-label="Next ${unit}">›</button>`
@@ -885,6 +921,9 @@ function calendarHtml() {
         .some((c) => c.site === detail.site && c.meetingId === detail.meetingId));
     }
     if (fresh) detail = fresh;
+    // A Turma event gone from its own week (deleted, or out of the org filter) closes its panel.
+    else if (detail.source === "turma" && got.have && !got.loading && !got.err
+      && days.some((d) => onDay(detail, d))) { detail = null; detailFrom = null; }
   }
   const colors = colorMap();
   shown = [];
@@ -932,7 +971,7 @@ function focusSig() {
   if (d.ev !== undefined) { const ev = shown[Number(d.ev)]; return ev ? { ev: `${ev.host}\u0000${ev.id}`, day: d.day } : null; }
   for (const k of ["step", "mode", "pick", "pmonth", "zoom"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
   for (const k of ["hostPrivate"]) if (d[k] !== undefined) return { attr: k, v: d[k] };
-  for (const k of ["calToday", "openPicker", "closeDetail", "hostSettings"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
+  for (const k of ["calToday", "calNew", "openPicker", "closeDetail", "hostSettings"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
   return null;
 }
 function restoreFocusSig(sig) {
@@ -1017,7 +1056,7 @@ function paintDetail(force = false) {
   lastDetail = html;
   const a = typeof document !== "undefined" ? document.activeElement : null;
   const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
-  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail"].find((x) => ds[x] !== undefined);
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail", "evEdit", "evDelete", "evDeleteYes", "evDeleteNo"].find((x) => ds[x] !== undefined);
   $info.innerHTML = html;
   if (k && $info.querySelectorAll) {
     const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
@@ -1086,7 +1125,7 @@ function closeDetail() {
 }
 function openDetail(e, from) {
   detailFrom = from;
-  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; attOpen = false; linkPick.clear(); linkErr.clear(); }
+  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; attOpen = false; linkPick.clear(); linkErr.clear(); delConfirm = false; evErr = ""; }
   detail = e;
   picker = null;
   paint(true);
@@ -1125,6 +1164,457 @@ async function relink(k, body, target) {
   }
   paintDetail(true);
 }
+// ---- Turma events: create / edit / delete (XERK-2971) ----------------------------
+// Events made in Turma, owned by the hub, in one or many orgs (contract-calendar.md
+// "Turma-created events"). Outlook events stay read-only: only an event served with
+// source "turma" AND editable offers Edit / Delete. No optimistic paint: a write
+// answers, the hub's `calendar` frame (and our own refetch) re-reads the weeks.
+const ORGS_MAX = 20;                      // CALENDAR_TURMA_ORGS_MAX
+const ATTENDEES_MAX = 100;
+const BODY_MAX = 4000;                    // CALENDAR_BODY_MAX, code points
+// The hub's CAL_EMAIL_RE (server.js): no quote, angle bracket, backtick, space,
+// slash, control, bidi or invisible character, one @, a dot after it.
+const EMAIL_PART = "[^@\\s/\"<>`\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u061c\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\ufeff]+";
+const EMAIL_RE = new RegExp(`^${EMAIL_PART}@${EMAIL_PART}\\.${EMAIL_PART}$`);
+const cps = (s) => [...String(s ?? "")].length;
+// The address as the hub stores it (trimmed, lower-cased), or "" when it would refuse it.
+function normEmail(v) {
+  const e = typeof v === "string" ? v.trim().toLowerCase() : "";
+  return e.length <= 200 && EMAIL_RE.test(e) ? e : "";
+}
+// "Ann Lee <ann@x.org>" or "ann@x.org" → {name, email}; null when no valid address.
+function parseAttendee(text) {
+  const t = String(text ?? "").trim();
+  const m = /^(.*?)\s*<([^<>]*)>$/.exec(t);
+  const email = normEmail(m ? m[2] : t);
+  if (!email) return null;
+  const name = m ? m[1].replace(/^["']|["']$/g, "").trim() : "";
+  return { name: [...name].slice(0, 100).join(""), email };
+}
+const browserZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"; } catch { return "UTC"; } };
+// Wall-clock fields of instant `ms` in IANA zone `tz`.
+function zoneParts(ms, tz) {
+  const f = new Intl.DateTimeFormat("en-US", { timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const p = {};
+  for (const x of f.formatToParts(ms)) p[x.type] = x.value;
+  return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour % 24, mi: +p.minute, s: +p.second };
+}
+function zoneOffsetMin(ms, tz) {
+  const p = zoneParts(ms, tz);
+  return Math.round((Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000) / 60000);
+}
+const ymdOf = (p) => `${p.y}-${pad(p.mo)}-${pad(p.d)}`;
+// "YYYY-MM-DD" + n calendar days.
+function addYmd(ymd, n) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd || ""));
+  if (!m) return "";
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3] + n));
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+}
+// A wall date + time in `tz` as the ISO-with-offset the hub requires, or null.
+// A time a DST gap skips lands on the instant the old offset names; the ISO is
+// always that instant's own wall time + offset, so it parses back to itself.
+function wallToIso(date, time, tz) {
+  const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
+  const t = /^(\d{2}):(\d{2})$/.exec(String(time || ""));
+  if (!d || !t || +t[1] > 23 || +t[2] > 59) return null;
+  const [y, mo, dd] = [+d[1], +d[2], +d[3]];
+  if (mo < 1 || mo > 12 || dd < 1 || dd > new Date(Date.UTC(y, mo, 0)).getUTCDate()) return null;
+  try {
+    const guess = Date.UTC(y, mo - 1, dd, +t[1], +t[2]);
+    let ms = guess - zoneOffsetMin(guess, tz) * 60000;
+    const off2 = zoneOffsetMin(ms, tz);
+    if (guess - off2 * 60000 !== ms && zoneOffsetMin(guess - off2 * 60000, tz) === off2) ms = guess - off2 * 60000;
+    const p = zoneParts(ms, tz), off = zoneOffsetMin(ms, tz);
+    const sign = off < 0 ? "-" : "+", a = Math.abs(off);
+    return { ms, iso: `${ymdOf(p)}T${pad(p.h)}:${pad(p.mi)}:00${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}` };
+  } catch { return null; }
+}
+function zoneKnown(tz) { try { new Intl.DateTimeFormat("en-US", { timeZone: tz }); return true; } catch { return false; } }
+// The zones the picker offers: the runtime's list, plus the browser's and the event's own.
+function zoneList(cur) {
+  let all = [];
+  try { all = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : []; } catch { all = []; }
+  return [...new Set([cur, browserZone(), "UTC", ...all].filter((z) => typeof z === "string" && z))];
+}
+// A fresh form: [startMs, endMs) on the browser's wall clock, in `orgs`.
+function blankForm(startMs, endMs, orgs = []) {
+  const tz = browserZone();
+  const s = zoneParts(startMs, tz), e = zoneParts(endMs, tz);
+  return { subject: "", startDate: ymdOf(s), startTime: `${pad(s.h)}:${pad(s.mi)}`, endDate: ymdOf(e),
+    endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay: false, timeZone: tz, location: "", online: false, joinUrl: "",
+    body: "", busy: "busy", category: "", priv: false, sensitivity: "normal", orgs: orgs.slice(0, ORGS_MAX),
+    required: [], optional: [], reqDraft: "", optDraft: "" };
+}
+// The form for an event the hub served: its wall times in the zone it was made in.
+function formFromEvent(ev) {
+  const tz = typeof ev.timeZone === "string" && zoneKnown(ev.timeZone) ? ev.timeZone : browserZone();
+  const allDay = ev.allDay === true;
+  const s = zoneParts(ev.startMs, tz);
+  const e = zoneParts(allDay && ev.endMs > ev.startMs ? ev.endMs - 1 : ev.endMs, tz);
+  const att = (Array.isArray(ev.attendees) ? ev.attendees : []).filter((a) => a && typeof a === "object" && normEmail(a.email))
+    .map((a) => ({ name: typeof a.name === "string" ? a.name : "", email: normEmail(a.email), role: a.role === "optional" ? "optional" : "required" }));
+  const sens = typeof ev.sensitivity === "string" ? ev.sensitivity : "normal";
+  const join = safeHttps(ev.joinUrl);
+  return { subject: typeof ev.subject === "string" ? ev.subject : "", startDate: ymdOf(s), startTime: `${pad(s.h)}:${pad(s.mi)}`,
+    endDate: ymdOf(e), endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay, timeZone: tz,
+    location: typeof ev.location === "string" ? ev.location : "", online: ev.isOnlineMeeting === true || !!join, joinUrl: join,
+    body: typeof ev.body === "string" ? ev.body : "", busy: Object.prototype.hasOwnProperty.call(SHOW_AS, ev.busy) ? ev.busy : "busy",
+    category: (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string").join(", "),
+    priv: sens === "private" || sens === "confidential", sensitivity: sens, orgs: evOrgs(ev).slice(0, ORGS_MAX),
+    required: att.filter((a) => a.role === "required").map(({ name, email }) => ({ name, email })),
+    optional: att.filter((a) => a.role === "optional").map(({ name, email }) => ({ name, email })),
+    reqDraft: "", optDraft: "" };
+}
+// The instants a form names: {start, end, startMs, endMs} or {error}. An all-day
+// event runs midnight to the midnight after its last day, in its zone.
+function formTimes(f) {
+  const tz = f.timeZone;
+  if (!zoneKnown(tz)) return { error: { timeZone: "Pick a time zone." } };
+  const s = wallToIso(f.startDate, f.allDay ? "00:00" : f.startTime, tz);
+  if (!s) return { error: { start: "Pick a start date and time." } };
+  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz);
+  if (!e) return { error: { end: "Pick an end date and time." } };
+  if (e.ms < s.ms || (f.allDay && e.ms <= s.ms)) return { error: { end: "The end is before the start." } };
+  return { start: s.iso, end: e.iso, startMs: s.ms, endMs: e.ms };
+}
+const categoriesOf = (f) => [...new Set(String(f.category || "").split(",").map((c) => c.trim()).filter(Boolean))];
+// What keeps the form from saving, field → message (the hub's rules, said before it refuses).
+// `pickable` is the orgs the viewer may pick.
+function validateForm(f, pickable = null) {
+  const err = {};
+  if (!f.orgs.length) err.orgs = "Pick at least one org.";
+  else if (f.orgs.length > ORGS_MAX) err.orgs = `An event belongs to at most ${ORGS_MAX} orgs.`;
+  else if (pickable && f.orgs.some((o) => !pickable.includes(o))) err.orgs = "Pick only orgs you can see.";
+  if (cps(f.subject) > 300) err.subject = "The title is longer than 300 characters.";
+  if (cps(f.location) > 300) err.location = "The location is longer than 300 characters.";
+  if (cps(f.body) > BODY_MAX) err.body = `The details are longer than ${BODY_MAX} characters.`;
+  if (f.online && String(f.joinUrl || "").trim() && !safeHttps(String(f.joinUrl).trim())) err.joinUrl = "A join link must be an https:// link.";
+  else if (f.online && cps(String(f.joinUrl || "").trim()) > 500) err.joinUrl = "The join link is longer than 500 characters.";
+  for (const [k, d] of [["required", "reqDraft"], ["optional", "optDraft"]]) {
+    if (String(f[d] || "").trim() && !parseAttendee(f[d])) err[d] = "Not an email address: type name@example.com or Name <name@example.com>.";
+  }
+  if (f.required.length + f.optional.length > ATTENDEES_MAX) err.reqDraft = `At most ${ATTENDEES_MAX} attendees.`;
+  const cats = categoriesOf(f);
+  if (cats.length > 20 || cats.some((c) => cps(c) > 100)) err.category = "At most 20 categories of at most 100 characters.";
+  const t = formTimes(f);
+  if (t.error) Object.assign(err, t.error);
+  return err;
+}
+// The route body (POST /api/calendar/events, or a PATCH with `version`).
+function formPayload(f, version) {
+  const t = formTimes(f);
+  if (t.error) return null;
+  const attendees = [...f.required.map((a) => ({ ...a, role: "required" })), ...f.optional.map((a) => ({ ...a, role: "optional" }))]
+    .map((a) => ({ name: String(a.name || ""), email: a.email, role: a.role }));
+  const keepPriv = f.sensitivity === "private" || f.sensitivity === "confidential" ? f.sensitivity : "private";
+  const body = { orgs: f.orgs.slice(), subject: String(f.subject || "").trim(), start: t.start, end: t.end, timeZone: f.timeZone,
+    allDay: !!f.allDay, location: String(f.location || "").trim(), body: String(f.body || ""), attendees,
+    joinUrl: f.online ? String(f.joinUrl || "").trim() : "", isOnlineMeeting: !!f.online, busy: f.busy,
+    categories: categoriesOf(f), sensitivity: f.priv ? keepPriv : (f.sensitivity === "personal" ? "personal" : "normal") };
+  if (version !== undefined) body.version = version;
+  return body;
+}
+// The orgs a viewer may put an event in: every org its fleet reports (the hub has
+// already scoped the snapshot to the caller's tenant), plus any the event holds.
+function pickableOrgs(extra = []) {
+  return [...new Set([...sites().map((s) => s.siteKey), ...extra].filter((o) => typeof o === "string" && o))];
+}
+
+// The panel's Edit / Delete (only an editable Turma event) and a refusal in the hub's words.
+let delConfirm = false, evBusy = false, evErr = "";
+function turmaActionsHtml(ev) {
+  if (ev.editable !== true) return `<p class="cal-dnote">Only someone who can see every org of this event can change it.</p>`;
+  const dis = evBusy ? ' aria-disabled="true"' : "";
+  return `<div class="cal-dact">`
+    + (delConfirm
+      ? `<span class="cal-dask">Delete this event for ${evOrgs(ev).length > 1 ? "every org" : "everyone"}?</span>`
+        + `<button type="button" class="btn-sm cal-danger" data-ev-delete-yes${dis}>${evBusy ? "Deleting…" : "Delete"}</button>`
+        + `<button type="button" class="btn-sm" data-ev-delete-no${dis}>Cancel</button>`
+      : `<button type="button" class="btn-sm" data-ev-edit${dis}>Edit</button>`
+        + `<button type="button" class="btn-sm" data-ev-delete${dis}>Delete</button>`)
+    + `</div>` + (evErr ? `<div class="mt-err">${esc(evErr)}</div>` : "");
+}
+// One fetch with the hub's refusal worded (XERK-264): {res, out, text}. text is set on failure.
+async function writeJson(method, url, body, what) {
+  let res = null, out = {};
+  try {
+    res = await fetch(url, { method, headers: { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+    try { out = await res.json(); } catch { out = {}; }
+  } catch { res = null; }
+  if (res && res.status === 401) { location.href = "/login"; return { res, out, text: "", signedOut: true }; }
+  const T = typeof TurmaNav !== "undefined" ? TurmaNav : null;
+  if (res && res.ok) return { res, out, text: "" };
+  const text = res ? (T && T.refusalText ? T.refusalText(what, res.status, out)
+    : `${what} failed — ${(out && out.error) || `the hub answered HTTP ${res.status}`}`) : `${what} failed — the hub is unreachable`;
+  if (T && T.toast) T.toast(text);
+  return { res, out, text };
+}
+async function deleteEvent() {
+  const ev = detail;
+  if (!ev || ev.source !== "turma" || ev.editable !== true || evBusy) return;
+  evBusy = true; evErr = "";
+  paintDetail(true);
+  const r = await writeJson("DELETE", `/api/calendar/events/${encodeURIComponent(ev.id)}`, undefined, "Deleting the event");
+  evBusy = false;
+  if (r.signedOut) return;
+  if (r.text) { evErr = r.text; delConfirm = false; if (r.res && r.res.status === 404) refetch(); return void paintDetail(true); }
+  delConfirm = false;
+  if (detail && evKey(detail) === evKey(ev)) closeDetail();
+  refetch();
+}
+
+// The editor: a Teams-style form in a modal (.td-backdrop, full screen when narrow).
+let $edBack = null, $edPanel = null;
+let ed = null;            // {mode:"new"|"edit", id?, version?, f, errors, err, busy, tried}
+function openEditor(opts = {}) {
+  if (!$edPanel) return;
+  let f;
+  if (opts.event) {
+    f = formFromEvent(opts.event);
+    ed = { mode: "edit", id: String(opts.event.id), version: opts.event.version, f, errors: {}, err: "", busy: false, tried: false };
+  } else {
+    const now = nowFn();
+    let s = num(opts.startMs) ? opts.startMs : 0;
+    if (!s) {
+      // Today: the next half hour; another day shown: 9:00 on its first day.
+      const d = new Date(now); d.setSeconds(0, 0); d.setMinutes(d.getMinutes() < 30 ? 30 : 60);
+      s = visibleDays(anchor, mode()).some((x) => x === dayStart(now)) ? d.getTime()
+        : new Date(visibleDays(anchor, mode())[0]).setHours(9, 0, 0, 0);
+    }
+    const e = num(opts.endMs) && opts.endMs > s ? opts.endMs : s + 30 * 60000;
+    const pick = pickableOrgs();
+    const filt = orgKeys().filter((o) => pick.includes(o));
+    f = blankForm(s, e, filt.length ? filt : pick.length === 1 ? pick : []);
+    if (opts.allDay) f.allDay = true;
+    ed = { mode: "new", f, errors: {}, err: "", busy: false, tried: false };
+  }
+  ed.opener = typeof document !== "undefined" ? document.activeElement : null;
+  $edBack.hidden = false;
+  if (typeof document !== "undefined" && document.body && document.body.classList) document.body.classList.add("td-open");
+  paintEditor(true);
+  const first = $edPanel.querySelector && $edPanel.querySelector("[data-ed-field=subject]");
+  if (first && first.focus) first.focus(); else if ($edPanel.focus) $edPanel.focus();
+}
+function closeEditor() {
+  if (!ed) return;
+  const back = ed.opener;
+  ed = null;
+  $edBack.hidden = true;
+  $edPanel.innerHTML = "";
+  if (typeof document !== "undefined" && document.body && document.body.classList) document.body.classList.remove("td-open");
+  if (back && back.focus && back.isConnected !== false) back.focus({ preventScroll: true });
+}
+function chipsHtml(list, role) {
+  return list.map((a, i) => `<span class="cal-chip" title="${esc(a.email)}">${esc(a.name || a.email)}`
+    + `<button type="button" class="cal-chip-x" data-ed-unchip="${role}:${i}" aria-label="Remove ${esc(a.name || a.email)}">✕</button></span>`).join("");
+}
+function editorHtml() {
+  const f = ed.f, er = ed.tried ? ed.errors : {};
+  const fieldErr = (k) => (er[k] ? `<div class="mt-err" id="calEdErr-${k}">${esc(er[k])}</div>` : "");
+  const inv = (k) => (er[k] ? ` aria-invalid="true" aria-describedby="calEdErr-${k}"` : "");
+  const dis = ed.busy ? ' aria-disabled="true"' : "";
+  const colors = colorMap();
+  const orgs = pickableOrgs(ed.mode === "edit" ? f.orgs : []);
+  const tzs = zoneList(f.timeZone);
+  const show = Object.entries(SHOW_AS).map(([k, l]) => `<option value="${k}"${k === f.busy ? " selected" : ""}>${esc(l)}</option>`).join("");
+  return `<div class="td-head"><h2 class="cal-ed-title" id="calEdTitle">${ed.mode === "edit" ? "Edit event" : "New event"}</h2>`
+    + `<button type="button" class="td-close" data-ed-close aria-label="Close">✕</button></div>`
+    + `<div class="cal-ed-form">`
+    + `<label class="cal-ed-row"><span class="k">Title</span><input type="text" data-ed-field="subject" maxlength="300" placeholder="Add a title" value="${esc(f.subject)}"${inv("subject")}></label>${fieldErr("subject")}`
+    + `<div class="cal-ed-row"><span class="k" id="calEdOrgsK">Orgs</span><div class="cal-ed-orgs" role="group" aria-labelledby="calEdOrgsK"${inv("orgs")}>`
+    + (orgs.length ? orgs.map((o) => {
+      const c = safeColor(colors.get(o));
+      return `<label class="cal-ed-org"><input type="checkbox" data-ed-org="${esc(o)}"${f.orgs.includes(o) ? " checked" : ""}>`
+        + `<span class="cal-orgdot"${c ? ` style="--org:${c}"` : ""} aria-hidden="true"></span>${esc(orgLabel(o))}</label>`;
+    }).join("") : `<span class="cal-dnote">No org reports a host yet.</span>`)
+    + `</div></div>${fieldErr("orgs")}`
+    + ["required", "optional"].map((role) => {
+      const d = role === "required" ? "reqDraft" : "optDraft";
+      return `<div class="cal-ed-row"><span class="k">${role === "required" ? "Required" : "Optional"}</span><div class="cal-ed-chips">`
+        + chipsHtml(f[role], role)
+        + `<input type="text" data-ed-field="${d}" data-ed-chipin="${role}" placeholder="${role === "required" ? "Invite people" : "Optional attendees"} (name@example.com)"`
+        + ` aria-label="${role === "required" ? "Required" : "Optional"} attendees" value="${esc(f[d])}"${inv(d)}></div></div>${fieldErr(d)}`;
+    }).join("")
+    + `<div class="cal-ed-row"><span class="k">Starts</span><div class="cal-ed-when">`
+    + `<input type="date" data-ed-field="startDate" aria-label="Start date" value="${esc(f.startDate)}"${inv("start")}>`
+    + (f.allDay ? "" : `<input type="time" data-ed-field="startTime" step="300" aria-label="Start time" value="${esc(f.startTime)}"${inv("start")}>`)
+    + `</div></div>${fieldErr("start")}`
+    + `<div class="cal-ed-row"><span class="k">Ends</span><div class="cal-ed-when">`
+    + `<input type="date" data-ed-field="endDate" aria-label="End date" value="${esc(f.endDate)}"${inv("end")}>`
+    + (f.allDay ? "" : `<input type="time" data-ed-field="endTime" step="300" aria-label="End time" value="${esc(f.endTime)}"${inv("end")}>`)
+    + `</div></div>${fieldErr("end")}`
+    + `<div class="cal-ed-row"><span class="k"></span><div class="cal-ed-when">`
+    + `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="allDay"${f.allDay ? " checked" : ""}> All day</label>`
+    + `<select data-ed-field="timeZone" aria-label="Time zone"${inv("timeZone")}>${tzs.map((z) => `<option value="${esc(z)}"${z === f.timeZone ? " selected" : ""}>${esc(z.replace(/_/g, " "))}</option>`).join("")}</select>`
+    + `</div></div>${fieldErr("timeZone")}`
+    + `<div class="cal-ed-row"><span class="k">Repeat</span><select disabled aria-label="Repeat" title="Repeating events are coming soon"><option>Does not repeat</option></select></div>`
+    + `<label class="cal-ed-row"><span class="k">Location</span><input type="text" data-ed-field="location" maxlength="300" placeholder="Add a location" value="${esc(f.location)}"${inv("location")}></label>${fieldErr("location")}`
+    + `<div class="cal-ed-row"><span class="k">Online</span><div class="cal-ed-when">`
+    + `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="online"${f.online ? " checked" : ""}> Online meeting</label>`
+    + (f.online ? `<input type="url" data-ed-field="joinUrl" class="cal-ed-grow" placeholder="https://… join link" aria-label="Join link" value="${esc(f.joinUrl)}"${inv("joinUrl")}>` : "")
+    + `</div></div>${fieldErr("joinUrl")}`
+    + `<div class="cal-ed-row"><span class="k">Show as</span><div class="cal-ed-when"><select data-ed-field="busy" aria-label="Show as">${show}</select>`
+    + `<input type="text" data-ed-field="category" class="cal-ed-grow" placeholder="Category" aria-label="Category" value="${esc(f.category)}"${inv("category")}>`
+    + `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="priv"${f.priv ? " checked" : ""}> Private</label></div></div>${fieldErr("category")}`
+    + `<label class="cal-ed-row cal-ed-top"><span class="k">Details</span><textarea data-ed-field="body" rows="5" placeholder="Add details"${inv("body")}>${esc(f.body)}</textarea></label>${fieldErr("body")}`
+    + `</div>`
+    + (ed.err ? `<div class="mt-err cal-ed-err" role="alert">${esc(ed.err)}</div>` : "")
+    + `<div class="cal-ed-foot"><button type="button" data-ed-cancel>Cancel</button>`
+    + `<button type="button" class="primary" data-ed-save${dis}>${ed.busy ? "Saving…" : ed.mode === "edit" ? "Save" : "Save event"}</button></div>`;
+}
+let lastEd = "";
+function paintEditor(force = false) {
+  if (!$edPanel || !ed) return;
+  const html = editorHtml();
+  if (!force && html === lastEd) return;
+  lastEd = html;
+  const B = typeof TurmaBoard !== "undefined" ? TurmaBoard : null;
+  const key = B && B.focusKeyIn && $edPanel.ownerDocument ? B.focusKeyIn($edPanel) : null;
+  $edPanel.innerHTML = html;
+  if (key && B.restoreFocusIn) B.restoreFocusIn($edPanel, key);
+}
+// Commit a typed attendee into a chip; false when it is no address.
+function commitChip(role) {
+  const d = role === "required" ? "reqDraft" : "optDraft";
+  const a = parseAttendee(ed.f[d]);
+  if (!a) return false;
+  const all = [...ed.f.required, ...ed.f.optional];
+  if (!all.some((x) => x.email === a.email)) ed.f[role].push(a);
+  ed.f[d] = "";
+  return true;
+}
+async function saveEditor() {
+  if (!ed || ed.busy) return;
+  const cur = ed;
+  for (const role of ["required", "optional"]) commitChip(role);
+  cur.tried = true;
+  cur.errors = validateForm(cur.f, pickableOrgs(cur.mode === "edit" && detail ? evOrgs(detail) : []));
+  cur.err = "";
+  if (Object.keys(cur.errors).length) return void paintEditor(true);
+  const body = formPayload(cur.f, cur.mode === "edit" ? cur.version : undefined);
+  cur.busy = true;
+  paintEditor(true);
+  const r = cur.mode === "edit"
+    ? await writeJson("PATCH", `/api/calendar/events/${encodeURIComponent(cur.id)}`, body, "Saving the event")
+    : await writeJson("POST", "/api/calendar/events", body, "Creating the event");
+  cur.busy = false;
+  if (r.signedOut || ed !== cur) return;
+  if (r.text) {
+    cur.err = r.text;
+    // Changed since it was opened: the hub sends the current event. Reload it and say so.
+    if (r.res && r.res.status === 409 && r.out && r.out.event && typeof r.out.event === "object" && cur.mode === "edit") {
+      const fresh = { source: "turma", ...r.out.event, orgs: Array.isArray(r.out.event.orgs) ? r.out.event.orgs : cur.f.orgs };
+      cur.f = formFromEvent(fresh);
+      cur.version = r.out.event.version;
+      cur.tried = false;
+      refetch();
+    }
+    return void paintEditor(true);
+  }
+  const saved = r.out && r.out.event && typeof r.out.event === "object" ? r.out.event : null;
+  closeEditor();
+  // The event left every org the header filters to: it no longer shows here.
+  const keys = orgKeys();
+  if (saved && detail && detail.source === "turma" && String(detail.id) === String(saved.id)) {
+    const orgs = Array.isArray(saved.orgs) ? saved.orgs : [];
+    if (keys.length && !orgs.some((o) => keys.includes(o))) closeDetail();
+    else { detail = { ...detail, ...saved, source: "turma", host: "" }; paintDetail(true); }
+  }
+  refetch();
+}
+// A pointer press on an empty slot of the grid → its 30-minute row (wall minutes).
+function slotMinAt(col, y) {
+  const r = col && col.getBoundingClientRect ? col.getBoundingClientRect() : null;
+  if (!r || !(r.height > 0)) return -1;
+  const m = Math.floor(((y - r.top) / r.height) * 48) * 30;
+  return Math.max(0, Math.min(1410, m));
+}
+function slotMs(day, min) { const d = new Date(day); d.setHours(Math.floor(min / 60), min % 60, 0, 0); return d.getTime(); }
+let slotPress = null;
+function mountEditor() {
+  if (typeof document === "undefined" || !document.createElement) return;
+  $edBack = document.createElement("div");
+  $edBack.className = "td-backdrop cal-ed-back";
+  $edBack.hidden = true;
+  $edPanel = document.createElement("div");
+  $edPanel.className = "td-panel cal-ed";
+  $edPanel.setAttribute("role", "dialog");
+  $edPanel.setAttribute("aria-modal", "true");
+  $edPanel.setAttribute("aria-labelledby", "calEdTitle");
+  $edPanel.tabIndex = -1;
+  $edBack.appendChild($edPanel);
+  const host = document.body || document.documentElement;
+  if (host && host.appendChild) host.appendChild($edBack);
+  // A press on the dimmed backdrop itself closes, like the board's panels.
+  $edBack.addEventListener("click", (e) => { if (e.target === $edBack && ed && !ed.busy) closeEditor(); });
+  $edPanel.addEventListener("keydown", (e) => {
+    if (!ed) return;
+    if (e.key === "Escape") { e.preventDefault(); if (!ed.busy) closeEditor(); return; }
+    const t = e.target, d = t && t.dataset;
+    if (e.key === "Enter" && d && d.edChipin) {
+      e.preventDefault();
+      if (commitChip(d.edChipin)) { delete ed.errors[d.edField]; paintEditor(true); }
+      else if (String(ed.f[d.edField] || "").trim()) { ed.tried = true; ed.errors = { ...ed.errors, [d.edField]: validateForm(ed.f)[d.edField] }; paintEditor(true); }
+    } else if (e.key === "Backspace" && d && d.edChipin && !t.value) {
+      const list = ed.f[d.edChipin];
+      if (list.length) { list.pop(); paintEditor(true); }
+    }
+  });
+  $edPanel.addEventListener("input", (e) => {
+    const t = e.target, d = t && t.dataset;
+    if (!ed || !d || d.edField === undefined) return;
+    ed.f[d.edField] = String(t.value ?? "");
+    // A comma or semicolon ends an address.
+    if (d.edChipin && /[,;]\s*$/.test(ed.f[d.edField])) {
+      ed.f[d.edField] = ed.f[d.edField].replace(/[,;]\s*$/, "");
+      if (commitChip(d.edChipin)) paintEditor(true);
+    }
+  });
+  $edPanel.addEventListener("change", (e) => {
+    const t = e.target, d = t && t.dataset;
+    if (!ed || !d) return;
+    if (d.edOrg !== undefined) {
+      const set = new Set(ed.f.orgs);
+      if (t.checked) set.add(d.edOrg); else set.delete(d.edOrg);
+      ed.f.orgs = pickableOrgs(ed.f.orgs).filter((o) => set.has(o));
+    } else if (d.edFlag !== undefined) {
+      ed.f[d.edFlag] = !!t.checked;
+      if (d.edFlag === "allDay" && t.checked && ed.f.endDate < ed.f.startDate) ed.f.endDate = ed.f.startDate;
+    } else if (d.edField !== undefined) {
+      ed.f[d.edField] = String(t.value ?? "");
+      // Moving the start keeps the length, as Teams does.
+      if ((d.edField === "startDate" || d.edField === "startTime") && ed.prevStart) {
+        const was = formTimes({ ...ed.f, ...ed.prevStart }), now = formTimes({ ...ed.f, endDate: ed.f.startDate, endTime: ed.f.startTime });
+        if (!was.error && !now.error) {
+          const len = Math.max(0, was.endMs - was.startMs);
+          const p = zoneParts(now.startMs + len, ed.f.timeZone);
+          ed.f.endDate = ymdOf(p);
+          if (!ed.f.allDay) ed.f.endTime = `${pad(p.h)}:${pad(p.mi)}`;
+        }
+      }
+    } else return;
+    ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
+    if (ed.tried) ed.errors = validateForm(ed.f);
+    paintEditor();
+  });
+  $edPanel.addEventListener("focusin", () => { if (ed) ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime }; });
+  $edPanel.addEventListener("click", (e) => {
+    if (!ed) return;
+    const b = e.target && e.target.closest ? e.target.closest("[data-ed-close],[data-ed-cancel],[data-ed-save],[data-ed-unchip]") : null;
+    if (!b) return;
+    if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
+    const d = b.dataset;
+    if (d.edClose !== undefined || d.edCancel !== undefined) { if (!ed.busy) closeEditor(); return; }
+    if (d.edSave !== undefined) return void saveEditor();
+    if (d.edUnchip !== undefined) {
+      const [role, i] = String(d.edUnchip).split(":");
+      if (Array.isArray(ed.f[role])) { ed.f[role].splice(Number(i), 1); paintEditor(true); }
+    }
+  });
+}
+
 function go(ms) { revealing = null; anchor = dayStart(ms); paint(true); }
 
 function mount(el, opts = {}) {
@@ -1147,6 +1637,7 @@ function mount(el, opts = {}) {
   $side.appendChild($mt);
   $root.appendChild($grid);
   $root.appendChild($side);
+  mountEditor();
   $side.addEventListener("pointerdown", () => { sidePress = true; }, true);
   $side.addEventListener("focusout", flushSide);
   const release = () => { if (sidePress) { sidePress = false; flushSide(); } };
@@ -1174,7 +1665,8 @@ function mount(el, opts = {}) {
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom]") : null;
+        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom],"
+        + "[data-cal-new],[data-ev-edit],[data-ev-delete],[data-ev-delete-yes],[data-ev-delete-no]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -1186,6 +1678,14 @@ function mount(el, opts = {}) {
       return;
     }
     if (d.closeDetail !== undefined) return void closeDetail();
+    if (d.calNew !== undefined) return void openEditor();
+    if (d.evEdit !== undefined || d.evDelete !== undefined || d.evDeleteYes !== undefined || d.evDeleteNo !== undefined) {
+      if ((b.getAttribute && b.getAttribute("aria-disabled") === "true") || !detail || detail.source !== "turma" || detail.editable !== true) return;
+      if (d.evEdit !== undefined) return void openEditor({ event: detail });
+      if (d.evDelete !== undefined) { delConfirm = true; evErr = ""; return void paintDetail(true); }
+      if (d.evDeleteNo !== undefined) { delConfirm = false; return void paintDetail(true); }
+      return void deleteEvent();
+    }
     if (d.hostSettings !== undefined) { hostSetOpen = !hostSetOpen; return void paint(true); }
     if (d.openNotes !== undefined) {
       const t = notesTarget(detail, nowFn());
@@ -1242,6 +1742,28 @@ function mount(el, opts = {}) {
     zoom(wheelAcc < 0 ? 1 : -1);
     wheelAcc = 0;
   }, { passive: false });
+  // Click or drag on an empty slot opens the editor on that span (XERK-2971). A
+  // touch that moved is a swipe or a scroll, never a create.
+  $grid.addEventListener("pointerdown", (ev) => {
+    slotPress = null;
+    if (ev.button !== undefined && ev.button !== 0) return;
+    const t = ev.target;
+    const col = t && t.closest ? t.closest(".cal-col") : null;
+    if (!col || (t.closest && t.closest(".cal-ev"))) return;
+    const min = slotMinAt(col, ev.clientY);
+    if (min < 0) return;
+    slotPress = { day: Number(col.dataset.col), min, x: ev.clientX, y: ev.clientY, touch: ev.pointerType === "touch" };
+  });
+  $grid.addEventListener("pointerup", (ev) => {
+    const p = slotPress;
+    slotPress = null;
+    if (!p || ed) return;
+    if (p.touch && Math.hypot(ev.clientX - p.x, ev.clientY - p.y) > 10) return;
+    const col = ev.target && ev.target.closest ? ev.target.closest(".cal-col") : null;
+    const end = col && Number(col.dataset.col) === p.day ? slotMinAt(col, ev.clientY) : p.min;
+    const a = Math.min(p.min, end < 0 ? p.min : end), b = Math.max(p.min, end < 0 ? p.min : end) + 30;
+    openEditor({ startMs: slotMs(p.day, a), endMs: slotMs(p.day, b) });
+  });
   // The operator's own scroll is the new view to hold (scroll does not bubble: capture).
   $grid.addEventListener("scroll", (ev) => {
     const sc = ev.target;
@@ -1290,6 +1812,9 @@ const api = {
   _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
+  validateForm, formPayload, formFromEvent, blankForm, wallToIso, parseAttendee, normEmail, evOrgs, openEditor, closeEditor,
+  saveEditor, slotMinAt,
+  _ed: () => ed, _edEls: () => ({ back: $edBack, panel: $edPanel }),
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
 };
 if (typeof window !== "undefined") window.TurmaCalendar = api;

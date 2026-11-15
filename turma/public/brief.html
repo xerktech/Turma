@@ -395,6 +395,63 @@
   .cal-people .resp.accepted { color: var(--good-text); }
   .cal-people .resp.declined { color: var(--critical-text); }
   .cal-people .resp.tentative { color: var(--warning-text); }
+  /* Turma-made events (XERK-2971): a multi-org event's left bar is its orgs' colors stacked. */
+  /* Every Turma-made event wears the Turma icon's blue → purple (favicon.svg's lit "T"); its
+     left bar stays its org color(s). Text is white on it, in both themes. */
+  .cal-ev.turma { --turma-grad: linear-gradient(135deg, #4a95f0 0%, #6271df 55%, #7a4dcf 100%);
+    background: var(--turma-grad); color: #fff; }
+  .cal-ev.turma:hover { background: var(--turma-grad); filter: brightness(1.08); }
+  .cal-ev.turma .m { color: rgba(255, 255, 255, 0.88); }
+  .cal-ev.turma.canceled { background: var(--turma-grad); opacity: 0.6; }
+  .cal-ev.multi { border-left: 0; padding-left: 12px; }
+  .cal-orgbar { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; }
+  .cal-ev.allday.multi { position: relative; }
+  button.cal-new { white-space: nowrap; }
+  .cal-orgchip { display: inline-flex; align-items: center; gap: 5px; margin: 0 10px 2px 0; }
+  .cal-orgdot { --org: var(--muted); flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--org); }
+  .cal-dact { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; border-top: 1px solid var(--hairline); padding: 10px 0 4px; }
+  .cal-dask { font-size: 13px; }
+  button.cal-danger { color: #fff; background: var(--critical); border-color: var(--critical); }
+  .cal-col { cursor: cell; }
+  .cal-ed { max-width: 640px; }
+  .cal-ed-title { flex: 1 1 auto; font-family: var(--font-display); font-size: 18px; margin: 0; }
+  .cal-ed-form { display: flex; flex-direction: column; gap: 2px; margin-top: 12px; }
+  .cal-ed-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; min-width: 0; font-size: 13.5px; }
+  .cal-ed-row.cal-ed-top { align-items: flex-start; }
+  .cal-ed-row > .k { flex: 0 0 76px; color: var(--muted); }
+  .cal-ed-row > input, .cal-ed-row > textarea, .cal-ed-row > select { flex: 1 1 auto; min-width: 0; box-sizing: border-box; }
+  .cal-ed-row > textarea { resize: vertical; font: inherit; line-height: 1.4; }
+  .cal-ed input:not([type=checkbox]), .cal-ed select, .cal-ed textarea { background: var(--page); color: var(--ink);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: inherit; font-size: 13px; padding: 6px 8px; }
+  .cal-ed input:focus, .cal-ed select:focus, .cal-ed textarea:focus { outline: none; border-color: var(--accent); }
+  .cal-ed [aria-invalid="true"] { border-color: var(--critical); }
+  .cal-ed select:disabled { color: var(--muted); }
+  .cal-ed-when { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; }
+  .cal-ed-when select { max-width: 100%; }
+  .cal-ed-grow { flex: 1 1 160px; min-width: 0; }
+  .cal-ed-check { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .cal-ed-orgs { display: flex; flex-wrap: wrap; gap: 6px 14px; flex: 1 1 auto; min-width: 0; }
+  .cal-ed-org { display: inline-flex; align-items: center; gap: 6px; }
+  .cal-ed-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; flex: 1 1 auto; min-width: 0;
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px 4px; background: var(--page); }
+  .cal-ed .cal-ed-chips input { flex: 1 1 160px; min-width: 0; border: 0; outline: none; background: none; padding: 3px 4px; color: var(--ink); }
+  .cal-ed-chips:has([aria-invalid="true"]) { border-color: var(--critical); }
+  .cal-ed-chips:focus-within { border-color: var(--accent); }
+  .cal-chip { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; font-size: 12.5px; padding: 1px 2px 1px 8px;
+    border-radius: 11px; background: var(--accent-soft); color: var(--accent-text); overflow-wrap: anywhere; }
+  button.cal-chip-x { border: 0; background: none; color: inherit; padding: 0 5px; font-size: 11px; cursor: pointer; }
+  .cal-ed .mt-err { margin: 0 0 4px 86px; }
+  .cal-ed .cal-ed-err { margin: 8px 0 0; }
+  .cal-ed-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hairline); }
+  /* Full screen at the calendar's narrow breakpoint, labels above their fields. */
+  @media (max-width: 759px) {
+    .cal-ed-back { padding: 0; }
+    .cal-ed { max-width: none; min-height: 100vh; max-height: none; border: 0; border-radius: 0; }
+    .cal-ed-row { flex-wrap: wrap; }
+    .cal-ed-row > .k { flex-basis: 100%; }
+    .cal-ed-row > .k:empty { display: none; }
+    .cal-ed .mt-err { margin-left: 0; }
+  }
   .cal-cat { display: inline-block; font-size: 12px; padding: 1px 7px; margin: 0 4px 2px 0; border-radius: 9px; background: var(--hairline); }
   .cal-link { border-top: 1px solid var(--hairline); padding: 8px 0; font-size: 13px; }
   .cal-link-what { color: var(--ink-2); margin-bottom: 6px; overflow-wrap: anywhere; }
