@@ -352,6 +352,9 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   - Only events of tenants the caller may see (`principalMaySite` on the record's orgs).
   - A private/confidential event is withheld exactly like an Outlook one for every viewer but its
     creator (`createdBy`).
+- **Clients send the body Android's `calDraftPayload` builds** (XERK-2972): every field whole
+  (an edit that clears one clears it), `start`/`end` with the offset of the picked `timeZone`,
+  all-day ending at the midnight after its last day. Edit/Delete only on `editable:true`.
 - **Every write broadcasts the coalesced `calendar` frame** under the tenant-level key
   `turma:events@<tenant>` (plain `turma:events` untenanted). The SSE scoper's `mayHost` passes it
   only to that tenant's viewers; clients refetch on any frame, so no client change is needed.

@@ -87,8 +87,23 @@ data class CalendarEvent(
     val calendarEventMissing: Boolean = false,
     val calendarEventId: String = "",
     val moved: Boolean = false,
+    // A Turma-created event's own fields (XERK-2968/2972): every org it belongs to
+    // (`org` = orgs[0]), whether this caller may edit or delete it, its optimistic-
+    // concurrency version and the wall clock it was made in. null = an older hub:
+    // the event is read-only.
+    @Serializable(with = LenientNullableStringsSerializer::class)
+    val orgs: List<String>? = null,
+    val editable: Boolean? = null,
+    val version: Long? = null,
+    val timeZone: String = "",
 ) {
     val tenir: Boolean get() = source == "tenir"
+
+    /** A Turma-created event (XERK-2967): owned by the hub, never on Outlook. */
+    val turma: Boolean get() = source == "turma"
+
+    /** Edit and Delete are offered only for a Turma event the hub says this caller may change. */
+    val canEdit: Boolean get() = turma && editable == true && version != null
 
     /** Host + id: one meeting on two hosts is two rows of the answer (the web's `evKey`). */
     val key: String get() = "$host\u0000$id"
@@ -196,7 +211,7 @@ internal fun cleanCalendarText(s: String): String = if (CALENDAR_CONTROL.contain
 // Keys that IDENTIFY a row and are sent back to the hub or matched against its ids:
 // never cleaned, or an id the hub accepts (CAL_ID_RE allows zero-width marks) would
 // round-trip as one it doesn't have (QA).
-private val CALENDAR_ID_KEYS = setOf("host", "id", "seriesId", "org", "matchOrg", "site", "meetingId", "calendarEventId")
+private val CALENDAR_ID_KEYS = setOf("host", "id", "seriesId", "org", "orgs", "matchOrg", "site", "meetingId", "calendarEventId")
 
 /** Every display string in [e] (values only, id keys kept as sent) through [cleanCalendarText]. */
 internal fun cleanCalendarJson(e: JsonElement): JsonElement = when (e) {
@@ -227,6 +242,27 @@ object LenientStringsSerializer : KSerializer<List<String>> {
         (encoder as JsonEncoder).encodeJsonElement(TurmaJson.encodeToJsonElement(ListSerializer(String.serializer()), value))
     }
 }
+/** [LenientStringsSerializer], but an absent / non-array value reads as null ("an older hub"). */
+object LenientNullableStringsSerializer : KSerializer<List<String>?> {
+    override val descriptor: SerialDescriptor = ListSerializer(JsonElement.serializer()).descriptor
+
+    override fun deserialize(decoder: Decoder): List<String>? {
+        val arr = (decoder as? JsonDecoder)?.decodeJsonElement() as? JsonArray ?: return null
+        return arr.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.takeIf { p -> p.isString }?.content }
+    }
+
+    override fun serialize(encoder: Encoder, value: List<String>?) {
+        val json = encoder as JsonEncoder
+        json.encodeJsonElement(
+            if (value == null) JsonNull else TurmaJson.encodeToJsonElement(ListSerializer(String.serializer()), value),
+        )
+    }
+}
+
+/** `{ok, event}` / `{error, event?}` of the Turma-event routes (XERK-2968): a 409 carries the current event. */
+@Serializable
+data class TurmaEventResponse(val ok: Boolean = false, val event: CalendarEvent? = null, val error: String = "")
+
 object LenientHolidaysSerializer : LenientListSerializer<Holiday>(Holiday.serializer())
 
 /**

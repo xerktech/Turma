@@ -495,6 +495,23 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): Response<com.xerktech.turma.model.MeetingCalendarResponse>
 
+    // Turma-created calendar events (XERK-2968): create, edit (with the version it
+    // was made to; a stale one is a 409 carrying the current event) and delete.
+    // Raw bodies: TurmaJson's explicitNulls=false would drop a cleared field.
+    @POST("api/calendar/events")
+    suspend fun createTurmaEvent(
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<com.xerktech.turma.model.TurmaEventResponse>
+
+    @retrofit2.http.PATCH("api/calendar/events/{id}")
+    suspend fun updateTurmaEvent(
+        @Path("id") id: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): Response<com.xerktech.turma.model.TurmaEventResponse>
+
+    @retrofit2.http.DELETE("api/calendar/events/{id}")
+    suspend fun deleteTurmaEvent(@Path("id") id: String): Response<kotlinx.serialization.json.JsonObject>
+
     // An org's meeting settings (XERK-2858's panel): whose work ({names, role},
     // XERK-2514), its Tenir label ({label: "<label>"|null}, XERK-2638) and its
     // standup schedule (PUT merges the sent fields, XERK-2391). Raw objects: a
