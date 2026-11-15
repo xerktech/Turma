@@ -160,6 +160,21 @@ A pure-core/adapter-shell split:
     `BoxWithConstraints`; pinch on the grid (consumed in the Initial pass so the scroll and the
     day swipe never see it) and TalkBack "Zoom in/out" custom actions stand in for the web's − / +.
     `CalendarViewModel.zoom`, saved once per pinch (prefs `zoom-hours`). Default 10h = 8 AM–6 PM.
+  - **The swipe follows the finger** (XERK-2980): the grid draws the days a swipe slides in
+    off-screen either side (`calSwipeNeighbours`, a `DayStrip` per row), shifted in placement
+    only. Day / 3 days swipe ONE day (`calSwipeStep`); ‹ › still page by what is shown.
+    - The shift is keyed by the strip (first day AND length) and left at its end when a settle
+      steps: the new days need a recomposition (next frame) but the shift is read in placement
+      (this frame), so zeroing it in the settle drew the old days unshifted for a frame (QA flash).
+    - A second finger always settles back; a touch mid-settle lands it first; ‹ › or a mode pick
+      mid-settle wins (keying by length too: a mode pick keeps the first day).
+    - A TAP mid-settle is swallowed (its up consumed): Compose picks the tapped child at the down,
+      before the land moves the days, so it opened the day that was sliding away (QA).
+    - Only the shown days size a row: an off-screen day's all-day chips grew the band (QA).
+    - The grid's minute-holding re-scroll uses `dispatchRawDelta`, never `scrollTo`: a land changes
+      the band (so the pane) under a vertical flick, and `scrollTo`'s lock cancelled the fling (QA).
+    - The off-screen cells carry no test tags and no semantics (`clearAndSetSemantics`).
+    - Tests touching the grid aim at on-screen points: `cal-scroll`'s node spans all 24 hours.
   - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact
     POST/PATCH body; `calScopedPayload` for an occurrence-scoped edit), `core/CalendarRepeat.kt`
     (the Repeat rule, XERK-2973), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.

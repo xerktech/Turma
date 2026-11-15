@@ -80,6 +80,23 @@ fun calVisibleDays(anchor: LocalDate, mode: CalMode): List<LocalDate> {
 fun calStep(anchor: LocalDate, mode: CalMode, dir: Int): LocalDate =
     anchor.plusDays(dir.toLong() * (if (mode.weekly) 7 else mode.days))
 
+/**
+ * A swipe moves a week in the week modes, else ONE day (XERK-2980): 3 days slides a day at a
+ * time, unlike ‹ › which page by what is shown.
+ */
+fun calSwipeStep(anchor: LocalDate, mode: CalMode, dir: Int): LocalDate =
+    if (mode.weekly) calStep(anchor, mode, dir) else anchor.plusDays(dir.toLong())
+
+/**
+ * The days a swipe slides in: those a swipe back / on would show that [calVisibleDays] does
+ * not, drawn off-screen either side so the grid follows the finger (XERK-2980).
+ */
+fun calSwipeNeighbours(anchor: LocalDate, mode: CalMode): Pair<List<LocalDate>, List<LocalDate>> {
+    val shown = calVisibleDays(anchor, mode).toSet()
+    fun side(dir: Int) = calVisibleDays(calSwipeStep(anchor, mode, dir), mode).filter { it !in shown }
+    return side(-1) to side(1)
+}
+
 /** The weeks (their Sundays) a set of days touches: what is fetched. */
 fun calWeeksOf(days: List<LocalDate>): List<LocalDate> = days.map(::calWeekStart).distinct()
 

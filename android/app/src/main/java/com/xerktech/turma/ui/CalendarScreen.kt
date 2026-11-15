@@ -9,6 +9,18 @@ import androidx.compose.foundation.gestures.calculateCentroid
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.tween
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.Constraints
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
 import com.xerktech.turma.core.calSlotDp
@@ -142,6 +154,8 @@ import com.xerktech.turma.core.calRevealFind
 import com.xerktech.turma.core.calSafeHttps
 import com.xerktech.turma.core.calSpan
 import com.xerktech.turma.core.calStep
+import com.xerktech.turma.core.calSwipeNeighbours
+import com.xerktech.turma.core.calSwipeStep
 import com.xerktech.turma.core.calStyle
 import com.xerktech.turma.core.calTime
 import com.xerktech.turma.core.calTitle
@@ -178,7 +192,8 @@ import kotlinx.serialization.json.put
  * Outlook events, Tenir's impromptu captures and holidays — and the Turma-made
  * events (XERK-2972): ＋ or a tap on an empty slot opens the editor
  * (CalendarEventEditor.kt), and an editable one's detail offers Edit / Delete. A phone shows Day or
- * 3 days under a week day strip, ‹ › and swipe moving it; a wide screen
+ * 3 days under a week day strip, ‹ › and a finger-following swipe moving it (a day at a
+ * time on a phone, XERK-2980); a wide screen
  * (tablet / unfolded foldable) the Work week or full Week. A tap opens the
  * event's detail — Outlook's details and a linked capture reviewed in place with
  * the notes review's own controls (MeetingPart), never a fork. Every served
@@ -275,6 +290,10 @@ private fun CalendarBody(
     val keys = remember(scoped) { scoped.sorted() }
     LaunchedEffect(days, keys) { cvm.show(days, keys) }
     val range = calCollect(days, zone) { weeks[cvm.weekKey(it, keys)] }
+    // The days a swipe slides in, drawn off-screen either side (XERK-2980); they are in the
+    // fetched weeks already (`calWantedWeeks`), so the grid reads them from the same cache.
+    val (before, after) = calSwipeNeighbours(anchor, mode)
+    val stripRange = calCollect(before + days + after, zone) { weeks[cvm.weekKey(it, keys)] }
 
     var detailKey by rememberSaveable { mutableStateOf("") }
     var detailLast by remember { mutableStateOf<CalendarEvent?>(null) }
@@ -367,11 +386,11 @@ private fun CalendarBody(
             if (hostSetOpen) HostSettings(range.hostRows, names, cvm)
             CalNotices(range, now, zone, locale)
             WeekGrid(
-                Modifier.weight(1f), weekly, days, range, now, zone, locale, fleet, keys, names, colors,
+                Modifier.weight(1f), weekly, days, before, after, stripRange, now, zone, locale, fleet, keys, names, colors,
                 detailKey = detail?.key, scrollTo = scrollTo, onScrolled = { scrollTo = -1.0 },
                 zoomHours = zoom, onZoom = { h, end -> cvm.setZoom(h, save = end) },
                 onOpen = ::openDetail,
-                onSwipe = { dir -> go(calStep(anchor, mode, dir)) },
+                onSwipe = { dir -> go(calSwipeStep(anchor, mode, dir)) },
                 onSlot = { d, min -> newEvent(d, calSlotStart(min)) },
             )
         }
@@ -553,6 +572,8 @@ private fun WeekGrid(
     modifier: Modifier,
     wide: Boolean,
     days: List<LocalDate>,
+    before: List<LocalDate>,
+    after: List<LocalDate>,
     range: CalRange,
     now: Long,
     zone: ZoneId,
@@ -581,27 +602,97 @@ private fun WeekGrid(
     val orgLabel: (String) -> String = { s -> if (s.isEmpty()) "No org" else com.xerktech.turma.core.orgName(s, names[s].orEmpty()) }
     // A Turma event of several orgs is ONE block naming every org (XERK-2972).
     val orgsLabel: (CalendarEvent) -> String = { ev -> calOrgsOf(ev).ifEmpty { listOf("") }.joinToString(", ") { orgLabel(it) } }
-    val offOf = days.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
-    val swipePx = with(density) { 60.dp.toPx() }
-    Column(
+    // The grid draws [strip]: the shown days plus, off-screen, the ones a swipe slides in
+    // (XERK-2980). Those are hidden from TalkBack and carry no test tags.
+    val strip = before + days + after
+    val shownDays = days.toSet()
+    fun Modifier.shown(d: LocalDate, tag: String? = null): Modifier =
+        if (d !in shownDays) clearAndSetSemantics {} else if (tag != null) testTag(tag) else this
+    val offOf = strip.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
+    // How far the days are dragged, in px, and the strip it was dragged on (its first day AND its
+    // length, so a mode pick that keeps the first day is a new strip too). Read only when placing
+    // them, so a drag relayouts the strip and never recomposes the grid. Keyed so a settle can leave
+    // it at its end: the new days, a frame later, ignore it. Zeroing it in the settle instead placed
+    // the OLD days unshifted for a frame (a flash, QA).
+    var shift by remember { mutableStateOf(0L to 0f) }
+    val stripKey = days.first().toEpochDay() * 8 + days.size
+    val stripFirst by rememberUpdatedState(stripKey)
+    fun shiftNow(): Float = shift.let { (d, px) -> if (d == stripFirst) px else 0f }
+    // Once the new days are on screen, forget the old strip's offset: ‹ back to that day later
+    // must not find it again.
+    LaunchedEffect(stripKey) { if (shift.first != stripKey) shift = stripKey to 0f }
+    var gridW by remember { mutableIntStateOf(0) }
+    val colPx = (gridW - with(density) { gutter.toPx() }).coerceAtLeast(0f) / days.size
+    val reach by rememberUpdatedState(before.size * colPx to after.size * colPx)
+    val swipeTo by rememberUpdatedState(onSwipe)
+    val scope = rememberCoroutineScope()
+    var settling by remember { mutableStateOf<Job?>(null) }
+    // The step a running settle will take once it lands; a new touch lands it at once.
+    var landing by remember { mutableStateOf<(() -> Unit)?>(null) }
+    val flingPx = with(density) { 400.dp.toPx() }
+    // Released: on to the next / previous days past a third of the step or on a fling, else back.
+    // [step] false (a pinch took over) always goes back.
+    fun settle(vx: Float, step: Boolean = true) {
+        val (back, on) = reach
+        val from = shiftNow()
+        val dir = when {
+            !step -> 0
+            kotlin.math.abs(vx) > flingPx -> if (vx < 0) 1 else -1
+            from < 0 && -from > on / 3 -> 1
+            from > 0 && from > back / 3 -> -1
+            else -> 0
+        }
+        val target = when (dir) { 1 -> -on; -1 -> back; else -> 0f }
+        val day = stripFirst
+        // Steps only if the strip is still the one dragged: ‹ › or a mode pick mid-settle wins.
+        val land = {
+            landing = null
+            if (stripFirst == day) { if (dir != 0) swipeTo(dir); shift = day to target }
+        }
+        landing = land
+        settling = scope.launch {
+            animate(from, target, animationSpec = tween(220, easing = FastOutSlowInEasing)) { v, _ -> if (stripFirst == day) shift = day to v }
+            land()
+        }
+    }
+        Column(
         modifier.fillMaxWidth().semantics { contentDescription = "Calendar, ${calRangeLabel(days, locale)}" }
-            // Swipe left/right moves like › / ‹; a swipe never also opens the event under it.
-            .pointerInput(days.first(), days.size) {
+            .onSizeChanged { gridW = it.width }
+            // The days follow a horizontal drag (XERK-2980); a drag never also opens the event
+            // under it, and a pinch zooms, never swipes.
+            .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                    var last = down.position
+                    // A touch mid-settle lands it now, so a quick second swipe moves on from the
+                    // landed days. A tap then is swallowed: Compose picked its target at the down,
+                    // on the days still moving, so letting it through opened the wrong day (QA).
+                    val interrupted = settling?.isActive == true
+                    if (interrupted) { settling?.cancel(); landing?.invoke() }
+                    val velocity = VelocityTracker().apply { addPosition(down.uptimeMillis, down.position) }
+                    val slop = viewConfiguration.touchSlop
+                    var dragging = false
                     while (true) {
                         val ev = awaitPointerEvent(PointerEventPass.Initial)
-                        if (ev.changes.count { it.pressed } > 1) break  // a pinch zooms, never swipes
-                        val c = ev.changes.firstOrNull { it.id == down.id } ?: break
-                        last = c.position
+                        val c = ev.changes.firstOrNull { it.id == down.id }
+                        if (c == null || ev.changes.count { it.pressed } > 1) {
+                            if (dragging) settle(0f, step = false)   // a pinch zooms, never swipes
+                            break
+                        }
+                        velocity.addPosition(c.uptimeMillis, c.position)
+                        val dx = c.position.x - down.position.x
+                        val dy = c.position.y - down.position.y
+                        if (!dragging) {
+                            if (kotlin.math.abs(dx) > slop && kotlin.math.abs(dx) > 2 * kotlin.math.abs(dy)) dragging = true
+                            else if (kotlin.math.abs(dy) > slop) break   // a vertical scroll's
+                        }
+                        if (dragging) {
+                            c.consume()
+                            val (back, on) = reach
+                            shift = stripFirst to dx.coerceIn(-on, back)
+                        }
                         if (!c.pressed) {
-                            val dx = last.x - down.position.x
-                            val dy = last.y - down.position.y
-                            if (kotlin.math.abs(dx) > swipePx && kotlin.math.abs(dx) > 2 * kotlin.math.abs(dy)) {
-                                c.consume()
-                                onSwipe(if (dx < 0) 1 else -1)
-                            }
+                            if (dragging) settle(velocity.calculateVelocity().x)
+                            else if (interrupted) c.consume()   // a consumed up cancels the tap
                             break
                         }
                     }
@@ -611,14 +702,13 @@ private fun WeekGrid(
         // Day headers: date + weekday; today in the accent with a top bar; a day off says so.
         Row(Modifier.fillMaxWidth()) {
             Spacer(Modifier.width(gutter))
-            for (d in days) {
+            DayStrip(Modifier.weight(1f), strip, before.size, days.size, { shiftNow() }) { d ->
                 val isToday = d == today
                 val off = offOf[d].orEmpty()
                 Column(
-                    Modifier.weight(1f)
+                    Modifier.shown(d, "cal-dh-${calDayKey(d)}")
                         .padding(horizontal = 2.dp)
-                        .semantics(mergeDescendants = true) {}
-                        .testTag("cal-dh-${calDayKey(d)}"),
+                        .semantics(mergeDescendants = true) {},
                 ) {
                     Box(
                         Modifier.fillMaxWidth().height(3.dp)
@@ -651,9 +741,9 @@ private fun WeekGrid(
                 "All day", Modifier.width(gutter).padding(4.dp), fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            for (d in days) {
+            DayStrip(Modifier.weight(1f), strip, before.size, days.size, { shiftNow() }) { d ->
                 Column(
-                    Modifier.weight(1f).then(if (offOf[d].orEmpty().isNotEmpty()) Modifier.hatch(offShade) else Modifier)
+                    Modifier.shown(d).then(if (offOf[d].orEmpty().isNotEmpty()) Modifier.hatch(offShade) else Modifier)
                         .padding(1.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
@@ -700,7 +790,11 @@ private fun WeekGrid(
                 lastSlotPx = with(density) { slot.toPx() }
                 val (min, y) = hold ?: (if (was > 0f) scroll.value / was * 30.0 to 0f else return@LaunchedEffect)
                 withFrameNanos { }
-                scroll.scrollTo(with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) })
+                // A raw delta, never scrollTo: that takes the scroll's lock and cancels a fling in
+                // flight. A swipe landing at a vertical flick's down changes the band (so the pane)
+                // under it, and this hold then killed the flick (QA, emulator).
+                val to = with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) }
+                scroll.dispatchRawDelta((to - scroll.value).toFloat())
                 hold = null
             }
             val hours by rememberUpdatedState(zoomHours)
@@ -751,12 +845,12 @@ private fun WeekGrid(
                             )
                         }
                     }
-                    for (d in days) {
+                    DayStrip(Modifier.weight(1f).fillMaxHeight(), strip, before.size, days.size, { shiftNow() }) { d ->
                         val isToday = d == today
                         val off = offOf[d].orEmpty().isNotEmpty()
                         val surface = MaterialTheme.colorScheme.surface
                         BoxWithConstraints(
-                            Modifier.weight(1f).fillMaxHeight()
+                            Modifier.fillMaxHeight()
                                 .drawBehind {
                                     drawRect(offShade)
                                     val hp = hourDp.toPx()
@@ -771,7 +865,7 @@ private fun WeekGrid(
                                 .pointerInput(d, slot) {
                                     detectTapGestures { p -> onSlot(d, (p.y / slot.toPx() * 30).toInt()) }
                                 }
-                                .testTag("cal-col-${calDayKey(d)}"),
+                                .shown(d, "cal-col-${calDayKey(d)}"),
                         ) {
                             val w = maxWidth
                             for (seg in calDaySegments(range.events, d, zone)) {
@@ -802,6 +896,37 @@ private fun WeekGrid(
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * One row of [strip]'s day cells, [shown] of them filling the width, the first [lead] to its left
+ * and the rest to its right, all moved by [shift] px and clipped to the row (XERK-2980). Each
+ * [cell] must emit one layout node; it is measured at its column's exact width.
+ */
+@Composable
+private fun DayStrip(
+    modifier: Modifier,
+    strip: List<LocalDate>,
+    lead: Int,
+    shown: Int,
+    shift: () -> Float,
+    cell: @Composable (LocalDate) -> Unit,
+) {
+    Layout({ for (d in strip) key(d) { cell(d) } }, modifier.clipToBounds()) { ms, c ->
+        val col = c.maxWidth.toFloat() / shown
+        val cells = ms.mapIndexed { i, m ->
+            val x0 = ((i - lead) * col).roundToInt()
+            val w = ((i - lead + 1) * col).roundToInt() - x0
+            x0 to m.measure(Constraints(w, w, c.minHeight, c.maxHeight))
+        }
+        // Only the shown days size the row: an off-screen day's all-day chips must not grow it.
+        val h = (cells.subList(lead, lead + shown).maxOfOrNull { it.second.height } ?: 0)
+            .coerceIn(c.minHeight, c.maxHeight)
+        layout(c.maxWidth, h) {
+            val dx = shift().roundToInt()
+            for ((x, p) in cells) p.placeRelative(x + dx, 0)
         }
     }
 }
