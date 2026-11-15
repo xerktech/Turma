@@ -348,15 +348,21 @@ test("a search-hit open still lands on its hit, not the bottom", () => {
 });
 
 // A static scroll with a fake laid-out pane (top 0, bottom 400) holding
-// `nodes` — {uuid, cls, rect} — whose rects the re-render can move.
+// `nodes` — {uuid, cls, dkey?, rect} — whose rects the re-render can move.
 function laidOutScroll(id, nodes) {
   const st = staticScroll(id);
   st.scrollHeight = 20000;
   st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
-  const el = (n) => ({ dataset: { uuid: n.uuid }, classList: [n.cls], getBoundingClientRect: () => n.rect });
+  const el = (n) => ({ dataset: { uuid: n.uuid, dkey: n.dkey }, classList: [n.cls],
+    getBoundingClientRect: () => n.rect });
   st.querySelectorAll = (sel) => {
     const m = /data-uuid="([^"]*)"/.exec(sel);
     return nodes.filter((n) => !m || n.uuid === m[1]).map(el);
+  };
+  st.querySelector = (sel) => {
+    const m = /data-dkey="([^"]*)"/.exec(sel);
+    const n = m && nodes.find((x) => x.dkey === m[1]);
+    return n ? el(n) : null;
   };
   return st;
 }
@@ -397,12 +403,14 @@ test("a verbosity change mid-transcript keeps the message the reader was on in p
 });
 
 test("an entry with several bubbles restores the one the reader was on", () => {
-  // A dsh/qwen entry renders several text parts under one uuid; the reader
-  // is on the THIRD at +40.
+  // A dsh/qwen entry renders text parts with tool cards between them under one
+  // uuid; the reader is on the MIDDLE bubble at +40.
   const nodes = [
     { uuid: "u5", cls: "tr-msg", rect: { top: -900, bottom: -800 } },
-    { uuid: "u5", cls: "tr-msg", rect: { top: -400, bottom: -300 } },
+    { uuid: "u5", cls: "action-card", rect: { top: -700, bottom: -600 } },
     { uuid: "u5", cls: "tr-msg", rect: { top: 40, bottom: 140 } },
+    { uuid: "u5", cls: "action-card", rect: { top: 200, bottom: 300 } },
+    { uuid: "u5", cls: "tr-msg", rect: { top: 350, bottom: 450 } },
   ];
   const st = laidOutScroll("trScroll8", nodes);
   const verb = verbosityHost();
@@ -410,11 +418,33 @@ test("an entry with several bubbles restores the one the reader was on", () => {
   window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t8" });
   st.scrollTop = 5000; st.fire("scroll");
   Object.defineProperty(st, "innerHTML", { set() {
-    nodes[0].rect = { top: -1400, bottom: -1300 }; nodes[1].rect = { top: -500, bottom: -400 };
-    nodes[2].rect = { top: 540, bottom: 640 };
+    nodes[0].rect = { top: -1400, bottom: -1300 }; nodes[1].rect = { top: -1000, bottom: -500 };
+    nodes[2].rect = { top: 540, bottom: 640 }; nodes[3].rect = { top: 900, bottom: 1400 };
+    nodes[4].rect = { top: 1500, bottom: 1600 };
   }, get() { return ""; } });
   verb.pick("verbose");
-  assert.equal(st.scrollTop, 5500, "the third bubble is back at +40");
+  assert.equal(st.scrollTop, 5500, "the middle bubble is back at +40");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a card is restored by its own key, not its place among the entry's cards", () => {
+  // Concise shows only the file card, so it is the entry's FIRST card there and
+  // its third under Normal: counting would restore a Bash card instead.
+  const nodes = [
+    { uuid: "u5", cls: "action-card", dkey: "file", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll11", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t11" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes.unshift({ uuid: "u5", cls: "action-card", dkey: "bash1", rect: { top: 40, bottom: 140 } },
+      { uuid: "u5", cls: "action-card", dkey: "bash2", rect: { top: 160, bottom: 260 } });
+    nodes[2].rect = { top: 280, bottom: 380 };
+  }, get() { return ""; } });
+  verb.pick("normal");
+  assert.equal(st.scrollTop, 5240, "the file card is back at +40");
   delete window.CSS; delete globalThis.CSS;
 });
 

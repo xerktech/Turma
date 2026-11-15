@@ -3913,9 +3913,11 @@
     // view (one element covers the whole pane) that covering element anchors.
     const pane = stScroll.getBoundingClientRect(), top = pane.top;
     // One entry renders several elements under its uuid — a thought group, a
-    // tool card, a bubble, and (dsh/qwen) several text parts and tool cards —
-    // so the anchor is named by uuid, kind (first class) and which one of that
-    // kind it is (`nth`), and found again by all three.
+    // tool card, a bubble, and (dsh/qwen) several text parts and tool cards.
+    // A card carries its own data-dkey, which no preset changes, so it is found
+    // again by that. A bubble has none: it is named by uuid, kind (first class)
+    // and which one of that kind it is (`nth`) — bubbles show in every preset,
+    // so that count holds; a card's would not (Concise keeps file cards only).
     const kindOf = (n) => (n.classList && n.classList[0]) || "";
     const seen = new Map();
     let anchor = null, off = 0, nth = 0;
@@ -3931,9 +3933,11 @@
     }
     const uuid = anchor && anchor.dataset.uuid;
     const kind = anchor && kindOf(anchor);
+    const dkey = anchor && anchor.dataset.dkey;
     repaintStatic();
     let el = null;
-    if (uuid && window.CSS && CSS.escape) {
+    if (dkey && window.CSS && CSS.escape) el = stScroll.querySelector('[data-dkey="' + CSS.escape(dkey) + '"]');
+    if (!el && uuid && window.CSS && CSS.escape) {
       const same = Array.from(stScroll.querySelectorAll('[data-uuid="' + CSS.escape(uuid) + '"]'));
       const ofKind = same.filter((n) => kindOf(n) === kind);
       // The new verbosity may hide that kind (a tool card under Concise):
