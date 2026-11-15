@@ -3915,7 +3915,10 @@
     loadStaticVerbosity(stTranscriptId);
     renderStaticVerbosity();
     repaintStatic();
+    // A search-result open lands on its hit; any other open lands on the most
+    // recent messages (XERK-2956), like the live chat — not the first prompt.
     if (opts.scrollUuid) scrollToStaticHit(opts.scrollUuid);
+    else if (stScroll) stScroll.scrollTop = stScroll.scrollHeight;
     // Wire card expand/collapse persistence for the static scroll too.
     wireStaticDelegation();
   }

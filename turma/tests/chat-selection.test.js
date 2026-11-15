@@ -297,3 +297,20 @@ test("the live turn is still escaped — markup in it can never reach the DOM", 
   assert.doesNotMatch(html, /<img|<script/);
   assert.match(html, /&lt;img src=x onerror=/);
 });
+
+// ---- an ended (static) transcript opens at its newest messages (XERK-2956) --
+test("an ended session's transcript opens scrolled to the bottom", () => {
+  const st = makeEl("trScroll");
+  st.querySelector = () => null;
+  window.TurmaChat.renderStatic({ entries: [entry("a", "first"), entry("b", "last")], scrollEl: st, transcriptId: "t1" });
+  assert.equal(st.scrollTop, st.scrollHeight);
+});
+
+test("a search-hit open still lands on its hit, not the bottom", () => {
+  const st = makeEl("trScroll");
+  st.querySelector = () => null; // hit not found: scroll stays put
+  globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: [entry("a", "x")], scrollEl: st, transcriptId: "t2", scrollUuid: "a" });
+  assert.equal(st.scrollTop, 0);
+  delete globalThis.CSS;
+});

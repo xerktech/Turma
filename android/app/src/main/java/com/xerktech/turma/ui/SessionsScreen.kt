@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
@@ -1310,9 +1311,17 @@ internal fun EndedSessionView(
                 transcriptId.isBlank() -> EndedMessage("No conversation was recorded for this session.")
                 ready != null -> {
                     val items = buildItems(ready.entries, VerbosityPrefs.forPreset(verbosity))
+                    // Open on the most recent messages, not the first prompt
+                    // (XERK-2956; web twin: chat.js openStatic). Keyed on the
+                    // transcript so a verbosity change keeps the reader's place.
+                    val listState = rememberLazyListState()
+                    LaunchedEffect(ready.transcriptId) {
+                        if (items.isNotEmpty()) listState.scrollToItem(items.size - 1)
+                    }
                     SelectionContainer(Modifier.fillMaxSize()) {
                         LazyColumn(
                             Modifier.fillMaxSize(),
+                            state = listState,
                             contentPadding = PaddingValues(12.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) { items(items.size) { i -> ChatItemView(items[i]) } }
@@ -1396,9 +1405,15 @@ private fun SubagentView(
                 agents != null -> WorkflowAgentPicker(agents, ui.agentsTruncated, onOpenAgent)
                 ui.entries.isNotEmpty() -> {
                     val items = buildItems(ui.entries, VerbosityPrefs.forPreset(verbosity))
+                    // Same as the ended-session view: open on the newest messages.
+                    val listState = rememberLazyListState()
+                    LaunchedEffect(host, sessionId, agentId) {
+                        if (items.isNotEmpty()) listState.scrollToItem(items.size - 1)
+                    }
                     SelectionContainer(Modifier.fillMaxSize()) {
                         LazyColumn(
                             Modifier.fillMaxSize(),
+                            state = listState,
                             contentPadding = PaddingValues(12.dp),
                             verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) { items(items.size) { i -> ChatItemView(items[i]) } }
