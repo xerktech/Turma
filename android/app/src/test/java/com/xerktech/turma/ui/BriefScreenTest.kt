@@ -721,21 +721,20 @@ class BriefScreenTest {
         }
     }
 
-    // ---- Days off + calendar email domains (XERK-2929) --------------------------------------
+    // ---- Days off (XERK-2929); no calendar email domains (XERK-2964) ------------------------
 
     private val catalog = """{
         "ca": { "name": "Canada", "holidays": [ { "id": "ca-canada-day", "name": "Canada Day" } ] },
         "us": { "name": "United States", "holidays": [
             { "id": "us-new-year", "name": "New Year's Day" }, { "id": "us-july-4", "name": "Independence Day" } ] } }"""
 
-    private fun calFleet(rules: String = "") = """
+    private fun calFleet() = """
         { "now": 1, "agents": [ $host ],
           "holidaySettings": { "$site": { "countries": ["us"], "off": ["us-new-year"] } },
-          "holidayCatalog": $catalog
-          ${if (rules.isEmpty()) "" else """, "calendarOrgRules": { "$site": $rules }"""} }
+          "holidayCatalog": $catalog }
     """.trimIndent()
 
-    private fun seedCal(rules: String = "") = hub.seedFleet(calFleet(rules))
+    private fun seedCal() = hub.seedFleet(calFleet())
 
     private fun awaitEnabled(tag: String) = compose.waitUntil(10_000) {
         compose.onAllNodes(androidx.compose.ui.test.hasTestTag(tag) and androidx.compose.ui.test.isEnabled())
@@ -761,39 +760,8 @@ class BriefScreenTest {
         awaitEnabled("hol-country-ca")
         compose.onNodeWithTag("hol-country-ca").performScrollTo().performClick()
         assertEquals("""{"countries":["us","ca"]}""", hub.findRequest("/api/orgs/$site/holidays").body.readUtf8())
-    }
-
-    @Test fun `the email domains save as the hub reads them, and a refusal keeps the draft`() {
-        hub.json("/api/jira/$site/create-meta", """{ "projects": [] }""")
-        // The hub's fleet follows its own store, so the save's poll does not undo the save.
-        val rules = java.util.concurrent.atomic.AtomicReference("""{ "domains": ["old.com"] }""")
-        seedCal(rules.get())
-        hub.route("/api/agents") {
-            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(calFleet(rules.get()))
-        }
-        hub.route("/api/orgs/$site/calendar-rules") {
-            rules.set("""{ "domains": ["acme.com", "acme.co.uk"] }""")
-            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json")
-                .setBody("""{ "ok": true, "rules": ${rules.get()} }""")
-        }
-        val mvm = main.track(MeetingsViewModel(hub.app))
-        show(mvm = mvm)
-        compose.onNodeWithContentDescription("o settings").performClick()
-        compose.onNodeWithTag("cal-domains").performScrollTo().performTextReplacement(" @Acme.com,acme.co.uk; ")
-        compose.onNodeWithTag("save-domains").performScrollTo().performClick()
-        assertEquals("""{"domains":["acme.com","acme.co.uk"]}""", hub.findRequest("/calendar-rules").body.readUtf8())
-        // The field takes the domains as the hub stored them.
-        compose.waitUntil(5_000) { compose.onAllNodesWithText("acme.com, acme.co.uk").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Saved").assertExists()
-
-        hub.route("/api/orgs/$site/calendar-rules") { HubHarness.refusal("a domain must look like example.com", 400) }
-        val message = hub.expectMessage(mvm.messages)
-        compose.onNodeWithTag("cal-domains").performScrollTo().performTextReplacement("not a domain!")
-        compose.onNodeWithTag("save-domains").performScrollTo().performClick()
-        assertEquals("✗ Saving the email domains failed — a domain must look like example.com", message())
-        assertEquals("""{"domains":["not","a","domain!"]}""", hub.findRequest("/calendar-rules").body.readUtf8())
-        compose.onNodeWithText("not a domain!").assertExists()
-        compose.onNodeWithText("Saved").assertDoesNotExist()
+        // An event's org is its host's (XERK-2964): no per-org email-domain rule to edit.
+        compose.onNodeWithText("Calendar email domains", ignoreCase = true).assertDoesNotExist()
     }
 
     @Test fun `an org the hub lists no days off for shows neither section`() {

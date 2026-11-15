@@ -3,6 +3,7 @@ package com.xerktech.turma.ui
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
@@ -347,8 +348,7 @@ class CalendarScreenTest {
 
     // ---- Calendar settings (XERK-2929) -----------------------------------------------------
 
-    private val other = "p.atlassian.net"
-    private val settingsRow = """, "org": "$site", "orgs": ["$other", "$site"], "defaultOrg": "", "showPrivate": false"""
+    private val settingsRow = """, "org": "$site", "showPrivate": false"""
 
     /** One Outlook event today on h1, with the host's settings row; [extra] adds event fields. */
     private fun seedSettings(extra: String = "") {
@@ -366,56 +366,28 @@ class CalendarScreenTest {
         compose.onAllNodes(hasTestTag(tag) and androidx.compose.ui.test.isEnabled()).fetchSemanticsNodes().isNotEmpty()
     }
 
-    @Test fun `the calendar's settings save each host's default org and private events`() {
+    @Test fun `the calendar's settings name each host's org and save only private events`() {
         seedSettings()
         hub.json("/api/agents/h1/calendar/settings", """{ "ok": true, "settings": {} }""")
         show()
         awaitEvent("Weekly sync")
         compose.onNodeWithTag("cal-settings").performClick()
-        compose.waitUntil(10_000) { compose.onAllNodesWithText("Its own org (o)", substring = true).fetchSemanticsNodes().isNotEmpty() }
+        // XERK-2964: the org is the host's, shown as text; there is no Default org pick.
+        compose.onNodeWithTag("cal-host-org-h1").assertTextEquals("o")
+        compose.onNodeWithText("Default org").assertDoesNotExist()
 
-        compose.onNodeWithTag("cal-host-default-h1").performClick()
-        compose.onNodeWithText("p").performClick()
-        assertEquals("""{"defaultOrg":"$other"}""", settingsBody())
-
-        // The first option goes back to the host's own org: an explicit null on the wire.
-        awaitEnabled("cal-host-default-h1")
-        compose.onNodeWithTag("cal-host-default-h1").performClick()
-        compose.onAllNodesWithText("Its own org (o)")[0].performClick()
-        assertEquals("""{"defaultOrg":null}""", settingsBody())
-
-        awaitEnabled("cal-host-private-h1")
         compose.onNodeWithTag("cal-host-private-h1").performClick()
         assertEquals("""{"showPrivate":true}""", settingsBody())
     }
 
-    @Test fun `an event's Org picker pins its series to an org, with no No-org choice`() {
-        seedSettings()
-        hub.json("/api/agents/h1/calendar/settings", """{ "ok": true, "settings": {} }""")
+    @Test fun `an event's org is shown as text, never picked`() {
+        seedSettings(""", "recurring": true """)
         show()
         awaitEvent("Weekly sync")
         compose.onNode(event("Weekly sync")).performScrollTo().performClick()
-        compose.onNodeWithText("Automatic (o)", substring = true).performClick()
-        // XERK-2936: every meeting has an org, so there is no pin to none.
-        assertEquals(0, compose.onAllNodesWithText("No org").fetchSemanticsNodes().size)
-        compose.onNodeWithText("p").performClick()
-        assertEquals("""{"series":{"id":"S9","org":"$other"}}""", settingsBody())
-    }
-
-    @Test fun `a pinned series goes back to Automatic, and a refusal reads in the hub's words`() {
-        seedSettings(""", "recurring": true, "seriesOrg": "$other" """)
-        hub.route("/api/agents/h1/calendar/settings") { HubHarness.refusal("that series is not on this host's calendar", 404) }
-        val cvm = calendarVm()
-        show(cvm)
-        awaitEvent("Weekly sync")
-        compose.onNode(event("Weekly sync")).performScrollTo().performClick()
-        compose.onNodeWithText("for the whole series").assertExists()
-        val message = hub.expectMessage(cvm.messages)
-        compose.onNodeWithTag("cal-series-org").performClick()
-        compose.onNodeWithText("Automatic").performClick()
-        assertEquals("""{"series":{"id":"S9","org":null}}""", settingsBody())
-        val want = "Setting the meeting's org failed — that series is not on this host's calendar"
-        assertEquals("✗ $want", message())
-        compose.waitUntil(5_000) { compose.onAllNodesWithText(want).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Part of a recurring series").assertExists()
+        compose.onNodeWithTag("cal-series-org").assertDoesNotExist()
+        compose.onNodeWithText("for the whole series").assertDoesNotExist()
+        compose.onNodeWithText("Automatic", substring = true).assertDoesNotExist()
     }
 }

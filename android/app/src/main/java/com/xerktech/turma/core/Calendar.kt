@@ -592,7 +592,7 @@ data class CalRange(
     val err: String = "",
     val truncated: Boolean = false,
     val have: Boolean = false,
-    // Each host's settings row (one that carries `orgs`, XERK-2929), by host key.
+    // Each host's settings row (XERK-2929), by host key.
     val hostRows: Map<String, CalendarHost> = emptyMap(),
 )
 
@@ -621,7 +621,7 @@ fun calCollect(days: List<LocalDate>, zone: ZoneId, weekOf: (LocalDate) -> CalWe
         for (n in calHostNotices(cal, from, calDayStartMs(ws.plusDays(7), zone))) {
             if (n.host !in hosts || n.syncing) hosts[n.host] = n
         }
-        for (h in cal.hosts) if (h.host.isNotEmpty() && h.orgs != null) hostRows[h.host] = h
+        for (h in cal.hosts) if (h.host.isNotEmpty()) hostRows[h.host] = h
         for (h in w.hol.orEmpty()) if (h.date.isNotEmpty()) hol["${h.date}\u0000${h.id}"] = h
     }
     val list = evs.values.sortedWith(compareBy<CalendarEvent> { it.startMs }.thenBy { it.endMs })

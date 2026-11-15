@@ -6,13 +6,11 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.CreateMetaFetch
-import com.xerktech.turma.core.calendarDomains
 import com.xerktech.turma.core.meetingDefaultType
 import com.xerktech.turma.core.meetingProject
 import com.xerktech.turma.core.meetingMaybeCreated
 import com.xerktech.turma.core.meetingReviewable
 import com.xerktech.turma.core.meetingTicketDescription
-import com.xerktech.turma.model.CalendarOrgRule
 import com.xerktech.turma.model.CreateProject
 import com.xerktech.turma.model.HolidaySettings
 import com.xerktech.turma.model.TurmaJson
@@ -442,19 +440,6 @@ class MeetingsViewModel(app: Application) : AndroidViewModel(app) {
                     ?.let { container.fleet.patchHolidaySettings(siteKey, it) }
             }
         }) { container.client.api.putHolidaySettings(siteKey, patch) }
-
-    /** The org's calendar email domains (XERK-2929), as typed; none clears them. */
-    fun saveDomains(siteKey: String, text: String): Job =
-        save(siteKey, "domains", "Saving the email domains", apply = { out ->
-            val rules = (out["rules"] as? JsonObject)?.let { v ->
-                runCatching { TurmaJson.decodeFromJsonElement(CalendarOrgRule.serializer(), v) }.getOrNull()
-            }
-            container.fleet.patchCalendarOrgRules(siteKey, rules)
-        }) {
-            container.client.api.setCalendarOrgRules(siteKey, buildJsonObject {
-                putJsonArray("domains") { calendarDomains(text).forEach { add(JsonPrimitive(it)) } }
-            })
-        }
 
     /** What the hub answered a save with, per "site\u0000what"; [seq] tells two equal answers apart. */
     data class Stored(val seq: Int, val body: JsonObject)

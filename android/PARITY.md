@@ -761,10 +761,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     also hides a block's time line by the block's drawn height (`SHORT_DP` against the zoomed row
     height on Android).
 - **Calendar settings (XERK-2929)**: an org's ⚙ settings edit its days off (a tick per catalog
-  country and per holiday, each saved at once) and its calendar email domains; the calendar's ⚙
-  lists each host's Default org + Show private events; an Outlook event's Org row picks the
-  series' org (Automatic / an org; no "No org", XERK-2936). `holidaySettings`, `holidayCatalog` and
-  `calendarOrgRules` decode per entry.
+  country and per holiday, each saved at once); the calendar's ⚙ lists each host's org (text) +
+  Show private events. An Outlook event's Org row is text: its host's org, locked (XERK-2964).
+  `holidaySettings` and `holidayCatalog` decode per entry.
   - Platform difference: a refused save toasts (and the calendar's rows show it inline); the
     settings panel's refusal is the toast alone, as its other sections (one failure surface).
 
