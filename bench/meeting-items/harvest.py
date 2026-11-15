@@ -23,6 +23,7 @@ TURMA_HUB_PASSWORD (break-glass Basic). Never put either on the command line.
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,7 @@ def outcomes(proposals):
                     "outcome": outcome(it), "finalTitle": r.get("title") or it.get("title"),
                     "assignedTo": r.get("assignedTo"), "unassigned": bool(r.get("unassigned")),
                     "assigneeChanged": bool(r.get("assigneeChanged")),
+                    "assigneeRefused": bool(r.get("assigneeRefused")),
                 })
     return rows
 
@@ -82,7 +84,8 @@ def summarize(rows):
     rate = counts.get("approved", 0) / judged if judged else None
     mapped = [r for r in rows if r["mapped"] and r["outcome"] in ("approved", "edited")]
     return {"counts": counts, "judged": judged, "approvedWithoutEdits": rate,
-            "mappedAssigneeKept": sum(not r["assigneeChanged"] for r in mapped),
+            "mappedAssigneeKept": sum(not r["assigneeChanged"] and not r["assigneeRefused"]
+                                      for r in mapped),
             "mappedAssigneeOf": len(mapped)}
 
 
@@ -129,6 +132,14 @@ def case_of(site, m, segments):
            "endedAt": m.get("endedAt"), "participants": people, "segments": segments}
     return {"transcript": doc, "repos": [], "expect": expect, "forbid": sorted(set(forbid)),
             "source": "review"}
+
+
+def case_name(site, meeting_id):
+    """A file name per (org, meeting): readable, plus a hash of both, so two
+    meetings never share a file (`m:1` and `m-1` fold alike, and two orgs can
+    use one id)."""
+    tag = hashlib.sha1(f"{site}\0{meeting_id}".encode()).hexdigest()[:10]
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", f"review-{meeting_id}")[:80] + "-" + tag
 
 
 def _hub_get(hub, path):
@@ -183,7 +194,7 @@ def cmd_cases(a):
             case = case_of(site, m, segs)
             if not case:
                 continue
-            name = re.sub(r"[^A-Za-z0-9._-]+", "-", f"review-{m['meetingId']}")[:100]
+            name = case_name(site, m["meetingId"])
             with open(os.path.join(a.out, name + ".json"), "w") as f:
                 json.dump(case, f, indent=1, ensure_ascii=False)
             n += 1

@@ -200,7 +200,11 @@ ticket builds to this file; change it here first.
     fingerprint, so one title assigned two ways is two creates.
   - The review records what the operator changed, for the eval set: `title` (the final title when
     it differs), `assignedTo` (the mapped name) or `unassigned: true`, and `assigneeChanged: true`
-    when a mapped user was overridden. Tests: `XERK-2517:` in `server.test.js`, `meetings.test.js`.
+    when the operator's OWN pick overrode a mapped user (an older client sends none: no edit).
+  - **The create result decides who got it, not the pick** (QA): an agent result with
+    `assignRefused: true` settles `unassigned + assigneeRefused`, never the requested name, and a
+    created review keeps the agent's `warning` (≤300), which the page shows beside "Created".
+  - Tests: `XERK-2517:` in `server.test.js`, `meetings.test.js`.
 - **Reopen** (XERK-2856): `action:"reopen"` on a `rejected`/`failed` item removes its `review`
   (pending again), and unarchives the meeting (it has pending work again). Else 409 "only a
   rejected or failed proposal can be reopened".

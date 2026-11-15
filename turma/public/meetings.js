@@ -408,6 +408,9 @@ function reviewStateHtml(site, it) {
           : "session starts once the board lists it with a repo";
       s += `<span class="state${r.session === "failed" ? " bad" : ""}">· ${esc(sess)}</span>`;
     }
+    // What the tracker did not do (XERK-2517): an assignee it refused, files it
+    // would not attach. Said here, never left to look like a clean create.
+    if (r.warning) s += `<span class="state bad">· ${esc(r.warning)}</span>`;
     return s;
   }
   return "";
@@ -1039,7 +1042,7 @@ const editing = () => fieldIn($list);
 // else one of this pane's controls by its data attribute.
 const FOCUS_ATTRS = ["search", "filter", "openCal", "orgToggle", "orgSettings", "entry", "showReviewed", "transcript", "archive",
   "drawerClose", "back", "labelSave", "labelReset", "focusSave", "focusClear", "missUse", "metaFocus",
-  "holOff", "holCountry"];
+  "holOff", "holCountry", "assign"];
 function focusKey(root = $list) {
   if (root === $list && hooks.focusKey) { const k = hooks.focusKey(); if (k) return { page: k }; }
   const a = document.activeElement;

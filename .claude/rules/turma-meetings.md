@@ -92,6 +92,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   proposal in `assignPicks` and rides Approve as `assignee`. A pick other than Me hides Approve +
   start (S answers "approve it without a session"). Never paint the tracker id. No mapping = the
   plain "Owner:" line and the old Approve. Android: a `PARITY.md` gap.
+  - `assign` is in `FOCUS_ATTRS`: the pick repaints, and without it keyboard focus fell to
+    `<body>` mid-ArrowDown (QA).
+  - A created proposal shows the review's `warning` (a refused assignee, unattached files).
 - **The default description is the proposal only** (`ticketDescription`, XERK-2514): no meeting
   title, date, quote or Tenir link. The ticket lands in the org's tracker where colleagues read
   it; captions stay in Turma. Android's `meetingTicketDescription` sends the same.

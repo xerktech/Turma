@@ -5251,6 +5251,11 @@ function sanitizeMeetingReview(v) {
     if (to) out.assignedTo = to;
   }
   if (v.assigneeChanged === true) out.assigneeChanged = true;
+  if (v.assigneeRefused === true) out.assigneeRefused = true;
+  if (v.state === "created") {
+    const warning = meetingText(v.warning, MEETING_ERROR_MAX);
+    if (warning) out.warning = warning;
+  }
   if (v.state === "creating") {
     if (typeof v.cmdId !== "string" || !MEETING_CMD_ID_RE.test(v.cmdId)) return null;
     if (typeof v.host !== "string" || !v.host || v.host.length > 200) return null;
@@ -13625,6 +13630,8 @@ function ingestCreateResults(agent, results) {
       // A create that succeeded but couldn't be assigned: a success the client
       // still has to say something about, since the board won't show it.
       warning: r.warning || null, fetchedAt: now,
+      // XERK-2517: the create's explicit assignee did not land (created unassigned).
+      ...(r.assignRefused === true ? { assignRefused: true } : {}),
       // The agent restarted mid-create (XERK-2867): a ticket may exist.
       ...(r.maybeCreated === true ? { maybeCreated: true } : {}),
     };
@@ -23217,7 +23224,9 @@ function reviewMeetingItem(siteKey, meetingId, itemId, body, now = Date.now()) {
   return save({ state: "creating", at: now, project, issueType, cmdId: q.body.cmdId,
     host: q.body.host, ...(edited ? { edited: true } : {}),
     ...(title !== item.title ? { title } : {}), ...who,
-    ...(item.assignee && assign !== "suggested" ? { assigneeChanged: true } : {}),
+    // Only an operator's own pick is an edit: an older client (Android) sends
+    // none, and its approve of a mapped proposal must not read as one.
+    ...(item.assignee && body.assignee != null && assign !== "suggested" ? { assigneeChanged: true } : {}),
     ...(body.start === true ? { start: true } : {}) });
 }
 
@@ -23277,7 +23286,14 @@ function settleMeetingReview(siteKey, rv, now) {
           error: r.error || "the tracker named no ticket" };
       }
       refreshOrgBoard(siteKey);
-      return { ...base, state: "created", at: now, key: r.key, url: r.url || undefined,
+      // The agent's warning (unassigned, files not attached) is shown on the
+      // proposal, and an assignee the tracker refused is never recorded as
+      // given (XERK-2517 QA: the review said Ann, the ticket was nobody's).
+      const { assignedTo, ...kept } = base;
+      const who = r.assignRefused === true
+        ? { unassigned: true, assigneeRefused: true } : (assignedTo ? { assignedTo } : {});
+      return { ...kept, ...who, state: "created", at: now, key: r.key, url: r.url || undefined,
+        ...(typeof r.warning === "string" && r.warning ? { warning: r.warning } : {}),
         ...(rv.start ? { session: "waiting" } : {}) };
     }
     const gap = a ? agentGapError(a, "createTicket", "create tickets") : null;

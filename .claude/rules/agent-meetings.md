@@ -54,8 +54,12 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
   - A match is the meeting-focus name rule (`_meeting_names_match`); two or zero candidates map to
     nothing. Hits and misses cached per folded name for `MEETING_ASSIGNEE_TTL_SEC`; errors not.
 - **A `createTicket` with `assignee`** (`ASSIGN_SELF` absent / None / an id) assigns that user,
-  or nobody, instead of this host's (`meetings.assign` says so). A named assignee Jira refuses
-  with a 4xx is created unassigned with a warning (a 5xx is never re-sent). Tests:
+  or nobody, instead of this host's (`meetings.assign` says so).
+  - **Jira unassigned is SENT as `"assignee": null`, never omitted**: an omitted field takes the
+    project's default assignee (XERK's is the project lead, the operator — QA).
+  - A named assignee Jira refuses with a 4xx is re-sent explicitly unassigned, flagged
+    `assignRefused` + a warning; a 429 or 5xx is never re-sent, and a refused null fails the
+    create in Jira's words (no silent fall to the project default). Tests:
   `TestMeetingAssignee`, the `xerk2517` cases in `TestCreateJiraIssue`/`TestStageCreateTicket`.
 - **`repoGuess` reuses the triage candidates** (`self.triage_cands`, `_triage_candidates`): the
   same allowlist a ticket's repoGuess is checked against.

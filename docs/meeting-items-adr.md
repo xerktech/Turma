@@ -123,5 +123,7 @@ Goal: most proposals approved with no edit. Two changes, and a way to measure it
   reviewed meeting as a corpus case into the git-ignored `reviewed/` (real captions are never
   committed), and `run_eval.py run --corpus bench/meeting-items/reviewed` scores a prompt or
   model change against them.
+- **Unassigned on Jira is an explicit `null`.** Omitting the field gives the project's default
+  assignee, which for a project-lead default is the operator — the very pick they declined.
 - Not yet measured: no week of real reviews exists in this repo. Run `harvest.py report` against
   the hub after a week of meetings and record the number here.

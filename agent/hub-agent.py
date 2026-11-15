@@ -23952,16 +23952,25 @@ def create_jira_issue(project, issue_type, summary, description, labels,
     assign_error = None
     if acct:
         fields["assignee"] = {"id": acct}
+    elif assignee is None:
+        # Unassigned is SAID, never left out: Jira gives an issue created with
+        # no assignee field the project's default assignee (often the project
+        # lead, i.e. the operator), which is the self-assignment the operator
+        # just declined (XERK-2517 QA).
+        fields["assignee"] = None
     try:
         data = jira_post("/rest/api/3/issue", {"fields": fields})
     except Exception as e:
         # A named assignee Jira refuses (not assignable in that project) must
         # not cost the operator the ticket: a 4xx proves nothing was created,
-        # so create it unassigned and say why. Self-assignment keeps its old
-        # behaviour.
-        if assignee is ASSIGN_SELF or not acct or not _write_was_refused(e):
+        # so create it explicitly UNASSIGNED and say why. A 429 is not a
+        # refusal of the assignee (only a busy tracker), so it fails as it
+        # stands. If unassigned is refused too, the create fails in Jira's
+        # words: never a silent fall to the project default.
+        code = getattr(e, "code", None)
+        if assignee is ASSIGN_SELF or not acct or not _write_was_refused(e) or code == 429:
             raise
-        fields.pop("assignee", None)
+        fields["assignee"] = None
         reason = str(e).strip().splitlines()
         assign_error = (reason[0] if reason else "refused")[:BOARD_ERROR_MAX_CHARS]
         log(f"jira create rejected assignee {acct!r} ({assign_error}); creating unassigned")
@@ -25013,10 +25022,13 @@ def create_azure_issue(project, wtype, title, description, tags,
         # is the operator's only lead on which spelling their server wants.
         tried = ", ".join(repr(c) for c in candidates) or "no candidate identity"
         reason = str(refused or "").strip().splitlines()
-        assign_error = (
-            f"the server refused every identity this host could find "
-            f"({reason[0][:BOARD_ERROR_MAX_CHARS]})" if reason else
-            "this host could not work out your identity")
+        if assignee is not ASSIGN_SELF:
+            assign_error = (reason[0] if reason else "refused")[:BOARD_ERROR_MAX_CHARS]
+        else:
+            assign_error = (
+                f"the server refused every identity this host could find "
+                f"({reason[0][:BOARD_ERROR_MAX_CHARS]})" if reason else
+                "this host could not work out your identity")
         log(f"azure work item in {project} created UNASSIGNED — tried {tried}")
     wid = data.get("id")
     if wid is None:
@@ -41957,6 +41969,7 @@ class SessionManager:
                 return {"cmdId": cid, "key": None, "url": None,
                         "error": str(e)[:300]}
             warnings = []
+            assign_refused = False
             if assignee is ASSIGN_SELF:
                 if not created.get("assigned"):
                     warnings.append(unassigned_warning(created))
@@ -41964,13 +41977,19 @@ class SessionManager:
                 why = str(created.get("assignError") or "").strip()
                 warnings.append("created unassigned: the tracker refused the assignee"
                                 + (f" — {why}" if why else ""))
+                assign_refused = True
             missed = self._attach_ticket_files(created.get("key"), files)
             if missed:
                 warnings.append("created, but these files could not be attached: "
                                 + "; ".join(missed))
-            return {"cmdId": cid, "key": created.get("key"),
-                    "url": created.get("url"), "error": None,
-                    "warning": " · ".join(warnings)[:600] or None}
+            row = {"cmdId": cid, "key": created.get("key"),
+                   "url": created.get("url"), "error": None,
+                   "warning": " · ".join(warnings)[:600] or None}
+            if assign_refused:
+                # XERK-2517: the operator's pick did not land; the hub's
+                # review must not go on claiming it did.
+                row["assignRefused"] = True
+            return row
 
         maybe = {"cmdId": cid, "key": None, "url": None,
                  "error": CREATE_MAYBE_RAN_ERROR, "maybeCreated": True}

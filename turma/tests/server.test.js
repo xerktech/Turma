@@ -30568,6 +30568,39 @@ test("XERK-2517: Approve assigns the mapped speaker, nobody, or me — only via 
   delete hub.getMeetings()[S];
 });
 
+test("XERK-2517: a refused assignee settles as unassigned with the warning; an older client's approve is no edit", async () => {
+  const S = "mtRf2517.atlassian.net";
+  const ann = { id: "557058:ann-1", name: "Ann Lee" };
+  hub.putMeeting(S, okMeeting2510("r1", { items: [
+    { kind: "task", title: "One", suggestedAssignee: "Ann", assignee: ann },
+    { kind: "task", title: "Two", suggestedAssignee: "Ann", assignee: ann },
+  ] }));
+  // Only a strict boolean `assign` counts: a string or 1 is an older/forged host.
+  for (const bad of ["true", 1]) {
+    await beat1574("mtBad2517", S, { meetings: { available: true, assign: bad } });
+    assert.equal(agents.mtBad2517.meetings.assign, undefined);
+    const r = await review2510(S, "r1", "p1", { action: "approve", project: "ENG", issueType: "1", assignee: "suggested" });
+    assert.equal(r.status, 409, String(bad));
+  }
+  delete agents.mtBad2517;
+  await beat1574("mtNew2517b", S, { meetings: { available: true, assign: true } });
+  assert.equal((await review2510(S, "r1", "p1", { action: "approve", project: "ENG", issueType: "1",
+    assignee: "suggested" })).status, 200);
+  const [c] = creates2510("mtNew2517b");
+  await beat1574("mtNew2517b", S, { meetings: { available: true, assign: true },
+    createTicketResults: [{ cmdId: c.cmdId, key: "ENG-8", url: null, error: null, assignRefused: true,
+      warning: "created unassigned: the tracker refused the assignee — HTTP 400" }] });
+  const rv = item2510(S, "r1", "p1").review;
+  assert.deepEqual([rv.state, rv.assignedTo, rv.unassigned, rv.assigneeRefused, rv.warning],
+    ["created", undefined, true, true, "created unassigned: the tracker refused the assignee — HTTP 400"]);
+  // An older client (Android) sends no assignee: approved for "me", never an edit.
+  assert.equal((await review2510(S, "r1", "p2", { action: "approve", project: "ENG", issueType: "1" })).status, 200);
+  const r2 = item2510(S, "r1", "p2").review;
+  assert.equal("assigneeChanged" in r2, false);
+  delete agents.mtNew2517b;
+  delete hub.getMeetings()[S];
+});
+
 test("XERK-2510: a create whose host goes silent fails in honest words; an agent cannot forge a review", async () => {
   const S = "mtF2510.atlassian.net";
   await beat1574("mtFail2510", S);

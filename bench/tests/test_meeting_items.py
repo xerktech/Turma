@@ -110,3 +110,23 @@ class TestHarvest(unittest.TestCase):
         self.assertEqual(ev.score_expect(case, good)["met"], 1)
         self.assertIsNone(hv.case_of("s", {"items": [{"id": "p1", "kind": "task", "title": "x"}]}, segs))
         self.assertIsNone(hv.case_of("s", self._row(), []))
+
+
+class TestHarvestFixes(unittest.TestCase):
+    def test_case_names_never_collide(self):
+        names = {hv.case_name(s, m) for s, m in [("a", "m:1"), ("a", "m-1"), ("b", "m:1")]}
+        self.assertEqual(len(names), 3)
+
+    def test_a_caption_spelling_scores_the_models_full_name(self):
+        case = {"expect": [{"kind": "task", "words": ["runbook"], "assignee": "Ann"}], "forbid": []}
+        got = ev.score_expect(case, [{"kind": "task", "title": "runbook", "suggestedAssignee": "Ann Lee"}])
+        self.assertEqual(got["assigneeOk"], 1)
+        got = ev.score_expect(case, [{"kind": "task", "title": "runbook", "suggestedAssignee": "Bo Ng"}])
+        self.assertEqual(got["assigneeOk"], 0)
+
+    def test_a_refused_assignee_is_not_kept(self):
+        rows = hv.outcomes({"s": [{"meetingId": "m", "status": "ok", "items": [
+            {"id": "p1", "kind": "task", "title": "x", "assignee": {"id": "a", "name": "A"},
+             "review": {"state": "created", "unassigned": True, "assigneeRefused": True}}]}]})
+        s = hv.summarize(rows)
+        self.assertEqual((s["mappedAssigneeKept"], s["mappedAssigneeOf"], s["approvedWithoutEdits"]), (0, 1, 1.0))

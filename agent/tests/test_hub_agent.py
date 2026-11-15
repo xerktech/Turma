@@ -42981,7 +42981,10 @@ class TestCreateJiraIssue(unittest.TestCase):
             nobody = ha.create_jira_issue("E", "1", "T", "", [], assignee=None)
         self.assertEqual(bodies[0]["fields"]["assignee"], {"id": "ann-7"})
         self.assertTrue(named["assigned"])
-        self.assertNotIn("assignee", bodies[1]["fields"])
+        # Unassigned is SENT as null: an absent field takes the project's
+        # default assignee, often the operator (XERK-2517 QA).
+        self.assertIn("assignee", bodies[1]["fields"])
+        self.assertIsNone(bodies[1]["fields"]["assignee"])
         self.assertFalse(nobody["assigned"])
 
     def test_xerk2517_a_refused_assignee_still_creates_the_ticket(self):
@@ -42992,15 +42995,39 @@ class TestCreateJiraIssue(unittest.TestCase):
 
         def fp(path, body):
             bodies.append(json.loads(json.dumps(body)))
-            if "assignee" in body["fields"]:
+            if body["fields"].get("assignee"):
                 raise Refused("HTTP 400: user cannot be assigned issues")
             return {"key": "E-3"}
         with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
                 mock.patch.object(ha, "jira_post", fp):
             out = ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
         self.assertEqual(len(bodies), 2)
+        self.assertIsNone(bodies[1]["fields"]["assignee"], "the retry is explicitly unassigned")
         self.assertEqual((out["key"], out["assigned"]), ("E-3", False))
         self.assertIn("cannot be assigned", out["assignError"])
+
+        # Unassigned refused too: the create fails in Jira's words, never a
+        # silent fall to the project default.
+        def fp_none(path, body):
+            raise Refused("HTTP 400: assignee is required")
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp_none):
+            with self.assertRaises(Refused):
+                ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+
+        # A 429 is a busy tracker, not a refused assignee: not re-sent unassigned.
+        class Busy(Exception):
+            code = 429
+        sent = []
+
+        def fp429(path, body):
+            sent.append(1)
+            raise Busy("HTTP 429")
+        with mock.patch.object(ha, "JIRA_SITE", "o.atlassian.net"), \
+                mock.patch.object(ha, "jira_post", fp429):
+            with self.assertRaises(Busy):
+                ha.create_jira_issue("E", "1", "T", "", [], assignee="ann-7")
+        self.assertEqual(len(sent), 1)
 
         # A 5xx may have created it: never re-sent.
         class Down(Exception):
@@ -43955,10 +43982,18 @@ class TestStageCreateTicket(ManagerMixin, unittest.TestCase):
         with self._cfg(), mock.patch.object(ha, "create_board_issue", return_value={
                 "key": "ENG-2", "url": "u", "assigned": False, "assignError": "not assignable"}):
             sm.handle_commands([self._cmd(cmdId="b1", assignee={"id": "ann-7"})])
-        w = sm.create_ticket_results[0]["warning"]
+        row = sm.create_ticket_results[0]
+        w = row["warning"]
         self.assertIn("created unassigned", w)
         self.assertIn("not assignable", w)
         self.assertNotIn("your board", w)
+        self.assertIs(row["assignRefused"], True)
+        # A self-assign create never carries the flag.
+        sm.create_ticket_results.clear()
+        with self._cfg(), mock.patch.object(ha, "create_board_issue", return_value={
+                "key": "ENG-3", "url": "u", "assigned": False}):
+            sm.handle_commands([self._cmd(cmdId="b2")])
+        self.assertNotIn("assignRefused", sm.create_ticket_results[0])
 
     def test_xerk2935_files_are_attached_off_the_beat_and_ride_the_result(self):
         ok = {"key": "ENG-5", "url": "u", "assigned": True}
@@ -57942,6 +57977,14 @@ class TestMeetingAssignee(unittest.TestCase):
         self.assertEqual([i.get("assignee") for i in items],
                          [{"id": "a-1", "name": "Ann Lee"}, None, None, None])
         self.assertEqual(calls, [("Ann", ["ENG"]), ("Zed", ["ENG"])])
+
+        # A spent budget maps nothing more (and asks nothing).
+        items = [{"kind": "task", "title": "a", "suggestedAssignee": "Ann"}]
+        calls.clear()
+        with mock.patch.object(ha, "meeting_assignee", look), \
+                mock.patch.object(ha, "MEETING_ASSIGNEE_BUDGET_SEC", 0):
+            sm._meeting_assignees(items)
+        self.assertEqual((calls, "assignee" in items[0]), ([], False))
 
         # An error stops the pass; the items still ship unmapped.
         items = [{"kind": "task", "title": "a", "suggestedAssignee": "Ann"}]

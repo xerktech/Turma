@@ -734,8 +734,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   toast is cut at two lines (a platform limit on toasts).
 - **Gap: no "Assign to" picker yet** (XERK-2517). The web pre-fills a proposal's assignee with
   the tracker user its speaker maps to (`item.assignee`); the phone sends no `assignee`, so its
-  Approve still assigns the ticket to the operator, as before. Decode-safe: `assignee` and the
-  review's new fields are untyped here. Port: a picker in `ItemRow`, the body field in
+  Approve still assigns the ticket to the operator, as before (the hub records no assignee edit
+  for it). Decode-safe: `assignee` and the review's new fields (`warning`, `assigneeRefused`…)
+  are untyped here, so a created proposal's warning is not shown on the phone yet either. Port: a picker in `ItemRow`, the body field in
   `core/Meetings.kt`, Approve + start hidden when the pick is not "Me".
 - `dailyBriefs`, `dailyBriefSchedules`, `meetingLabels`, `meetingLabelMisses` and `meetingFocus`
   decode per org (`LenientSiteMapSerializer`), so a malformed entry drops alone.

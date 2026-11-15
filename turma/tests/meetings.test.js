@@ -335,6 +335,15 @@ test("XERK-2517: a mapped speaker is pre-filled as the assignee; the pick rides 
   assert.match(P.list(), /approve it without a session/);
   await P.review(k1, "approve");
   assert.equal(P.fetches.filter((f) => f.method === "POST").pop().body.assignee, "none");
+  // A refused assignee is said on the created proposal, escaped.
+  const created = meeting({ items: [{ ...row.items[0], review: { state: "created", at: 1, key: "ACME-9",
+    unassigned: true, assigneeRefused: true, warning: "created unassigned: <refused>" } }] });
+  P.setCache(data([created]));
+  P.renderMeetings(data([created]), true);
+  P.click({ showReviewed: P.meetingKey(SITE, "m1") });
+  assert.match(P.list(), /· created unassigned: &lt;refused&gt;/);
+  P.setCache(d);
+  P.renderMeetings(d, true);
   // The unmapped proposal never sends one.
   await P.review(P.itemKey(SITE, "m1", "p3"), "approve");
   assert.equal("assignee" in P.fetches.filter((f) => f.method === "POST").pop().body, false);
