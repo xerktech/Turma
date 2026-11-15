@@ -749,15 +749,17 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     Outlook subject with its time + invitees, Impromptu, Open in calendar.
   - Platform differences: no keyboard walking (←/→/↑/↓, Esc) and no A/S/E/R/J/K in the panel;
     the date picker is Material's, not the web's mini-month.
-  - The grid fills the screen on both (XERK-2937). The web also stretches its 30-min rows when
-    the pane is taller than a 24-hour day (1152px); Android keeps 24dp rows, since no phone or
-    tablet screen is that tall. The web widens the Calendar view to the board's 1640px column.
+  - The grid fills the screen on both (XERK-2937); the web widens the Calendar view to the
+    board's 1640px column.
+  - Zoom (XERK-2954): both size the rows so N hours fill the pane (4–24, default 10 = 8 AM–6 PM),
+    kept per viewer. Web: − / + in the bar and Ctrl/⌘+wheel; Android: pinch, plus TalkBack's
+    "Zoom in" / "Zoom out" actions in place of the buttons.
   - On for every org, no feature flag (XERK-2901). A host going offline or back re-reads the
     open week on both clients (the hub's `calendar` frame), so the stale-host notice is live.
   - XERK-2943 (web) needs no Android change: a wide web window now narrows the week while the
     detail panel is open, which Android already does by placing the detail beside the grid. The web
-    also hides a block's time line by the block's drawn height (`SHORT_DP` against fixed `SLOT_DP`
-    rows on Android, which never stretch).
+    also hides a block's time line by the block's drawn height (`SHORT_DP` against the zoomed row
+    height on Android).
 - **Calendar settings (XERK-2929)**: an org's ⚙ settings edit its days off (a tick per catalog
   country and per holiday, each saved at once) and its calendar email domains; the calendar's ⚙
   lists each host's Default org + Show private events; an Outlook event's Org row picks the

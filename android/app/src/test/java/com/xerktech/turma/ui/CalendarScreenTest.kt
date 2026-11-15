@@ -1,6 +1,7 @@
 package com.xerktech.turma.ui
 
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
@@ -186,6 +187,33 @@ class CalendarScreenTest {
         compose.onNodeWithTag("cal-link-go").performScrollTo().performClick()
         val req = hub.findRequest("/meetings/m1/calendar")
         assertEquals("""{"eventId":"E2"}""", req.body.readUtf8())
+    }
+
+    @Test fun `XERK-2954 the grid opens on 10 hours and zooms by its accessibility actions, kept per phone`() {
+        seed()
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        assertEquals(10f, cvm.zoom.value)
+        val grid = compose.onNodeWithTag("cal-scroll")
+        val action = { label: String ->
+            grid.fetchSemanticsNode().config[SemanticsActions.CustomActions].first { it.label == label }
+        }
+        compose.runOnUiThread { action("Zoom in").action() }
+        compose.waitForIdle()
+        assertEquals(8f, cvm.zoom.value)
+        compose.runOnUiThread { action("Zoom out").action(); }
+        compose.waitForIdle()
+        compose.runOnUiThread { action("Zoom out").action(); }
+        compose.waitForIdle()
+        assertEquals(12f, cvm.zoom.value)
+        // The whole day is the widest step: no Zoom out there.
+        cvm.setZoom(24f)
+        compose.waitForIdle()
+        val labels = grid.fetchSemanticsNode().config[SemanticsActions.CustomActions].map { it.label }
+        assertEquals(listOf("Zoom in"), labels)
+        // The pick outlives the screen (kept on this phone).
+        assertEquals(24f, calendarVm().zoom.value)
     }
 
     @Test fun `an offline host's copy shows a stale notice`() {

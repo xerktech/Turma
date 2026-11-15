@@ -511,4 +511,23 @@ class CalendarTest {
         val multi = ev("md", at(2026, 11, 9, 0), at(2026, 11, 12, 0), allDay = true)
         assertEquals("Monday, November 9 – Wednesday, November 11, all day", calWhenText(multi, ny, l))
     }
+
+    @Test fun `XERK-2954 zoom opens on 8 AM to 6 PM and steps like the web`() {
+        assertEquals(10f, CAL_ZOOM_DEFAULT_H)
+        // 10 hours fill a 600dp pane: 30dp rows, so 8 AM - 6 PM is exactly the pane.
+        assertEquals(30f, calSlotDp(600f, CAL_ZOOM_DEFAULT_H))
+        assertEquals(600f, calSlotDp(600f, CAL_ZOOM_DEFAULT_H) * 2 * (18 - 8))
+        assertEquals(8f, calZoomStep(10f, 1))
+        assertEquals(12f, calZoomStep(10f, -1))
+        assertNull(calZoomStep(4f, 1))
+        assertNull(calZoomStep(24f, -1))
+        // A pinch between steps steps to the neighbours, and never past either end.
+        assertEquals(8f, calZoomStep(9.3f, 1))
+        assertEquals(10f, calZoomStep(9.3f, -1))
+        assertEquals(4f, calZoomClamp(1f))
+        assertEquals(24f, calZoomClamp(100f))
+        assertEquals(CAL_ZOOM_DEFAULT_H, calZoomClamp(Float.NaN))
+        // The whole day on a short pane keeps a readable row.
+        assertEquals(CAL_SLOT_MIN_DP, calSlotDp(300f, 24f))
+    }
 }

@@ -15,14 +15,16 @@
 // Loaded after org.js; in server.js's HASHED_ASSETS. Tests: tests/calendar.test.js.
 (() => {
 const DAY_MS = 86400000;
-const SLOT_PX = 24;                 // one 30-minute row
-const HOUR_PX = SLOT_PX * 2;
-// A length of `n` 30-minute rows. The grid stretches its rows to fill a pane
-// taller than the day (XERK-2937): `--slot` is SLOT_PX until the day fits, then
-// grows (brief.html, .cal-body). Scroll math stays in SLOT_PX: a stretched day
-// never scrolls.
+const SLOT_PX = 24;                 // one 30-minute row where the browser cannot size it (no cqh)
+// A length of `n` 30-minute rows. The zoom (XERK-2954) is how many hours fill the
+// pane: brief.html sizes `--slot` from `--hours` and the pane's height. Scroll
+// math reads the rendered row height back (pxPerMin), never assumes SLOT_PX.
 const slots = (n, minus = 0) => `calc(var(--slot, ${SLOT_PX}px) * ${n}${minus ? ` - ${minus}px` : ""})`;
 const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid opens at 8:00
+// The zoom steps, as hours the pane shows; the default fits 8 AM - 6 PM (XERK-2954).
+const ZOOMS = [24, 16, 12, 10, 8, 6, 4];
+const ZOOM_DEFAULT = 10;
+const ZOOM_KEY = "turma-calendar-zoom";
 const MIN_LAYOUT_MIN = 20;          // a shorter (or zero-length) event lays out as 20 minutes (one readable line)
 const NARROW_PX = 760;
 const RETRY_PENDING_MS = 20000;     // a sync the hub queued: re-read in case its frame is missed
@@ -259,6 +261,41 @@ let upcomingWanted = false;       // the notes review reads the upcoming weeks (
 let revealing = null;             // {eventId?, site?, meetingId?} to select once its week is read (reveal())
 let revealFocus = false;          // the revealed event's panel takes focus on the next paint
 let scrollToMin = -1;             // the grid scrolls to this wall minute on the next paint
+let zoomHours = ((z) => (ZOOMS.includes(z) ? z : ZOOM_DEFAULT))(loadStore(ZOOM_KEY, ZOOM_DEFAULT));
+let zoomAnchor = -1;              // the wall minute held at the pane's middle across a zoom
+// Rendered px per minute: the body is 24h tall. A fake scroller (tests) has no height.
+const pxPerMin = (sc) => (sc.scrollHeight > 0 ? sc.scrollHeight / 1440 : SLOT_PX / 30);
+// 8:00 at the top, its label clear of the edge (in minutes, so a pane resize keeps it).
+const openMin = (sc) => Math.max(0, WORK_FROM_H * 60 - 8 / pxPerMin(sc));
+// The rows follow the pane's height, so a height change (the loading notice going, a
+// host notice, a window resize) would slide the view to another time: the wall minute
+// at the pane's top is held instead (QA XERK-2954). The operator's scroll moves it.
+let topMin = -1;
+let paneSig = "";
+// The scrollTop holdTop last wrote: its scroll event can arrive after the pane has
+// grown (the notice gone), and read as the operator's it moved the view (QA).
+let wroteTop = -1;
+function holdTop(sc, min) {
+  if (min !== undefined) topMin = min;
+  const sig = `${sc.clientHeight}|${sc.scrollHeight}`;
+  if (min === undefined && sig === paneSig) return;
+  paneSig = sig;
+  if (topMin < 0) return;
+  const was = sc.scrollTop;
+  sc.scrollTop = Math.max(0, topMin * pxPerMin(sc));
+  // Only a write that moved the pane sends an event; arming for one that did not would
+  // swallow the operator's next scroll to that pixel.
+  if (Math.abs(sc.scrollTop - was) >= 1) wroteTop = sc.scrollTop;
+}
+function zoom(dir) {
+  const i = ZOOMS.indexOf(zoomHours) + (dir > 0 ? 1 : -1);
+  if (i < 0 || i >= ZOOMS.length) return;
+  const sc = $grid && $grid.querySelector && $grid.querySelector("#calScroll");
+  if (sc && sc.clientHeight) zoomAnchor = (sc.scrollTop + sc.clientHeight / 2) / pxPerMin(sc);
+  zoomHours = ZOOMS[i];
+  saveStore(ZOOM_KEY, zoomHours);
+  paint();
+}
 
 const wideMode = () => (modes && (modes.wide === "week" || modes.wide === "work") ? modes.wide : "work");
 const narrowMode = () => (modes && (modes.narrow === "three" || modes.narrow === "day") ? modes.narrow : "day");
@@ -533,7 +570,6 @@ function evStyle(ev, colors) {
 }
 function timedHtml(seg, day, colors, now) {
   const ev = seg.ev;
-  const h = ((seg.bottom - seg.top) / 30) * SLOT_PX - 2;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
   // Whether the time line fits is the block's DRAWN height, not this one: a tall
   // pane stretches the rows, so brief.html decides it with a container query.
@@ -843,6 +879,9 @@ function panelSpec(ev) {
   return { site, meetingIds: caps.filter((c) => c.site === site).map((c) => c.meetingId),
     dailyAt: ev.source === "tenir" ? 0 : ev.startMs };
 }
+// aria-disabled, not disabled: the focused button keeps focus at the last step.
+const zoomBtn = (dir, label, glyph, end) => `<button type="button" class="cal-ic" data-zoom="${dir}" aria-label="${label}"`
+  + ` title="${label}${end ? "" : ` (${dir > 0 ? "fewer" : "more"} hours)`}"${end ? ' aria-disabled="true"' : ""}>${glyph}</button>`;
 function headerHtml(days) {
   const m = mode();
   const opts = narrow ? [["day", "Day"], ["three", "3 days"]] : [["work", "Work week"], ["week", "Week"]];
@@ -856,6 +895,9 @@ function headerHtml(days) {
     + (picker !== null ? pickerHtml(days, nowFn()) : "") + `</span>`
     + `<span class="sp"></span><span class="cal-modes" role="group" aria-label="View">`
     + opts.map(([k, l]) => `<button type="button" class="tri-chip${k === m ? " on" : ""}" data-mode="${k}" aria-pressed="${k === m}">${l}</button>`).join("")
+    + `</span><span class="cal-zoom" role="group" aria-label="Zoom">`
+    + zoomBtn(-1, "Zoom out", "−", zoomHours === ZOOMS[0])
+    + zoomBtn(1, "Zoom in", "+", zoomHours === ZOOMS[ZOOMS.length - 1])
     + `</span><button type="button" class="cal-ic" data-host-settings aria-expanded="${hostSetOpen}" aria-label="Calendar settings" title="Calendar settings">⚙</button></div>`;
 }
 function calendarHtml() {
@@ -922,7 +964,7 @@ function calendarHtml() {
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
-    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};height:${slots(48)}">`
+    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};--hours:${zoomHours};height:${slots(48)}">`
     + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 
@@ -932,7 +974,7 @@ function focusSig() {
   if (!a || !$root || !$root.contains || !$root.contains(a)) return null;
   const d = a.dataset || {};
   if (d.ev !== undefined) { const ev = shown[Number(d.ev)]; return ev ? { ev: `${ev.host}\u0000${ev.id}`, day: d.day } : null; }
-  for (const k of ["step", "mode", "pick", "pmonth"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
+  for (const k of ["step", "mode", "pick", "pmonth", "zoom"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
   for (const k of ["hostDefault", "hostPrivate"]) if (d[k] !== undefined) return { attr: k, v: d[k] };
   for (const k of ["calToday", "openPicker", "closeDetail", "hostSettings"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
   return null;
@@ -962,15 +1004,17 @@ function paint(force = false) {
     restoreFocusSig(sig);
     const sc = $grid.querySelector && $grid.querySelector("#calScroll");
     revealed = !!(sc && scrollToMin >= 0);
-    if (sc && scrollToMin >= 0) { sc.scrollTop = Math.max(0, (scrollToMin / 30) * SLOT_PX - HOUR_PX); scrolled = true; }
-    else if (sc && !scrolled) { sc.scrollTop = WORK_FROM_H * HOUR_PX - 12; scrolled = true; }  // 8 AM label in view
+    if (sc && scrollToMin >= 0) { holdTop(sc, Math.max(0, scrollToMin - 60)); scrolled = true; }
+    else if (sc && zoomAnchor >= 0) { holdTop(sc, Math.max(0, zoomAnchor - sc.clientHeight / 2 / pxPerMin(sc))); revealed = true; }
+    else if (sc && !scrolled) { holdTop(sc, openMin(sc)); scrolled = true; }
     scrollToMin = -1;
+    zoomAnchor = -1;
   }
   refit(revealed);
   paintDetail(force);
   if (revealFocus) { revealFocus = false; if ($side && !$side.hidden && $side.focus) $side.focus(); }
 }
-// A stretched day (the pane taller than 24h) has nothing to scroll, so its
+// Also holds the top minute across a pane-size change (holdTop). A stretched day has nothing to scroll, so its
 // scrollTop is 0; once a resize makes the pane scroll again, open it at 8 AM like
 // a fresh paint instead of leaving it stuck at midnight (XERK-2937).
 let fitWas = false;
@@ -980,7 +1024,8 @@ function refit(keep = false) {
   const sc = active && $grid && $grid.querySelector && $grid.querySelector("#calScroll");
   if (!sc || !sc.clientHeight) return;
   const fits = sc.scrollHeight <= sc.clientHeight + 1;
-  if (fitWas && !fits && !keep) sc.scrollTop = WORK_FROM_H * HOUR_PX - 12;
+  if (fitWas && !fits && !keep) holdTop(sc, openMin(sc));
+  else holdTop(sc);
   fitWas = fits;
 }
 // The detail panel paints apart from the grid, into its own element: the grid's
@@ -1184,7 +1229,7 @@ function mount(el, opts = {}) {
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings]") : null;
+        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -1213,6 +1258,10 @@ function mount(el, opts = {}) {
       if (target) relink(d.linkGo, { eventId: target.id }, target);
       return;
     }
+    if (d.zoom !== undefined) {
+      if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
+      return void zoom(Number(d.zoom));
+    }
     if (d.step !== undefined) return void go(stepAnchor(anchor, mode(), Number(d.step) < 0 ? -1 : 1));
     if (d.calToday !== undefined) return void go(nowFn());
     if (d.mode !== undefined) { revealWeek = false; revealing = null; setMode(d.mode); return void paint(true); }
@@ -1232,6 +1281,31 @@ function mount(el, opts = {}) {
   // On the document, so Esc closes the picker / panel after a click elsewhere;
   // arrows act only on a focused event button (onKey checks the target).
   (typeof document !== "undefined" && document.addEventListener ? document : $root).addEventListener("keydown", onKey);
+  // Ctrl/⌘ + wheel over the grid zooms (a trackpad pinch arrives as this); one step per notch.
+  // A pause or a turn of direction starts a new gesture: a leftover never zooms later.
+  let wheelAcc = 0, wheelAt = 0;
+  $root.addEventListener("wheel", (ev) => {
+    if (!(ev.ctrlKey || ev.metaKey) || !(ev.target && ev.target.closest && ev.target.closest(".cal-grid"))) return;
+    ev.preventDefault();
+    const t = Date.now();
+    // A line-mode wheel (Firefox) reports ~3 per notch: count it as pixels.
+    const dy = ev.deltaMode === 1 ? ev.deltaY * 40 : ev.deltaMode === 2 ? ev.deltaY * 400 : ev.deltaY;
+    if (t - wheelAt > 400 || Math.sign(dy) !== Math.sign(wheelAcc)) wheelAcc = 0;
+    wheelAt = t;
+    wheelAcc += dy;
+    if (Math.abs(wheelAcc) < 40) return;
+    zoom(wheelAcc < 0 ? 1 : -1);
+    wheelAcc = 0;
+  }, { passive: false });
+  // The operator's own scroll is the new view to hold (scroll does not bubble: capture).
+  $grid.addEventListener("scroll", (ev) => {
+    const sc = ev.target;
+    if (!sc || sc.id !== "calScroll" || !sc.clientHeight) return;
+    // One-shot: the first event after a write may be ours; every later one is the operator's.
+    const ours = wroteTop >= 0 && Math.abs(sc.scrollTop - wroteTop) < 1;
+    wroteTop = -1;
+    if (!ours) topMin = sc.scrollTop / pxPerMin(sc);
+  }, true);
   // Swipe left/right on the grid moves like › / ‹ (the narrow layout's arrows).
   let touch = null;
   $root.addEventListener("touchstart", (ev) => {
@@ -1266,7 +1340,9 @@ const api = {
   wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
   detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost,
-  _state: () => ({ anchor, mode: mode(), weeks, detail, picker }),
+  _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
+  _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
+  _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
