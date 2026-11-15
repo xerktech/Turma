@@ -53,6 +53,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.ClosedCaption
+import androidx.compose.material.icons.outlined.Repeat
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
@@ -387,7 +388,7 @@ private fun CalendarBody(
                 m, ev, colors[ev.org]?.let { series[it % series.size] },
                 side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
-                onEdit = { e -> cvm.openEditor(calDraftOf(e, zone)) },
+                onEdit = { e, scope -> cvm.openEditor(com.xerktech.turma.core.calDraftFor(e, zone, scope)) },
             )
         }
     }
@@ -857,6 +858,10 @@ private fun EventBlock(
                 if (st.tenir) {
                     Icon(Icons.Outlined.ClosedCaption, null, Modifier.size(12.dp).padding(end = 2.dp))
                 }
+                // A repeating event wears the recurring glyph, an Outlook occurrence and a Turma series alike (XERK-2973).
+                if (ev.recurring) {
+                    Icon(Icons.Outlined.Repeat, null, Modifier.size(11.dp).padding(end = 1.dp).testTag("cal-recur"))
+                }
                 Text(
                     calTitle(ev), Modifier.weight(1f, fill = false), fontSize = if (short) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold,
                     maxLines = if (short) 1 else 2, overflow = TextOverflow.Ellipsis,
@@ -929,11 +934,13 @@ private fun CalendarDetail(
     onClose: () -> Unit,
     onOpenNotes: (NotesTarget) -> Unit,
     dailyFor: (String, Long) -> TriageEntry?,
-    onEdit: (CalendarEvent) -> Unit,
+    // The event, and for an occurrence of a series the events it is for (XERK-2973; "" = a plain event).
+    onEdit: (CalendarEvent, String) -> Unit,
 ) {
     val uri = LocalUriHandler.current
     val eventBusy by cvm.eventBusy.collectAsStateWithLifecycle()
     var confirmDelete by remember { mutableStateOf(false) }
+    var askScope by remember { mutableStateOf("") }   // "edit" | "delete" for an occurrence of a series
     // The panel wears its event's org tint, as its grid block does (XERK-2939); no org = plain.
     // Its text colors are pulled toward ink so they stay ≥4.5:1 on every tint (web `.cal-detail`).
     val cs = MaterialTheme.colorScheme
@@ -977,7 +984,19 @@ private fun CalendarDetail(
             val evOrgs = calOrgsOf(ev)
             if (ev.turma && evOrgs.size > 1) DetailRow("Orgs", evOrgs.joinToString(", ") { orgLabel(it) })
             else DetailRow("Org", orgLabel(ev.org))
-            if (ev.recurring) DetailRow("Repeats", "Part of a recurring series")
+            if (ev.recurring) {
+                // A Turma series says its rule as the editor does; an Outlook one only that it repeats (XERK-2973).
+                val rule = if (ev.turma) com.xerktech.turma.core.calRuleOf(ev.recurrence) else null
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Repeats", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Icon(Icons.Outlined.Repeat, null, Modifier.size(16.dp))
+                    Text(
+                        if (rule != null) com.xerktech.turma.core.calRepeatSummary(rule, com.xerktech.turma.core.calAnchorDay(ev, zone))
+                        else "Part of a recurring series",
+                        Modifier.weight(1f).testTag("cal-repeats"), style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
             DetailRow("Where", ev.location)
             DetailRow(
                 "Organizer",
@@ -997,9 +1016,33 @@ private fun CalendarDetail(
             // an Outlook event is changed in Outlook.
             if (ev.canEdit) {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    GhostButton("Edit", { onEdit(ev) }, Modifier.testTag("cal-edit"), enabled = !eventBusy)
-                    GhostButton("Delete", { confirmDelete = true }, Modifier.testTag("cal-delete"), enabled = !eventBusy)
+                    // An occurrence of a series first asks which events (XERK-2973), as Teams does.
+                    GhostButton("Edit", { if (ev.turmaOccurrence) askScope = "edit" else onEdit(ev, "") }, Modifier.testTag("cal-edit"), enabled = !eventBusy)
+                    GhostButton("Delete", { if (ev.turmaOccurrence) askScope = "delete" else confirmDelete = true }, Modifier.testTag("cal-delete"), enabled = !eventBusy)
                 }
+            }
+            if (askScope.isNotEmpty()) {
+                val del = askScope == "delete"
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { askScope = "" },
+                    title = { Text(if (del) "Delete which events?" else "Edit which events?") },
+                    text = {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("“${calTitle(ev)}” repeats.", style = MaterialTheme.typography.bodyMedium)
+                            for ((scope, label) in listOf("occurrence" to "This event", "following" to "This and following", "series" to "All events")) {
+                                TextButton({
+                                    askScope = ""
+                                    if (del) cvm.deleteEvent(ev.id, scope) { r -> if (r is com.xerktech.turma.vm.EventResult.Deleted) onClose() }
+                                    else onEdit(ev, scope)
+                                }, Modifier.fillMaxWidth().testTag("cal-scope-$scope"), enabled = !eventBusy) {
+                                    Text(label, Modifier.fillMaxWidth(), color = if (del) TurmaColors.critical else Color.Unspecified)
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {},
+                    dismissButton = { TextButton({ askScope = "" }, Modifier.testTag("cal-scope-cancel")) { Text("Cancel") } },
+                )
             }
             if (confirmDelete) {
                 androidx.compose.material3.AlertDialog(

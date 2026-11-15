@@ -1,0 +1,43 @@
+{
+  "_comment": "XERK-2973: the editor's Repeat control <-> the hub's rule, and its one-line summary. Read by turma/tests/calendar.test.js (calendar.js) AND android CalendarRepeatTest (core/CalendarRepeat.kt): add a vector here, never to one side. `ymd` is the series' first day; `kind` is the control's preset for the rule; every rule must read back equal through the control.",
+  "roundTrip": [
+    { "name": "does not repeat", "ymd": "2026-11-17", "rule": null, "kind": "none", "summary": "Does not repeat" },
+    { "name": "every weekday", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1, "byDay": ["MO", "TU", "WE", "TH", "FR"] }, "kind": "weekday", "summary": "Every weekday" },
+    { "name": "daily", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1 }, "kind": "daily", "summary": "Every day" },
+    { "name": "weekly on the start's day", "ymd": "2026-11-17", "rule": { "freq": "weekly", "interval": 1 }, "kind": "weekly", "summary": "Every week on Tue" },
+    { "name": "weekly on days", "ymd": "2026-11-17", "rule": { "freq": "weekly", "interval": 1, "byDay": ["MO", "WE", "FR"] }, "kind": "weekly", "summary": "Every week on Mon, Wed, Fri" },
+    { "name": "monthly on the start's day", "ymd": "2026-11-17", "rule": { "freq": "monthly", "interval": 1 }, "kind": "monthly", "summary": "Every month on day 17" },
+    { "name": "monthly on the nth weekday", "ymd": "2026-11-17", "rule": { "freq": "monthly", "interval": 1, "byWeekday": { "n": 3, "day": "TU" } }, "kind": "monthly", "summary": "Every month on the third Tuesday" },
+    { "name": "monthly on the last weekday", "ymd": "2026-11-30", "rule": { "freq": "monthly", "interval": 1, "byWeekday": { "n": -1, "day": "MO" } }, "kind": "monthly", "summary": "Every month on the last Monday" },
+    { "name": "monthly kept on the 31st after a split", "ymd": "2027-04-30", "rule": { "freq": "monthly", "interval": 1, "byMonthDay": 31 }, "kind": "monthly", "summary": "Every month on day 31" },
+    { "name": "yearly", "ymd": "2026-11-17", "rule": { "freq": "yearly", "interval": 1 }, "kind": "yearly", "summary": "Every year on 17 November" },
+    { "name": "custom every 3 days", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 3 }, "kind": "custom", "summary": "Every 3 days" },
+    { "name": "custom every day on weekends", "ymd": "2026-11-21", "rule": { "freq": "daily", "interval": 1, "byDay": ["SU", "SA"] }, "kind": "custom", "summary": "Every day on Sun, Sat" },
+    { "name": "custom every 2 weeks on days until", "ymd": "2026-11-16", "rule": { "freq": "weekly", "interval": 2, "byDay": ["MO", "WE"], "until": "2026-12-31" }, "kind": "custom", "summary": "Every 2 weeks on Mon, Wed until 31 Dec" },
+    { "name": "custom every 2 months on the nth weekday", "ymd": "2026-11-17", "rule": { "freq": "monthly", "interval": 2, "byWeekday": { "n": 3, "day": "TU" } }, "kind": "custom", "summary": "Every 2 months on the third Tuesday" },
+    { "name": "custom every 3 months on day", "ymd": "2026-11-17", "rule": { "freq": "monthly", "interval": 3 }, "kind": "custom", "summary": "Every 3 months on day 17" },
+    { "name": "custom yearly on the nth weekday", "ymd": "2026-11-26", "rule": { "freq": "yearly", "interval": 1, "byWeekday": { "n": 4, "day": "TH" } }, "kind": "custom", "summary": "Every year on the fourth Thursday of November" },
+    { "name": "custom every 2 years", "ymd": "2026-11-17", "rule": { "freq": "yearly", "interval": 2 }, "kind": "custom", "summary": "Every 2 years on 17 November" },
+    { "name": "until next year names the year", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1, "until": "2027-03-01" }, "kind": "daily", "summary": "Every day until 1 Mar 2027" },
+    { "name": "after N occurrences", "ymd": "2026-11-17", "rule": { "freq": "weekly", "interval": 1, "count": 10 }, "kind": "weekly", "summary": "Every week on Tue, 10 times" },
+    { "name": "after one occurrence", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1, "count": 1 }, "kind": "daily", "summary": "Every day, 1 time" }
+  ],
+  "fromControl": [
+    { "name": "weekday preset", "ymd": "2026-11-17", "pick": "weekday", "rule": { "freq": "daily", "interval": 1, "byDay": ["MO", "TU", "WE", "TH", "FR"] } },
+    { "name": "monthly preset is the start's day, implicit", "ymd": "2026-11-17", "pick": "monthly", "rule": { "freq": "monthly", "interval": 1 } },
+    { "name": "monthly nth preset names the start's weekday", "ymd": "2026-11-17", "pick": "monthlyNth", "rule": { "freq": "monthly", "interval": 1, "byWeekday": { "n": 3, "day": "TU" } } },
+    { "name": "the 5th weekday of a month reads last", "ymd": "2026-11-30", "pick": "monthlyNth", "rule": { "freq": "monthly", "interval": 1, "byWeekday": { "n": -1, "day": "MO" } } },
+    { "name": "yearly preset", "ymd": "2026-11-17", "pick": "yearly", "rule": { "freq": "yearly", "interval": 1 } },
+    { "name": "custom from weekday keeps Mon-Fri", "ymd": "2026-11-17", "pick": "weekday", "then": "custom", "rule": { "freq": "daily", "interval": 1, "byDay": ["MO", "TU", "WE", "TH", "FR"] } },
+    { "name": "custom from weekly is weekly", "ymd": "2026-11-17", "pick": "weekly", "then": "custom", "rule": { "freq": "weekly", "interval": 1 } },
+    { "name": "custom from does-not-repeat is every week", "ymd": "2026-11-17", "pick": "custom", "rule": { "freq": "weekly", "interval": 1 } }
+  ],
+  "errors": [
+    { "name": "interval past 99", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 3 }, "set": { "interval": "100" }, "error": "Repeat every 1 to 99." },
+    { "name": "interval 0", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 3 }, "set": { "interval": "0" }, "error": "Repeat every 1 to 99." },
+    { "name": "until before the start", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1, "until": "2026-11-16" }, "set": {}, "error": "It must repeat until a day on or after its start." },
+    { "name": "until missing", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1 }, "set": { "end": "until", "until": "" }, "error": "Pick the date it repeats until." },
+    { "name": "count past 999", "ymd": "2026-11-17", "rule": { "freq": "daily", "interval": 1, "count": 5 }, "set": { "count": "1000" }, "error": "End after 1 to 999 occurrences." },
+    { "name": "a fine rule", "ymd": "2026-11-17", "rule": { "freq": "weekly", "interval": 2, "byDay": ["MO"] }, "set": {}, "error": "" }
+  ]
+}

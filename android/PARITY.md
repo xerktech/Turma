@@ -772,8 +772,13 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     height on Android).
 - **Turma-created events (epic XERK-2967 → Android XERK-2972)**: ＋ (FAB) or a tap on an empty
   slot opens a full-screen editor (title, required / optional attendees, start / end, all-day, time
-  zone, location, online + join link, details, show as, categories, private, orgs ≥1; Repeat is a
-  "Does not repeat" placeholder until XERK-2969) → `POST|PATCH|DELETE /api/calendar/events`.
+  zone, location, online + join link, details, show as, categories, private, orgs ≥1, Repeat)
+  → `POST|PATCH|DELETE /api/calendar/events`.
+  - Repeat (XERK-2973) is the web's control: the same presets, custom interval / unit / days /
+    month mode, end never / on date / after N, and summary (`core/CalendarRepeat.kt`, both clients
+    read `turma/tests/fixtures/calendar-repeat-vectors.json`). An occurrence's Edit / Delete asks
+    This event / This and following / All events; This event locks orgs, zone and rule.
+  - Platform difference: the scope prompt is a dialog, the web's is inline in the panel.
   - An event of several orgs is ONE block with a "+N" mark, its detail naming every org; the hub's
     `?org=` filter matches any of them. Edit / Delete only on a Turma event served `editable:true`
     with a `version` (absent = an older hub, read-only); Outlook events are unchanged.

@@ -18,6 +18,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.outlined.Repeat
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DatePicker
@@ -48,7 +51,21 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.xerktech.turma.core.CAL_DAYS
+import com.xerktech.turma.core.CAL_REPEAT_UNITS
 import com.xerktech.turma.core.CAL_SHOW_AS
+import com.xerktech.turma.core.RepeatForm
+import com.xerktech.turma.core.calAnchorNth
+import com.xerktech.turma.core.calDayLong
+import com.xerktech.turma.core.calDayShort
+import com.xerktech.turma.core.calRepeatDay
+import com.xerktech.turma.core.calRepeatDaysShown
+import com.xerktech.turma.core.calRepeatPick
+import com.xerktech.turma.core.calRepeatPresetOf
+import com.xerktech.turma.core.calRepeatPresets
+import com.xerktech.turma.core.calRepeatSummary
+import com.xerktech.turma.core.calRepeatToggleDay
+import com.xerktech.turma.core.calRuleOfRepeat
 import com.xerktech.turma.core.TurmaEventDraft
 import com.xerktech.turma.core.calDraftErrors
 import com.xerktech.turma.core.calLongDay
@@ -67,7 +84,8 @@ import java.util.Locale
  * XERK-2967): the fields the hub's record holds — title, required / optional
  * attendees, start / end, all-day, time zone, location, online + join link,
  * details, show-as, categories, private, and the orgs it belongs to (one or
- * more). Repeat is a placeholder until recurring events land (XERK-2969).
+ * more), and how it repeats (XERK-2973: core/CalendarRepeat.kt, the web's control). An
+ * occurrence of a series opened for "This event" keeps the series' orgs, zone and rule.
  * Saving is the view model's; a refusal stays on screen in the hub's words, and
  * a 409 (changed since opened) reloads the editor from the event as it is now.
  */
@@ -115,7 +133,13 @@ internal fun CalendarEventEditor(
         Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(::close, Modifier.testTag("cal-editor-close")) { Icon(Icons.Filled.Close, "Discard and close") }
             Text(
-                if (d.editing) "Edit event" else "New event", Modifier.weight(1f).semantics { heading() },
+                when {
+                    !d.editing -> "New event"
+                    d.scope == "occurrence" -> "Edit this event"
+                    d.scope == "following" -> "Edit this and following events"
+                    d.scope == "series" -> "Edit all events"
+                    else -> "Edit event"
+                }, Modifier.weight(1f).semantics { heading() },
                 style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold,
             )
             Button(::save, Modifier.testTag("cal-editor-save"), enabled = !busy) { Text(if (busy) "Saving…" else "Save") }
@@ -148,13 +172,9 @@ internal fun CalendarEventEditor(
             WhenRow("Ends", d.endDate, d.endTime, d.allDay, locale, "end", { picker = it })
             OutlinedTextField(
                 d.timeZone, { set(d.copy(timeZone = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
-                label = { Text("Time zone") }, singleLine = true,
+                label = { Text("Time zone") }, singleLine = true, enabled = !d.oneOccurrence,
             )
-            // Recurrence is the next child of the epic (XERK-2969): shown, not yet editable.
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Repeat", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("Does not repeat", Modifier.testTag("cal-ed-repeat"), color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            RepeatSection(d, ::set, { picker = it }, locale)
             HorizontalDivider()
             OutlinedTextField(
                 d.location, { set(d.copy(location = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-location"),
@@ -187,7 +207,9 @@ internal fun CalendarEventEditor(
             HorizontalDivider()
             Text("Orgs", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Text(
-                "Every org picked sees this event; it shows once on the all-orgs view.",
+                if (d.oneOccurrence) "A series' orgs apply to every event in it. Edit All events to change them."
+                else "Every org picked sees this event; it shows once on the all-orgs view.",
+                Modifier.testTag("cal-ed-orgs-note"),
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             // An org the event holds that this phone no longer lists stays pickable, so an edit never drops it silently.
@@ -201,6 +223,7 @@ internal fun CalendarEventEditor(
                         selected = key in d.orgs,
                         onClick = { set(d.copy(orgs = if (key in d.orgs) d.orgs - key else d.orgs + key)) },
                         label = { Text(label) },
+                        enabled = !d.oneOccurrence,
                         modifier = Modifier.testTag("cal-ed-org-$key"),
                     )
                 }
@@ -210,6 +233,22 @@ internal fun CalendarEventEditor(
     }
 
     when (picker) {
+        "until" -> {
+            val cur = d.repeat.until ?: calRepeatDay(d)
+            val state = rememberDatePickerState(initialSelectedDateMillis = cur.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli())
+            DatePickerDialog(
+                onDismissRequest = { picker = "" },
+                confirmButton = {
+                    TextButton({
+                        state.selectedDateMillis?.let { ms ->
+                            set(d.copy(repeat = d.repeat.copy(until = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate())))
+                        }
+                        picker = ""
+                    }, Modifier.testTag("cal-ed-until-ok")) { Text("OK") }
+                },
+                dismissButton = { TextButton({ picker = "" }) { Text("Cancel") } },
+            ) { DatePicker(state) }
+        }
         "startDate", "endDate" -> {
             val cur = if (picker == "startDate") d.startDate else d.endDate
             val state = rememberDatePickerState(initialSelectedDateMillis = cur.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli())
@@ -246,11 +285,112 @@ internal fun CalendarEventEditor(
     }
 }
 
-/** Moving the start keeps the event's length, as every calendar does. */
+/**
+ * Moving the start keeps the event's length, as every calendar does; a new start day
+ * names a new "day N" / "nth weekday" for its repeat (XERK-2973, the web's rule).
+ */
 private fun moveStart(d: TurmaEventDraft, day: LocalDate, time: LocalTime): TurmaEventDraft {
     val len = java.time.Duration.between(d.startDate.atTime(d.startTime), d.endDate.atTime(d.endTime))
     val end = day.atTime(time).plus(if (len.isNegative) java.time.Duration.ZERO else len)
-    return d.copy(startDate = day, startTime = time, endDate = end.toLocalDate(), endTime = end.toLocalTime())
+    val repeat = if (day != d.startDate) d.repeat.copy(monthDay = null, nth = null) else d.repeat
+    return d.copy(startDate = day, startTime = time, endDate = end.toLocalDate(), endTime = end.toLocalTime(), repeat = repeat)
+}
+
+/**
+ * The Repeat control (XERK-2973), the web's: a preset menu named for the start day,
+ * then for a repeating event its days / interval / month mode / end, and the
+ * one-line summary the detail shows too. One occurrence shows its series' rule, read-only.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pick: (String) -> Unit, locale: Locale) {
+    val r = d.repeat
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val summary = com.xerktech.turma.core.calEditorSummary(d)
+    fun put(next: RepeatForm) = set(d.copy(repeat = next))
+    @Composable
+    fun label(t: String) = Text(t, Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = muted)
+    if (d.oneOccurrence) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            label("Repeat")
+            Text(
+                "$summary. A series repeats as a whole: edit All events to change it.",
+                Modifier.weight(1f).testTag("cal-ed-repeat"), style = MaterialTheme.typography.bodySmall, color = muted,
+            )
+        }
+        return
+    }
+    val presets = calRepeatPresets(calRepeatDay(d), r)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        label("Repeat")
+        Picker(
+            presets.firstOrNull { it.first == calRepeatPresetOf(r) }?.second ?: "Does not repeat", presets,
+            { put(calRepeatPick(r, it)) }, Modifier.testTag("cal-ed-repeat"),
+        )
+    }
+    if (r.kind == "none") return
+    val custom = r.kind == "custom"
+    if (custom) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            label("Every")
+            OutlinedTextField(
+                r.interval, { put(r.copy(interval = it.filter(Char::isDigit).take(3))) }, Modifier.width(84.dp).testTag("cal-ed-rep-interval"),
+                singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            )
+            val plural = r.interval.trim() != "1"
+            Picker(
+                r.unit + if (plural) "s" else "", CAL_REPEAT_UNITS.map { it to it + if (plural) "s" else "" },
+                { put(r.copy(unit = it, days = emptyList())) }, Modifier.testTag("cal-ed-rep-unit"),
+            )
+        }
+    }
+    val unit = if (custom) r.unit else mapOf("weekly" to "week", "monthly" to "month")[r.kind]
+    if (unit == "week" || (custom && unit == "day")) {
+        val on = calRepeatDaysShown(r, calRepeatDay(d))
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            for (code in CAL_DAYS) {
+                FilterChip(
+                    selected = code in on, onClick = { put(calRepeatToggleDay(r, calRepeatDay(d), code, code !in on)) },
+                    label = { Text(calDayShort(code).take(2)) },
+                    modifier = Modifier.testTag("cal-ed-rep-day-$code").semantics { contentDescription = calDayLong(code) },
+                )
+            }
+        }
+    }
+    if (custom && (unit == "month" || unit == "year")) {
+        val nth = r.nth ?: calAnchorNth(calRepeatDay(d))
+        val opts = listOf(
+            "day" to "On day ${r.monthDay ?: calRepeatDay(d).dayOfMonth}",
+            "weekday" to "On the ${listOf("", "first", "second", "third", "fourth").getOrElse(nth.n) { "last" }} ${calDayLong(nth.day)}",
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            label("")
+            Picker(
+                opts.first { it.first == r.monthMode }.second, opts,
+                { put(r.copy(monthMode = it, monthDay = null, nth = null)) }, Modifier.testTag("cal-ed-rep-month"),
+            )
+        }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        label("")   // the event's own "Ends" sits just above: the options say it
+        val ends = listOf("never" to "Never ends", "until" to "Ends on", "count" to "Ends after")
+        Picker(ends.first { it.first == r.end }.second, ends, { put(r.copy(end = it)) }, Modifier.testTag("cal-ed-rep-end"))
+        when (r.end) {
+            "until" -> GhostButton(r.until?.let { calLongDay(it, locale) } ?: "Pick a date", { pick("until") }, Modifier.testTag("cal-ed-rep-until"))
+            "count" -> {
+                OutlinedTextField(
+                    r.count, { put(r.copy(count = it.filter(Char::isDigit).take(4))) }, Modifier.width(84.dp).testTag("cal-ed-rep-count"),
+                    singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                )
+                Text(if (d.wholeCount) "occurrences in the whole series" else "occurrences", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        label("")
+        Icon(Icons.Outlined.Repeat, null, Modifier.size(14.dp).padding(end = 2.dp), tint = muted)
+        Text(summary, Modifier.testTag("cal-ed-rep-summary"), style = MaterialTheme.typography.bodySmall)
+    }
 }
 
 @Composable

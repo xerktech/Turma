@@ -300,5 +300,30 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   repaint. Unit tests can't see this ordering: drive a real mouse (`fill()` hides it).
 - A skipped DST time takes the offset BEFORE the switch, a repeated one its first pass, east of UTC
   too (`wallToIso` tries the offsets a day either side).
-- Repeat is a disabled placeholder until XERK-2969.
-- Tests: the `XERK-2971:` cases in `calendar.test.js`.
+- **Repeat (XERK-2973)**: a Teams-style preset menu named for the start day, Custom (interval +
+  unit + days / month mode), Ends never / on date / after N, and a one-line summary.
+  - Rule ⇄ control is calendar.js's repeat block; Android's `core/CalendarRepeat.kt` is its port.
+    Both read `turma/tests/fixtures/calendar-repeat-vectors.json`: add a vector there, never to one side.
+  - An implicit day stays implicit (`byMonthDay`/`byWeekday` sent only when the rule named one or
+    the mode asks for the nth weekday), so moving the series moves its day, as the hub intends.
+  - Typed repeat fields (interval, until, count) update the summary IN PLACE, never by repaint
+    (the change-on-blur rule above); selects and day boxes repaint.
+- **An occurrence of a Turma series asks which events** (`isTurmaOccurrence`, `scopeAsk`): Edit and
+  Delete each offer This event / This and following / All events and send `scope` (PATCH body,
+  DELETE `?scope=`) to the OCCURRENCE id; the series' `version` rides along.
+  - **A scoped edit sends ONLY the fields that changed** (`scopedBody`, Android `calScopedPayload`;
+    start/end together; nothing changed = nothing sent). Never resend the whole form there (QA):
+    a resent rule re-grew a count and dropped the hub's month-end day on "This and following", a
+    resent start dragged the series, and "This event" pinned every field into its override.
+  - Every scoped editor reads the repeat off the series' first day (`seriesStart` → `f.seriesDate`,
+    `repDay`), never the opened occurrence's (a clamped Apr 30 or a moved Wednesday). A date MOVE
+    re-anchors it as the hub does: "following" on the new day, "All events" shifted by the move.
+    A "following" until may not end before the split (`splitDay`).
+  - A rule sent for "following" is the SERIES' rule as changed; the hub re-anchors it at the split
+    (implicit month day pinned; a count series' count is the whole run's, and the editor says
+    "in the whole series", `wholeCount`) — `contract-calendar.md`.
+  - "This event" disables the orgs and zone (with a note) and sends no `recurrence`: the hub refuses
+    an occurrence's own rule, orgs or zone.
+- **Every repeating event wears `RECUR_SVG`** (Outlook's circling arrows) beside its title and in
+  the panel's Repeats row; a Turma series' row reads its summary (`evAnchorYmd`: the original day).
+- Tests: the `XERK-2971:` and `XERK-2973:` cases in `calendar.test.js`; Android `CalendarRepeatTest`.

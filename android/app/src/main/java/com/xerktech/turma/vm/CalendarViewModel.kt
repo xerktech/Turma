@@ -408,12 +408,19 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
     /** Save the open editor; it closes on success, and a 409 reloads it from the event as it is now. */
     fun saveEditor(zone: ZoneId = this.zone): Job? {
         val ed = _editor.value ?: return null
-        return saveEvent(ed.draft, ed.orgsOrder) { r ->
+        // A scoped occurrence edit sends only what changed from the editor as opened (XERK-2973 QA).
+        if (ed.draft.editing && ed.draft.scope.isNotEmpty() && calDraftErrors(ed.draft).isEmpty() &&
+            com.xerktech.turma.core.calScopedPayload(ed.base, ed.draft, ed.orgsOrder) == null) {
+            _editor.value = null
+            return null
+        }
+        return saveEvent(ed.draft, ed.orgsOrder, ed.base) { r ->
             when (r) {
                 is EventResult.Saved, EventResult.Deleted -> if (_editor.value?.base == ed.base) _editor.value = null
                 is EventResult.Conflict -> if (_editor.value?.base == ed.base) {
                     // Only into the editor this save came from: one discarded meanwhile stays closed.
-                    val fresh = com.xerktech.turma.core.calDraftOf(r.event, zone)
+                    // The scope it was opened for stays: the reload is the same edit, redone.
+                    val fresh = com.xerktech.turma.core.calDraftFor(r.event, zone, ed.draft.scope)
                     _editor.value = EventEditor(fresh, fresh, fresh.orgs.toList(), r.message)
                 }
                 is EventResult.Failed -> _editor.update { it?.copy(error = r.message) }
@@ -433,7 +440,13 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
      * 409 (the event changed since it was opened) carries the current event, so
      * the editor reloads from it; every answer re-reads the shown weeks.
      */
-    fun saveEvent(draft: TurmaEventDraft, orgsOrder: List<String> = emptyList(), done: (EventResult) -> Unit = {}): Job? {
+    fun saveEvent(
+        draft: TurmaEventDraft,
+        orgsOrder: List<String> = emptyList(),
+        // The draft as opened: a scoped occurrence edit sends only what differs from it.
+        base: TurmaEventDraft? = null,
+        done: (EventResult) -> Unit = {},
+    ): Job? {
         if (_eventBusy.value) return null
         val errs = calDraftErrors(draft)
         if (errs.isNotEmpty()) { done(EventResult.Failed(errs.first())); return null }
@@ -441,7 +454,9 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         val what = if (draft.editing) "Saving the event" else "Creating the event"
         return viewModelScope.launch {
             val out = try {
-                val body = calDraftPayload(draft, orgsOrder)
+                val body = (if (base != null && draft.editing && draft.scope.isNotEmpty()) {
+                    com.xerktech.turma.core.calScopedPayload(base, draft, orgsOrder)
+                } else null) ?: calDraftPayload(draft, orgsOrder)
                 val r = if (draft.editing) container.client.api.updateTurmaEvent(draft.id, body)
                 else container.client.api.createTurmaEvent(body)
                 eventResult(r, what) { it.event?.let { ev -> EventResult.Saved(ev) } ?: EventResult.Failed("$what failed — the hub refused it") }
@@ -455,14 +470,17 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Delete a Turma event (`DELETE /api/calendar/events/<id>`). */
-    fun deleteEvent(id: String, done: (EventResult) -> Unit = {}): Job? {
+    /**
+     * Delete a Turma event (`DELETE /api/calendar/events/<id>`); for an occurrence of a
+     * series, [scope] names which events go (occurrence | following | series, XERK-2973).
+     */
+    fun deleteEvent(id: String, scope: String? = null, done: (EventResult) -> Unit = {}): Job? {
         if (_eventBusy.value) return null
         _eventBusy.value = true
         val what = "Deleting the event"
         return viewModelScope.launch {
             val out = try {
-                eventResult(container.client.api.deleteTurmaEvent(id), what) { EventResult.Deleted }
+                eventResult(container.client.api.deleteTurmaEvent(id, scope), what) { EventResult.Deleted }
             } catch (e: CancellationException) {
                 _eventBusy.value = false
                 throw e

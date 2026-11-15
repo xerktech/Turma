@@ -361,6 +361,9 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
       any admin-role principal owns it (not `legacy`). A disabled creator still counts as live.
     - Only the owner may make an event private/confidential: a non-owner hiding one locked every
       other viewer out, itself included, with no way back. Both refusals carry no `event`.
+- **Clients send `recurrence` (the rule, or null) and an occurrence's `scope`** (XERK-2973): never a
+  `recurrence` with `scope: occurrence`. The control ⇄ rule mapping is shared by vector file
+  (`turma-meetings.md` "Repeat").
 - **Clients send the body Android's `calDraftPayload` builds** (XERK-2972): every field whole
   (an edit that clears one clears it), `start`/`end` with the offset of the picked `timeZone`,
   all-day ending at the midnight after its last day. Edit/Delete only on `editable:true`.
@@ -403,7 +406,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 - **An occurrence's id is `<seriesId>:<original start>`**, the original start as UTC ISO with
   seconds (`turma:ab…:2026-11-16T14:00:00Z`) — the Outlook reader's own convention, so clients treat
   both alike. Served as `{...series fields, id, seriesId, recurring:true, originalStart, exception,
-  start, end, startMs, endMs}`; a single event carries `seriesId:""`, `recurring:false`. The series
+  seriesStart, start, end, startMs, endMs}`; `seriesStart` (XERK-2973) is the series' first
+  instant, the day an implicit rule day reads off; a single event carries `seriesId:""`, `recurring:false`. The series
   record itself is never served as an event, and `exceptions` never ride the wire.
 - **`exceptions`: `{<original start>: {deleted:true} | {override fields}}`** on the series,
   ≤`CALENDAR_TURMA_EXCEPTIONS_MAX` (100; past it a 409 in words). Overrides are any client field but
@@ -450,6 +454,10 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
     occurrences before it) and PATCH creates a NEW series at it carrying the edit and the
     exceptions from it on → `{ok, event: <new series>, previous: <old series>}`. DELETE only ends
     the old one. From the first occurrence it is `series`.
+  - A `recurrence` SENT with it is the series' rule as the client edited it (XERK-2973): the hub
+    re-anchors it like the kept one — the day pin below, and on a count series a sent `count` is
+    the WHOLE run's (clients say "in the whole series"): the new series gets what is left, a 400
+    in words when nothing is.
   - A monthly/yearly rule with an implicit day gets `byMonthDay` = the old anchor's day on the new
     series: split at Apr 30 of "the 31st", it must stay on the 31st, not move to the 30th. Not
     when the edit moves the occurrence to another DATE (the local date, not the day number, never on

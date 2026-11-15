@@ -6516,7 +6516,7 @@ function turmaOccurrenceRecord(rec, o, ex) {
 function turmaOccurrenceWire(p, rec, o, served = rec.orgs) {
   const ex = rec.exceptions[o.key];
   const w = { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served), id: `${rec.id}:${o.key}`,
-    seriesId: rec.id, originalStart: o.key, exception: !!ex };
+    seriesId: rec.id, originalStart: o.key, exception: !!ex, seriesStart: rec.start };
   // Writes are refused while the SERIES is withheld (calTurmaHiddenFrom), even on an
   // occurrence its owner made public: never offer an editor the route refuses.
   if (calTurmaWithheld(p, rec)) w.editable = false;
@@ -6853,19 +6853,29 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   // following: the series ends before this occurrence and a NEW series starts at
   // it, carrying the edit and the exceptions from it on.
   const prev = calTurmaEndBefore(f.rec, f.occ, f.t, now);
-  const { count, freq, byMonthDay, byWeekday } = f.rec.recurrence;
-  // A monthly/yearly rule's day defaults to its anchor's, and the new anchor
-  // may be a CLAMPED one (Apr 30 of "the 31st"): name the old day outright —
-  // unless the edit moves the occurrence to another DATE, which then names the
-  // new series' day (a start or zone resent on the same date does not).
+  const { count } = f.rec.recurrence;
+  // The rule the new series runs: the one sent, else the series' own. Either way it is the
+  // series' rule RE-ANCHORED at this occurrence (XERK-2973: a client editing "this and
+  // following" sends the series' rule as the person changed it):
+  // - A monthly/yearly rule's day defaults to its anchor's, and the new anchor may be a
+  //   CLAMPED one (Apr 30 of "the 31st"): name the old day outright — unless the edit moves
+  //   the occurrence to another DATE, which then names the new series' day (a start or zone
+  //   resent on the same date does not).
+  // - A count series' count is its WHOLE run, and so is a count sent for it (clients label it
+  //   "in the whole series"): the new series takes what is left of it.
   const dom = (ms, tz) => Number(recurrence.localDate(ms, tz).slice(8));
   const newTz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
   const newStart = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.occ.startMs;
-  const day = (freq === "monthly" || freq === "yearly") && !byMonthDay && !byWeekday &&
+  const sent = "recurrence" in body ? body.recurrence : f.rec.recurrence;
+  const day = sent && (sent.freq === "monthly" || sent.freq === "yearly") && !sent.byMonthDay && !sent.byWeekday &&
     recurrence.localDate(newStart, newTz) === recurrence.localDate(f.occ.startMs, f.rec.timeZone)
     ? { byMonthDay: dom(f.rec.startMs, f.rec.timeZone) } : {};
-  const rule = "recurrence" in body ? body.recurrence
-    : { ...f.rec.recurrence, ...day, ...(count ? { count: count - prev.recurrence.count } : {}) };
+  const rest = sent && count && Number.isSafeInteger(sent.count) ? { count: sent.count - prev.recurrence.count } : {};
+  if (rest.count !== undefined && rest.count < 1) {
+    return { status: 400, body: { error: `${prev.recurrence.count} of this series' occurrences come before this one: ` +
+      `end it after more than ${prev.recurrence.count} in all` } };
+  }
+  const rule = sent ? { ...sent, ...day, ...rest } : null;
   // The new series is anchored at this occurrence's ORIGINAL start, so the
   // exceptions from it on still land; a start/end in the edit re-times it (and,
   // like any re-timed series, drops those exceptions). The occurrence's own

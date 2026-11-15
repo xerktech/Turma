@@ -1240,7 +1240,7 @@ test("XERK-2971: the payload is the route's shape — ISO with offset, all-day e
     online: false, joinUrl: "https://meet.example/x", category: "Ops, ops2, Ops", priv: true, location: " R4 " };
   const b = cal.formPayload(f);
   assert.deepEqual(Object.keys(b), ["orgs", "subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
-    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity"]);
+    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "recurrence"]);
   assert.deepEqual([b.subject, b.start, b.end, b.timeZone, b.location], ["Plan", "2027-05-04T09:00:00-04:00", "2027-05-04T10:00:00-04:00", "America/New_York", "R4"]);
   assert.deepEqual(b.attendees, [{ name: "Ann", email: "ann@acme.com", role: "required" }, { name: "", email: "bob@globex.com", role: "optional" }]);
   assert.equal(b.joinUrl, "", "no link without the online toggle");
@@ -1511,4 +1511,332 @@ test("XERK-2971 QA: a half-typed start keeps the length; the shifted end is writ
     fire("change", { dataset: { edField: "joinUrl" }, value: "https://x.io/a", tagName: "INPUT", type: "url" });
     assert.equal(cal._ed().errors.joinUrl, undefined);
   } finally { panel.querySelector = qs; panel.querySelectorAll = qsa; cal.closeEditor(); }
+}));
+
+// ---- XERK-2973: repeat options and this-occurrence / whole-series editing ----------
+const REPEAT = require("./fixtures/calendar-repeat-vectors.json");
+
+test("XERK-2973: every rule reads into the Repeat control and back unchanged, with the shared summary", () => {
+  for (const v of REPEAT.roundTrip) {
+    const r = cal.repeatFromRule(v.rule);
+    assert.equal(r.kind, v.kind, `${v.name}: kind`);
+    assert.deepEqual(cal.ruleFromRepeat(r, v.ymd), v.rule, `${v.name}: rule round trip`);
+    assert.equal(cal.repeatSummary(v.rule, v.ymd), v.summary, `${v.name}: summary`);
+    assert.equal(cal.repeatError(r, v.ymd), "", `${v.name}: a stored rule is saveable`);
+  }
+});
+
+test("XERK-2973: each Repeat preset sends the rule it names", () => {
+  for (const v of REPEAT.fromControl) {
+    let r = cal.repeatPick(cal.blankRepeat(), v.pick);
+    if (v.then) r = cal.repeatPick(r, v.then);
+    assert.deepEqual(cal.ruleFromRepeat(r, v.ymd), v.rule, v.name);
+  }
+  // The menu names the presets for the start day, Teams-style.
+  const labels = cal.repeatPresets("2026-11-17").map(([, l]) => l);
+  assert.deepEqual(labels, ["Does not repeat", "Every weekday (Mon–Fri)", "Daily", "Weekly on Tuesday", "Monthly on day 17",
+    "Monthly on the third Tuesday", "Yearly on 17 November", "Custom…"]);
+});
+
+test("XERK-2973: a Repeat the hub would refuse is said before Save", () => {
+  for (const v of REPEAT.errors) {
+    const r = { ...cal.repeatFromRule(v.rule), ...v.set };
+    assert.equal(cal.repeatError(r, v.ymd), v.error, v.name);
+  }
+  const f = { ...cal.blankForm(at(2026, 11, 17, 9), at(2026, 11, 17, 10)), orgs: ["acme"],
+    repeat: { ...cal.repeatFromRule({ freq: "daily", interval: 3 }), interval: "0" } };
+  assert.equal(cal.validateForm(f).repeat, "Repeat every 1 to 99.");
+});
+
+test("XERK-2973: a new event's Repeat rides the payload; an occurrence's own edit sends none", () => {
+  const f = { ...cal.blankForm(at(2026, 11, 17, 9), at(2026, 11, 17, 10)), orgs: ["acme"] };
+  assert.equal(cal.formPayload(f).recurrence, null, "does not repeat = a single event");
+  f.repeat = cal.repeatPick(cal.blankRepeat(), "monthlyNth");
+  assert.deepEqual(cal.formPayload(f).recurrence, { freq: "monthly", interval: 1, byWeekday: { n: 3, day: "TU" } });
+  const one = cal.formPayload(f, 4, "occurrence");
+  assert.equal("recurrence" in one, false, "the hub refuses a rule on one occurrence");
+  assert.deepEqual([one.version, one.scope], [4, "occurrence"]);
+  assert.equal(cal.formPayload(f, 4, "following").scope, "following");
+  assert.deepEqual(cal.formPayload(f, 4, "following").recurrence, { freq: "monthly", interval: 1, byWeekday: { n: 3, day: "TU" } });
+});
+
+const occ = (over = {}) => tev({ id: "turma:0123456789abcdef:2027-05-04T14:00:00Z", seriesId: "turma:0123456789abcdef",
+  recurring: true, originalStart: "2027-05-04T14:00:00Z", recurrence: { freq: "weekly", interval: 2, byDay: ["TU", "TH"], until: "2027-06-30" }, ...over });
+
+test("XERK-2973: a recurring event wears the glyph on its block and says its rule in the panel", () => withOrgs(async () => {
+  replies = { "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [occ()] : [] }) };
+  cal.refetch();
+  const html = await show(at(2027, 5, 4));
+  assert.match(html, /class="cal-recur"/);
+  assert.match(html, /aria-label="Joint planning[^"]*repeats/);
+  const info = await openEvent(at(2027, 5, 4), "Joint planning");
+  assert.match(info, /Repeats<\/span><span class="v"><svg class="cal-recur"[^]*Every 2 weeks on Tue, Thu until 30 Jun/);
+  // An Outlook occurrence keeps the plain line (its rule is Outlook's).
+  assert.match(cal.detailHtml({ ...occ(), source: "outlook", recurrence: undefined }, at(2027, 5, 1)), /Part of a recurring series/);
+  click({ closeDetail: "" });
+}));
+
+test("XERK-2973: Edit on an occurrence asks which events, and each answer sends its scope", () => withOrgs(async () => {
+  replies = {
+    "/api/calendar/events/": () => ({ ok: true, event: occ() }),
+    "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [occ()] : [] }),
+  };
+  cal.refetch();
+  for (const [scope, title] of [["occurrence", "Edit this event"], ["following", "Edit this and following events"], ["series", "Edit all events"]]) {
+    await openEvent(at(2027, 5, 4), "Joint planning");
+    click({ evEdit: "" });
+    assert.equal(cal._ed(), null, "the press only asks");
+    assert.match(cal._els().info.innerHTML, /Edit which events\?[^]*data-ev-scope="occurrence">This event[^]*data-ev-scope="following">This and following[^]*data-ev-scope="series">All events/);
+    click({ evScope: scope });
+    const e = cal._ed();
+    assert.equal(e.scope, scope);
+    const panel = cal._edEls().panel.innerHTML;
+    assert.match(panel, new RegExp(`id="calEdTitle">${title}<`));
+    if (scope === "occurrence") {
+      assert.match(panel, /data-ed-org="acme" checked disabled/, "orgs are the series'");
+      assert.match(panel, /A series' orgs apply to every event in it/);
+      assert.match(panel, /data-ed-field="timeZone" aria-label="Time zone" disabled/);
+      assert.doesNotMatch(panel, /data-ed-rep="preset"/, "one occurrence has no rule of its own");
+    } else {
+      assert.doesNotMatch(panel, /disabled/);
+      assert.match(panel, /data-ed-rep="preset"[^]*value="custom" selected/);
+      assert.match(panel, /data-ed-rep-summary[^>]*>[^]*Every 2 weeks on Tue, Thu until 30 Jun/);
+    }
+    // Nothing changed: nothing is sent (a resent form is not neutral, see scopedBody).
+    posts.length = 0;
+    await cal.saveEditor();
+    assert.equal(posts.length, 0);
+    assert.equal(cal._ed(), null);
+    click({ evEdit: "" });
+    click({ evScope: scope });
+    editorFill({ subject: "Renamed" });
+    await cal.saveEditor();
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url, `/api/calendar/events/${encodeURIComponent("turma:0123456789abcdef:2027-05-04T14:00:00Z")}`);
+    assert.deepEqual(posts[0].body, { subject: "Renamed", version: 2, scope }, "only the change, the series' version and the scope");
+    click({ closeDetail: "" });
+  }
+  // Cancel backs out; a single event never asks.
+  await openEvent(at(2027, 5, 4), "Joint planning");
+  click({ evEdit: "" });
+  click({ evScopeNo: "" });
+  assert.match(cal._els().info.innerHTML, /data-ev-edit/);
+  click({ closeDetail: "" });
+}));
+
+test("XERK-2973: Delete on an occurrence asks which events and sends ?scope=", () => withOrgs(async () => {
+  for (const scope of ["occurrence", "following", "series"]) {
+    replies = {
+      "/api/calendar/events/": () => ({ ok: true }),
+      "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [occ()] : [] }),
+    };
+    cal.refetch();
+    await openEvent(at(2027, 5, 4), "Joint planning");
+    posts.length = 0;
+    click({ evDelete: "" });
+    assert.equal(posts.length, 0, "the first press only asks");
+    assert.match(cal._els().info.innerHTML, /Delete which events\?[^]*class="btn-sm cal-danger" data-ev-scope="occurrence"/);
+    click({ evScope: scope });
+    for (let i = 0; i < 6; i++) await tick();
+    assert.equal(posts[0].url, `/api/calendar/events/${encodeURIComponent("turma:0123456789abcdef:2027-05-04T14:00:00Z")}?scope=${scope}`);
+    assert.equal(cal._els().side.hidden, true);
+  }
+}));
+
+test("XERK-2973: the editor's Repeat control drives the rule — preset, days, custom, end", () => withOrgs(async () => {
+  replies = {};
+  await show(at(2026, 11, 17));
+  cal.openEditor({ startMs: at(2026, 11, 17, 9), endMs: at(2026, 11, 17, 10) });
+  const panel = () => cal._edEls().panel.innerHTML;
+  assert.match(panel(), /data-ed-rep="preset"[^]*Weekly on Tuesday/);
+  const chg = (dataset, value, checked) => { for (const f of cal._edEls().panel.listeners.change) f({ target: { dataset, value, checked } }); };
+  const inp = (dataset, value) => { for (const f of cal._edEls().panel.listeners.input) f({ target: { dataset, value } }); };
+  chg({ edRep: "preset" }, "weekly");
+  assert.match(panel(), /data-ed-repday="TU" aria-label="Tuesday" checked/, "the start's day is ticked");
+  chg({ edRepday: "TH" }, "on", true);
+  assert.deepEqual(cal.ruleFromRepeat(cal._ed().f.repeat, cal._ed().f.startDate), { freq: "weekly", interval: 1, byDay: ["TU", "TH"] });
+  chg({ edRep: "preset" }, "custom");
+  inp({ edRep: "interval" }, "2");
+  chg({ edRep: "end" }, "until");
+  inp({ edRep: "until" }, "2026-12-31");
+  assert.deepEqual(cal.ruleFromRepeat(cal._ed().f.repeat, cal._ed().f.startDate),
+    { freq: "weekly", interval: 2, byDay: ["TU", "TH"], until: "2026-12-31" });
+  chg({ edRep: "unit" }, "month");
+  chg({ edRep: "monthMode" }, "weekday");
+  assert.match(panel(), /On the third Tuesday/);
+  chg({ edRep: "end" }, "count");
+  inp({ edRep: "count" }, "6");
+  assert.deepEqual(cal.ruleFromRepeat(cal._ed().f.repeat, cal._ed().f.startDate),
+    { freq: "monthly", interval: 2, byWeekday: { n: 3, day: "TU" }, count: 6 });
+  // A typed field is said in place (no repaint mid-typing); the next repaint carries it.
+  chg({ edRep: "monthMode" }, "weekday");
+  assert.match(panel(), /data-ed-rep-summary[^>]*><svg[^]*<\/svg>Every 2 months on the third Tuesday, 6 times</);
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: a scoped edit sends only what changed — start/end together, the rule only when touched", () => {
+  const base = { subject: "A", start: "s0", end: "e0", recurrence: { freq: "weekly", interval: 1, count: 10 }, version: 2, scope: "following" };
+  assert.equal(cal.scopedBody(base, { ...base }), null);
+  assert.deepEqual(cal.scopedBody(base, { ...base, end: "e1" }), { start: "s0", end: "e1", version: 2, scope: "following" });
+  assert.deepEqual(cal.scopedBody(base, { ...base, recurrence: { freq: "weekly", interval: 2, count: 10 } }),
+    { recurrence: { freq: "weekly", interval: 2, count: 10 }, version: 2, scope: "following" });
+});
+
+test("XERK-2973 QA: an occurrence's rule reads off its series' first day, not a clamped one", () => withOrgs(async () => {
+  // Feb 28 2027 is an occurrence of "monthly on the 31st" (first day Jan 31): day 31, never day 28.
+  const feb = occ({ id: "turma:0123456789abcdef:2027-02-28T15:00:00Z", originalStart: "2027-02-28T15:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-02-28T10:00:00-05:00", end: "2027-02-28T11:00:00-05:00",
+    startMs: Date.parse("2027-02-28T15:00:00Z"), endMs: Date.parse("2027-02-28T16:00:00Z"), recurrence: { freq: "monthly", interval: 1 } });
+  assert.match(cal.detailHtml(feb, at(2027, 2, 1)), /Every month on day 31/);
+  // "All events" from it keeps the implicit 31st and may end before Feb 28 (it starts Jan 31).
+  cal.openEditor({ event: feb, scope: "series" });
+  const f = cal._ed().f;
+  assert.equal(f.seriesDate, "2027-01-31");
+  f.repeat = { ...f.repeat, end: "until", until: "2027-02-15" };
+  assert.equal(cal.validateForm(f).repeat, undefined);
+  assert.deepEqual(cal.formPayload(f, 2, "series").recurrence, { freq: "monthly", interval: 1, until: "2027-02-15" });
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: a stored weekly rule's preset names its own days", () => {
+  const r = cal.repeatFromRule({ freq: "weekly", interval: 1, byDay: ["MO", "WE", "FR"] });
+  assert.equal(new Map(cal.repeatPresets("2026-11-17", r)).get("weekly"), "Weekly on Mon, Wed, Fri");
+});
+
+test("XERK-2973 QA: every scoped editor reads the series' rule off its first day; a split's until starts at the split", () => withOrgs(async () => {
+  const apr = occ({ id: "turma:0123456789abcdef:2027-04-30T14:00:00Z", originalStart: "2027-04-30T14:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-04-30T10:00:00-04:00", end: "2027-04-30T11:00:00-04:00",
+    startMs: Date.parse("2027-04-30T14:00:00Z"), endMs: Date.parse("2027-04-30T15:00:00Z"), recurrence: { freq: "monthly", interval: 1 } });
+  for (const scope of ["occurrence", "following", "series"]) {
+    cal.openEditor({ event: apr, scope });
+    assert.match(cal._edEls().panel.innerHTML, /Every month on day 31/, scope);
+    cal.closeEditor();
+  }
+  cal.openEditor({ event: apr, scope: "following" });
+  const f = cal._ed().f;
+  f.repeat = { ...f.repeat, end: "until", until: "2027-03-31" };
+  assert.equal(cal.validateForm(f).repeat, "It must repeat until a day on or after its start.", "the new series starts Apr 30");
+  f.repeat = { ...f.repeat, end: "count", count: 4 };
+  // Sent implicit: the hub pins the 31st at the split (server.test.js XERK-2973).
+  assert.deepEqual(cal.formPayload(f, 2, "following").recurrence, { freq: "monthly", interval: 1, count: 4 });
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: a scoped edit that MOVES the date re-anchors the repeat as the hub does", () => withOrgs(async () => {
+  // Weekly-on-Tuesday series (first day Tue 2027-01-05); open its Tue 2027-01-26 occurrence.
+  const tue = occ({ id: "turma:0123456789abcdef:2027-01-26T15:00:00Z", originalStart: "2027-01-26T15:00:00Z",
+    seriesStart: "2027-01-05T10:00:00-05:00", start: "2027-01-26T10:00:00-05:00", end: "2027-01-26T11:00:00-05:00",
+    startMs: Date.parse("2027-01-26T15:00:00Z"), endMs: Date.parse("2027-01-26T16:00:00Z"), recurrence: { freq: "weekly", interval: 1, count: 8 } });
+  const label = () => /data-ed-rep-summary[^>]*><svg[^]*?<\/svg>([^<]*)</.exec(cal._edEls().panel.innerHTML)[1];
+  const change = (field, value) => { for (const f of cal._edEls().panel.listeners.change) f({ target: { dataset: { edField: field }, value } }); };
+  const repaint = () => { for (const f of cal._edEls().panel.listeners.change) f({ target: { dataset: { edRep: "end" }, value: "count" } }); };
+  // "This and following" moved to Wed: the new series runs on Wednesdays.
+  cal.openEditor({ event: tue, scope: "following" });
+  assert.match(label(), /Every week on Tue/);
+  change("startDate", "2027-01-27");
+  repaint();
+  assert.match(label(), /Every week on Wed/);
+  assert.match(cal._edEls().panel.innerHTML, /Weekly on Wednesday/);
+  cal.closeEditor();
+  // "All events" moved a day later shifts the whole series: Tuesdays become Wednesdays too.
+  cal.openEditor({ event: tue, scope: "series" });
+  change("startDate", "2027-01-27");
+  repaint();
+  assert.match(label(), /Every week on Wed/);
+  cal.closeEditor();
+  // "This event" moved keeps showing the series' own rule.
+  cal.openEditor({ event: tue, scope: "occurrence" });
+  change("startDate", "2027-01-27");
+  assert.match(cal._edEls().panel.innerHTML, /Every week on Tue/);
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: a 409 reload keeps the series' day the editor reads", () => withOrgs(async () => {
+  const feb = occ({ id: "turma:0123456789abcdef:2027-02-28T15:00:00Z", originalStart: "2027-02-28T15:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-02-28T10:00:00-05:00", end: "2027-02-28T11:00:00-05:00",
+    startMs: Date.parse("2027-02-28T15:00:00Z"), endMs: Date.parse("2027-02-28T16:00:00Z"), recurrence: { freq: "monthly", interval: 1 } });
+  replies = { "/api/calendar/events/": () => ({ status: 409, body: { error: "changed", event: { ...feb, subject: "Theirs", version: 3 } } }) };
+  cal.openEditor({ event: feb, scope: "series" });
+  editorFill({ subject: "Mine" });
+  await cal.saveEditor();
+  assert.equal(cal._ed().f.seriesDate, "2027-01-31");
+  assert.match(cal._edEls().panel.innerHTML, /Every month on day 31/);
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: keyboard focus follows the scope prompt and its Cancel", () => withOrgs(async () => {
+  replies = { "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [occ()] : [] }) };
+  cal.refetch();
+  await openEvent(at(2027, 5, 4), "Joint planning");
+  const info = cal._els().info, focused = [];
+  info.querySelector = (sel) => ({ focus: () => focused.push(sel) });
+  try {
+    click({ evEdit: "" });
+    click({ evScopeNo: "" });
+    click({ evDelete: "" });
+    click({ evScopeNo: "" });
+    assert.deepEqual(focused, ['[data-ev-scope="occurrence"]', "[data-ev-edit]", "[data-ev-scope-no]", "[data-ev-delete]"]);
+  } finally { delete info.querySelector; click({ closeDetail: "" }); }
+}));
+
+test("XERK-2973 QA: a split's move on a clamped day, its until, a 409 reload's anchor, and the whole-series count", () => withOrgs(async () => {
+  const apr = occ({ id: "turma:0123456789abcdef:2027-04-30T14:00:00Z", originalStart: "2027-04-30T14:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-04-30T10:00:00-04:00", end: "2027-04-30T11:00:00-04:00",
+    startMs: Date.parse("2027-04-30T14:00:00Z"), endMs: Date.parse("2027-04-30T15:00:00Z"), recurrence: { freq: "monthly", interval: 1, count: 8 } });
+  const label = () => /data-ed-rep-summary[^>]*><svg[^]*?<\/svg>([^<]*)</.exec(cal._edEls().panel.innerHTML)[1];
+  const change = (dataset, value) => { for (const f of cal._edEls().panel.listeners.change) f({ target: { dataset, value } }); };
+  cal.openEditor({ event: apr, scope: "following" });
+  assert.equal(label(), "Every month on day 31, 8 times in the whole series");
+  assert.match(cal._edEls().panel.innerHTML, /occurrences in the whole series/);
+  // Moved a day earlier: the new series runs on the 29th (never "the series shifted": day 30).
+  change({ edField: "startDate" }, "2027-04-29");
+  change({ edRep: "end" }, "count");
+  assert.match(label(), /^Every month on day 29/);
+  // Its until may not end before the NEW start.
+  const f = cal._ed().f;
+  f.repeat = { ...f.repeat, end: "until", until: "2027-04-28" };
+  assert.equal(cal.validateForm(f).repeat, "It must repeat until a day on or after its start.");
+  f.repeat = { ...f.repeat, until: "2027-04-29" };
+  assert.equal(cal.validateForm(f).repeat, undefined);
+  cal.closeEditor();
+  // After a 409 reload a move still re-anchors (the reload keeps the opened date).
+  replies = { "/api/calendar/events/": () => ({ status: 409, body: { error: "changed", event: { ...apr, subject: "Theirs", version: 3 } } }) };
+  cal.openEditor({ event: apr, scope: "following" });
+  editorFill({ subject: "Mine" });
+  await cal.saveEditor();
+  change({ edField: "startDate" }, "2027-04-29");
+  change({ edRep: "end" }, "count");
+  assert.match(label(), /^Every month on day 29/);
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: the whole-series count is said visibly, only on a split, kept across a 409, and live while typing", () => withOrgs(async () => {
+  const w8 = occ({ recurrence: { freq: "weekly", interval: 1, count: 8 } });
+  const visible = () => cal._edEls().panel.innerHTML.replace(/aria-label="[^"]*"/g, "");
+  cal.openEditor({ event: w8, scope: "following" });
+  assert.match(visible(), /> occurrences in the whole series/, "the text, not just the aria-label");
+  assert.match(visible(), /8 times in the whole series/);
+  // Live while typing: the in-place refresh says it too.
+  const sum = { innerHTML: "" };
+  const panel = cal._edEls().panel;
+  panel.querySelector = (sel) => (sel === "[data-ed-rep-summary]" ? sum : null);
+  panel.querySelectorAll = () => [];
+  try {
+    for (const f of panel.listeners.input) f({ target: { dataset: { edRep: "count" }, value: "10" } });
+    assert.match(sum.innerHTML, /10 times in the whole series$/);
+  } finally { delete panel.querySelector; delete panel.querySelectorAll; }
+  cal.closeEditor();
+  // "All events" and "This event" count only the series itself: no suffix.
+  for (const scope of ["series", "occurrence"]) {
+    cal.openEditor({ event: w8, scope });
+    assert.doesNotMatch(visible(), /in the whole series/, scope);
+    cal.closeEditor();
+  }
+  // A 409 reload keeps saying it.
+  replies = { "/api/calendar/events/": () => ({ status: 409, body: { error: "changed", event: { ...w8, subject: "Theirs", version: 3 } } }) };
+  cal.openEditor({ event: w8, scope: "following" });
+  editorFill({ subject: "Mine" });
+  await cal.saveEditor();
+  assert.match(visible(), /8 times in the whole series/);
+  cal.closeEditor();
 }));

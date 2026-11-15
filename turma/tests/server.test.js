@@ -33929,6 +33929,8 @@ test("XERK-2969: a series is served as its occurrences over the asked range only
     const occ = await occ2969();
     assert.deepEqual(occ.map((e) => e.id), [0, 1, 2, 3, 4].map((k) => `${s.id}:${key2969(k)}`));
     assert.ok(occ.every((e) => e.seriesId === s.id && e.recurring && e.editable && !e.exception));
+    // XERK-2973: each occurrence names its series' first instant, which an implicit rule day reads off.
+    assert.ok(occ.every((e) => e.seriesStart === s.start));
     assert.deepEqual([occ[2].start, occ[2].end, occ[2].originalStart], [key2969(2), iso2968(T2968 + 2 * W2969 + 3.6e6), key2969(2)]);
     // A range far ahead is expanded by itself, and only it.
     const far = await occ2969(T2968 + 52 * W2969, T2968 + 54 * W2969);
@@ -34084,6 +34086,29 @@ test("XERK-2969: 'following' splits the series into two; a count is shared out; 
     assert.deepEqual((await calGet2891(Date.parse("2027-02-01T00:00:00Z"), Date.parse("2027-04-30T00:00:00Z"))).body.events
       .filter((e) => [m15.id, mv.body.event.id].includes(e.seriesId)).map((e) => e.start),
     ["2027-02-15T09:00:00Z", "2027-03-20T09:00:00Z", "2027-04-20T09:00:00Z"]);
+    // XERK-2973: a rule the client SENDS for "following" is re-anchored the same way (QA):
+    // an implicit month day keeps the 31st, the series' own count is what is left of it.
+    const c31 = (await turma2968("POST", null, ev2968([S2968A], { timeZone: "UTC", start: "2027-01-31T09:00:00Z",
+      end: "2027-01-31T10:00:00Z", recurrence: { freq: "monthly" } }))).body.event;
+    const cs = await turma2968("PATCH", `${c31.id}:2027-04-30T09:00:00Z`, { version: 1, scope: "following",
+      recurrence: { freq: "monthly", interval: 1, count: 4 } });
+    assert.equal(cs.status, 200, JSON.stringify(cs.body));
+    assert.deepEqual(cs.body.event.recurrence, { freq: "monthly", interval: 1, byMonthDay: 31, count: 4 }, "a new count is the new series'");
+    const w10 = (await turma2968("POST", null, weekly2969({ recurrence: { freq: "weekly", count: 10 } }))).body.event;
+    const ws = await turma2968("PATCH", `${w10.id}:${key2969(5)}`, { version: 1, scope: "following",
+      recurrence: { freq: "weekly", interval: 2, count: 10 } });
+    assert.equal(ws.status, 200, JSON.stringify(ws.body));
+    assert.deepEqual([ws.body.previous.recurrence.count, ws.body.event.recurrence], [5, { freq: "weekly", interval: 2, count: 5 }],
+      "the series' count resent is what is left of it, never a fresh 10");
+    const w12 = (await turma2968("POST", null, weekly2969({ recurrence: { freq: "weekly", count: 12 } }))).body.event;
+    const wd = await turma2968("PATCH", `${w12.id}:${key2969(2)}`, { version: 1, scope: "following",
+      recurrence: { freq: "weekly", interval: 1, count: 3 } });
+    assert.equal(wd.body.event.recurrence.count, 1, "a sent count is the whole series' total: 3 in all, 2 already ran");
+    const w5 = (await turma2968("POST", null, weekly2969({ recurrence: { freq: "weekly", count: 5 } }))).body.event;
+    const wz = await turma2968("PATCH", `${w5.id}:${key2969(3)}`, { version: 1, scope: "following",
+      recurrence: { freq: "weekly", interval: 1, count: 3 } });
+    assert.equal(wz.status, 400);
+    assert.match(wz.body.error, /3 of this series' occurrences come before this one: end it after more than 3 in all/);
     // 'following' from the first occurrence is the whole series.
     const whole = await turma2968("PATCH", `${next.id}:${key2969(2)}`, { version: 1, scope: "following", subject: "All" });
     assert.equal(whole.body.event.id, next.id);

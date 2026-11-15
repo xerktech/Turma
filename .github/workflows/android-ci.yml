@@ -30,6 +30,8 @@ on:
     branches: [main]
     paths:
       - "android/**"
+      # Read by CalendarRepeatTest (XERK-2973): a vector change must run the Android side too.
+      - "turma/tests/fixtures/calendar-repeat-vectors.json"
       - "VERSION"
       - ".github/workflows/android-ci.yml"
 

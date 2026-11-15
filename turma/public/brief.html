@@ -443,6 +443,19 @@
   button.cal-chip-x { border: 0; background: none; color: inherit; padding: 0 5px; font-size: 11px; cursor: pointer; }
   .cal-ed .mt-err { margin: 0 0 4px 86px; }
   .cal-ed .cal-ed-err { margin: 8px 0 0; }
+  /* The recurring glyph (XERK-2973): on a block beside its title, in the panel's Repeats row. */
+  .cal-recur { width: 11px; height: 11px; flex: none; margin-left: 3px; opacity: 0.85; }
+  .cal-drow .cal-recur, .cal-ed-sum .cal-recur { width: 13px; height: 13px; margin: 0 5px 0 0; vertical-align: -2px; }
+  .cal-ed-days { display: flex; flex-wrap: wrap; gap: 4px; }
+  .cal-ed-day { position: relative; display: inline-flex; }
+  .cal-ed-day input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+  .cal-ed-day span { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 50%;
+    border: 1px solid var(--hairline); font-size: 12px; color: var(--muted); }
+  .cal-ed-day input:checked + span { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .cal-ed-day input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+  input.cal-ed-num { width: 4.5em; }
+  .cal-ed-sum { font-size: 13px; color: var(--ink); }
+  .cal-ed .cal-ed-note { margin: 0; }
   .cal-ed-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hairline); }
   /* Full screen at the calendar's narrow breakpoint, labels above their fields. */
   @media (max-width: 759px) {
