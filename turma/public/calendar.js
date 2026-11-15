@@ -1473,6 +1473,20 @@ function editorHtml() {
     + `<div class="cal-ed-foot"><button type="button" data-ed-cancel>Cancel</button>`
     + `<button type="button" class="primary" data-ed-save${dis}>${ed.busy ? "Saving…" : ed.mode === "edit" ? "Save" : "Save event"}</button></div>`;
 }
+// After a failed Save, drop the messages for fields now fixed, in place: a repaint
+// here would land mid-typing in a date/time field. New errors wait for the next Save.
+function clearFixedErrors() {
+  ed.errors = validateForm(ed.f);
+  if (!$edPanel || !$edPanel.querySelectorAll) return;
+  for (const n of [...$edPanel.querySelectorAll(".mt-err[id^='calEdErr-']")]) {
+    const k = n.id.slice("calEdErr-".length);
+    if (ed.errors[k]) continue;
+    for (const x of [...$edPanel.querySelectorAll(`[aria-describedby="${n.id}"]`)]) {
+      x.removeAttribute("aria-invalid"); x.removeAttribute("aria-describedby");
+    }
+    n.remove();
+  }
+}
 let lastEd = "";
 function paintEditor(force = false) {
   if (!$edPanel || !ed) return;
@@ -1619,7 +1633,12 @@ function mountEditor() {
           }
         }
       }
-      ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
+      // Remember only a start that parses: Chrome fires change with "" while a time is
+      // half typed, and remembering that lost the length on the next digit (QA).
+      if (!formTimes({ ...ed.f, endDate: ed.f.startDate, endTime: ed.f.startTime }).error) {
+        ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
+      }
+      if (ed.tried) clearFixedErrors();
       return;
     } else return;
     // A checkbox's change follows its own click, so a repaint here loses nothing.

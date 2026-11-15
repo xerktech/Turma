@@ -1476,3 +1476,31 @@ test("XERK-2971 QA: join link case and DST edges match the hub", () => {
   assert.equal(cal.wallToIso("2027-04-04", "01:45", "Australia/Lord_Howe").iso, "2027-04-04T01:45:00+11:00");
   assert.equal(cal.wallToIso("0050-06-01", "09:00", "UTC"), null, "no 19xx for a year under 100");
 });
+
+test("XERK-2971 QA: a half-typed start keeps the length; the shifted end is written into the inputs; a fixed field's error clears", () => withOrgs(async () => {
+  cal.openEditor({ startMs: at(2027, 5, 5, 9), endMs: at(2027, 5, 5, 9, 30) });
+  const panel = cal._edEls().panel;
+  const inputs = { endDate: { value: "" }, endTime: { value: "" } };
+  const errEnd = { id: "calEdErr-end", removed: false, remove() { this.removed = true; } };
+  const endIn = { attrs: { "aria-invalid": "true" }, removeAttribute(k) { delete this.attrs[k]; } };
+  const qs = panel.querySelector, qsa = panel.querySelectorAll;
+  panel.querySelector = (sel) => { const m = /data-ed-field="(\w+)"/.exec(sel); return m ? inputs[m[1]] || null : null; };
+  panel.querySelectorAll = (sel) => (sel.startsWith(".mt-err") ? (errEnd.removed ? [] : [errEnd]) : sel.includes("calEdErr-end") ? [endIn] : []);
+  const fire = (kind, target) => { for (const f of panel.listeners[kind] || []) f({ target, preventDefault() {} }); };
+  try {
+    fire("focusin", {});
+    fire("change", { dataset: { edField: "startTime" }, value: "", tagName: "INPUT", type: "time" });       // first digit
+    fire("change", { dataset: { edField: "startTime" }, value: "14:15", tagName: "INPUT", type: "time" });
+    assert.deepEqual([cal._ed().f.endTime, inputs.endTime.value, inputs.endDate.value], ["14:45", "14:45", "2027-05-05"],
+      "30 minutes kept, and written into the end inputs");
+    // A failed Save's error clears in place once the field is fixed.
+    cal._ed().f.orgs = ["acme"];
+    cal._ed().f.endTime = "13:00";
+    await cal.saveEditor();
+    assert.match(cal._ed().errors.end, /before the start/);
+    fire("change", { dataset: { edField: "endTime" }, value: "15:00", tagName: "INPUT", type: "time" });
+    assert.equal(cal._ed().errors.end, undefined);
+    assert.equal(errEnd.removed, true, "the message goes");
+    assert.equal(endIn.attrs["aria-invalid"], undefined, "and so does aria-invalid");
+  } finally { panel.querySelector = qs; panel.querySelectorAll = qsa; cal.closeEditor(); }
+}));
