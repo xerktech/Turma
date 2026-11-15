@@ -99,10 +99,9 @@ data class FleetState(
     val meetingLabels: Map<String, com.xerktech.turma.model.MeetingLabel> = emptyMap(),
     val meetingLabelMisses: Map<String, com.xerktech.turma.model.MeetingLabelMiss> = emptyMap(),
     val meetingFocus: Map<String, com.xerktech.turma.model.MeetingFocus> = emptyMap(),
-    // Each org's days off + the catalogs, and its calendar email domains (XERK-2929).
+    // Each org's days off + the catalogs (XERK-2929).
     val holidaySettings: Map<String, com.xerktech.turma.model.HolidaySettings> = emptyMap(),
     val holidayCatalog: Map<String, com.xerktech.turma.model.HolidayCountry> = emptyMap(),
-    val calendarOrgRules: Map<String, com.xerktech.turma.model.CalendarOrgRule> = emptyMap(),
 )
 
 class FleetRepository(
@@ -173,12 +172,6 @@ class FleetRepository(
         emit(_state.value.now, null)
     }
 
-    /** An org's calendar email domains as a save's answer stored them; null = cleared. */
-    fun patchCalendarOrgRules(siteKey: String, v: com.xerktech.turma.model.CalendarOrgRule?) {
-        calendarOrgRules = if (v == null) calendarOrgRules - siteKey else calendarOrgRules + (siteKey to v)
-        emit(_state.value.now, null)
-    }
-
     /** Force an immediate poll (after a mutation, on resume). */
     fun nudge() {
         scope.launch { refresh() }
@@ -233,7 +226,6 @@ class FleetRepository(
             meetingFocus = resp.meetingFocus
             holidaySettings = resp.holidaySettings
             holidayCatalog = resp.holidayCatalog
-            calendarOrgRules = resp.calendarOrgRules
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -313,9 +305,6 @@ class FleetRepository(
     @Volatile
     private var holidayCatalog: Map<String, com.xerktech.turma.model.HolidayCountry> = emptyMap()
 
-    @Volatile
-    private var calendarOrgRules: Map<String, com.xerktech.turma.model.CalendarOrgRule> = emptyMap()
-
     // Bumped by every meetingProposals SSE frame and local patch: a poll that
     // started before one keeps the newer map (the web page's XERK-444 merge).
     @Volatile
@@ -352,7 +341,6 @@ class FleetRepository(
             meetingFocus = meetingFocus,
             holidaySettings = holidaySettings,
             holidayCatalog = holidayCatalog,
-            calendarOrgRules = calendarOrgRules,
         )
     }
 
@@ -387,7 +375,7 @@ class FleetRepository(
      */
     @androidx.annotation.VisibleForTesting
     internal fun onSseEvent(type: String?, data: String) {
-        if (type == "calendar" || type == "holidaySettings" || type == "calendarOrgRules" || type == "meetingProposals") {
+        if (type == "calendar" || type == "holidaySettings" || type == "meetingProposals") {
             _calendarFrames.value++
         }
         when (type) {
@@ -494,13 +482,10 @@ class FleetRepository(
             "meetingFocus" -> runCatching {
                 TurmaJson.decodeFromString(com.xerktech.turma.model.LenientMeetingFocusSerializer, data)
             }.getOrNull()?.let { meetingFocus = it; emit(_state.value.now, null) }
-            // An org's days off or calendar email domains changed (XERK-2929); whole map.
+            // An org's days off changed (XERK-2929); whole map.
             "holidaySettings" -> runCatching {
                 TurmaJson.decodeFromString(com.xerktech.turma.model.LenientHolidaySettingsSerializer, data)
             }.getOrNull()?.let { holidaySettings = it; emit(_state.value.now, null) }
-            "calendarOrgRules" -> runCatching {
-                TurmaJson.decodeFromString(com.xerktech.turma.model.LenientCalendarOrgRulesSerializer, data)
-            }.getOrNull()?.let { calendarOrgRules = it; emit(_state.value.now, null) }
         }
     }
 

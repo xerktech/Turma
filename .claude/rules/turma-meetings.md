@@ -105,7 +105,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   press released on pointerup/pointercancel/contextmenu and the WINDOW's blur only (never a
   capture blur). The search's own paint is forced and gives focus + caret back.
 - **A control that saves on change and holds no draft is exempt from the focus hold** (the
-  day-off boxes, the calendar's series Org select, XERK-2929): held, it showed a stale read until
+  day-off boxes, XERK-2929): held, it showed a stale read until
   blur. Its busy state is `aria-disabled` too, and focus is restored by its data key.
 - Buttons go `aria-disabled` while busy, never `disabled`; `busy` / `archBusy` / `labelBusy` /
   `focusBusy` are the guard. Busy from the first await (XERK-2511: a Reject must not overtake an
@@ -181,10 +181,10 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
       the loading notice leaving opened the day at 7:34, not 8:00 (QA). Android does the same.
     - **Scroll math reads the drawn row height back** (`pxPerMin` = `scrollHeight / 1440`), never
       `SLOT_PX` — that is only the no-cqh fallback (10h). A fake scroller in tests has no height.
-  - 30-min rows, working hours 8–17 shaded white, the grid opens with 8:00 at the top, a red
+  - 30-min rows, working hours 9–17 shaded white, the grid opens with 8:00 at the top, a red
     now-line with a dot on today, today's header in the accent with a top bar.
-  - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event an
-    org (XERK-2936, its host's when no rule decides); neutral only for a host in no org;
+  - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event its
+    host's org (XERK-2964; the panel shows it as text, never a picker); neutral only for a host in no org;
     overlaps share the width and widen into free columns to the right (`layoutDay`).
   - Tentative / not responded = hatched; free / declined = outlined; canceled = "Canceled: " +
     strikethrough (kept, as Teams keeps them); past = dimmed; Tenir-only (`source:"tenir"`) = a

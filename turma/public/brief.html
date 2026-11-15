@@ -303,7 +303,7 @@
     background:
       repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px calc(var(--slot) * 2)),
       repeating-linear-gradient(to bottom, transparent 0 var(--slot), color-mix(in srgb, var(--hairline) 45%, transparent) var(--slot) calc(var(--slot) + 1px), transparent calc(var(--slot) + 1px) calc(var(--slot) * 2)),
-      linear-gradient(to bottom, var(--page) 0 calc(var(--slot) * 16), transparent calc(var(--slot) * 16) calc(var(--slot) * 34), var(--page) calc(var(--slot) * 34)); }
+      linear-gradient(to bottom, var(--page) 0 calc(var(--slot) * 18), transparent calc(var(--slot) * 18) calc(var(--slot) * 34), var(--page) calc(var(--slot) * 34)); }
   .cal-col.off, .cal-band-day.off, .cal-dh.off { background-color: color-mix(in srgb, var(--muted) 10%, transparent); }
   .cal-col.off { background-image:
       repeating-linear-gradient(to bottom, var(--hairline) 0 1px, transparent 1px calc(var(--slot) * 2)),
@@ -375,9 +375,10 @@
   .cal-hostset { border: 1px solid var(--hairline); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; font-size: 13px; }
   .cal-hostset .cal-dnote { margin: 0 0 6px; }
   .cal-hostrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 6px 0; border-top: 1px solid var(--hairline); min-width: 0; }
+  .cal-hostrow:first-child { border-top: 0; }
   .cal-hostrow b { overflow-wrap: anywhere; min-width: 0; }
+  .cal-hostrow .cal-dnote { margin: 0; overflow-wrap: anywhere; min-width: 0; }
   .cal-hostrow label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-  .cal-hostrow select { max-width: 100%; min-width: 0; }
   .cal-drow .v { min-width: 0; overflow-wrap: anywhere; }
   .cal-drow a { color: var(--accent-text); }
   .cal-dnote { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }
@@ -953,7 +954,6 @@ async function refresh() {
       body.meetingLabelMisses = cache.meetingLabelMisses;
       body.meetingFocus = cache.meetingFocus;
       body.holidaySettings = cache.holidaySettings;
-      body.calendarOrgRules = cache.calendarOrgRules;
     }
     cache = body;
     if (typeof TurmaNav !== "undefined" && TurmaNav.noteSnapshot) TurmaNav.noteSnapshot(r);
@@ -1008,8 +1008,8 @@ function connectSSE() {
   });
   // Each org's Tenir label and the labels no org has (XERK-2638), and whose
   // work its meetings propose (XERK-2514).
-  // Each org's days off and calendar email domains, which its drawer edits (XERK-2929).
-  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus", "holidaySettings", "calendarOrgRules"]) {
+  // Each org's days off, which its drawer edits (XERK-2929).
+  for (const ev of ["meetingLabels", "meetingLabelMisses", "meetingFocus", "holidaySettings"]) {
     es.addEventListener(ev, (e) => {
       let d;
       try { d = JSON.parse(e.data); } catch { return; }
@@ -1017,7 +1017,7 @@ function connectSSE() {
       labelsClock++;
       cache[ev] = d;
       renderBriefs(cache, Date.now());
-      if (ev === "holidaySettings" || ev === "calendarOrgRules") calendarSoon();
+      if (ev === "holidaySettings") calendarSoon();
     });
   }
   // The calendar reads its own routes; these frames only say what changed.

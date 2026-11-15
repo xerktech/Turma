@@ -97,6 +97,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.core.CAL_DAILY_EVENT_MS
+import com.xerktech.turma.core.CAL_OPEN_AT_H
 import com.xerktech.turma.core.CAL_WORK_FROM_H
 import com.xerktech.turma.core.CAL_WORK_UNTIL_H
 import com.xerktech.turma.core.CalMode
@@ -358,7 +359,7 @@ private fun CalendarBody(
             val series = TurmaColors.series()
             CalendarDetail(
                 m, ev, colors[ev.org]?.let { series[it % series.size] },
-                side, now, zone, locale, fleet, names, range.events, range.hostRows[ev.host], cvm, bvm, mvm,
+                side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
             )
         }
@@ -649,7 +650,7 @@ private fun WeekGrid(
             val slot = calSlotDp(paneDp, zoomHours).dp
             val hourDp = slot * 2
             // The grid opens with 8 AM at the top (its label clear); a reveal scrolls to its event.
-            LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (hourDp * CAL_WORK_FROM_H - 8.dp).roundToPx() }) }
+            LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (hourDp * CAL_OPEN_AT_H - 8.dp).roundToPx() }) }
             LaunchedEffect(scrollTo) {
                 if (scrollTo >= 0) {
                     scroll.animateScrollTo(with(density) { ((slot * (scrollTo / 30).toFloat()) - hourDp).roundToPx().coerceAtLeast(0) })
@@ -877,7 +878,6 @@ private fun CalendarDetail(
     fleet: FleetState,
     names: Map<String, String>,
     events: List<CalendarEvent>,
-    hostRow: com.xerktech.turma.model.CalendarHost?,
     cvm: CalendarViewModel,
     bvm: BriefViewModel,
     mvm: MeetingsViewModel,
@@ -924,8 +924,8 @@ private fun CalendarDetail(
                 DetailRow("Moved", "from ${calLongDay(calDay(o, zone), locale)}, ${calTime(o, zone, locale)}")
             }
             if (ev.tenir && ev.moved) DetailRow("Moved", "its Outlook event moved to another time")
-            if (!ev.tenir && hostRow != null && ev.id.isNotEmpty()) SeriesOrgRow(ev, hostRow, orgLabel, cvm)
-            else DetailRow("Org", orgLabel(ev.org))
+            // Locked (XERK-2964): an Outlook event's org is its host's, shown, never picked.
+            DetailRow("Org", orgLabel(ev.org))
             if (ev.recurring) DetailRow("Repeats", "Part of a recurring series")
             DetailRow("Where", ev.location)
             DetailRow(
@@ -1027,9 +1027,9 @@ private fun CalendarDetail(
 }
 
 /**
- * Each host's calendar settings (XERK-2929, the web's `hostSettingsHtml`): the org
- * its unmatched meetings take, and whether its private events are shown. Each
- * change saves at once.
+ * Each host's calendar settings (XERK-2929, the web's `hostSettingsHtml`): whether its
+ * private events are shown, saved at once. Its org is shown, never set: every event
+ * takes its host's org (XERK-2964).
  */
 @Composable
 private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost>, names: Map<String, String>, cvm: CalendarViewModel) {
@@ -1044,29 +1044,15 @@ private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost
                 Text("No host has synced a calendar yet.", style = MaterialTheme.typography.bodySmall, color = muted)
                 return@Column
             }
-            Text(
-                "A meeting no email-domain rule (Meetings settings) claims takes its host's default org.",
-                style = MaterialTheme.typography.bodySmall, color = muted,
-            )
             for (h in list) {
                 val k = h.host
                 val on = k !in busy
                 HorizontalDivider()
                 Text(h.device.ifEmpty { h.host }, fontWeight = FontWeight.SemiBold)
-                val orgs = h.orgs.orEmpty().filter { it.isNotEmpty() }
-                val own = if (h.org.isNotEmpty()) "Its own org (${orgLabel(h.org)})" else "No org"
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("Default org", style = MaterialTheme.typography.bodyMedium)
-                    Picker(
-                        label = if (h.defaultOrg.isNotEmpty()) orgLabel(h.defaultOrg) else own,
-                        options = listOf("" to own) + orgs.map { it to orgLabel(it) },
-                        onPick = { v ->
-                            cvm.saveHost(k, buildJsonObject { put("defaultOrg", if (v.isEmpty()) JsonNull else JsonPrimitive(v)) })
-                        },
-                        modifier = Modifier.testTag("cal-host-default-$k"),
-                        enabled = on,
-                    )
-                }
+                Text(
+                    if (h.org.isNotEmpty()) orgLabel(h.org) else "No org",
+                    Modifier.testTag("cal-host-org-$k"), style = MaterialTheme.typography.bodySmall, color = muted,
+                )
                 CheckRow(
                     "Show private events", h.showPrivate,
                     { cvm.saveHost(k, buildJsonObject { put("showPrivate", it) }) },
@@ -1077,49 +1063,6 @@ private fun HostSettings(rows: Map<String, com.xerktech.turma.model.CalendarHost
         }
     }
 }
-
-/**
- * The event's org and the operator's per-series pick of it (XERK-2929, the web's
- * `seriesOrgHtml`): "Automatic" leaves it to the domain rules / host default /
- * host org. No "No org" pin: the hub refuses "" (XERK-2936).
- */
-@Composable
-private fun SeriesOrgRow(ev: CalendarEvent, h: com.xerktech.turma.model.CalendarHost, orgLabel: (String) -> String, cvm: CalendarViewModel) {
-    val busy by cvm.setBusy.collectAsStateWithLifecycle()
-    val errs by cvm.setErr.collectAsStateWithLifecycle()
-    val pinned = ev.seriesOrg != null
-    val auto = if (pinned) "Automatic" else "Automatic (${orgLabel(ev.org)})"
-    // Values are "auto" or "=" + the org, so no org key can collide with Automatic.
-    val options = listOf(AUTO_ORG to auto) + h.orgs.orEmpty().filter { it.isNotEmpty() }.map { "=$it" to orgLabel(it) }
-    val cur = ev.seriesOrg?.let { "=$it" } ?: AUTO_ORG
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
-        Text("Org", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Column(Modifier.weight(1f)) {
-            Picker(
-                label = options.firstOrNull { it.first == cur }?.second ?: orgLabel(ev.seriesOrg.orEmpty()),
-                options = options,
-                onPick = { v ->
-                    val id = ev.seriesId.ifEmpty { ev.id }
-                    cvm.saveHost(ev.host, buildJsonObject {
-                        put("series", buildJsonObject {
-                            put("id", id)
-                            put("org", if (v == AUTO_ORG) JsonNull else JsonPrimitive(v.removePrefix("=")))
-                        })
-                    })
-                },
-                modifier = Modifier.testTag("cal-series-org"),
-                enabled = ev.host !in busy,
-            )
-            if (ev.recurring) Text("for the whole series", style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-            errs[ev.host]?.let { Text(it, color = TurmaColors.critical, style = MaterialTheme.typography.bodySmall) }
-        }
-    }
-}
-
-// The series picker's "Automatic" value; every other value starts with "=", so an org
-// named "auto" cannot collide with it (QA XERK-2929: a master token can mint any org key).
-private const val AUTO_ORG = "auto"
 
 @Composable
 private fun DetailRow(k: String, v: String) {
