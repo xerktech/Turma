@@ -27,7 +27,8 @@ import java.util.Locale
 
 const val CAL_DAY_MS = 86_400_000L
 const val CAL_MIN_LAYOUT_MIN = 20          // a shorter (or zero-length) event lays out as 20 minutes
-const val CAL_WORK_FROM_H = 8
+const val CAL_OPEN_AT_H = 8            // the grid opens scrolled here, an hour above the shaded band
+const val CAL_WORK_FROM_H = 9            // shaded working hours 9–17 (web: brief.html .cal-col)
 const val CAL_WORK_UNTIL_H = 17
 
 /** The zoom (XERK-2954, the web's ZOOMS): hours the grid's pane shows, widest first. */

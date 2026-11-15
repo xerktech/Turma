@@ -181,7 +181,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
       the loading notice leaving opened the day at 7:34, not 8:00 (QA). Android does the same.
     - **Scroll math reads the drawn row height back** (`pxPerMin` = `scrollHeight / 1440`), never
       `SLOT_PX` — that is only the no-cqh fallback (10h). A fake scroller in tests has no height.
-  - 30-min rows, working hours 8–17 shaded white, the grid opens with 8:00 at the top, a red
+  - 30-min rows, working hours 9–17 shaded white, the grid opens with 8:00 at the top, a red
     now-line with a dot on today, today's header in the accent with a top bar.
   - Events: a 22% tint of the org color with a 4px solid left bar. The hub gives every event an
     org (XERK-2936, its host's when no rule decides); neutral only for a host in no org;

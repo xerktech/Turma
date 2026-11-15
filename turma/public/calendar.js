@@ -20,7 +20,7 @@ const SLOT_PX = 24;                 // one 30-minute row where the browser canno
 // pane: brief.html sizes `--slot` from `--hours` and the pane's height. Scroll
 // math reads the rendered row height back (pxPerMin), never assumes SLOT_PX.
 const slots = (n, minus = 0) => `calc(var(--slot, ${SLOT_PX}px) * ${n}${minus ? ` - ${minus}px` : ""})`;
-const WORK_FROM_H = 8, WORK_UNTIL_H = 17;  // the shaded working hours; the grid opens at 8:00
+const OPEN_AT_H = 8;  // the grid opens with 8:00 at the top, an hour above the 9–17 shaded working hours (brief.html .cal-col)
 // The zoom steps, as hours the pane shows; the default fits 8 AM - 6 PM (XERK-2954).
 const ZOOMS = [24, 16, 12, 10, 8, 6, 4];
 const ZOOM_DEFAULT = 10;
@@ -266,7 +266,7 @@ let zoomAnchor = -1;              // the wall minute held at the pane's middle a
 // Rendered px per minute: the body is 24h tall. A fake scroller (tests) has no height.
 const pxPerMin = (sc) => (sc.scrollHeight > 0 ? sc.scrollHeight / 1440 : SLOT_PX / 30);
 // 8:00 at the top, its label clear of the edge (in minutes, so a pane resize keeps it).
-const openMin = (sc) => Math.max(0, WORK_FROM_H * 60 - 8 / pxPerMin(sc));
+const openMin = (sc) => Math.max(0, OPEN_AT_H * 60 - 8 / pxPerMin(sc));
 // The rows follow the pane's height, so a height change (the loading notice going, a
 // host notice, a window resize) would slide the view to another time: the wall minute
 // at the pane's top is held instead (QA XERK-2954). The operator's scroll moves it.

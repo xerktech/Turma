@@ -97,6 +97,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.core.CAL_DAILY_EVENT_MS
+import com.xerktech.turma.core.CAL_OPEN_AT_H
 import com.xerktech.turma.core.CAL_WORK_FROM_H
 import com.xerktech.turma.core.CAL_WORK_UNTIL_H
 import com.xerktech.turma.core.CalMode
@@ -649,7 +650,7 @@ private fun WeekGrid(
             val slot = calSlotDp(paneDp, zoomHours).dp
             val hourDp = slot * 2
             // The grid opens with 8 AM at the top (its label clear); a reveal scrolls to its event.
-            LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (hourDp * CAL_WORK_FROM_H - 8.dp).roundToPx() }) }
+            LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (hourDp * CAL_OPEN_AT_H - 8.dp).roundToPx() }) }
             LaunchedEffect(scrollTo) {
                 if (scrollTo >= 0) {
                     scroll.animateScrollTo(with(density) { ((slot * (scrollTo / 30).toFloat()) - hourDp).roundToPx().coerceAtLeast(0) })
