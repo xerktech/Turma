@@ -34205,34 +34205,42 @@ test("XERK-2977: a non-owner's series-level write never drops an occurrence its 
   cleanup2968(D2968A);
   try {
     await beat1574(D2968A, S2968A);
-    const s = (await turma2968("POST", null, weekly2969())).body.event;   // made by break-glass
-    const priv = `${s.id}:${key2969(1)}`;
-    const pub = `${s.id}:${key2969(2)}`;
-    assert.equal((await turma2968("PATCH", priv, { version: 1, sensitivity: "private" })).status, 200);
     const other = { kind: "legacy", roles: [] };
     const later = (k, h) => new Date(T2968 + k * W2969 + h * 36e5).toISOString();
     const refused = (r) => { assert.equal(r.status, 409); assert.match(r.body.error, /made private/); assert.ok(!("event" in r.body)); };
-    // Re-timing the series through a public occurrence, or editing its rule, drops the override: refused.
-    refused(hub.patchTurmaEvent(other, pub, { version: 2, scope: "series", start: later(2, 1), end: later(2, 2) }));
-    refused(hub.patchTurmaEvent(other, s.id, { version: 2, recurrence: { freq: "weekly", interval: 2 } }));
-    // Deleting the series, or "this and following" from before the private one, drops it too.
-    refused(hub.deleteTurmaEvent(other, s.id));
-    refused(hub.deleteTurmaEvent(other, `${s.id}:${key2969(0)}`, "series"));
-    // A "following" edit from a LATER occurrence leaves it on the old series; one that re-times
-    // the split from an earlier occurrence drops it.
-    refused(hub.patchTurmaEvent(other, `${s.id}:${key2969(0)}`, { version: 2, scope: "following", start: later(0, 1), end: later(0, 2) }));
-    // Nothing above changed the series.
-    const still = (await occ2969()).find((e) => e.id === priv);
-    assert.deepEqual([still.sensitivity, still.exception], ["private", true]);
-    // Writes that keep the override still work for a non-owner.
-    assert.equal(hub.patchTurmaEvent(other, s.id, { version: 2, subject: "Renamed" }).status, 200);
-    assert.equal(hub.patchTurmaEvent(other, s.id, { version: 3, recurrence: { freq: "daily" } }).status, 200);
-    assert.equal((await occ2969()).find((e) => e.id === priv).sensitivity, "private");
-    assert.equal(hub.patchTurmaEvent(other, s.id, { version: 4, recurrence: { freq: "weekly" } }).status, 200);
-    const split = hub.patchTurmaEvent(other, `${s.id}:${key2969(3)}`, { version: 5, scope: "following", subject: "Later" });
-    assert.equal(split.status, 200);
-    // The owner may still drop it.
-    assert.equal((await turma2968("DELETE", s.id)).status, 200);
+    for (const sensitivity of ["private", "confidential"]) {
+      const s = (await turma2968("POST", null, weekly2969({ recurrence: { freq: "weekly", count: 6 } }))).body.event;   // made by break-glass
+      const occ = (k) => `${s.id}:${key2969(k)}`;
+      const priv = occ(2);
+      assert.equal((await turma2968("PATCH", priv, { version: 1, sensitivity })).status, 200);
+      // Re-timing the series through a public occurrence or the series id, or a rule it no
+      // longer lands on: refused.
+      refused(hub.patchTurmaEvent(other, occ(3), { version: 2, scope: "series", start: later(3, 1), end: later(3, 2) }));
+      refused(hub.patchTurmaEvent(other, s.id, { version: 2, recurrence: { freq: "weekly", interval: 3 } }));
+      // "This and following" from before it: a re-timed new series drops it (`next`), a rule
+      // that ends the old series first while the new one skips it drops it too.
+      refused(hub.patchTurmaEvent(other, occ(1), { version: 2, scope: "following", start: later(1, 1), end: later(1, 2) }));
+      refused(hub.patchTurmaEvent(other, occ(1), { version: 2, scope: "following", recurrence: { freq: "weekly", interval: 3 } }));
+      // Deleting the series, or "this and following" from before it.
+      refused(hub.deleteTurmaEvent(other, s.id));
+      refused(hub.deleteTurmaEvent(other, occ(0), "series"));
+      refused(hub.deleteTurmaEvent(other, occ(1), "following"));
+      // Nothing above changed the series.
+      const still = (await occ2969()).find((e) => e.id === priv);
+      assert.deepEqual([still.sensitivity, still.exception, still.version], [sensitivity, true, 2]);
+      // Writes that keep the override still work for a non-owner.
+      assert.equal(hub.patchTurmaEvent(other, s.id, { version: 2, subject: "Renamed" }).status, 200);
+      assert.equal(hub.patchTurmaEvent(other, s.id, { version: 3, recurrence: { freq: "daily", count: 40 } }).status, 200);
+      assert.equal((await occ2969()).find((e) => e.id === priv).sensitivity, sensitivity);
+      assert.equal(hub.patchTurmaEvent(other, s.id, { version: 4, recurrence: { freq: "weekly", count: 6 } }).status, 200);
+      // A split from before it carries it unchanged onto the new series.
+      const split = hub.patchTurmaEvent(other, occ(1), { version: 5, scope: "following", subject: "Later" });
+      assert.equal(split.status, 200);
+      assert.equal(hub.deleteTurmaEvent(other, `${split.body.event.id}:${key2969(3)}`, "following").status, 200);
+      // The owner may still drop it.
+      assert.equal((await turma2968("DELETE", split.body.event.id)).status, 200);
+      assert.equal((await turma2968("DELETE", s.id)).status, 200);
+    }
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);
