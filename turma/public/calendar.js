@@ -1616,7 +1616,10 @@ function mountEditor() {
       // back resurrected an attendee the comma had just committed (QA). And a text field
       // never repaints the panel here — a repaint on blur detaches the button the mouse
       // is pressing, and the browser drops that first click (QA: Save did nothing).
-      if (d.edChipin || t.tagName === "INPUT" && t.type === "text" || t.tagName === "TEXTAREA" || t.type === "url") return;
+      if (d.edChipin || t.tagName === "INPUT" && t.type === "text" || t.tagName === "TEXTAREA" || t.type === "url") {
+        if (ed.tried) clearFixedErrors();      // removes messages only: nothing under the pointer moves
+        return;
+      }
       ed.f[d.edField] = String(t.value ?? "");
       // Moving the start keeps the length, as Teams does.
       if ((d.edField === "startDate" || d.edField === "startTime") && ed.prevStart) {

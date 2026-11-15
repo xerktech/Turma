@@ -1502,5 +1502,13 @@ test("XERK-2971 QA: a half-typed start keeps the length; the shifted end is writ
     assert.equal(cal._ed().errors.end, undefined);
     assert.equal(errEnd.removed, true, "the message goes");
     assert.equal(endIn.attrs["aria-invalid"], undefined, "and so does aria-invalid");
+    // A text field fixed after a failed Save clears its message on blur too.
+    cal._ed().f.online = true;
+    cal._ed().f.joinUrl = "HTTPS://x.io/a";
+    await cal.saveEditor();
+    assert.match(cal._ed().errors.joinUrl, /https/);
+    cal._ed().f.joinUrl = "https://x.io/a";
+    fire("change", { dataset: { edField: "joinUrl" }, value: "https://x.io/a", tagName: "INPUT", type: "url" });
+    assert.equal(cal._ed().errors.joinUrl, undefined);
   } finally { panel.querySelector = qs; panel.querySelectorAll = qsa; cal.closeEditor(); }
 }));
