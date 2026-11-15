@@ -33418,7 +33418,13 @@ test("XERK-2968: each tenant sees and edits only its own Turma events; private o
     // Another viewer of tenant A (not the creator) gets it withheld.
     const other = { kind: "user", userId: "someone-else", tenantId: T.A.t, roles: ["user"] };
     const v = hub.calendarView(other, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === id);
-    assert.deepEqual([v.subject, v.private, v.editable], ["Private event", true, true]);
+    assert.deepEqual([v.subject, v.private, v.editable], ["Private event", true, false]);
+    // XERK-2972 QA: nor may that viewer change or delete it — a save of the blanked fields
+    // would wipe the creator's event. The creator still may.
+    assert.deepEqual(hub.patchTurmaEvent(other, id, { version: 1, subject: "Private event", body: "" }).status, 409);
+    assert.equal(hub.deleteTurmaEvent(other, id).status, 409);
+    assert.equal(hub.getCalendarTurmaEvents()[T.A.t][id].subject, "Planning");
+    assert.equal((await turma2968("PATCH", id, { version: 1, subject: "Planning 2" }, T.A.h)).status, 200);
     // Every write announces the tenant-level key; another tenant's viewer never gets it.
     await new Promise((r) => setTimeout(r, 5));
     assert.ok(framesA.some((f) => f.includes("event: calendar") && f.includes(`turma:events@${T.A.t}`)), "A's viewer is told");

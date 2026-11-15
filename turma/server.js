@@ -6376,13 +6376,19 @@ const calTurmaFrameKey = (t) => tenantHostKey("turma:events", t);
 // The caller may edit an event only when it may see EVERY org on it, so nobody
 // strips an org they cannot see.
 const calTurmaMayEdit = (p, rec) => rec.orgs.every((o) => principalMaySite(p, o));
+// A private/confidential event is withheld from every viewer but its creator, and only
+// the creator may change or delete it: a client saving the withheld (blanked) fields
+// back would wipe the creator's event (XERK-2972 QA).
+const calTurmaWithheld = (p, rec) =>
+  (rec.sensitivity === "private" || rec.sensitivity === "confidential") && rec.createdBy !== calTurmaActor(p);
+const CAL_TURMA_PRIVATE_REFUSAL = { status: 409, body: { error: "a private event can be changed only by the one who made it" } };
 const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
 
 // The served form for principal `p`; `served` = the orgs still decided.
 function turmaEventWire(p, rec, served = rec.orgs) {
   const out = { source: "turma", host: "", ...rec, orgs: served, org: served[0] || "",
-    editable: calTurmaMayEdit(p, rec), meeting: calendarLinkCandidate(rec) };
-  if ((rec.sensitivity === "private" || rec.sensitivity === "confidential") && rec.createdBy !== calTurmaActor(p)) {
+    editable: calTurmaMayEdit(p, rec) && !calTurmaWithheld(p, rec), meeting: calendarLinkCandidate(rec) };
+  if (calTurmaWithheld(p, rec)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "",
       categories: [], private: true });
   }
@@ -6522,6 +6528,7 @@ function createTurmaEvent(p, body, now = Date.now()) {
 function patchTurmaEvent(p, id, body, now = Date.now()) {
   const f = calTurmaFind(p, id);
   if (f.status) return f;
+  if (calTurmaWithheld(p, f.rec)) return CAL_TURMA_PRIVATE_REFUSAL;
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { status: 400, body: { error: "body must be {version, orgs?, ...fields}" } };
   }
@@ -6550,6 +6557,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
 function deleteTurmaEvent(p, id) {
   const f = calTurmaFind(p, id);
   if (f.status) return f;
+  if (calTurmaWithheld(p, f.rec)) return CAL_TURMA_PRIVATE_REFUSAL;
   delete calendarTurmaEvents[f.t][id];
   if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
   persistCalendarTurmaEvents();
@@ -30437,7 +30445,7 @@ if (process.env.TURMA_TEST) {
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     // XERK-2968: Turma-created events.
-    sanitizeTurmaEvent, calendarTurmaEventsCoerce, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
+    sanitizeTurmaEvent, calendarTurmaEventsCoerce, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,

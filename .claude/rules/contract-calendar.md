@@ -336,7 +336,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   - `editable` = the caller passes the route check above; `meeting` = `calendarLinkCandidate`.
   - Only events of tenants the caller may see (`principalMaySite` on the record's orgs).
   - A private/confidential event is withheld exactly like an Outlook one for every viewer but its
-    creator (`createdBy`).
+    creator (`createdBy`), and only the creator may PATCH/DELETE it (409 otherwise; served
+    `editable:false`): a client saving the blanked fields back wiped the event (XERK-2972 QA).
 - **Every write broadcasts the coalesced `calendar` frame** under the tenant-level key
   `turma:events@<tenant>` (plain `turma:events` untenanted). The SSE scoper's `mayHost` passes it
   only to that tenant's viewers; clients refetch on any frame, so no client change is needed.
