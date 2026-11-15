@@ -87,6 +87,23 @@ function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
     return fs.existsSync(fileOf(keyOf(meetingId, receivedAt)));
   }
 
+  // Which of `rows` ({meetingId, receivedAt}) have no document kept — locally, nor
+  // (HA) in Postgres, asked in one statement per 500. Throws when Postgres is
+  // unreachable: "can't tell" must never read as "missing" (XERK-2965).
+  async function missing(rows) {
+    let out = rows.filter((r) => !has(r.meetingId, r.receivedAt));
+    if (!pool || !out.length) return out;
+    await ensureSchema();
+    const found = new Set();
+    for (let i = 0; i < out.length; i += 500) {
+      const keys = out.slice(i, i + 500).map((r) => keyOf(r.meetingId, r.receivedAt));
+      const res = await pool.query(`SELECT key FROM ${TABLE} WHERE key IN (${keys.map((_, j) => `$${j + 1}`).join(", ")})`, keys);
+      for (const r of res || []) found.add(r.key);
+    }
+    out = out.filter((r) => !found.has(keyOf(r.meetingId, r.receivedAt)));
+    return out;
+  }
+
   // The stored document, or null when none was kept. Only a document naming the
   // same meeting counts (a hash collision reads as absent, never as another's).
   async function load(meetingId, receivedAt) {
@@ -217,7 +234,7 @@ function makeTranscriptStore({ dir, pool = null, log = console } = {}) {
     return out;
   }
 
-  return { save, has, load, sweep, keyOf, overBudget, SAVE_GRACE_MS, _unsynced: unsynced };
+  return { save, has, missing, load, sweep, keyOf, overBudget, SAVE_GRACE_MS, _unsynced: unsynced };
 }
 
 module.exports = { makeTranscriptStore, keyOf, TABLE };

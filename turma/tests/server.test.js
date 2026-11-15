@@ -29757,6 +29757,73 @@ test("XERK-2941: a settled meeting's full transcript is kept, served to its org 
   cleanup2508(O, ["mtTrO2941"]);
 });
 
+test("XERK-2965: Tenir lists the settled meetings with no transcript kept and back-fills them by resend", async () => {
+  const S = "mtBf2965.atlassian.net";
+  const O = "mtBfO2965.atlassian.net";
+  await meetHost2508("mtBf2965", S);
+  await beat1574("mtBfO2965", O);
+  const list = (site, headers = meetHeaders2508) =>
+    request("GET", `/api/orgs/${encodeURIComponent(site)}/meetings/missing-transcripts`, { headers });
+  // A meeting settled before transcripts were kept, and one whose document is kept.
+  hub.getMeetings()[S] = [
+    hub.sanitizeMeeting({ meetingId: "old1", title: "Old", platform: "zoom",
+      startedAt: 1, endedAt: 2, receivedAt: 3, status: "ok", items: [] }),
+    hub.sanitizeMeeting({ meetingId: "kept1", title: "Kept", platform: "zoom",
+      startedAt: 1, endedAt: 2, receivedAt: 4, status: "failed", error: "x" }),
+    hub.sanitizeMeeting({ ...meeting2508("wait1"), status: "queued", receivedAt: 5 }),
+  ];
+  hub.meetingTranscripts.save("kept1", 4, { segments: [{ speaker: "A", text: "hi", startMs: 0, endMs: 1 }] });
+  // Tenir's bearer only; a pending meeting keeps its own segments, so it is never listed.
+  assert.equal((await list(S, { authorization: "Bearer nope" })).status, 401);
+  assert.equal((await list(S, userHeaders)).status, 401, "the operator login is not Tenir's bearer");
+  assert.deepEqual((await list(S)).body, { meetingIds: ["old1"] });
+  assert.equal((await list("nobody2965.atlassian.net")).status, 404);
+  assert.deepEqual((await list(O)).body, { meetingIds: [] }, "another org's rows are not listed");
+  // The resend saves the transcript and leaves the row alone (first copy wins).
+  const before = JSON.stringify(hub.getMeetings()[S][0]);
+  const segs = [{ speaker: "Ann", text: "the old words", startMs: 0, endMs: 900 }];
+  const r = await postMeeting2508(S, meeting2508("old1", { title: "Renamed", segments: segs, backfill: true }));
+  assert.deepEqual([r.status, r.body.duplicate, r.body.transcriptSaved], [200, true, true]);
+  assert.equal(JSON.stringify(hub.getMeetings()[S][0]), before);
+  const got = await request("GET", `/api/orgs/${encodeURIComponent(S)}/meetings/old1/transcript`, { headers: userHeaders });
+  assert.deepEqual([got.status, got.body.segments], [200, segs]);
+  assert.deepEqual((await list(S)).body, { meetingIds: [] });
+  // A kept transcript is never overwritten by a later resend.
+  const again = await postMeeting2508(S, meeting2508("old1", { segments: [{ text: "other", startMs: 0, endMs: 1 }], backfill: true }));
+  assert.deepEqual([again.status, again.body.transcriptSaved], [200, undefined]);
+  assert.equal((await hub.meetingTranscripts.load("old1", 3)).segments[0].text, "the old words");
+  // A backfill for a meeting the hub no longer holds creates nothing (it would be read twice).
+  const gone = await postMeeting2508(S, meeting2508("gone1", { backfill: true }));
+  assert.equal(gone.status, 404);
+  assert.equal(hub.getMeetings()[S].some((m) => m.meetingId === "gone1"), false);
+  assert.equal(meetCmds2508("mtBf2965").length, 0, "no read was started");
+  cleanup2508(S, ["mtBf2965"]);
+  cleanup2508(O, ["mtBfO2965"]);
+});
+
+test("XERK-2965: missing() asks Postgres once for what the disk lacks, and throws when it cannot tell", async () => {
+  const { makeTranscriptStore } = require("../meeting-transcripts.js");
+  const dir = fs.mkdtempSync(path.join(scratchDir(), "mtm2965-"));
+  const remote = new Set();
+  let fail = false;
+  let selects = 0;
+  const pool = { async query(sql, params = []) {
+    if (/^CREATE TABLE/.test(sql)) return [];
+    if (/^INSERT/.test(sql)) return [];
+    if (/^SELECT key FROM/.test(sql)) { selects++; if (fail) throw new Error("down"); return params.filter((k) => remote.has(k)).map((key) => ({ key })); }
+    throw new Error(`unexpected SQL ${sql}`);
+  } };
+  const st = makeTranscriptStore({ dir, pool, log: { error() {} } });
+  st.save("disk", 1, { segments: [] });
+  remote.add(st.keyOf("pg", 2));
+  const rows = [{ meetingId: "disk", receivedAt: 1 }, { meetingId: "pg", receivedAt: 2 }, { meetingId: "none", receivedAt: 3 }];
+  assert.deepEqual((await st.missing(rows)).map((r) => r.meetingId), ["none"]);
+  assert.equal(selects, 1);
+  fail = true;
+  await assert.rejects(st.missing(rows));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("XERK-2941 QA: the transcript store holds its byte budget by the biggest tenant's oldest, and ignores a colliding id", async () => {
   const { makeTranscriptStore } = require("../meeting-transcripts.js");
   const dir = fs.mkdtempSync(path.join(scratchDir(), "mtr2941-"));
