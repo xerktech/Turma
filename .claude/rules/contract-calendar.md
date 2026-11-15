@@ -212,6 +212,8 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   - ≤`CALENDAR_LINK_SCAN_MAX` (200) candidates are scored per capture.
   - Candidates: events of hosts of the MEETING's tenant only, whose `org` is the meeting's org;
     never `canceled`.
+  - And the tenant's Turma events whose `orgs` contains the meeting's org (XERK-2970): one event
+    in orgs A and B links captures of either. The link is the same `calendarEventId` (a `turma:` id).
   - **Only real meetings** (`calendarLinkCandidate`): someone other than the organizer invited
     (a resource does not count) or a join link/online meeting; not all-day, ≤12h, not declined, `busy` not free/outOfOffice/workingElsewhere. Why:
     a capture inside Focus time / Lunch / WFH linked to that block and never left (QA).
@@ -226,10 +228,15 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   happened). An auto link to a still-overlapping event yields only to another event scoring over
   it by the margin (a late invite); one whose event left the store (sync, `calendarTick`) or
   now counts for another org rematches. An operator's choice is never touched by the matcher.
+  - A Turma event deleted, or the meeting's org dropped from its `orgs`, has left the store for
+    that org: an auto link rematches; an operator link is kept and served `calendarEventMissing`.
+  - **Every Turma event write (create, edit, delete, org loss in `calendarTurmaTick`) schedules
+    `scheduleCalendarRelink` for its tenant**, like a changed Outlook sync.
 - `POST /api/orgs/<site>/meetings/<mid>/calendar` (OPERATOR-authed, `org` class):
   `{eventId}` link | `{eventId: null}` unlink for good | `{auto: true}` back to the matcher.
   Exactly one shape (`auto` with `eventId`, or `auto: false`, is a 400).
-  400 body → 404 org no host is decided into / meeting / an id no host of the org's TENANT holds.
+  400 body → 404 org no host is decided into / meeting / an id the org's TENANT holds neither on a
+  host nor as a Turma event.
   Answers `{ok, meeting}` (meetingWire, with `calendarEvent`).
 - **Served on `GET /api/calendar`**: every Outlook event carries `source: "outlook"` and
   `meetings: [{site, meetingId, title}]` (linked captures of orgs the caller may see).
@@ -334,6 +341,11 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   - `orgs` served = the stored ones still decided in the record's tenant; none left = not served.
   - `org = orgs[0]` keeps older clients' colour; the `?org=` filter matches when ANY of `orgs` is in it.
   - `editable` = the caller passes the route check above; `meeting` = `calendarLinkCandidate`.
+  - `meetings` (XERK-2970): its linked captures, exactly as on an Outlook event; their own
+    Turma-only entries are dropped. No `matchOrg`: it counts for every org in `orgs`.
+  - Beside a linked capture (`meetingWire`'s `calendarEvent`) it is `host: ""`, `org` = the
+    capture's org; a private/confidential one is withheld there for EVERY viewer, its creator too
+    (the meetings frame has no principal).
   - Only events of tenants the caller may see (`principalMaySite` on the record's orgs).
   - A private/confidential event is withheld exactly like an Outlook one for every viewer but its
     creator (`createdBy`).
