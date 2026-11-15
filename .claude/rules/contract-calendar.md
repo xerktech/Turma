@@ -409,6 +409,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   - **Kept only while the key is still an occurrence** (checked by the whitelist), so editing the
     rule — or re-timing the series — drops the ones it no longer lands on.
   - A moved occurrence is served where it moved to, also into or out of the asked range.
+- **A private event's owner rule (XERK-2972) applies per occurrence too**: a write naming an
+  occurrence made private alone is refused (409) to anyone but the owner, like a private series.
 - **Orgs are series-level**: an occurrence cannot change orgs or zone (400), so one series is one
   org set. An occurrence edit that resends the series' OWN orgs/zone unchanged is accepted (the
   web form sends every field).

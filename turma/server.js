@@ -6459,6 +6459,10 @@ function calTurmaOwner(p, rec) {
   return !!t && p?.kind === "user" && p.tenantId === t && !String(rec.createdBy).startsWith("user:");
 }
 const calTurmaWithheld = (p, rec) => CAL_TURMA_HIDDEN.has(rec.sensitivity) && !calTurmaOwner(p, rec);
+// A write target withheld from `p`: the series, or the one occurrence it names
+// when that occurrence alone was made private (XERK-2969).
+const calTurmaHiddenFrom = (p, f) => calTurmaWithheld(p, f.rec) ||
+  (!!f.occ && calTurmaWithheld(p, turmaOccurrenceRecord(f.rec, f.occ, f.rec.exceptions[f.key])));
 const CAL_TURMA_PRIVATE_REFUSAL = { status: 409, body: { error: "a private event can be changed only by the one who made it" } };
 const CAL_TURMA_MAKE_PRIVATE_REFUSAL = { status: 409, body: { error: "only the one who made an event can make it private" } };
 const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
@@ -6749,7 +6753,7 @@ function calTurmaEndBefore(rec, occ, t, now) {
 function patchTurmaEvent(p, id, body, now = Date.now()) {
   const f = calTurmaTarget(p, id);
   if (f.status) return f;
-  if (calTurmaWithheld(p, f.rec)) return CAL_TURMA_PRIVATE_REFUSAL;
+  if (calTurmaHiddenFrom(p, f)) return CAL_TURMA_PRIVATE_REFUSAL;
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { status: 400, body: { error: "body must be {version, scope?, orgs?, ...fields}" } };
   }
@@ -6884,7 +6888,7 @@ function patchTurmaOccurrence(p, f, body, now) {
 function deleteTurmaEvent(p, id, scope, now = Date.now()) {
   const f = calTurmaTarget(p, id);
   if (f.status) return f;
-  if (calTurmaWithheld(p, f.rec)) return CAL_TURMA_PRIVATE_REFUSAL;
+  if (calTurmaHiddenFrom(p, f)) return CAL_TURMA_PRIVATE_REFUSAL;
   const sc = calTurmaScope(f, scope);
   if (sc.error) return sc.error;
   if (sc.scope === "series") {

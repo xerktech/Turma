@@ -34180,3 +34180,21 @@ test("XERK-2969: a relink past the index's work bound leaves the rows it could n
     cleanup2896(A, ["cutA2969"]);
   }
 });
+
+test("XERK-2969: an occurrence made private by its owner is the owner's alone to change or delete", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const s = (await turma2968("POST", null, weekly2969())).body.event;   // made by break-glass
+    const occ = `${s.id}:${key2969(1)}`;
+    assert.equal((await turma2968("PATCH", occ, { version: 1, sensitivity: "private" })).status, 200);
+    const other = { kind: "legacy", roles: [] };
+    assert.equal(hub.patchTurmaEvent(other, occ, { version: 2, sensitivity: "normal" }).status, 409);
+    assert.equal(hub.deleteTurmaEvent(other, occ).status, 409);
+    // The rest of the series is still everyone's.
+    assert.equal(hub.patchTurmaEvent(other, `${s.id}:${key2969(2)}`, { version: 2, subject: "Fine" }).status, 200);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
