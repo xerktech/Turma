@@ -67,6 +67,10 @@ A pure-core/adapter-shell split:
   - `LiveTail` closes its socket in a `finally`: an `awaitClose` after the reconnect loop never ran on
     cancel, so every chat left kept its socket and the hub kept the agent tailing it.
   - Tests: `vm/ChatLiveFeedTest`.
+- **Narrow Sessions keeps the list's place across a session** (XERK-2955): `SessionsRoute` owns the
+  list's `LazyListState` and the last-closed session (`lastKey`, the selected border), because narrow
+  mode disposes `SessionsListPane` while a chat is open. Never move either back into the pane.
+  Tests: `ui/SessionsBackPositionTest`.
 - No in-place chat/terminal toggle (terminal is its own screen), so the compose draft lives in
   `data/DraftStore.kt` keyed per (host, session); `ChatViewModel` mirrors it into
   `ChatUiState.draft`, writing every change (dictation, send-clears) back through it. Tests:

@@ -16,6 +16,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,6 +53,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -429,6 +433,15 @@ fun SessionsRoute(
     // empty box after reading the first result. Searching means trying results
     // in turn, so it has to survive the round trip.
     var query by rememberSaveable { mutableStateOf("") }
+    // The list's scroll position, hoisted HERE for the same reason as the query
+    // (XERK-2955): narrow mode disposes the list pane while a session is open, so
+    // a state remembered inside it came back at the top on every Back. Saveable,
+    // so it also survives a terminal/trajectory round trip and a fold/unfold.
+    val listState = rememberLazyListState()
+    // The session last backed out of in narrow mode (XERK-2955), so the list
+    // marks where the operator just was — the wide pane marks its live selection
+    // the same way. Replaced by the next pick.
+    var lastKey by rememberSaveable { mutableStateOf<String?>(null) }
     val select: (String, String) -> Unit = { h, s ->
         endHost = null; endTid = null; subType = null; subLabel = null; subAgentId = ""
         selHost = h; selId = s
@@ -443,6 +456,7 @@ fun SessionsRoute(
         if (subAgentId.isNotEmpty()) subAgentId = "" else { subType = null; subLabel = null }
     }
     val clear: () -> Unit = {
+        lastKey = selKey(selHost, selId) ?: selKey(endHost, endTid) ?: lastKey
         selHost = null; selId = null; endHost = null; endTid = null
         subType = null; subLabel = null; subAgentId = ""
     }
@@ -499,6 +513,7 @@ fun SessionsRoute(
             Row(m.fillMaxSize()) {
                 SessionsListPane(
                     selectedKey = selKey(selHost, selId) ?: selKey(endHost, endTid),
+                    listState = listState,
                     onSelect = select,
                     onSelectEnded = selectEnded,
                     query = query, onQuery = { query = it },
@@ -514,7 +529,8 @@ fun SessionsRoute(
         // Narrow, nothing picked: just the list.
         else -> MainScaffold(TopDest.SESSIONS, onNavigate) { m ->
             SessionsListPane(
-                selectedKey = null, onSelect = select, onSelectEnded = selectEnded,
+                selectedKey = lastKey, listState = listState,
+                onSelect = select, onSelectEnded = selectEnded,
                 query = query, onQuery = { query = it }, modifier = m,
             )
         }
@@ -538,6 +554,7 @@ private fun DetailEmpty() {
 fun SessionsListPane(
     selectedKey: String?,
     onSelect: (String, String) -> Unit,
+    listState: LazyListState = rememberLazyListState(),
     onSelectEnded: (String, String) -> Unit = { _, _ -> },
     query: String = "",
     onQuery: (String) -> Unit = {},
@@ -617,6 +634,7 @@ fun SessionsListPane(
         )
         LazyColumn(
             Modifier.fillMaxSize(),
+            state = listState,
             contentPadding = PaddingValues(10.dp, 4.dp, 10.dp, 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
@@ -907,7 +925,7 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel:
 private fun EndedSessionRow(
     e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit,
 ) {
-    val cardMod = Modifier.fillMaxWidth().then(
+    val cardMod = Modifier.fillMaxWidth().semantics { this.selected = selected }.then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
         else Modifier,
@@ -1047,7 +1065,7 @@ private fun SessionListCard(
     onMove: (String) -> Unit,
     onClick: () -> Unit,
 ) {
-    val cardMod = Modifier.fillMaxWidth().then(
+    val cardMod = Modifier.fillMaxWidth().semantics { this.selected = selected }.then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
         else Modifier,
