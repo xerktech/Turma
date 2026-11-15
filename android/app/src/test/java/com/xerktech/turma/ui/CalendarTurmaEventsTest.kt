@@ -221,6 +221,10 @@ class CalendarTurmaEventsTest {
         compose.onNodeWithTag("cal-new-event").performClick()
         compose.onNodeWithTag("cal-ed-title").performTextInput("Account A's draft")
         assertEquals("Account A's draft", cvm.editor.value?.draft?.subject)
+        // A re-login on the SAME account (a refreshed session token) keeps it.
+        val cfg = hub.app.container.config.current
+        hub.app.container.config.save(cfg.hubUrl, cfg.user, cfg.password, "fresh-token")
+        assertEquals("Account A's draft", cvm.editor.value?.draft?.subject)
         hub.app.container.config.clear()   // what sign-out does
         assertEquals(null, cvm.editor.value)
         assertEquals(null, hub.app.container.calendarEditor.value)
