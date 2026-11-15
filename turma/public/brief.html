@@ -256,7 +256,8 @@
   .cal-grid > .cal-scroll { flex: 1 1 0; }
   .cal-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
   .cal-bar .sp { flex: 1 1 auto; }
-  .cal-modes { display: inline-flex; gap: 6px; }
+  .cal-modes, .cal-zoom { display: inline-flex; gap: 6px; }
+  button.cal-ic[aria-disabled="true"] { opacity: .45; cursor: default; }
   button.cal-ic { min-width: 30px; height: 30px; padding: 0 6px; font-size: 18px; line-height: 1; }
   .cal-range-wrap { position: relative; }
   button.cal-range { border: 0; background: none; font-family: var(--font-display); font-size: 17px; font-weight: 600; color: var(--ink); padding: 4px 6px; }
@@ -291,10 +292,10 @@
   .cal-hol { font-size: 11.5px; padding: 2px 6px; border-radius: 3px; background: var(--hairline); color: var(--ink-2);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cal-scroll { min-height: 360px; container-type: size; overflow-y: auto; overscroll-behavior: contain; }
-  /* 48 rows fill the pane once it is taller than 48 x 24px (XERK-2937). */
-  .cal-body { position: relative; --slot: 24px; }
+  /* The zoom (XERK-2954): --hours (calendar.js, default 10 = 8 AM-6 PM) fill the pane. */
+  .cal-body { position: relative; --hours: 10; --slot: calc(240px / var(--hours)); }
   /* Gated: a browser without cqh would hold an invalid --slot and lose every row. */
-  @supports (height: 1cqh) { .cal-body { --slot: max(24px, 100cqh / 48); } }
+  @supports (height: 1cqh) { .cal-body { --slot: max(10px, 100cqh / (var(--hours) * 2)); } }
   .cal-gutter { position: relative; }
   .cal-hr { position: absolute; right: 6px; transform: translateY(-50%); font-size: 10.5px; color: var(--muted); white-space: nowrap; }
   .cal-col { position: relative; border-left: 1px solid var(--hairline);

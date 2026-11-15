@@ -1104,3 +1104,131 @@ test("XERK-2939: the detail panel's tint is exactly the session card's mix", () 
   assert.equal(mix(read("app.css"), "\\.kanban-card"), card);
   assert.equal(mix(read("brief.html"), "\\.cal-detail"), card, "the panel matches the session card (operator's rule)");
 });
+
+test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  replies = { "/api/calendar": () => ({ hosts: [], events: [] }) };
+  const [grid] = root.children;
+  // A 600px pane: rows are max(10px, 600 / (hours * 2)), so the day is 48 rows of that.
+  const scroller = { scrollTop: 0, clientHeight: 600,
+    get scrollHeight() { return 48 * Math.max(10, 600 / (cal._state().zoomHours * 2)); } };
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  try {
+    cal._go(at(2026, 11, 12));
+    cal.setActive(true);
+    for (let i = 0; i < 4; i++) await tick();
+    assert.equal(cal._state().zoomHours, 10, "opens showing 10 hours");
+    assert.match(cal.calendarHtml(), /--hours:10;/);
+    const ppm = () => scroller.scrollHeight / 1440;
+    const mid = () => (scroller.scrollTop + 300) / ppm();
+    scroller.scrollTop = 500;
+    const before = mid();
+    click({ zoom: "1" });
+    assert.equal(cal._state().zoomHours, 8);
+    assert.match(cal.calendarHtml(), /--hours:8;/);
+    assert.ok(Math.abs(mid() - before) < 1e-6, "the middle minute stays put");
+    for (let i = 0; i < 9; i++) click({ zoom: "1" });
+    assert.equal(cal._state().zoomHours, cal.ZOOMS[cal.ZOOMS.length - 1], "zoom in stops at the last step");
+    assert.match(cal.calendarHtml(), /data-zoom="1" aria-label="Zoom in" title="Zoom in" aria-disabled="true"/);
+    for (let i = 0; i < 9; i++) click({ zoom: "-1" });
+    assert.equal(cal._state().zoomHours, 24, "zoom out stops at the whole day");
+    assert.match(cal.calendarHtml(), /data-zoom="-1" aria-label="Zoom out" title="Zoom out" aria-disabled="true"/);
+    assert.match(cal.calendarHtml(), /data-zoom="1" aria-label="Zoom in" title="Zoom in \(fewer hours\)">/);
+  } finally {
+    while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
+    grid.querySelector = qs;
+    cal.setActive(false);
+  }
+});
+
+test("XERK-2954: brief.html sizes the rows from --hours over the pane's height", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "..", "public", "brief.html"), "utf8");
+  assert.match(html, /\.cal-body \{ position: relative; --hours: 10; --slot: calc\(240px \/ var\(--hours\)\); \}/);
+  assert.match(html, /--slot: max\(10px, 100cqh \/ \(var\(--hours\) \* 2\)\)/);
+});
+
+test("XERK-2954 QA: the grid opens with 8:00 at the top and keeps it while the pane changes height", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  let hold;
+  replies = { "/api/calendar": () => new Promise((r) => { hold = r; }) };
+  const [grid] = root.children;
+  // The loading notice takes 26px off the pane until the week lands (QA: 597 -> 623px).
+  const pane = { h: 597 };
+  const slotPx = () => Math.max(10, pane.h / (cal._state().zoomHours * 2));
+  const scroller = { id: "calScroll", scrollTop: 0, get clientHeight() { return pane.h; },
+    get scrollHeight() { return 48 * slotPx(); } };
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  // In px off the line: the open leaves 8px above 8:00 so its label is not cut.
+  const ppm = () => scroller.scrollHeight / 1440;
+  const topOff = (min) => min * ppm() - scroller.scrollTop;
+  const topAt = () => scroller.scrollTop / ppm();
+  try {
+    cal._reopen();
+    cal.refetch();
+    cal._go(at(2026, 11, 12));
+    cal.setActive(true);
+    for (let i = 0; i < 4; i++) await tick();
+    assert.ok(Math.abs(topOff(480) - 8) < 0.5, `opens at 8:00 (8:00 is ${topOff(480)}px down)`);
+    pane.h = 623;
+    // The open's own scroll event lands after the pane grew (QA): it is not the operator's.
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    hold({ hosts: [], events: [{ host: "h1", id: "z1", org: "", subject: "Late", startMs: at(2026, 11, 12, 9), endMs: at(2026, 11, 12, 10) }] });
+    for (let i = 0; i < 8; i++) await tick();
+    assert.ok(Math.abs(topOff(480) - 8) < 0.5, `still 8:00 once the notice goes (${topOff(480)}px down)`);
+    assert.ok(Math.abs(topOff(1080) - pane.h - 8) < 0.5, "and 6 PM at the bottom, 8px past it");
+    // A window resize keeps the operator's place, not the pixel offset.
+    scroller.scrollTop = 600 * (scroller.scrollHeight / 1440);
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    pane.h = 900;
+    cal.setActive(true);  // a repaint
+    assert.ok(Math.abs(topAt() - 600) < 1, `resize holds 10:00 at the top (top ${topAt()})`);
+    // QA: scrolling away and back to the pixel the calendar last wrote still counts.
+    const scrollTo = (min) => { scroller.scrollTop = min * ppm(); for (const f of grid.listeners.scroll || []) f({ target: scroller }); };
+    pane.h = 700;
+    cal.setActive(true);                     // writes 10:00 at the new height, arming one event
+    const written = scroller.scrollTop;
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });   // that write's own event
+    scrollTo(780);
+    scroller.scrollTop = written;            // back to the written pixel
+    for (const f of grid.listeners.scroll || []) f({ target: scroller });
+    pane.h = 640;
+    cal.setActive(true);
+    assert.ok(Math.abs(topAt() - 600) < 1, `the operator's return to 10:00 is kept (top ${topAt()})`);
+  } finally {
+    grid.querySelector = qs;
+    cal.setActive(false);
+  }
+});
+
+test("XERK-2954 QA: Ctrl+wheel zooms one step per notch, a stale leftover never fires, the pick is saved", () => {
+  const saved = {};
+  globalThis.localStorage = { getItem: (k) => saved[k] ?? null, setItem: (k, v) => { saved[k] = v; } };
+  const inGrid = { closest: (sel) => (sel === ".cal-grid" ? {} : null) };
+  const wheel = (deltaY, extra = {}) => { for (const f of root.listeners.wheel) f({ ctrlKey: true, deltaY, target: inGrid, preventDefault() {}, ...extra }); };
+  const realNow = Date.now;
+  let t = 1e6;
+  Date.now = () => t;
+  try {
+    assert.equal(cal._state().zoomHours, 10);
+    wheel(-100);
+    assert.equal(cal._state().zoomHours, 8, "wheel up zooms in");
+    assert.equal(saved["turma-calendar-zoom"], "8", "kept per viewer");
+    wheel(12); wheel(12); wheel(12);
+    assert.equal(cal._state().zoomHours, 8, "small deltas gather");
+    t += 2000;
+    wheel(12);
+    assert.equal(cal._state().zoomHours, 8, "a pause drops the leftover");
+    wheel(-30); wheel(30);
+    assert.equal(cal._state().zoomHours, 8, "a turn of direction drops the leftover");
+    wheel(3, { deltaMode: 1 });
+    assert.equal(cal._state().zoomHours, 10, "one line-mode notch zooms out");
+    wheel(-100, { ctrlKey: false });
+    assert.equal(cal._state().zoomHours, 10, "a plain wheel only scrolls");
+  } finally {
+    Date.now = realNow;
+    delete globalThis.localStorage;
+    while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
+  }
+});
