@@ -87,6 +87,8 @@ const ROUTES = [
   ["POST", "/api/jira/refresh", "filtered"],
   // The caller's hosts' calendars (XERK-2891): calendarView keeps only hosts it may drive.
   ["GET", "/api/calendar", "filtered"],
+  // Turma-created events (XERK-2968): the handlers check every org in the body and on the event.
+  ["POST", "/api/calendar/events", "filtered"], ["PATCH DELETE", "/api/calendar/events/:id", "filtered"],
   // per host (the operator commands)
   ["POST", "/api/agents/:host/clone", "host"],
   ["POST", "/api/agents/:host/repos/:repo/prune", "host"],

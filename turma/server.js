@@ -688,6 +688,8 @@ const HOLIDAY_SETTINGS_FILE = process.env.HOLIDAY_SETTINGS_FILE || "/data/holida
 const CALENDAR_EVENTS_FILE = process.env.CALENDAR_EVENTS_FILE || "/data/calendar-events.json";
 const CALENDAR_ORG_RULES_FILE = process.env.CALENDAR_ORG_RULES_FILE || "/data/calendar-org-rules.json";
 const CALENDAR_HOST_SETTINGS_FILE = process.env.CALENDAR_HOST_SETTINGS_FILE || "/data/calendar-host-settings.json";
+// Events made in Turma (XERK-2968): tenant -> eventId -> record, each in one or more orgs.
+const CALENDAR_TURMA_EVENTS_FILE = process.env.CALENDAR_TURMA_EVENTS_FILE || "/data/calendar-turma-events.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
@@ -5977,6 +5979,95 @@ const persistCalendarHostSettings = registerExternalStore({
   install: (v) => { calendarHostSettings = v; },
 });
 
+// ---- Turma-created events (XERK-2968) ------------------------------------------
+// Events made in Turma, owned by the hub and never written to Outlook: tenant id
+// ("" = untenanted) -> eventId -> record. Keyed by TENANT because one event may
+// belong to several orgs of that tenant. Contract: contract-calendar.md
+// ("Turma-created events").
+const CALENDAR_TURMA_EVENTS_MAX = 1500;           // per tenant (a host's Outlook cap)
+const CALENDAR_TURMA_BYTES_MAX = 2 << 20;         // per tenant, JSON bytes
+const CALENDAR_TURMA_ORGS_MAX = 20;
+const CALENDAR_TURMA_BODY_MAX = 64 << 10;         // a route's request body
+const CALENDAR_TURMA_ORG_GRACE_MS = 864e5;        // undecided this long -> dropped from orgs
+const CAL_TURMA_ID_RE = /^turma:[0-9a-f]{16}$/;
+const CAL_TURMA_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere"]);
+const CAL_TURMA_ROLE = new Set(["required", "optional"]);
+const CAL_TENANT_BUCKET_RE = /^(?:[0-9a-f]{32})?$/;
+const CAL_ACTOR_RE = /^[\w.:@-]{1,200}$/;
+// The fields a client writes; everything else on a record is the hub's.
+const CAL_TURMA_FIELDS = ["subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
+  "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity"];
+
+// An IANA zone the runtime knows, in its canonical spelling (so the coerce is a
+// fixed point), else "".
+function calTimeZone(v) {
+  if (typeof v !== "string" || !v || v.length > 64) return "";
+  try {
+    return new Intl.DateTimeFormat("en-US", { timeZone: v }).resolvedOptions().timeZone || "";
+  } catch {
+    return "";
+  }
+}
+// The ONE record whitelist (routes, boot restore, HA watch) for tenant `t`'s
+// bucket. Field order is fixed and every value re-derives to itself.
+function sanitizeTurmaEvent(v, t) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const id = typeof v.id === "string" && CAL_TURMA_ID_RE.test(v.id) ? v.id : "";
+  const start = calIso(v.start);
+  const end = calIso(v.end);
+  if (!id || !start || !end) return null;
+  const startMs = Date.parse(start);
+  const endMs = Date.parse(end);
+  if (endMs < startMs) return null;
+  const orgs = [];
+  for (const o of Array.isArray(v.orgs) ? v.orgs.slice(0, CALENDAR_TURMA_ORGS_MAX) : []) {
+    if (typeof o === "string" && o && o.length <= 200 && tenantOfSite(o) === t && !orgs.includes(o)) orgs.push(o);
+  }
+  if (!orgs.length) return null;
+  const attendees = [];
+  for (const p of Array.isArray(v.attendees) ? v.attendees.slice(0, 100) : []) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) continue;
+    attendees.push({ name: meetingText(p.name, 100), email: calEmail(p.email),
+      role: typeof p.role === "string" && CAL_TURMA_ROLE.has(p.role) ? p.role : "required" });
+  }
+  const categories = (Array.isArray(v.categories) ? v.categories.slice(0, 20) : [])
+    .map((c) => meetingText(c, 100)).filter(Boolean);
+  const url = meetingText(v.joinUrl, 500);
+  return {
+    id, orgs, subject: meetingText(v.subject, 300), start, end, startMs, endMs,
+    timeZone: calTimeZone(v.timeZone) || "UTC", allDay: v.allDay === true,
+    location: meetingText(v.location, 300), body: meetingText(v.body, CALENDAR_BODY_MAX, true), attendees,
+    joinUrl: CAL_URL_RE.test(url) ? url : "", isOnlineMeeting: v.isOnlineMeeting === true,
+    busy: typeof v.busy === "string" && CAL_TURMA_BUSY.has(v.busy) ? v.busy : "busy", categories,
+    sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
+    // Filled by the recurrence child (XERK-2969); until then every event is single.
+    recurrence: null,
+    createdBy: typeof v.createdBy === "string" && CAL_ACTOR_RE.test(v.createdBy) ? v.createdBy : "",
+    createdAt: calMs(v.createdAt), updatedAt: calMs(v.updatedAt),
+    version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
+  };
+}
+function calendarTurmaEventsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [t, bucket] of Object.entries(raw).slice(0, 2000)) {
+    if (!CAL_TENANT_BUCKET_RE.test(t) || !bucket || typeof bucket !== "object" || Array.isArray(bucket)) continue;
+    const b = Object.create(null);
+    for (const [id, rec] of Object.entries(bucket).slice(0, CALENDAR_TURMA_EVENTS_MAX)) {
+      const ev = sanitizeTurmaEvent(rec, t);
+      if (ev && ev.id === id) b[id] = ev;
+    }
+    if (Object.keys(b).length) out[t] = b;
+  }
+  return out;
+}
+let calendarTurmaEvents = calendarTurmaEventsCoerce(readJsonFile(CALENDAR_TURMA_EVENTS_FILE));
+const persistCalendarTurmaEvents = registerExternalStore({
+  name: "calendarTurmaEvents", file: CALENDAR_TURMA_EVENTS_FILE,
+  coerce: calendarTurmaEventsCoerce, read: () => calendarTurmaEvents,
+  install: (v) => { calendarTurmaEvents = v; },
+});
+
 // ---- budget --------------------------------------------------------------------
 const calEventBytes = (e) => Buffer.byteLength(JSON.stringify(e));
 const calHostBytes = (h) => h.events.reduce((n, e) => n + calEventBytes(e), 0);
@@ -6280,7 +6371,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       events.push({ source: "outlook", ...w });
     }
   }
-  events = events.concat(tenir.entries, ...tenir.linked.values());
+  events = events.concat(tenir.entries, ...tenir.linked.values(), calendarTurmaView(p, from, until, orgFilter));
   events.sort((a, b) => a.startMs - b.startMs || (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   const truncated = events.length > CALENDAR_SERVE_MAX;
@@ -6362,6 +6453,244 @@ function setCalendarHostSettings(key, body) {
   return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
 }
 
+// ---- Turma-created events: routes' logic and serving (XERK-2968) ----------------
+// Who made an event, as its record keeps it: a user's id, else the principal kind.
+const calTurmaActor = (p) => (!p ? "" : p.kind === "user" ? `user:${p.userId}` : String(p.kind));
+// The tenant-level `calendar` frame key: the SSE scoper's mayHost passes it to that
+// tenant's viewers only, like a host key of the tenant.
+const calTurmaFrameKey = (t) => tenantHostKey("turma:events", t);
+// The caller may edit an event only when it may see EVERY org on it, so nobody
+// strips an org they cannot see.
+const calTurmaMayEdit = (p, rec) => rec.orgs.every((o) => principalMaySite(p, o));
+const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
+
+// The served form for principal `p`; `served` = the orgs still decided.
+function turmaEventWire(p, rec, served = rec.orgs) {
+  const out = { source: "turma", host: "", ...rec, orgs: served, org: served[0] || "",
+    editable: calTurmaMayEdit(p, rec), meeting: calendarLinkCandidate(rec) };
+  if ((rec.sensitivity === "private" || rec.sensitivity === "confidential") && rec.createdBy !== calTurmaActor(p)) {
+    Object.assign(out, { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "",
+      categories: [], private: true });
+  }
+  return out;
+}
+// The Turma events overlapping [from, until) that `p` may see, filtered on ANY org.
+function calendarTurmaView(p, from, until, orgFilter) {
+  const out = [];
+  const decided = decidedOrgs();
+  // principalMaySite on each org is the tenant boundary: a record's orgs are all of its tenant.
+  for (const bucket of Object.values(calendarTurmaEvents)) {
+    for (const rec of Object.values(bucket)) {
+      if (rec.startMs >= until || rec.endMs < from || (rec.endMs === from && rec.endMs !== rec.startMs)) continue;
+      const served = rec.orgs.filter((o) => decided.has(o) && principalMaySite(p, o));
+      if (!served.length || (orgFilter && !served.some((o) => orgFilter.has(o)))) continue;
+      out.push(turmaEventWire(p, rec, served));
+    }
+  }
+  return out;
+}
+
+// A 400 naming the first malformed client field of `b`, or null. Never coerces a
+// wrong value into a different event.
+function turmaEventFieldError(b) {
+  const cps = (s) => [...s].length;
+  for (const k of ["start", "end"]) {
+    if (k in b && !calIso(b[k])) return `${k} must be an ISO 8601 time with its offset, e.g. 2026-11-16T09:00:00-05:00`;
+  }
+  if ("timeZone" in b && !calTimeZone(b.timeZone)) return "timeZone must be an IANA time zone, e.g. America/New_York";
+  for (const [k, max] of [["subject", 300], ["location", 300], ["body", CALENDAR_BODY_MAX], ["joinUrl", 500]]) {
+    if (!(k in b)) continue;
+    if (typeof b[k] !== "string") return `${k} must be a string`;
+    if (cps(b[k]) > max) return `${k} is longer than ${max} characters`;
+  }
+  if ("joinUrl" in b && b.joinUrl.trim() && !CAL_URL_RE.test(meetingText(b.joinUrl, 500))) {
+    return "joinUrl must be an https:// link";
+  }
+  for (const k of ["allDay", "isOnlineMeeting"]) {
+    if (k in b && typeof b[k] !== "boolean") return `${k} must be true or false`;
+  }
+  if ("busy" in b && !CAL_TURMA_BUSY.has(b.busy)) return `busy must be one of ${[...CAL_TURMA_BUSY].join(", ")}`;
+  if ("sensitivity" in b && !CAL_SENSITIVITY.has(b.sensitivity)) {
+    return `sensitivity must be one of ${[...CAL_SENSITIVITY].join(", ")}`;
+  }
+  if ("categories" in b && (!Array.isArray(b.categories) || b.categories.length > 20 ||
+      !b.categories.every((c) => typeof c === "string" && cps(c) <= 100))) {
+    return "categories must be a list of at most 20 names of at most 100 characters";
+  }
+  if ("attendees" in b) {
+    if (!Array.isArray(b.attendees) || b.attendees.length > 100) return "attendees must be a list of at most 100";
+    for (const a of b.attendees) {
+      if (!a || typeof a !== "object" || Array.isArray(a)) return "each attendee must be {name, email, role}";
+      if ("name" in a && (typeof a.name !== "string" || cps(a.name) > 100)) return "an attendee's name must be a string of at most 100 characters";
+      if ("email" in a && (typeof a.email !== "string" || (a.email.trim() && !calEmail(a.email)))) {
+        return "an attendee's email must be an email address";
+      }
+      if ("role" in a && !CAL_TURMA_ROLE.has(a.role)) return "an attendee's role must be required or optional";
+    }
+  }
+  if ("recurrence" in b && b.recurrence !== null) return "recurring Turma events are not supported yet";
+  return null;
+}
+// {status, body} refusing `orgs` for principal `p`, or null when every org may be used.
+function turmaEventOrgsError(p, orgs) {
+  if (!Array.isArray(orgs) || !orgs.every((o) => typeof o === "string" && o)) {
+    return { status: 400, body: { error: "orgs must be a list of org keys" } };
+  }
+  if (!orgs.length) return { status: 400, body: { error: "an event must belong to at least one org" } };
+  if (orgs.length > CALENDAR_TURMA_ORGS_MAX) {
+    return { status: 400, body: { error: `an event belongs to at most ${CALENDAR_TURMA_ORGS_MAX} orgs` } };
+  }
+  const decided = decidedOrgs();
+  for (const o of orgs) {
+    // Another tenant's org reads as one no host is in: never says it exists.
+    if (!decided.has(o) || !principalMaySite(p, o)) return { status: 404, body: { error: `no host is in org ${o}` } };
+  }
+  if (new Set(orgs.map(tenantOfSite)).size > 1) {
+    return { status: 400, body: { error: "an event's orgs must all belong to one tenant" } };
+  }
+  return null;
+}
+// A 409 when putting `rec` (replacing its id) would take tenant `t` past its caps.
+function turmaEventCapError(t, rec) {
+  const bucket = calendarTurmaEvents[t] || {};
+  const isNew = !Object.hasOwn(bucket, rec.id);
+  const count = Object.keys(bucket).length + (isNew ? 1 : 0);
+  if (isNew && count > CALENDAR_TURMA_EVENTS_MAX) {
+    return { status: 409, body: { error: `the hub keeps at most ${CALENDAR_TURMA_EVENTS_MAX} Turma events per tenant; ` +
+      "delete some before creating more" } };
+  }
+  let bytes = calTurmaBytes(rec);
+  for (const [id, r] of Object.entries(bucket)) if (id !== rec.id) bytes += calTurmaBytes(r);
+  if (bytes > CALENDAR_TURMA_BYTES_MAX) {
+    return { status: 409, body: { error: `the hub keeps at most ${CALENDAR_TURMA_BYTES_MAX >> 20} MiB of Turma events ` +
+      "per tenant; delete some or shorten their descriptions" } };
+  }
+  return null;
+}
+const calPick = (b) => Object.fromEntries(CAL_TURMA_FIELDS.filter((k) => k in b).map((k) => [k, b[k]]));
+function calTurmaStore(t, rec) {
+  if (!calendarTurmaEvents[t]) calendarTurmaEvents[t] = Object.create(null);
+  calendarTurmaEvents[t][rec.id] = rec;
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(t));
+}
+// The event `id` among the tenants `p` may see and edit -> {t, rec} | {status, body}.
+function calTurmaFind(p, id) {
+  if (typeof id !== "string" || !id.startsWith("turma:")) {
+    return { status: 400, body: { error: "Outlook events are read-only: change them in Outlook" } };
+  }
+  for (const [t, bucket] of Object.entries(calendarTurmaEvents)) {
+    if (Object.hasOwn(bucket, id) && calTurmaMayEdit(p, bucket[id])) return { t, rec: bucket[id] };
+  }
+  return { status: 404, body: { error: "no such Turma event" } };
+}
+function createTurmaEvent(p, body, now = Date.now()) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {orgs, subject, start, end, timeZone?, ...}" } };
+  }
+  const oe = turmaEventOrgsError(p, body.orgs);
+  if (oe) return oe;
+  if (!("start" in body) || !("end" in body)) return { status: 400, body: { error: "start and end are required" } };
+  const fe = turmaEventFieldError(body);
+  if (fe) return { status: 400, body: { error: fe } };
+  const t = tenantOfSite(body.orgs[0]);
+  let id;
+  do id = `turma:${crypto.randomBytes(8).toString("hex")}`;
+  while (calendarTurmaEvents[t] && Object.hasOwn(calendarTurmaEvents[t], id));
+  const rec = sanitizeTurmaEvent({ ...calPick(body), id, orgs: body.orgs, createdBy: calTurmaActor(p),
+    createdAt: now, updatedAt: now, version: 1 }, t);
+  if (!rec) return { status: 400, body: { error: "end must not be before start" } };
+  const full = turmaEventCapError(t, rec);
+  if (full) return full;
+  calTurmaStore(t, rec);
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+}
+function patchTurmaEvent(p, id, body, now = Date.now()) {
+  const f = calTurmaFind(p, id);
+  if (f.status) return f;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "body must be {version, orgs?, ...fields}" } };
+  }
+  if (!Number.isSafeInteger(body.version)) {
+    return { status: 400, body: { error: "version is required: the event's version this edit was made to" } };
+  }
+  if (body.version !== f.rec.version) {
+    return { status: 409, body: { error: "this event was changed since you opened it; reload it and edit again",
+      event: turmaEventWire(p, f.rec) } };
+  }
+  if ("orgs" in body) {
+    const oe = turmaEventOrgsError(p, body.orgs);
+    if (oe) return oe;
+    if (tenantOfSite(body.orgs[0]) !== f.t) return { status: 404, body: { error: `no host is in org ${body.orgs[0]}` } };
+  }
+  const fe = turmaEventFieldError(body);
+  if (fe) return { status: 400, body: { error: fe } };
+  const rec = sanitizeTurmaEvent({ ...f.rec, ...calPick(body), orgs: "orgs" in body ? body.orgs : f.rec.orgs,
+    updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
+  if (!rec) return { status: 400, body: { error: "end must not be before start" } };
+  const full = turmaEventCapError(f.t, rec);
+  if (full) return full;
+  calTurmaStore(f.t, rec);
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
+}
+function deleteTurmaEvent(p, id) {
+  const f = calTurmaFind(p, id);
+  if (f.status) return f;
+  delete calendarTurmaEvents[f.t][id];
+  if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(f.t));
+  return { status: 200, body: { ok: true } };
+}
+// The Turma-event routes' shared tail (XERK-2968): parse the body, run the logic.
+async function turmaEventRoute(req, res, id) {
+  let body = null;
+  if (req.method !== "DELETE") {
+    try {
+      body = JSON.parse((await readBody(req, CALENDAR_TURMA_BODY_MAX)) || "null");
+    } catch (e) {
+      if (e && (e.tooLarge || e.budgetExceeded)) throw e;
+      return json(res, 400, { error: "body is not JSON" });
+    }
+  }
+  const p = requestPrincipal(req);
+  const out = req.method === "POST" ? createTurmaEvent(p, body)
+    : req.method === "PATCH" ? patchTurmaEvent(p, id, body) : deleteTurmaEvent(p, id);
+  return json(res, out.status, out.body);
+}
+// An org no host has been decided into for CALENDAR_TURMA_ORG_GRACE_MS leaves
+// every event's orgs; an event left with none is deleted. In memory: a restart
+// restarts the grace (the safe direction), and a host's brief drift out of its
+// org (decidedOrgOf "") never wipes that org's events. Serving hides it at once.
+const calTurmaOrgGoneAt = new Map();
+function calendarTurmaTick(now = Date.now()) {
+  const decided = decidedOrgs();
+  const seen = new Set();
+  let changed = 0;
+  for (const [t, bucket] of Object.entries(calendarTurmaEvents)) {
+    let touched = false;
+    for (const [id, rec] of Object.entries(bucket)) {
+      const keep = rec.orgs.filter((o) => {
+        if (decided.has(o)) return true;
+        seen.add(o);
+        if (!calTurmaOrgGoneAt.has(o)) calTurmaOrgGoneAt.set(o, now);
+        return now - calTurmaOrgGoneAt.get(o) < CALENDAR_TURMA_ORG_GRACE_MS;
+      });
+      if (keep.length === rec.orgs.length) continue;
+      touched = true;
+      changed++;
+      if (keep.length) bucket[id] = sanitizeTurmaEvent({ ...rec, orgs: keep, updatedAt: Math.max(now, rec.updatedAt),
+        version: rec.version + 1 }, t);
+      else delete bucket[id];
+    }
+    if (!Object.keys(bucket).length) delete calendarTurmaEvents[t];
+    if (touched) broadcastCalendarSoon(calTurmaFrameKey(t));
+  }
+  for (const o of calTurmaOrgGoneAt.keys()) if (!seen.has(o)) calTurmaOrgGoneAt.delete(o);
+  if (changed) persistCalendarTurmaEvents();
+  return changed;
+}
+
 // A host gone from the registry keeps its calendar CALENDAR_HOST_RETAIN_MS past
 // its last sync (served offline meanwhile), then loses it.
 function calendarTick(now = Date.now()) {
@@ -6379,6 +6708,7 @@ function calendarTick(now = Date.now()) {
   if (n) { persistCalendarEvents(); persistCalendarHostSettings(); }
   // An auto link to an event that just went has nothing to hold (XERK-2896).
   for (const t of tenants) scheduleCalendarRelink(t);
+  calendarTurmaTick(now);
   return n;
 }
 
@@ -9302,6 +9632,14 @@ registerTenantPurge("calendarEvents", (t) => {
   if (n) persistCalendarEvents();
   return n;
 });
+// Turma-created events (XERK-2968) are keyed by tenant.
+registerTenantPurge("calendarTurmaEvents", (t) => {
+  if (!t || !Object.hasOwn(calendarTurmaEvents, t)) return 0;
+  const n = Object.keys(calendarTurmaEvents[t]).length;
+  delete calendarTurmaEvents[t];
+  persistCalendarTurmaEvents();
+  return n;
+});
 registerTenantPurge("calendarHostSettings", (t) => {
   const n = dropTenantKeys(calendarHostSettings, t);
   if (n) persistCalendarHostSettings();
@@ -9611,6 +9949,27 @@ for (const [name, read, persist] of [
     },
   });
 }
+// An untenanted Turma event (XERK-2968) moves into the tenant when every org on
+// it does, its orgs re-keyed; one also in an org staying behind stays too.
+const calTurmaMovable = (scope) => Object.values(calendarTurmaEvents[""] || {})
+  .filter((r) => r.orgs.every((o) => siteMovable(o, scope)));
+registerTenantMigration({
+  name: "calendarTurmaEvents",
+  count: (t, scope) => calTurmaMovable(scope).length,
+  apply: (t, scope) => {
+    const moving = calTurmaMovable(scope);
+    if (!moving.length) return 0;
+    const src = calendarTurmaEvents[""];
+    const dst = calendarTurmaEvents[t] || (calendarTurmaEvents[t] = Object.create(null));
+    for (const r of moving) {
+      if (!Object.hasOwn(dst, r.id)) dst[r.id] = { ...r, orgs: r.orgs.map((o) => migrateSiteKey(o, t)) };
+      delete src[r.id];
+    }
+    if (!Object.keys(src).length) delete calendarTurmaEvents[""];
+    persistCalendarTurmaEvents();
+    return moving.length;
+  },
+});
 registerTenantMigration({
   name: "epicBuilders",
   count: (t, scope) => Object.values(epicBuilders).filter((r) => r && siteMovable(r.siteKey, scope)).length,
@@ -9877,6 +10236,7 @@ function tenantMigrationSnapshot() {
   for (const [, read, , siteOf = (k) => k] of TENANT_ORG_STORES) {
     for (const k of Object.keys(read())) addSite(siteOf(k));
   }
+  for (const r of Object.values(calendarTurmaEvents[""] || {})) r.orgs.forEach(addSite);
   return { hosts: [...hosts], sites: [...sites] };
 }
 
@@ -25458,6 +25818,20 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, calendarView(requestPrincipal(req), from, until, orgFilter));
     }
 
+    // POST /api/calendar/events, PATCH|DELETE /api/calendar/events/<id> — events
+    // made in Turma, in one or more orgs (XERK-2968, contract-calendar.md). The
+    // handlers scope by org: the caller must see every org in the body and on the event.
+    if (req.method === "POST" && url.pathname === "/api/calendar/events") {
+      return turmaEventRoute(req, res, null);
+    }
+    if ((req.method === "PATCH" || req.method === "DELETE") && parts[0] === "api" && parts[1] === "calendar" &&
+        parts[2] === "events" && parts.length === 4) {
+      let id;
+      try { id = decodeURIComponent(parts[3]); } catch { return json(res, 400, { error: "bad event id" }); }
+      return turmaEventRoute(req, res, id);
+    }
+
+
     // Who is signed in (XERK-2553): the clients' account label + admin-only screen.
     if (req.method === "GET" && url.pathname === "/api/me") {
       return json(res, 200, meView(requestPrincipal(req)));
@@ -30126,6 +30500,9 @@ if (process.env.TURMA_TEST) {
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     getCalendarOrgRules: () => calendarOrgRules,
+    // XERK-2968: Turma-created events.
+    sanitizeTurmaEvent, calendarTurmaEventsCoerce, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
+    CALENDAR_TURMA_EVENTS_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,
