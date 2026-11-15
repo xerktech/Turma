@@ -609,17 +609,18 @@ private fun WeekGrid(
     fun Modifier.shown(d: LocalDate, tag: String? = null): Modifier =
         if (d !in shownDays) clearAndSetSemantics {} else if (tag != null) testTag(tag) else this
     val offOf = strip.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
-    // How far the days are dragged, in px, and the first day of the strip it was dragged on. Read
-    // only when placing them, so a drag relayouts the strip and never recomposes the grid. Keyed by
-    // that day so a settle can leave it at its end: the new days, a frame later, ignore it. Zeroing
-    // it in the settle instead placed the OLD days unshifted for a frame (a flash, QA).
+    // How far the days are dragged, in px, and the strip it was dragged on (its first day AND its
+    // length, so a mode pick that keeps the first day is a new strip too). Read only when placing
+    // them, so a drag relayouts the strip and never recomposes the grid. Keyed so a settle can leave
+    // it at its end: the new days, a frame later, ignore it. Zeroing it in the settle instead placed
+    // the OLD days unshifted for a frame (a flash, QA).
     var shift by remember { mutableStateOf(0L to 0f) }
-    val firstDay = days.first().toEpochDay()
-    val stripFirst by rememberUpdatedState(firstDay)
+    val stripKey = days.first().toEpochDay() * 8 + days.size
+    val stripFirst by rememberUpdatedState(stripKey)
     fun shiftNow(): Float = shift.let { (d, px) -> if (d == stripFirst) px else 0f }
     // Once the new days are on screen, forget the old strip's offset: ‹ back to that day later
     // must not find it again.
-    LaunchedEffect(firstDay) { if (shift.first != firstDay) shift = firstDay to 0f }
+    LaunchedEffect(stripKey) { if (shift.first != stripKey) shift = stripKey to 0f }
     var gridW by remember { mutableIntStateOf(0) }
     val colPx = (gridW - with(density) { gutter.toPx() }).coerceAtLeast(0f) / days.size
     val reach by rememberUpdatedState(before.size * colPx to after.size * colPx)
@@ -643,7 +644,7 @@ private fun WeekGrid(
         }
         val target = when (dir) { 1 -> -on; -1 -> back; else -> 0f }
         val day = stripFirst
-        // Steps only if the days are still the ones dragged: ‹ › or a mode pick mid-settle wins.
+        // Steps only if the strip is still the one dragged: ‹ › or a mode pick mid-settle wins.
         val land = {
             landing = null
             if (stripFirst == day) { if (dir != 0) swipeTo(dir); shift = day to target }
@@ -662,9 +663,11 @@ private fun WeekGrid(
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                    // A touch mid-settle lands it now, so a quick second swipe or a tap acts on
-                    // the days it lands on, never on days still moving.
-                    if (settling?.isActive == true) { settling?.cancel(); landing?.invoke() }
+                    // A touch mid-settle lands it now, so a quick second swipe moves on from the
+                    // landed days. A tap then is swallowed: Compose picked its target at the down,
+                    // on the days still moving, so letting it through opened the wrong day (QA).
+                    val interrupted = settling?.isActive == true
+                    if (interrupted) { settling?.cancel(); landing?.invoke() }
                     val velocity = VelocityTracker().apply { addPosition(down.uptimeMillis, down.position) }
                     val slop = viewConfiguration.touchSlop
                     var dragging = false
@@ -689,6 +692,7 @@ private fun WeekGrid(
                         }
                         if (!c.pressed) {
                             if (dragging) settle(velocity.calculateVelocity().x)
+                            else if (interrupted) c.consume()   // a consumed up cancels the tap
                             break
                         }
                     }

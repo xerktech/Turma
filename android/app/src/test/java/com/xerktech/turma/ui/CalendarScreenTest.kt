@@ -20,6 +20,7 @@ import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
+import androidx.compose.ui.test.click
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.model.TurmaJson
@@ -362,6 +363,82 @@ class CalendarScreenTest {
         compose.onNodeWithTag("cal-next").performClick()   // no holiday on either side
         compose.waitForIdle()
         assertEquals(y1, compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().positionInRoot.y, 1f)
+    }
+
+    // A slow drag of [frac] of a column to the left, released: past a third, so it settles on.
+    private fun dragOn(frac: Float) = compose.onNodeWithTag("cal-scroll").performTouchInput {
+        down(center)
+        repeat(8) { moveBy(Offset(-colW() * frac / 8, 0f), delayMillis = 60) }
+        up()
+    }
+
+    @Test fun `a tap during a settle is swallowed, never opening a day still moving (XERK-2980)`() {
+        seed()
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        // Just inside the visible grid's top: the scroll node spans 24 hours, so its center is off-screen.
+        val top = compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().positionInRoot.y
+        val at: (Float, Float) -> Offset = { w, _ -> Offset(w * 0.6f, top + 20f) }
+        // At rest the same tap opens a new event, so the assertion below is not vacuous.
+        compose.onRoot().performTouchInput { click(at(width.toFloat(), height.toFloat())) }
+        compose.waitForIdle()
+        assertTrue("a tap at rest opens the editor", cvm.editor.value != null)
+        cvm.closeEditor()
+        compose.waitForIdle()
+        compose.mainClock.autoAdvance = false
+        dragOn(0.4f)
+        compose.mainClock.advanceTimeByFrame()
+        compose.onRoot().performTouchInput { click(at(width.toFloat(), height.toFloat())) }
+        compose.mainClock.autoAdvance = true
+        compose.waitForIdle()
+        assertTrue("a mid-settle tap opened ${cvm.editor.value}", cvm.editor.value == null)
+        assertTrue(shown("cal-dh-${today.plusDays(1)}"))
+    }
+
+    @Test fun `a mode pick during a settle wins and lays the new mode out at rest (XERK-2980)`() {
+        seed()
+        show(calendarVm())
+        awaitEvent(subject)
+        val rest = xOf("cal-dh-$today")
+        compose.mainClock.autoAdvance = false
+        dragOn(0.4f)
+        compose.mainClock.advanceTimeByFrame()
+        compose.onNodeWithTag("cal-mode-THREE").performClick()
+        repeat(20) {
+            compose.mainClock.advanceTimeByFrame()
+            if (shown("cal-dh-${today.plusDays(2)}")) assertEquals("frame $it", rest, xOf("cal-dh-$today"), 1f)
+        }
+        compose.mainClock.autoAdvance = true
+        compose.waitForIdle()
+        assertTrue(shown("cal-dh-$today") && shown("cal-dh-${today.plusDays(2)}"))
+        assertTrue(!shown("cal-dh-${today.plusDays(3)}"))
+        assertEquals(rest, xOf("cal-dh-$today"), 1f)
+    }
+
+    @Test fun `an arrow during a settle pages once, never adding the swipe's step (XERK-2980)`() {
+        threeDays()
+        compose.mainClock.autoAdvance = false
+        dragOn(0.5f)
+        compose.mainClock.advanceTimeBy(80)
+        compose.onNodeWithTag("cal-next").performClick()
+        compose.mainClock.autoAdvance = true
+        compose.waitForIdle()
+        assertTrue(shown("cal-dh-${today.plusDays(3)}") && shown("cal-dh-${today.plusDays(5)}"))
+        assertTrue(!shown("cal-dh-${today.plusDays(6)}"))
+    }
+
+    @Test fun `back to a day a swipe left lays it out at rest (XERK-2980)`() {
+        seed()
+        show(calendarVm())
+        awaitEvent(subject)
+        val rest = xOf("cal-dh-$today")
+        dragOn(0.5f)
+        compose.waitForIdle()
+        assertTrue(shown("cal-dh-${today.plusDays(1)}"))
+        compose.onNodeWithTag("cal-prev").performClick()
+        compose.waitForIdle()
+        assertEquals(rest, xOf("cal-dh-$today"), 1f)
     }
 
     @Test fun `the view switch is kept on this phone and a push opens the notes review`() {
