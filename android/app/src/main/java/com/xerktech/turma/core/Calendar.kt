@@ -173,7 +173,7 @@ fun calRealMeeting(ev: CalendarEvent): Boolean = ev.meeting
 
 /** The upcoming calendar meetings of [site] from [events], earliest first, one per Outlook id. */
 fun calUpcoming(site: String, events: List<CalendarEvent>, now: Long): List<CalendarEvent> =
-    events.filter { it.org == site && calIsUpcomingMeeting(it, now) }
+    events.filter { site in calOrgsOf(it) && calIsUpcomingMeeting(it, now) }
         .distinctBy { it.id }
         .sortedWith(compareBy<CalendarEvent> { it.s() }.thenBy { it.e() })
 
@@ -447,6 +447,7 @@ fun calAria(ev: CalendarEvent, day: LocalDate, orgLabel: String, badge: CalBadge
     }
     if (ev.myResponse == "declined") bits += "declined"
     if (ev.tenir) bits += "captured by Tenir, not on Outlook"
+    if (ev.turma) bits += "Turma event, not on Outlook"
     calBadgeText(badge).takeIf { it.isNotEmpty() }?.let { bits += it }
     return bits.joinToString(", ")
 }
@@ -491,7 +492,7 @@ fun calLinkCandidates(
 ): List<CalendarEvent> {
     val day = calDay(at, zone)
     return events.filter {
-        !it.tenir && !it.canceled && calDrawable(it) && !calInBand(it) && it.key != skipKey &&
+        !it.tenir && !it.turma && !it.canceled && calDrawable(it) && !calInBand(it) && it.key != skipKey &&
             calDay(it.s(), zone) == day && calEventOrg(it, hostOrg) == site && it.id.isNotEmpty()
     }.sortedBy { kotlin.math.abs(it.s() - at) }.take(20)
 }

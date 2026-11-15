@@ -16,6 +16,13 @@ import com.xerktech.turma.core.calZoomClamp
 import com.xerktech.turma.core.calZoomStep
 import kotlin.math.roundToInt
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
+import com.xerktech.turma.core.calDefaultOrgs
+import com.xerktech.turma.core.calDefaultStart
+import com.xerktech.turma.core.calDraftOf
+import com.xerktech.turma.core.calNewEventDraft
+import com.xerktech.turma.core.calOrgsOf
+import com.xerktech.turma.core.calSlotStart
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -40,6 +47,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
@@ -50,6 +58,7 @@ import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -164,8 +173,10 @@ import kotlinx.serialization.json.put
 
 /*
  * The Meetings tab's Calendar view (XERK-2900, the web's calendar.js of
- * XERK-2897/2898/2899): a read-only, Teams-mobile-style week of every org's
- * Outlook events, Tenir's impromptu captures and holidays. A phone shows Day or
+ * XERK-2897/2898/2899): a Teams-mobile-style week of every org's
+ * Outlook events, Tenir's impromptu captures and holidays — and the Turma-made
+ * events (XERK-2972): ＋ or a tap on an empty slot opens the editor
+ * (CalendarEventEditor.kt), and an editable one's detail offers Edit / Delete. A phone shows Day or
  * 3 days under a week day strip, ‹ › and swipe moving it; a wide screen
  * (tablet / unfolded foldable) the Work week or full Week. A tap opens the
  * event's detail — Outlook's details and a linked capture reviewed in place with
@@ -269,6 +280,14 @@ private fun CalendarBody(
     var scrollTo by remember { mutableStateOf(-1.0) }
     var picker by rememberSaveable { mutableStateOf(false) }
     var hostSetOpen by rememberSaveable { mutableStateOf(false) }
+    // The Turma-event editor (XERK-2972), full screen while open; its state is the view model's.
+    val editor by cvm.editor.collectAsStateWithLifecycle()
+    val orgOptions = remember(names) {
+        names.keys.sorted().map { it to com.xerktech.turma.core.orgName(it, names[it].orEmpty()) }
+    }
+    fun newEvent(day: LocalDate, start: java.time.LocalTime) {
+        cvm.openEditor(calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys)))
+    }
 
     fun go(d: LocalDate) { anchorDay = d.toEpochDay() }
     fun openDetail(ev: CalendarEvent) {
@@ -313,7 +332,7 @@ private fun CalendarBody(
     if (detail != null && detail.key != detailKey) LaunchedEffect(detail.key) { detailKey = detail.key; detailLast = detail }
     else if (detail != null && detail !== detailLast) LaunchedEffect(detail) { detailLast = detail }
 
-    BackHandler(enabled = detail != null) { closeDetail() }
+    BackHandler(enabled = detail != null && editor == null) { closeDetail() }
 
     if (picker) {
         val state = rememberDatePickerState(
@@ -332,7 +351,8 @@ private fun CalendarBody(
     }
 
     val grid: @Composable (Modifier) -> Unit = { m ->
-        Column(m) {
+        Box(m) {
+        Column(Modifier.fillMaxSize()) {
             CalToolbar(
                 weekly, mode, days, anchor, cvm.today(), locale,
                 onToday = { revealWeek = false; go(cvm.today()) },
@@ -351,7 +371,13 @@ private fun CalendarBody(
                 zoomHours = zoom, onZoom = { h, end -> cvm.setZoom(h, save = end) },
                 onOpen = ::openDetail,
                 onSwipe = { dir -> go(calStep(anchor, mode, dir)) },
+                onSlot = { d, min -> newEvent(d, calSlotStart(min)) },
             )
+        }
+            FloatingActionButton(
+                { newEvent(anchor, calDefaultStart(anchor, cvm.now(), zone)) },
+                Modifier.align(Alignment.BottomEnd).padding(16.dp).testTag("cal-new-event"),
+            ) { Icon(Icons.Filled.Add, "New event") }
         }
     }
     val panel: @Composable (Modifier, CalendarEvent) -> Unit = { m, ev ->
@@ -361,10 +387,13 @@ private fun CalendarBody(
                 m, ev, colors[ev.org]?.let { series[it % series.size] },
                 side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
+                onEdit = { e -> cvm.openEditor(calDraftOf(e, zone)) },
             )
         }
     }
+    val draft = editor
     when {
+        draft != null -> CalendarEventEditor(modifier.fillMaxSize(), draft, orgOptions, cvm)
         detail == null -> grid(modifier.fillMaxSize())
         side -> Row(modifier.fillMaxSize()) {
             grid(Modifier.weight(1f).fillMaxHeight())
@@ -538,6 +567,7 @@ private fun WeekGrid(
     onZoom: (hours: Float, end: Boolean) -> Unit,
     onOpen: (CalendarEvent) -> Unit,
     onSwipe: (Int) -> Unit,
+    onSlot: (LocalDate, Int) -> Unit,
 ) {
     val today = calDay(now, zone)
     val gutter = if (wide) 56.dp else 44.dp
@@ -548,6 +578,8 @@ private fun WeekGrid(
     val series = TurmaColors.series()
     val colorOf: (String) -> Color? = { org -> colors[org]?.let { series[it % series.size] } }
     val orgLabel: (String) -> String = { s -> if (s.isEmpty()) "No org" else com.xerktech.turma.core.orgName(s, names[s].orEmpty()) }
+    // A Turma event of several orgs is ONE block naming every org (XERK-2972).
+    val orgsLabel: (CalendarEvent) -> String = { ev -> calOrgsOf(ev).ifEmpty { listOf("") }.joinToString(", ") { orgLabel(it) } }
     val offOf = days.associateWith { calOffOrgs(it, range.holidays, keys.toSet()) }
     val swipePx = with(density) { 60.dp.toPx() }
     Column(
@@ -637,7 +669,7 @@ private fun WeekGrid(
                         EventBlock(
                             Modifier.fillMaxWidth().height(22.dp), ev, now, colorOf(ev.org), badge, short = true,
                             open = ev.key == detailKey,
-                            aria = calAria(ev, d, orgLabel(ev.org), badge, zone, locale),
+                            aria = calAria(ev, d, orgsLabel(ev), badge, zone, locale),
                         ) { onOpen(ev) }
                     }
                 }
@@ -733,6 +765,11 @@ private fun WeekGrid(
                                     drawLine(outline, Offset(0f, 0f), Offset(0f, size.height), 0.5.dp.toPx())
                                 }
                                 .then(if (off) Modifier.hatch(offShade) else Modifier)
+                                // A tap on an empty slot starts a new event there (XERK-2972); a block's
+                                // own click consumes its tap first, so this hears only the gaps.
+                                .pointerInput(d, slot) {
+                                    detectTapGestures { p -> onSlot(d, (p.y / slot.toPx() * 30).toInt()) }
+                                }
                                 .testTag("cal-col-${calDayKey(d)}"),
                         ) {
                             val w = maxWidth
@@ -743,7 +780,7 @@ private fun WeekGrid(
                                 EventBlock(
                                     segModifier(seg, w, h, slot), ev, now, colorOf(ev.org), badge, short = h < SHORT_DP,
                                     open = ev.key == detailKey,
-                                    aria = calAria(ev, d, orgLabel(ev.org), badge, zone, locale),
+                                    aria = calAria(ev, d, orgsLabel(ev), badge, zone, locale),
                                     meta = listOf(calSpan(ev.startMs ?: 0, ev.endMs ?: 0, zone, locale), ev.location)
                                         .filter { it.isNotEmpty() }.joinToString(" · "),
                                 ) { onOpen(ev) }
@@ -827,6 +864,14 @@ private fun EventBlock(
                     textDecoration = if (st.canceled) TextDecoration.LineThrough else null,
                 )
                 Spacer(Modifier.weight(0.001f))
+                // Several orgs share this one block (XERK-2972): "+N" beside the title.
+                val more = calOrgsOf(ev).size - 1
+                if (more > 0) {
+                    Text(
+                        "+$more", Modifier.padding(start = 2.dp).testTag("cal-multi-org"), fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 CalBadgeView(badge)
             }
             if (!short && meta.isNotEmpty()) {
@@ -884,8 +929,11 @@ private fun CalendarDetail(
     onClose: () -> Unit,
     onOpenNotes: (NotesTarget) -> Unit,
     dailyFor: (String, Long) -> TriageEntry?,
+    onEdit: (CalendarEvent) -> Unit,
 ) {
     val uri = LocalUriHandler.current
+    val eventBusy by cvm.eventBusy.collectAsStateWithLifecycle()
+    var confirmDelete by remember { mutableStateOf(false) }
     // The panel wears its event's org tint, as its grid block does (XERK-2939); no org = plain.
     // Its text colors are pulled toward ink so they stay ≥4.5:1 on every tint (web `.cal-detail`).
     val cs = MaterialTheme.colorScheme
@@ -925,7 +973,10 @@ private fun CalendarDetail(
             }
             if (ev.tenir && ev.moved) DetailRow("Moved", "its Outlook event moved to another time")
             // Locked (XERK-2964): an Outlook event's org is its host's, shown, never picked.
-            DetailRow("Org", orgLabel(ev.org))
+            // A Turma event names every org it belongs to (XERK-2972).
+            val evOrgs = calOrgsOf(ev)
+            if (ev.turma && evOrgs.size > 1) DetailRow("Orgs", evOrgs.joinToString(", ") { orgLabel(it) })
+            else DetailRow("Org", orgLabel(ev.org))
             if (ev.recurring) DetailRow("Repeats", "Part of a recurring series")
             DetailRow("Where", ev.location)
             DetailRow(
@@ -936,10 +987,34 @@ private fun CalendarDetail(
             DetailRow(
                 "Calendar",
                 if (ev.tenir) "Captured by Tenir — not on Outlook"
+                else if (ev.turma) "Made in Turma — not on Outlook"
                 else if (ev.host.isNotEmpty()) "Outlook on ${bareKey(ev.host)}" else "",
             )
+            if (ev.turma && !ev.private && ev.sensitivity == "private") DetailRow("Privacy", "Private: only you see its details")
             val cats = ev.categories.filter { it.isNotEmpty() }
             if (cats.isNotEmpty()) DetailRow("Categories", cats.joinToString(", "))
+            // Only a Turma event the hub says this caller may change offers these (XERK-2972);
+            // an Outlook event is changed in Outlook.
+            if (ev.canEdit) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    GhostButton("Edit", { onEdit(ev) }, Modifier.testTag("cal-edit"), enabled = !eventBusy)
+                    GhostButton("Delete", { confirmDelete = true }, Modifier.testTag("cal-delete"), enabled = !eventBusy)
+                }
+            }
+            if (confirmDelete) {
+                androidx.compose.material3.AlertDialog(
+                    onDismissRequest = { confirmDelete = false },
+                    title = { Text("Delete this event?") },
+                    text = { Text("“${calTitle(ev)}” is removed for every org it belongs to.") },
+                    confirmButton = {
+                        TextButton({
+                            confirmDelete = false
+                            cvm.deleteEvent(ev.id) { r -> if (r is com.xerktech.turma.vm.EventResult.Deleted) onClose() }
+                        }, Modifier.testTag("cal-delete-confirm")) { Text("Delete") }
+                    },
+                    dismissButton = { TextButton({ confirmDelete = false }) { Text("Cancel") } },
+                )
+            }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 val join = calSafeHttps(ev.joinUrl)
                 if (join.isNotEmpty()) GhostButton("Join meeting ↗", { uri.openUri(join) }, Modifier.testTag("cal-join"))
@@ -1017,7 +1092,7 @@ private fun CalendarDetail(
             for (c in calCapturesOf(ev)) {
                 RelinkControls(ev, c, fleet, events, zone, locale, cvm, hostOrg)
             }
-            if (!ev.tenir && calCapturesOf(ev).isEmpty() && (ev.startMs ?: 0) < now) {
+            if (!ev.tenir && !ev.turma && calCapturesOf(ev).isEmpty() && (ev.startMs ?: 0) < now) {
                 Text("Tenir captured nothing for this event.", style = MaterialTheme.typography.bodySmall, color = muted)
             }
             Spacer(Modifier.height(12.dp))

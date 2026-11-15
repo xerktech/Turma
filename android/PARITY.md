@@ -770,6 +770,18 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     detail panel is open, which Android already does by placing the detail beside the grid. The web
     also hides a block's time line by the block's drawn height (`SHORT_DP` against the zoomed row
     height on Android).
+- **Turma-created events (epic XERK-2967 → Android XERK-2972)**: ＋ (FAB) or a tap on an empty
+  slot opens a full-screen editor (title, required / optional attendees, start / end, all-day, time
+  zone, location, online + join link, details, show as, categories, private, orgs ≥1; Repeat is a
+  "Does not repeat" placeholder until XERK-2969) → `POST|PATCH|DELETE /api/calendar/events`.
+  - An event of several orgs is ONE block with a "+N" mark, its detail naming every org; the hub's
+    `?org=` filter matches any of them. Edit / Delete only on a Turma event served `editable:true`
+    with a `version` (absent = an older hub, read-only); Outlook events are unchanged.
+  - A 409 (changed since opened) shows the hub's words and reloads the editor from the event it
+    carries. The web editor (XERK-2971) has not landed; it must send the same body
+    (`core/CalendarEvents.kt` `calDraftPayload`).
+  - Platform differences: attendees are typed (`Name <email>`, comma-separated), not picked; the
+    time zone is a text field (an IANA id) defaulting to the phone's.
 - **Calendar settings (XERK-2929)**: an org's ⚙ settings edit its days off (a tick per catalog
   country and per holiday, each saved at once); the calendar's ⚙ lists each host's org (text) +
   Show private events. An Outlook event's Org row is text: its host's org, locked (XERK-2964).

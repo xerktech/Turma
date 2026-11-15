@@ -75,7 +75,7 @@ class Config private constructor(private val prefs: SharedPreferences) {
             .putString(KEY_PASS, password)
         if (sessionToken.isNotEmpty()) edit.putString(KEY_SESSION, sessionToken) else edit.remove(KEY_SESSION)
         edit.apply()
-        _state.value = read()
+        publish(read())
     }
 
     /**
@@ -89,7 +89,7 @@ class Config private constructor(private val prefs: SharedPreferences) {
             .putString(KEY_URL, hubUrl.trim())
             .putString(KEY_OIDC_VERIFIER, verifier)
             .apply()
-        _state.value = read()
+        publish(read())
     }
 
     /** The verifier stashed by [startOidc], read when the deep link returns. */
@@ -101,7 +101,7 @@ class Config private constructor(private val prefs: SharedPreferences) {
             .putString(KEY_SESSION, token)
             .remove(KEY_OIDC_VERIFIER)
             .apply()
-        _state.value = read()
+        publish(read())
     }
 
     /**
@@ -114,7 +114,7 @@ class Config private constructor(private val prefs: SharedPreferences) {
     fun clearSession() {
         if (prefs.getString(KEY_SESSION, "").isNullOrEmpty()) return
         prefs.edit().remove(KEY_SESSION).apply()
-        _state.value = read()
+        publish(read())
     }
 
     fun clear() {
@@ -122,10 +122,28 @@ class Config private constructor(private val prefs: SharedPreferences) {
             .remove(KEY_USER).remove(KEY_PASS)
             .remove(KEY_SESSION).remove(KEY_OIDC_VERIFIER)
             .apply()
-        _state.value = read()
+        publish(read())
     }
 
     val current: Settings get() = _state.value
+
+    private val accountListeners = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    /**
+     * Run [f] whenever the signed-in account changes or ends (sign-out, a new hub or
+     * user): state tied to one account (an open calendar draft, XERK-2972) drops there.
+     */
+    fun onChange(f: () -> Unit) {
+        accountListeners += f
+    }
+
+    private fun publish(next: Settings) {
+        val prev = _state.value
+        _state.value = next
+        if (prev.configured != next.configured || prev.baseUrl != next.baseUrl || prev.user != next.user) {
+            accountListeners.forEach { it() }
+        }
+    }
 
     companion object {
         // No baked-in hub; the operator enters it on the login screen.

@@ -357,6 +357,9 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
       that tenant's user (`calTurmaOwner`), or nobody could ever change or delete it.
     - Only the owner may make an event private/confidential: a non-owner hiding one locked every
       other viewer out, itself included, with no way back. Both refusals carry no `event`.
+- **Clients send the body Android's `calDraftPayload` builds** (XERK-2972): every field whole
+  (an edit that clears one clears it), `start`/`end` with the offset of the picked `timeZone`,
+  all-day ending at the midnight after its last day. Edit/Delete only on `editable:true`.
 - **Every write broadcasts the coalesced `calendar` frame** under the tenant-level key
   `turma:events@<tenant>` (plain `turma:events` untenanted). The SSE scoper's `mayHost` passes it
   only to that tenant's viewers; clients refetch on any frame, so no client change is needed.

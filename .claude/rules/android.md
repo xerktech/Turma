@@ -159,6 +159,25 @@ A pure-core/adapter-shell split:
     `BoxWithConstraints`; pinch on the grid (consumed in the Initial pass so the scroll and the
     day swipe never see it) and TalkBack "Zoom in/out" custom actions stand in for the web's − / +.
     `CalendarViewModel.zoom`, saved once per pinch (prefs `zoom-hours`). Default 10h = 8 AM–6 PM.
+  - **Turma-created events (XERK-2972)**: `core/CalendarEvents.kt` (draft, validation, the exact
+    POST/PATCH body), `ui/CalendarEventEditor.kt`, `CalendarViewModel.saveEvent/deleteEvent`.
+    - Edit/Delete only when `CalendarEvent.canEdit` (`source:"turma"`, `editable:true`, a
+      `version`, NOT `private`): an older hub serves none of them, so its events stay read-only.
+      A withheld private event's fields are blanked; editing it would save the blanks (QA).
+    - The open draft lives in `AppContainer.calendarEditor`, never composable or view-model state:
+      a rotation or bottom-tab switch (the Meetings VM dies with its tab) lost it (QA). A changed
+      draft asks before it is discarded.
+    - It is dropped on any account change (`Config.onChange`: sign-out, hub, user), synchronously:
+      process-lived, it opened and saved one account's draft under the next (QA).
+    - Validation ports the hub's own rules (`CAL_EMAIL_PART`, `CAL_URL_RE`, named zones only) and
+      refuses a wall time the clocks skip; a name with a comma is written quoted.
+    - A multi-org event's org list is `calOrgsOf` (`orgs`, else `org`); every per-org read (upcoming
+      meetings) goes through it, never `ev.org` alone. `orgs` is an id key (never cleaned).
+    - A 409's error body is read ONCE in `eventResult` (it carries the current `event`); never read
+      it again through `hubErrorMessage`, which would see an empty body.
+    - The empty-slot tap is a `detectTapGestures` on the day column: an event block's own click
+      consumes its tap first, so the column only hears the gaps.
+    - Tests: `core/CalendarEventsTest`, `ui/CalendarTurmaEventsTest`.
   - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`.
 
 ## Images (rollup XERK-2109)

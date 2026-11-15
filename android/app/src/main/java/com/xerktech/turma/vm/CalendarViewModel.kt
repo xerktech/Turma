@@ -14,7 +14,13 @@ import com.xerktech.turma.core.calHostNotices
 import com.xerktech.turma.core.calUpcomingWeeks
 import com.xerktech.turma.core.calWantedWeeks
 import com.xerktech.turma.core.calZoomClamp
+import com.xerktech.turma.core.EventEditor
+import com.xerktech.turma.core.TurmaEventDraft
+import com.xerktech.turma.core.calDraftErrors
+import com.xerktech.turma.core.calDraftPayload
 import com.xerktech.turma.model.CalendarAnswer
+import com.xerktech.turma.model.CalendarEvent
+import com.xerktech.turma.model.TurmaEventResponse
 import com.xerktech.turma.model.LenientHolidaysSerializer
 import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.net.FleetState
@@ -49,8 +55,18 @@ import kotlinx.serialization.json.JsonObject
  * while the calendar (or the notes review's upcoming list) is in use.
  *
  * Also the view's per-phone preferences (the Calendar / Notes review switch and
- * each layout's mode) and the one write: relinking a capture to another event.
+ * each layout's mode) and its writes: relinking a capture to another event, a
+ * host's calendar settings, and Turma events (create / edit / delete, XERK-2972).
  */
+/** What a Turma-event write came to (XERK-2972). */
+sealed class EventResult {
+    data class Saved(val event: CalendarEvent) : EventResult()
+    data object Deleted : EventResult()
+    /** The event changed since it was opened: the hub's words and the event as it is now. */
+    data class Conflict(val message: String, val event: CalendarEvent) : EventResult()
+    data class Failed(val message: String) : EventResult()
+}
+
 class CalendarViewModel(app: Application) : AndroidViewModel(app) {
     private val container = (app as TurmaApplication).container
     val fleet: StateFlow<FleetState> get() = container.fleet.state
@@ -369,6 +385,113 @@ class CalendarViewModel(app: Application) : AndroidViewModel(app) {
                 _messages.tryEmit("✗ $err")
             } else refetch()
         }
+    }
+
+    // The app container's, not this view model's: the Meetings tab's view model is
+    // cleared when another bottom tab opens (tabs keep no state, XERK-814), and the
+    // draft must outlive that as well as a rotation (XERK-2972 QA).
+    private val _editor = container.calendarEditor
+
+    /** The open Turma-event editor (XERK-2972), or null. */
+    val editor: StateFlow<EventEditor?> = _editor
+
+    fun openEditor(draft: TurmaEventDraft) {
+        _editor.value = EventEditor(draft, draft, draft.orgs.toList())
+    }
+
+    fun editDraft(draft: TurmaEventDraft) = _editor.update { it?.copy(draft = draft) }
+
+    fun closeEditor() {
+        _editor.value = null
+    }
+
+    /** Save the open editor; it closes on success, and a 409 reloads it from the event as it is now. */
+    fun saveEditor(zone: ZoneId = this.zone): Job? {
+        val ed = _editor.value ?: return null
+        return saveEvent(ed.draft, ed.orgsOrder) { r ->
+            when (r) {
+                is EventResult.Saved, EventResult.Deleted -> if (_editor.value?.base == ed.base) _editor.value = null
+                is EventResult.Conflict -> if (_editor.value?.base == ed.base) {
+                    // Only into the editor this save came from: one discarded meanwhile stays closed.
+                    val fresh = com.xerktech.turma.core.calDraftOf(r.event, zone)
+                    _editor.value = EventEditor(fresh, fresh, fresh.orgs.toList(), r.message)
+                }
+                is EventResult.Failed -> _editor.update { it?.copy(error = r.message) }
+            }
+        }
+    }
+
+    private val _eventBusy = MutableStateFlow(false)
+
+    /** A Turma-event create / edit / delete is in flight (XERK-2972). */
+    val eventBusy: StateFlow<Boolean> = _eventBusy
+
+    /**
+     * Save the editor's [draft] (XERK-2972): `POST /api/calendar/events` for a
+     * new event, `PATCH …/<id>` with the version it was made to for an edit.
+     * [done] gets the outcome; a refusal is also toasted in the hub's words. A
+     * 409 (the event changed since it was opened) carries the current event, so
+     * the editor reloads from it; every answer re-reads the shown weeks.
+     */
+    fun saveEvent(draft: TurmaEventDraft, orgsOrder: List<String> = emptyList(), done: (EventResult) -> Unit = {}): Job? {
+        if (_eventBusy.value) return null
+        val errs = calDraftErrors(draft)
+        if (errs.isNotEmpty()) { done(EventResult.Failed(errs.first())); return null }
+        _eventBusy.value = true
+        val what = if (draft.editing) "Saving the event" else "Creating the event"
+        return viewModelScope.launch {
+            val out = try {
+                val body = calDraftPayload(draft, orgsOrder)
+                val r = if (draft.editing) container.client.api.updateTurmaEvent(draft.id, body)
+                else container.client.api.createTurmaEvent(body)
+                eventResult(r, what) { it.event?.let { ev -> EventResult.Saved(ev) } ?: EventResult.Failed("$what failed — the hub refused it") }
+            } catch (e: CancellationException) {
+                _eventBusy.value = false
+                throw e
+            } catch (_: Exception) {
+                EventResult.Failed("$what failed — the hub is unreachable")
+            }
+            finishEvent(out, done)
+        }
+    }
+
+    /** Delete a Turma event (`DELETE /api/calendar/events/<id>`). */
+    fun deleteEvent(id: String, done: (EventResult) -> Unit = {}): Job? {
+        if (_eventBusy.value) return null
+        _eventBusy.value = true
+        val what = "Deleting the event"
+        return viewModelScope.launch {
+            val out = try {
+                eventResult(container.client.api.deleteTurmaEvent(id), what) { EventResult.Deleted }
+            } catch (e: CancellationException) {
+                _eventBusy.value = false
+                throw e
+            } catch (_: Exception) {
+                EventResult.Failed("$what failed — the hub is unreachable")
+            }
+            finishEvent(out, done)
+        }
+    }
+
+    private fun <T> eventResult(r: retrofit2.Response<T>, what: String, ok: (T) -> EventResult): EventResult {
+        if (r.isSuccessful) return r.body()?.let(ok) ?: EventResult.Failed("$what failed — the hub refused it")
+        // The error body is read once here: a 409's {error, event} names the current event.
+        val raw = runCatching { r.errorBody()?.string() }.getOrNull().orEmpty()
+        val parsed = runCatching { TurmaJson.decodeFromString(TurmaEventResponse.serializer(), raw) }.getOrNull()
+        val msg = "$what failed — " + (parsed?.error?.ifBlank { null } ?: "the hub answered HTTP ${r.code()}")
+        val current = parsed?.event
+        return if (r.code() == 409 && current != null) EventResult.Conflict(msg, current) else EventResult.Failed(msg)
+    }
+
+    private fun finishEvent(out: EventResult, done: (EventResult) -> Unit) {
+        _eventBusy.value = false
+        when (out) {
+            is EventResult.Failed -> _messages.tryEmit("✗ ${out.message}")
+            is EventResult.Conflict -> _messages.tryEmit("✗ ${out.message}")
+            else -> {}
+        }
+        refetch()
+        done(out)
     }
 
     /** Today on this phone's clock (tests pin it). */
