@@ -29816,6 +29816,17 @@ test("XERK-2965: Tenir lists the settled meetings with no transcript kept and ba
     const down = await postMeeting2508(S, meeting2508("pg1", { backfill: true }));
     assert.deepEqual([down.status, down.body.transcriptSaved, down.body.transcriptUnknown], [200, undefined, true]);
     assert.equal(hub.meetingTranscripts.has("pg1", 9), false);
+    // A failed disk write is "can't tell" too, never "kept".
+    hub.meetingTranscripts.missing = async (rows) => rows;
+    const realSave = hub.meetingTranscripts.save;
+    hub.meetingTranscripts.save = () => false;
+    try {
+      const sf = await postMeeting2508(S, meeting2508("pg1", { backfill: true }));
+      assert.deepEqual([sf.status, sf.body.transcriptSaved, sf.body.transcriptUnknown], [200, undefined, true]);
+    } finally {
+      hub.meetingTranscripts.save = realSave;
+    }
+    hub.meetingTranscripts.missing = async () => { throw new Error("postgres connection closed"); };
     // The list says so rather than reading "all missing" (QA m6).
     const l = await list(S);
     assert.equal(l.status, 503);
