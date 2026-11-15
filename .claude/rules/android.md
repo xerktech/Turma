@@ -163,9 +163,9 @@ A pure-core/adapter-shell split:
   - **The swipe follows the finger** (XERK-2980): the grid draws the days a swipe slides in
     off-screen either side (`calSwipeNeighbours`, a `DayStrip` per row), shifted in placement
     only. Day / 3 days swipe ONE day (`calSwipeStep`); ‹ › still page by what is shown.
-    - The shift is keyed by the strip (first day AND length) and left at its end when a settle steps: the
-      new days need a recomposition (next frame) but the shift is read in placement (this frame),
-      so zeroing it in the settle drew the old days unshifted for a frame (QA flash).
+    - The shift is keyed by the strip (first day AND length) and left at its end when a settle
+      steps: the new days need a recomposition (next frame) but the shift is read in placement
+      (this frame), so zeroing it in the settle drew the old days unshifted for a frame (QA flash).
     - A second finger always settles back; a touch mid-settle lands it first; ‹ › or a mode pick
       mid-settle wins (keying by length too: a mode pick keeps the first day).
     - A TAP mid-settle is swallowed (its up consumed): Compose picks the tapped child at the down,
