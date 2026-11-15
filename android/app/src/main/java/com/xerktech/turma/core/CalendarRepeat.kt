@@ -196,11 +196,12 @@ fun calRepeatSummary(rule: CalRule?, start: LocalDate): String {
 }
 
 /** The Repeat menu, Teams' presets named for the start day ("Weekly on Tuesday"). */
-fun calRepeatPresets(start: LocalDate): List<Pair<String, String>> = listOf(
+fun calRepeatPresets(start: LocalDate, r: RepeatForm? = null): List<Pair<String, String>> = listOf(
     "none" to "Does not repeat",
     "weekday" to "Every weekday (Mon–Fri)",
     "daily" to "Daily",
-    "weekly" to "Weekly on ${calDayLong(calDayCode(start))}",
+    // A weekly control names its own days (QA: a stored Mon/Wed/Fri read "Weekly on Tuesday").
+    "weekly" to "Weekly on ${if (r?.kind == "weekly" && r.days.isNotEmpty()) list(r.days) else calDayLong(calDayCode(start))}",
     "monthly" to "Monthly on day ${start.dayOfMonth}",
     "monthlyNth" to "Monthly on ${nthText(calAnchorNth(start))}",
     "yearly" to "Yearly on ${start.dayOfMonth} ${MONTHS[start.monthValue - 1]}",

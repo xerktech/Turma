@@ -33929,6 +33929,8 @@ test("XERK-2969: a series is served as its occurrences over the asked range only
     const occ = await occ2969();
     assert.deepEqual(occ.map((e) => e.id), [0, 1, 2, 3, 4].map((k) => `${s.id}:${key2969(k)}`));
     assert.ok(occ.every((e) => e.seriesId === s.id && e.recurring && e.editable && !e.exception));
+    // XERK-2973: each occurrence names its series' first instant, which an implicit rule day reads off.
+    assert.ok(occ.every((e) => e.seriesStart === s.start));
     assert.deepEqual([occ[2].start, occ[2].end, occ[2].originalStart], [key2969(2), iso2968(T2968 + 2 * W2969 + 3.6e6), key2969(2)]);
     // A range far ahead is expanded by itself, and only it.
     const far = await occ2969(T2968 + 52 * W2969, T2968 + 54 * W2969);

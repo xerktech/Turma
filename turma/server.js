@@ -6516,7 +6516,7 @@ function turmaOccurrenceRecord(rec, o, ex) {
 function turmaOccurrenceWire(p, rec, o, served = rec.orgs) {
   const ex = rec.exceptions[o.key];
   const w = { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served), id: `${rec.id}:${o.key}`,
-    seriesId: rec.id, originalStart: o.key, exception: !!ex };
+    seriesId: rec.id, originalStart: o.key, exception: !!ex, seriesStart: rec.start };
   // Writes are refused while the SERIES is withheld (calTurmaHiddenFrom), even on an
   // occurrence its owner made public: never offer an editor the route refuses.
   if (calTurmaWithheld(p, rec)) w.editable = false;

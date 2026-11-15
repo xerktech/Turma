@@ -388,7 +388,7 @@ private fun CalendarBody(
                 m, ev, colors[ev.org]?.let { series[it % series.size] },
                 side, now, zone, locale, fleet, names, range.events, cvm, bvm, mvm,
                 onClose = ::closeDetail, onOpenNotes = onOpenNotes, dailyFor = dailyFor,
-                onEdit = { e, scope -> cvm.openEditor(calDraftOf(e, zone).copy(scope = scope)) },
+                onEdit = { e, scope -> cvm.openEditor(com.xerktech.turma.core.calDraftFor(e, zone, scope)) },
             )
         }
     }

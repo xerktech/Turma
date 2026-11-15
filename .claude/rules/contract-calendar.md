@@ -406,7 +406,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 - **An occurrence's id is `<seriesId>:<original start>`**, the original start as UTC ISO with
   seconds (`turma:ab…:2026-11-16T14:00:00Z`) — the Outlook reader's own convention, so clients treat
   both alike. Served as `{...series fields, id, seriesId, recurring:true, originalStart, exception,
-  start, end, startMs, endMs}`; a single event carries `seriesId:""`, `recurring:false`. The series
+  seriesStart, start, end, startMs, endMs}`; `seriesStart` (XERK-2973) is the series' first
+  instant, the day an implicit rule day reads off; a single event carries `seriesId:""`, `recurring:false`. The series
   record itself is never served as an event, and `exceptions` never ride the wire.
 - **`exceptions`: `{<original start>: {deleted:true} | {override fields}}`** on the series,
   ≤`CALENDAR_TURMA_EXCEPTIONS_MAX` (100; past it a 409 in words). Overrides are any client field but

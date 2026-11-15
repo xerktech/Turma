@@ -101,6 +101,8 @@ data class CalendarEvent(
     val recurrence: kotlinx.serialization.json.JsonElement? = null,
     // An occurrence's original start (UTC ISO), the day its series' rule is read from.
     val originalStart: String = "",
+    // An occurrence's series' first instant (ISO with offset): the day an implicit rule day reads off.
+    val seriesStart: String = "",
 ) {
     val tenir: Boolean get() = source == "tenir"
 

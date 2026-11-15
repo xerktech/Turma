@@ -58,6 +58,7 @@ import com.xerktech.turma.core.RepeatForm
 import com.xerktech.turma.core.calAnchorNth
 import com.xerktech.turma.core.calDayLong
 import com.xerktech.turma.core.calDayShort
+import com.xerktech.turma.core.calRepeatDay
 import com.xerktech.turma.core.calRepeatDaysShown
 import com.xerktech.turma.core.calRepeatPick
 import com.xerktech.turma.core.calRepeatPresetOf
@@ -233,7 +234,7 @@ internal fun CalendarEventEditor(
 
     when (picker) {
         "until" -> {
-            val cur = d.repeat.until ?: d.startDate
+            val cur = d.repeat.until ?: calRepeatDay(d)
             val state = rememberDatePickerState(initialSelectedDateMillis = cur.atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli())
             DatePickerDialog(
                 onDismissRequest = { picker = "" },
@@ -305,7 +306,7 @@ private fun moveStart(d: TurmaEventDraft, day: LocalDate, time: LocalTime): Turm
 private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pick: (String) -> Unit, locale: Locale) {
     val r = d.repeat
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
-    val summary = calRepeatSummary(calRuleOfRepeat(r, d.startDate), d.startDate)
+    val summary = calRepeatSummary(calRuleOfRepeat(r, calRepeatDay(d)), calRepeatDay(d))
     fun put(next: RepeatForm) = set(d.copy(repeat = next))
     @Composable
     fun label(t: String) = Text(t, Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = muted)
@@ -319,7 +320,7 @@ private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pi
         }
         return
     }
-    val presets = calRepeatPresets(d.startDate)
+    val presets = calRepeatPresets(calRepeatDay(d), r)
     Row(verticalAlignment = Alignment.CenterVertically) {
         label("Repeat")
         Picker(
@@ -345,11 +346,11 @@ private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pi
     }
     val unit = if (custom) r.unit else mapOf("weekly" to "week", "monthly" to "month")[r.kind]
     if (unit == "week" || (custom && unit == "day")) {
-        val on = calRepeatDaysShown(r, d.startDate)
+        val on = calRepeatDaysShown(r, calRepeatDay(d))
         FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
             for (code in CAL_DAYS) {
                 FilterChip(
-                    selected = code in on, onClick = { put(calRepeatToggleDay(r, d.startDate, code, code !in on)) },
+                    selected = code in on, onClick = { put(calRepeatToggleDay(r, calRepeatDay(d), code, code !in on)) },
                     label = { Text(calDayShort(code).take(2)) },
                     modifier = Modifier.testTag("cal-ed-rep-day-$code").semantics { contentDescription = calDayLong(code) },
                 )
@@ -357,9 +358,9 @@ private fun RepeatSection(d: TurmaEventDraft, set: (TurmaEventDraft) -> Unit, pi
         }
     }
     if (custom && (unit == "month" || unit == "year")) {
-        val nth = r.nth ?: calAnchorNth(d.startDate)
+        val nth = r.nth ?: calAnchorNth(calRepeatDay(d))
         val opts = listOf(
-            "day" to "On day ${r.monthDay ?: d.startDate.dayOfMonth}",
+            "day" to "On day ${r.monthDay ?: calRepeatDay(d).dayOfMonth}",
             "weekday" to "On the ${listOf("", "first", "second", "third", "fourth").getOrElse(nth.n) { "last" }} ${calDayLong(nth.day)}",
         )
         Row(verticalAlignment = Alignment.CenterVertically) {

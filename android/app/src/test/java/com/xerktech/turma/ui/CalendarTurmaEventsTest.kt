@@ -281,13 +281,16 @@ class CalendarTurmaEventsTest {
         compose.onNodeWithText("A series' orgs apply to every event in it", substring = true).performScrollTo().assertExists()
         compose.onNodeWithTag("cal-ed-org-$a").performScrollTo().assertIsNotEnabled()
         compose.onNodeWithTag("cal-ed-repeat").performScrollTo().assertTextContains("Every 2 weeks on Tue, Thu", substring = true)
+        compose.onNodeWithTag("cal-ed-title").performScrollTo().performTextReplacement("Just this one")
         compose.onNodeWithTag("cal-editor-save").performClick()
-        val sent = body("/api/calendar/events/$occId")
-        assertEquals("occurrence", sent["scope"]!!.jsonPrimitive.content)
-        assertEquals(false, "recurrence" in sent)
+        // Only the change rides (XERK-2973 QA: a resent form pinned every field into the override).
+        assertEquals(setOf("subject", "version", "scope"), body("/api/calendar/events/$occId").let { sent ->
+            assertEquals("occurrence", sent["scope"]!!.jsonPrimitive.content)
+            sent.keys
+        })
     }
 
-    @Test fun `XERK-2973 This and following sends the scope and the rule`() {
+    @Test fun `XERK-2973 This and following sends the scope and only what changed, never the untouched rule`() {
         seed(occurrence())
         hub.json("/api/calendar/events/$occId", """{ "ok": true, "event": ${occurrence()} }""")
         show()
@@ -297,10 +300,12 @@ class CalendarTurmaEventsTest {
         compose.onNodeWithTag("cal-scope-following").performClick()
         compose.onNodeWithText("Edit this and following events").assertExists()
         compose.onNodeWithTag("cal-ed-rep-summary").performScrollTo().assertTextContains("Every 2 weeks on Tue, Thu", substring = true)
+        compose.onNodeWithTag("cal-ed-location").performScrollTo().performTextReplacement("Room 9")
         compose.onNodeWithTag("cal-editor-save").performClick()
         val sent = body("/api/calendar/events/$occId")
         assertEquals("following", sent["scope"]!!.jsonPrimitive.content)
-        assertEquals(TurmaJson.parseToJsonElement("""{"freq":"weekly","interval":2,"byDay":["TU","TH"]}"""), sent["recurrence"])
+        // A resent rule re-grew a count and dropped the hub's month-end day (XERK-2973 QA).
+        assertEquals(setOf("location", "version", "scope"), sent.keys)
     }
 
     @Test fun `XERK-2973 Delete on an occurrence asks which events and sends the scope`() {

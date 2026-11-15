@@ -67,6 +67,8 @@ data class TurmaEventDraft(
     // edit is for ("occurrence" | "following" | "series"; "" = a plain event / a new one).
     val repeat: RepeatForm = RepeatForm(),
     val scope: String = "",
+    // "All events" opened from a later occurrence: the series' first day, which its rule reads off.
+    val seriesDate: LocalDate? = null,
 ) {
     val editing: Boolean get() = id.isNotEmpty()
 
@@ -147,13 +149,42 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
     )
 }
 
+/** The editor's draft for [ev], opened for [scope] (XERK-2973; "" = a plain event). */
+fun calDraftFor(ev: CalendarEvent, fallback: ZoneId, scope: String): TurmaEventDraft =
+    calDraftOf(ev, fallback).copy(scope = scope, seriesDate = if (scope == "series") calAnchorDay(ev, fallback) else null)
+
+/** The day the draft's repeat is read against: the series' first day for "All events", else its start. */
+fun calRepeatDay(d: TurmaEventDraft): LocalDate = d.seriesDate ?: d.startDate
+
+/**
+ * An occurrence's scoped edit (the web's `scopedBody`): only the fields that differ from the
+ * draft as opened, plus `version` and `scope`; null when nothing changed. A resent form is not
+ * neutral (XERK-2973 QA): a resent rule re-grew a count and dropped the hub's month-end day,
+ * a resent start dragged the series, and "This event" pinned every field into its override.
+ * start/end ride together: the hub moves by their delta.
+ */
+fun calScopedPayload(base: TurmaEventDraft, draft: TurmaEventDraft, orgsOrder: List<String> = emptyList()): JsonObject? {
+    val was = calDraftPayload(base, orgsOrder)
+    val now = calDraftPayload(draft, orgsOrder)
+    val keys = now.keys.filter { it != "version" && it != "scope" && now[it] != was[it] }.toMutableSet()
+    if ("start" in keys || "end" in keys) keys += listOf("start", "end")
+    if (keys.isEmpty()) return null
+    return buildJsonObject {
+        for (k in now.keys) if (k in keys) put(k, now.getValue(k))
+        now["version"]?.let { put("version", it) }
+        now["scope"]?.let { put("scope", it) }
+    }
+}
+
 /**
  * The day a served occurrence's rule is read from: its ORIGINAL start (a moved
  * one keeps its series' day) in the zone it was made in.
  */
 fun calAnchorDay(ev: CalendarEvent, fallback: ZoneId): LocalDate {
     val zone = calZoneOrNull(ev.timeZone) ?: fallback
-    val ms = runCatching { java.time.Instant.parse(ev.originalStart).toEpochMilli() }.getOrNull() ?: ev.startMs ?: 0
+    // The series' own first day when served (a clamped Feb 28 must not read "day 28"), else the original start.
+    val ms = runCatching { OffsetDateTime.parse(ev.seriesStart).toInstant().toEpochMilli() }.getOrNull()
+        ?: runCatching { java.time.Instant.parse(ev.originalStart).toEpochMilli() }.getOrNull() ?: ev.startMs ?: 0
     return java.time.Instant.ofEpochMilli(ms).atZone(zone).toLocalDate()
 }
 
@@ -301,7 +332,7 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
     if (d.body.codePointCount() > CAL_BODY_MAX) add("The details are longer than $CAL_BODY_MAX characters.")
     val cats = calCategories(d.categories)
     if (cats.size > 20 || cats.any { it.codePointCount() > 100 }) add("At most 20 categories of at most 100 characters.")
-    if (!d.oneOccurrence) calRepeatError(d.repeat, d.startDate).takeIf { it.isNotEmpty() }?.let { add(it) }
+    if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
     if (d.orgs.isEmpty()) add("Pick at least one org.")
     if (d.orgs.size > CAL_TURMA_ORGS_MAX) add("An event belongs to at most $CAL_TURMA_ORGS_MAX orgs.")
 }
@@ -345,7 +376,7 @@ fun calDraftPayload(d: TurmaEventDraft, orgsOrder: List<String> = emptyList()): 
         put("categories", JsonArray(calCategories(d.categories).map { JsonPrimitive(it) }))
         put("sensitivity", if (d.private) "private" else d.sensitivity.takeIf { it != "private" } ?: "normal")
         // One occurrence takes no rule (the hub refuses it): the series' stands (XERK-2973).
-        if (!d.oneOccurrence) put("recurrence", calRuleJson(calRuleOfRepeat(d.repeat, d.startDate)))
+        if (!d.oneOccurrence) put("recurrence", calRuleJson(calRuleOfRepeat(d.repeat, calRepeatDay(d))))
         if (d.scope.isNotEmpty()) put("scope", d.scope)
     }
 }

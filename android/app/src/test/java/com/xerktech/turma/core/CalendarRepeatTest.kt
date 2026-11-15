@@ -125,4 +125,32 @@ class CalendarRepeatTest {
         val odd = TurmaJson.decodeFromString(CalendarEvent.serializer(), """{ "source": "turma", "recurrence": "weekly" }""")
         assertEquals(null, calRuleOf(odd.recurrence))
     }
+
+    @Test fun `QA a scoped edit sends only what changed, start and end together`() {
+        val base = draft(calRepeatOf(calRuleOf(TurmaJson.parseToJsonElement("""{"freq":"weekly","interval":1,"count":10}"""))), "following")
+        assertEquals(null, calScopedPayload(base, base))
+        val moved = calScopedPayload(base, base.copy(endTime = LocalTime.of(11, 0)))!!
+        assertEquals(setOf("start", "end", "version", "scope"), moved.keys)
+        val rule = calScopedPayload(base, base.copy(repeat = base.repeat.copy(kind = "custom", unit = "week", interval = "2")))!!
+        assertEquals(setOf("recurrence", "version", "scope"), rule.keys)
+    }
+
+    @Test fun `QA an occurrence's rule reads off its series' first day, never a clamped one`() {
+        val feb = TurmaJson.decodeFromString(CalendarEvent.serializer(), """{ "source": "turma", "id": "turma:0123456789abcdef:2027-02-28T15:00:00Z",
+            "seriesId": "turma:0123456789abcdef", "recurring": true, "originalStart": "2027-02-28T15:00:00Z", "seriesStart": "2027-01-31T10:00:00-05:00",
+            "start": "2027-02-28T10:00:00-05:00", "end": "2027-02-28T11:00:00-05:00", "startMs": 1, "endMs": 2,
+            "timeZone": "America/New_York", "orgs": ["acme"], "editable": true, "version": 4, "recurrence": { "freq": "monthly", "interval": 1 } }""")
+        assertEquals("Every month on day 31", calRepeatSummary(calRuleOf(feb.recurrence), calAnchorDay(feb, zone)))
+        val d = calDraftFor(feb, zone, "series")
+        assertEquals(LocalDate.of(2027, 1, 31), d.seriesDate)
+        // Ending before Feb 28 is fine for a series that starts Jan 31, and the implicit 31st stays implicit.
+        val until = d.copy(repeat = d.repeat.copy(end = "until", until = LocalDate.of(2027, 2, 15)))
+        assertEquals("", calRepeatError(until.repeat, calRepeatDay(until)))
+        assertEquals(TurmaJson.parseToJsonElement("""{"freq":"monthly","interval":1,"until":"2027-02-15"}"""), calDraftPayload(until)["recurrence"])
+    }
+
+    @Test fun `QA a stored weekly rule's preset names its own days`() {
+        val r = calRepeatOf(calRuleOf(TurmaJson.parseToJsonElement("""{"freq":"weekly","interval":1,"byDay":["MO","WE","FR"]}""")))
+        assertEquals("Weekly on Mon, Wed, Fri", calRepeatPresets(LocalDate.of(2026, 11, 17), r).toMap()["weekly"])
+    }
 }

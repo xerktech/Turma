@@ -311,6 +311,12 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 - **An occurrence of a Turma series asks which events** (`isTurmaOccurrence`, `scopeAsk`): Edit and
   Delete each offer This event / This and following / All events and send `scope` (PATCH body,
   DELETE `?scope=`) to the OCCURRENCE id; the series' `version` rides along.
+  - **A scoped edit sends ONLY the fields that changed** (`scopedBody`, Android `calScopedPayload`;
+    start/end together; nothing changed = nothing sent). Never resend the whole form there (QA):
+    a resent rule re-grew a count and dropped the hub's month-end day on "This and following", a
+    resent start dragged the series, and "This event" pinned every field into its override.
+  - "All events" reads its repeat off the series' first day (`seriesStart` → `f.seriesDate`,
+    `repDay`), never the opened occurrence's: a kept "day 31" was dropped and a valid until refused.
   - "This event" disables the orgs and zone (with a note) and sends no `recurrence`: the hub refuses
     an occurrence's own rule, orgs or zone.
 - **Every repeating event wears `RECUR_SVG`** (Outlook's circling arrows) beside its title and in

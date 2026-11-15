@@ -1602,14 +1602,18 @@ test("XERK-2973: Edit on an occurrence asks which events, and each answer sends 
       assert.match(panel, /data-ed-rep="preset"[^]*value="custom" selected/);
       assert.match(panel, /data-ed-rep-summary[^>]*>[^]*Every 2 weeks on Tue, Thu until 30 Jun/);
     }
+    // Nothing changed: nothing is sent (a resent form is not neutral, see scopedBody).
     posts.length = 0;
+    await cal.saveEditor();
+    assert.equal(posts.length, 0);
+    assert.equal(cal._ed(), null);
+    click({ evEdit: "" });
+    click({ evScope: scope });
+    editorFill({ subject: "Renamed" });
     await cal.saveEditor();
     assert.equal(posts.length, 1);
     assert.equal(posts[0].url, `/api/calendar/events/${encodeURIComponent("turma:0123456789abcdef:2027-05-04T14:00:00Z")}`);
-    assert.equal(posts[0].body.scope, scope);
-    assert.equal(posts[0].body.version, 2, "the series' version");
-    if (scope === "occurrence") assert.equal("recurrence" in posts[0].body, false);
-    else assert.deepEqual(posts[0].body.recurrence, { freq: "weekly", interval: 2, byDay: ["TU", "TH"], until: "2027-06-30" });
+    assert.deepEqual(posts[0].body, { subject: "Renamed", version: 2, scope }, "only the change, the series' version and the scope");
     click({ closeDetail: "" });
   }
   // Cancel backs out; a single event never asks.
@@ -1669,3 +1673,32 @@ test("XERK-2973: the editor's Repeat control drives the rule — preset, days, c
   assert.match(panel(), /data-ed-rep-summary[^>]*><svg[^]*<\/svg>Every 2 months on the third Tuesday, 6 times</);
   cal.closeEditor();
 }));
+
+test("XERK-2973 QA: a scoped edit sends only what changed — start/end together, the rule only when touched", () => {
+  const base = { subject: "A", start: "s0", end: "e0", recurrence: { freq: "weekly", interval: 1, count: 10 }, version: 2, scope: "following" };
+  assert.equal(cal.scopedBody(base, { ...base }), null);
+  assert.deepEqual(cal.scopedBody(base, { ...base, end: "e1" }), { start: "s0", end: "e1", version: 2, scope: "following" });
+  assert.deepEqual(cal.scopedBody(base, { ...base, recurrence: { freq: "weekly", interval: 2, count: 10 } }),
+    { recurrence: { freq: "weekly", interval: 2, count: 10 }, version: 2, scope: "following" });
+});
+
+test("XERK-2973 QA: an occurrence's rule reads off its series' first day, not a clamped one", () => withOrgs(async () => {
+  // Feb 28 2027 is an occurrence of "monthly on the 31st" (first day Jan 31): day 31, never day 28.
+  const feb = occ({ id: "turma:0123456789abcdef:2027-02-28T15:00:00Z", originalStart: "2027-02-28T15:00:00Z",
+    seriesStart: "2027-01-31T10:00:00-05:00", start: "2027-02-28T10:00:00-05:00", end: "2027-02-28T11:00:00-05:00",
+    startMs: Date.parse("2027-02-28T15:00:00Z"), endMs: Date.parse("2027-02-28T16:00:00Z"), recurrence: { freq: "monthly", interval: 1 } });
+  assert.match(cal.detailHtml(feb, at(2027, 2, 1)), /Every month on day 31/);
+  // "All events" from it keeps the implicit 31st and may end before Feb 28 (it starts Jan 31).
+  cal.openEditor({ event: feb, scope: "series" });
+  const f = cal._ed().f;
+  assert.equal(f.seriesDate, "2027-01-31");
+  f.repeat = { ...f.repeat, end: "until", until: "2027-02-15" };
+  assert.equal(cal.validateForm(f).repeat, undefined);
+  assert.deepEqual(cal.formPayload(f, 2, "series").recurrence, { freq: "monthly", interval: 1, until: "2027-02-15" });
+  cal.closeEditor();
+}));
+
+test("XERK-2973 QA: a stored weekly rule's preset names its own days", () => {
+  const r = cal.repeatFromRule({ freq: "weekly", interval: 1, byDay: ["MO", "WE", "FR"] });
+  assert.equal(new Map(cal.repeatPresets("2026-11-17", r)).get("weekly"), "Weekly on Mon, Wed, Fri");
+});

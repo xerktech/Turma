@@ -746,11 +746,13 @@ function captureLinkHtml(ev, c) {
     + (st && st.calendarBy === "operator" ? `<button type="button" class="btn-sm" data-link-auto="${esc(k)}"${dis} title="Let Turma match it to the calendar again">Match automatically</button>` : "")
     + `</div>` + (linkErr.has(k) ? `<div class="mt-err">${esc(linkErr.get(k))}</div>` : "") + `</div>`;
 }
-// The day an occurrence's rule is read from: its ORIGINAL start (a moved one keeps its
-// series' day) in the zone the event was made in.
+// The day an occurrence's rule is read from: its series' first day, else its ORIGINAL
+// start (a moved one keeps its series' day), in the zone the event was made in.
 function evAnchorYmd(ev) {
-  const o = Date.parse(ev && ev.originalStart);
-  const ms = Number.isFinite(o) ? o : ev.startMs;
+  // The series' own first day when the hub serves it (an implicit "day 31" reads off it, never
+  // off a clamped Feb 28 occurrence); else the occurrence's original start.
+  const s = Date.parse(ev && ev.seriesStart), o = Date.parse(ev && ev.originalStart);
+  const ms = Number.isFinite(s) ? s : Number.isFinite(o) ? o : ev.startMs;
   const tz = typeof ev.timeZone === "string" && zoneKnown(ev.timeZone) ? ev.timeZone : browserZone();
   return Number.isFinite(ms) ? ymdOf(zoneParts(ms, tz)) : "";
 }
@@ -1079,6 +1081,11 @@ function paintDetail(force = false) {
     const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
     if (el && el.focus) el.focus({ preventScroll: true });
   }
+}
+// Keyboard focus onto a control of the panel's info part after a repaint swapped it out.
+function focusInfo(sel) {
+  const x = $info && $info.querySelector ? $info.querySelector(sel) : null;
+  if (x && x.focus) x.focus({ preventScroll: true });
 }
 function flushSide() { setTimeout(() => { if (sidePending) paintDetail(); }, 0); }
 
@@ -1421,12 +1428,18 @@ function repeatSummary(rule, ymd) {
   else if (Number.isSafeInteger(rule.count)) s += `, ${rule.count} time${rule.count === 1 ? "" : "s"}`;
   return s;
 }
+// The day the editor's repeat is read against: the series' first day when "All events" is
+// edited from a later occurrence (QA: its own day dropped a kept "day 31" and refused a valid
+// until), else the start the form shows — a new event's, or the series a "following" edit starts.
+const repDay = (f) => (f && f.seriesDate) || f.startDate;
 // The Repeat menu, Teams' presets named for the start day ("Weekly on Tuesday").
-function repeatPresets(ymd) {
+// `r` (the control) names a weekly rule's own days in its preset.
+function repeatPresets(ymd, r) {
   const a = rAnchor(ymd) || { y: 0, m: 1, d: 1, dow: 0 };
   const nth = { n: rAnchorNth(a), day: R_DAYS[a.dow] };
+  const days = r && r.kind === "weekly" && Array.isArray(r.days) && r.days.length ? rList(r.days) : R_DAY_LONG[a.dow];
   return [["none", "Does not repeat"], ["weekday", "Every weekday (Mon–Fri)"], ["daily", "Daily"],
-    ["weekly", `Weekly on ${R_DAY_LONG[a.dow]}`], ["monthly", `Monthly on day ${a.d}`],
+    ["weekly", `Weekly on ${days}`], ["monthly", `Monthly on day ${a.d}`],
     ["monthlyNth", `Monthly on ${rNthText(nth)}`], ["yearly", `Yearly on ${a.d} ${R_MONTHS[a.m - 1]}`], ["custom", "Custom…"]];
 }
 // The preset a control shows (monthly splits on its mode).
@@ -1463,7 +1476,7 @@ function validateForm(f, pickable = null) {
   if (cats.length > 20 || cats.some((c) => cps(c) > 100)) err.category = "At most 20 categories of at most 100 characters.";
   const t = formTimes(f);
   if (t.error) Object.assign(err, t.error);
-  const re = repeatError(f.repeat, f.startDate);
+  const re = repeatError(f.repeat, repDay(f));
   if (re) err.repeat = re;
   return err;
 }
@@ -1480,10 +1493,28 @@ function formPayload(f, version, scope) {
     allDay: !!f.allDay, location: String(f.location || "").trim(), body: String(f.body || ""), attendees,
     joinUrl: f.online ? String(f.joinUrl || "").trim() : "", isOnlineMeeting: !!f.online, busy: f.busy,
     categories: categoriesOf(f), sensitivity: f.priv ? keepPriv : (f.sensitivity === "personal" ? "personal" : "normal") };
-  if (scope !== "occurrence") body.recurrence = ruleFromRepeat(f.repeat, f.startDate);
+  if (scope !== "occurrence") body.recurrence = ruleFromRepeat(f.repeat, repDay(f));
   if (version !== undefined) body.version = version;
   if (scope) body.scope = scope;
   return body;
+}
+// An occurrence's scoped edit: only the fields the person changed, plus `version` and
+// `scope` (null when nothing changed). Resending the rest is not neutral (XERK-2973 QA): a
+// resent rule re-grew a count and dropped the hub's month-end day on "This and following",
+// a resent start dragged the series to a moved occurrence's day, and "This event" pinned
+// every field into its override so a later "All events" rename never reached it.
+// start/end ride together: the hub moves by their delta.
+function scopedBody(base, cur) {
+  const out = {};
+  for (const k of Object.keys(cur)) {
+    if (k === "version" || k === "scope") continue;
+    if (JSON.stringify(cur[k]) !== JSON.stringify(base[k])) out[k] = cur[k];
+  }
+  if ("start" in out || "end" in out) { out.start = cur.start; out.end = cur.end; }
+  if (!Object.keys(out).length) return null;
+  if (cur.version !== undefined) out.version = cur.version;
+  if (cur.scope) out.scope = cur.scope;
+  return out;
 }
 // The orgs a viewer may put an event in: every org its fleet reports (the hub has
 // already scoped the snapshot to the caller's tenant), plus any the event holds.
@@ -1558,7 +1589,10 @@ function openEditor(opts = {}) {
     f = formFromEvent(opts.event);
     // An occurrence of a series is edited for the events its scope names (XERK-2973).
     const scope = isTurmaOccurrence(opts.event) && SCOPES.some(([s]) => s === opts.scope) ? opts.scope : undefined;
+    if (scope === "series") f.seriesDate = evAnchorYmd(opts.event);
     ed = { mode: "edit", id: String(opts.event.id), version: opts.event.version, scope, f, errors: {}, err: "", busy: false, tried: false };
+    // A scoped edit sends only what changed (scopedBody): the form as opened is the base.
+    if (scope) ed.base = formPayload(f, undefined, scope);
   } else {
     const now = nowFn();
     let s = num(opts.startMs) ? opts.startMs : 0;
@@ -1658,14 +1692,14 @@ function editorHtml() {
 // interval / month mode / end, then the one-line summary the panel shows too.
 function repeatRowsHtml(f, one) {
   const r = f.repeat || blankRepeat();
-  const summary = repeatSummary(ruleFromRepeat(r, f.startDate), f.startDate);
+  const summary = repeatSummary(ruleFromRepeat(r, repDay(f)), repDay(f));
   if (one) {
     return `<div class="cal-ed-row"><span class="k">Repeat</span><span class="cal-dnote cal-ed-note">${esc(summary)}. `
       + `A series repeats as a whole: edit All events to change it.</span></div>`;
   }
   const opt = (v, l, cur) => `<option value="${esc(v)}"${v === cur ? " selected" : ""}>${esc(l)}</option>`;
   let h = `<div class="cal-ed-row"><span class="k">Repeat</span><select data-ed-rep="preset" aria-label="Repeat">`
-    + repeatPresets(f.startDate).map(([v, l]) => opt(v, l, repeatPresetOf(r))).join("") + `</select></div>`;
+    + repeatPresets(repDay(f), r).map(([v, l]) => opt(v, l, repeatPresetOf(r))).join("") + `</select></div>`;
   if (r.kind === "none") return h;
   const custom = r.kind === "custom";
   if (custom) {
@@ -1674,9 +1708,9 @@ function repeatRowsHtml(f, one) {
       + `<select data-ed-rep="unit" aria-label="Repeat unit">${R_UNITS.map((u) => opt(u, `${u}${Number(r.interval) === 1 ? "" : "s"}`, r.unit)).join("")}</select></div></div>`;
   }
   const unit = custom ? r.unit : { weekly: "week", monthly: "month" }[r.kind];
-  if (unit === "week" || (custom && unit === "day")) h += `<div class="cal-ed-row"><span class="k"></span>${repeatDaysHtml(r, f.startDate, unit)}</div>`;
+  if (unit === "week" || (custom && unit === "day")) h += `<div class="cal-ed-row"><span class="k"></span>${repeatDaysHtml(r, repDay(f), unit)}</div>`;
   if (custom && (unit === "month" || unit === "year")) {
-    const a = rAnchor(f.startDate) || { d: 1, dow: 0 };
+    const a = rAnchor(repDay(f)) || { d: 1, dow: 0 };
     const nth = r.nth || { n: rAnchorNth(a), day: R_DAYS[a.dow] };
     h += `<div class="cal-ed-row"><span class="k"></span><select data-ed-rep="monthMode" aria-label="Repeat on">`
       + opt("day", `On day ${Number.isSafeInteger(r.monthDay) ? r.monthDay : a.d}`, r.monthMode)
@@ -1685,7 +1719,7 @@ function repeatRowsHtml(f, one) {
   // No "Ends" label: the event's own end sits just above (screenshot review).
   h += `<div class="cal-ed-row"><span class="k"></span><div class="cal-ed-when"><select data-ed-rep="end" aria-label="Repeat ends">`
     + opt("never", "Never ends", r.end) + opt("until", "Ends on", r.end) + opt("count", "Ends after", r.end) + `</select>`
-    + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(f.startDate)}" value="${esc(r.until)}">` : "")
+    + (r.end === "until" ? `<input type="date" data-ed-rep="until" aria-label="Repeat until" min="${esc(repDay(f))}" value="${esc(r.until)}">` : "")
     + (r.end === "count" ? `<input type="number" class="cal-ed-num" data-ed-rep="count" min="1" max="${R_COUNT_MAX}" step="1" aria-label="Number of occurrences" value="${esc(r.count)}"> occurrences` : "")
     + `</div></div>`;
   return h + `<div class="cal-ed-row"><span class="k"></span><span class="cal-ed-sum" data-ed-rep-summary aria-live="polite">${RECUR_SVG}${esc(summary)}</span></div>`;
@@ -1705,16 +1739,16 @@ function refreshRepeatText() {
   if (!ed || !$edPanel || !$edPanel.querySelector) return;
   const f = ed.f;
   const sum = $edPanel.querySelector("[data-ed-rep-summary]");
-  if (sum) sum.innerHTML = RECUR_SVG + esc(repeatSummary(ruleFromRepeat(f.repeat, f.startDate), f.startDate));
+  if (sum) sum.innerHTML = RECUR_SVG + esc(repeatSummary(ruleFromRepeat(f.repeat, repDay(f)), repDay(f)));
   const sel = $edPanel.querySelector('[data-ed-rep="preset"]');
   if (sel && sel.options) {
-    const labels = new Map(repeatPresets(f.startDate));
+    const labels = new Map(repeatPresets(repDay(f), f.repeat));
     for (const o of [...sel.options]) if (labels.has(o.value)) o.textContent = labels.get(o.value);
   }
   const unit = $edPanel.querySelector('[data-ed-rep="unit"]');
   if (unit && unit.options) for (const o of [...unit.options]) o.textContent = `${o.value}${Number(f.repeat.interval) === 1 ? "" : "s"}`;
   // A weekly rule with no day ticked repeats on its start's weekday: the boxes follow it.
-  const a = rAnchor(f.startDate), r = f.repeat;
+  const a = rAnchor(repDay(f)), r = f.repeat;
   if (a && r && !r.days.length && (r.kind === "weekly" || (r.kind === "custom" && r.unit === "week"))) {
     for (const x of [...$edPanel.querySelectorAll("[data-ed-repday]")]) x.checked = x.dataset.edRepday === R_DAYS[a.dow];
   }
@@ -1767,7 +1801,11 @@ async function saveEditor() {
   cur.errors = validateForm(cur.f, pickableOrgs(cur.mode === "edit" && detail ? evOrgs(detail) : []));
   cur.err = "";
   if (Object.keys(cur.errors).length) return void paintEditor(true);
-  const body = formPayload(cur.f, cur.mode === "edit" ? cur.version : undefined, cur.scope);
+  let body = formPayload(cur.f, cur.mode === "edit" ? cur.version : undefined, cur.scope);
+  if (cur.mode === "edit" && cur.scope && cur.base) {
+    body = scopedBody(cur.base, body);
+    if (!body) return void closeEditor();   // nothing changed: nothing to send
+  }
   cur.busy = true;
   paintEditor(true);
   const r = cur.mode === "edit"
@@ -1781,6 +1819,8 @@ async function saveEditor() {
     if (r.res && r.res.status === 409 && r.out && r.out.event && typeof r.out.event === "object" && cur.mode === "edit") {
       const fresh = { source: "turma", ...r.out.event, orgs: Array.isArray(r.out.event.orgs) ? r.out.event.orgs : cur.f.orgs };
       cur.f = formFromEvent(fresh);
+      if (cur.scope === "series") cur.f.seriesDate = evAnchorYmd(fresh);
+      if (cur.scope) cur.base = formPayload(cur.f, undefined, cur.scope);
       cur.version = r.out.event.version;
       cur.tried = false;
       refetch();
@@ -1866,7 +1906,7 @@ function mountEditor() {
       else if (d.edRep === "end") ed.f.repeat = { ...r, end: ["never", "until", "count"].includes(t.value) ? t.value : "never" };
       else return;
     } else if (d.edRepday !== undefined) {
-      const r = ed.f.repeat, a = rAnchor(ed.f.startDate);
+      const r = ed.f.repeat, a = rAnchor(repDay(ed.f));
       const week = r.kind === "weekly" || (r.kind === "custom" && r.unit === "week");
       const set = new Set(r.days.length ? r.days : week && a ? [R_DAYS[a.dow]] : []);
       if (t.checked) set.add(d.edRepday); else set.delete(d.edRepday);
@@ -2009,9 +2049,11 @@ function mount(el, opts = {}) {
       // An occurrence of a series first asks which events (XERK-2973).
       if ((d.evEdit !== undefined || d.evDelete !== undefined) && isTurmaOccurrence(detail)) {
         scopeAsk = d.evEdit !== undefined ? "edit" : "delete"; evErr = "";
-        return void paintDetail(true);
+        paintDetail(true);
+        // The prompt replaced the pressed button: focus its first answer (Cancel for a delete).
+        return void focusInfo(scopeAsk === "edit" ? '[data-ev-scope="occurrence"]' : "[data-ev-scope-no]");
       }
-      if (d.evScopeNo !== undefined) { scopeAsk = null; return void paintDetail(true); }
+      if (d.evScopeNo !== undefined) { scopeAsk = null; paintDetail(true); return void focusInfo("[data-ev-edit]"); }
       if (d.evScope !== undefined) {
         const scope = SCOPES.some(([s]) => s === d.evScope) ? d.evScope : null;
         if (!scope || !scopeAsk) return;
@@ -2019,8 +2061,8 @@ function mount(el, opts = {}) {
         return void deleteEvent(scope);
       }
       if (d.evEdit !== undefined) return void openEditor({ event: detail });
-      if (d.evDelete !== undefined) { delConfirm = true; evErr = ""; return void paintDetail(true); }
-      if (d.evDeleteNo !== undefined) { delConfirm = false; return void paintDetail(true); }
+      if (d.evDelete !== undefined) { delConfirm = true; evErr = ""; paintDetail(true); return void focusInfo("[data-ev-delete-no]"); }
+      if (d.evDeleteNo !== undefined) { delConfirm = false; paintDetail(true); return void focusInfo("[data-ev-delete]"); }
       return void deleteEvent();
     }
     if (d.hostSettings !== undefined) { hostSetOpen = !hostSetOpen; return void paint(true); }
@@ -2149,7 +2191,7 @@ const api = {
   _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
   _els: () => ({ grid: $grid, side: $side, info: $info, mt: $mt }),
   _go: go,
-  blankRepeat, repeatFromRule, ruleFromRepeat, repeatSummary, repeatError, repeatPresets, repeatPick, repeatPresetOf,
+  scopedBody, blankRepeat, repeatFromRule, ruleFromRepeat, repeatSummary, repeatError, repeatPresets, repeatPick, repeatPresetOf,
   validateForm, formPayload, formFromEvent, blankForm, wallToIso, parseAttendee, normEmail, evOrgs, openEditor, closeEditor,
   saveEditor, slotMinAt,
   _ed: () => ed, _edEls: () => ({ back: $edBack, panel: $edPanel }),
