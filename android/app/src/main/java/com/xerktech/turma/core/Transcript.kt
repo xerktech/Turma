@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.Block
+import com.xerktech.turma.model.PrLinkBlock
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
 import com.xerktech.turma.model.TextBlock
@@ -48,6 +49,7 @@ private fun blockText(b: Block): String = when (b) {
     is ToolUseBlock -> b.name + (b.input?.toString() ?: "") + b.caption +
         b.files.joinToString("") { it.src + it.html + it.name }
     is TaskNotificationBlock -> b.summary + b.status + b.result
+    is PrLinkBlock -> b.url // chat.js weight counts `url`
     else -> ""
 }
 
@@ -57,27 +59,51 @@ private fun blockText(b: Block): String = when (b) {
  * Grow-only: an incoming copy replaces the existing one only when it is at
  * least as heavy — or when it carries blocks the existing text-only copy lacks
  * (chat.js mergeTail's tie-break: the rich live copy must beat the heartbeat's
- * flat preview even at equal weight). New keys are appended in order.
+ * flat preview even at equal weight). A NEW key lands just before the next
+ * incoming key [existing] holds at a LATER slot than any seen so far; with no such
+ * key it is appended. Never anchored on the PREVIOUS key: a live-tail delta omits
+ * unchanged entries, and a seed repeats a restamped `pr-link:<url>` id. Mirrors
+ * chat.js mergeTail.
  */
 fun mergeTail(existing: List<TailEntry>, incoming: List<TailEntry>): List<TailEntry> {
     if (incoming.isEmpty()) return existing
     val out = existing.toMutableList()
-    val indexByKey = HashMap<String, Int>()
-    out.forEachIndexed { i, e -> indexByKey[e.key] = i }
+    val byKey = HashMap<String, TailEntry>()
+    out.forEach { byKey[it.key] = it }
+    var prev = -1
+    val run = ArrayList<TailEntry>()
     for (inc in incoming) {
         val k = inc.key
         if (k.isEmpty()) continue
-        val at = indexByKey[k]
-        if (at == null) {
-            indexByKey[k] = out.size
-            out.add(inc)
-        } else if (
-            entryWeight(inc) >= entryWeight(out[at]) ||
-            (inc.blocks.isNotEmpty() && out[at].blocks.isEmpty())
-        ) {
-            out[at] = inc
+        val cur = byKey[k]
+        if (cur == null) {
+            byKey[k] = inc
+            run.add(inc)
+            continue
+        }
+        val heavier = entryWeight(inc) >= entryWeight(cur) ||
+            (inc.blocks.isNotEmpty() && cur.blocks.isEmpty())
+        val at = out.indexOfFirst { it.key == k }
+        if (at < 0) {
+            // A repeat of a key still waiting in [run]: upgrade it there.
+            if (heavier) { run[run.indexOfFirst { it.key == k }] = inc; byKey[k] = inc }
+            continue
+        }
+        var slot = at
+        if (at > prev) {
+            if (run.isNotEmpty()) {
+                out.addAll(at, run)
+                slot = at + run.size
+                run.clear()
+            }
+            prev = slot
+        }
+        if (heavier) {
+            out[slot] = inc
+            byKey[k] = inc
         }
     }
+    out.addAll(run)
     return out
 }
 

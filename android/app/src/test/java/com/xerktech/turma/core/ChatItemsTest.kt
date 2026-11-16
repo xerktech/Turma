@@ -2,6 +2,7 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.CommandBlock
 import com.xerktech.turma.model.CommandOutputBlock
+import com.xerktech.turma.model.PrLinkBlock
 import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TextBlock
@@ -71,6 +72,59 @@ class ChatItemsTest {
         )
         assertEquals(CommandBlock(name = "!", args = "ls"), e.blocks[0])
         assertEquals(CommandOutputBlock(text = "x", isError = true), e.blocks[1])
+    }
+
+    // ---- XERK-3003: pr_link markers (web parity with chat.js `pr`) ------------
+
+    @Test fun `pr_link decodes and draws one marker per url at its first occurrence`() {
+        val wire = listOf(
+            """{"id":"p1","role":"assistant","blocks":[{"t":"text","text":"opened"},""" +
+                """{"t":"pr_link","url":"https://github.com/o/r/pull/7","number":7,"repo":"o/r"}]}""",
+            """{"id":"p2","role":"user","blocks":[{"t":"pr_link","url":"https://github.com/o/r/pull/7","number":7,"repo":"o/r"},""" +
+                """{"t":"text","text":"next"}]}""",
+        ).map { TurmaJson.decodeFromString(TailEntry.serializer(), it) }
+        val pr = wire[0].blocks[1] as PrLinkBlock
+        assertEquals("https://github.com/o/r/pull/7", pr.url)
+        assertEquals(7, pr.prNumber)
+        val items = buildItems(wire, VerbosityPrefs.forPreset(Verbosity.CONCISE))
+        val marks = items.filterIsInstance<ChatItem.PrMark>()
+        assertEquals(1, marks.size)
+        assertEquals("p1", marks[0].entryKey)
+        assertEquals("Opened PR #7 — o/r", prMarkLabel(marks[0]))
+        // In place: after the bubble it followed, before the next turn's bubble.
+        assertTrue(items[1] is ChatItem.PrMark)
+        assertEquals(3, items.size)
+    }
+
+    @Test fun `a malformed pr_link number decodes as no number instead of throwing`() {
+        for (n in listOf("true", "7.5", "99999999999", "\"7\"", "null")) {
+            val e = TurmaJson.decodeFromString(
+                TailEntry.serializer(),
+                """{"id":"p","role":"assistant","blocks":[{"t":"pr_link","url":"https://x/pull/1","number":$n}]}""",
+            )
+            assertEquals(n, 0, (e.blocks[0] as PrLinkBlock).prNumber)
+        }
+    }
+
+    @Test fun `a repeated pr_link does not split a hidden-thinking fold`() {
+        val url = "https://github.com/o/r/pull/7"
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "a", role = "assistant", blocks = listOf(PrLinkBlock(url))),
+                TailEntry(
+                    id = "b", role = "assistant",
+                    blocks = listOf(ThinkingBlock("t3"), PrLinkBlock(url), ThinkingBlock("t4")),
+                ),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        val folds = items.filterIsInstance<ChatItem.FoldedThoughts>()
+        assertEquals(1, folds.size)
+        assertEquals(2, folds[0].thoughts.size)
+    }
+
+    @Test fun `pr marker label omits a missing number and repo`() {
+        assertEquals("Opened PR", prMarkLabel(ChatItem.PrMark("k", "https://x", 0, "")))
     }
 
     // ---- XERK-235: the wire shape the hub actually sends --------------------
