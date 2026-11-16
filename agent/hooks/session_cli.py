@@ -326,7 +326,11 @@ __ATTACH__
         $it.BusyStatus = [int]$e.busy
         $it.Sensitivity = [int]$e.sensitivity
         $it.Categories = (@($e.categories) -join $sep)
-        $it.ReminderSet = $false
+        # A reminder (XERK-2988): Outlook on this host fires it; null = none.
+        if ($null -ne $e.reminder) {
+          $it.ReminderSet = $true
+          $it.ReminderMinutesBeforeStart = [int]$e.reminder
+        } else { $it.ReminderSet = $false }
         $it.Save()
         $r.ok = $true
         $r.outlookId = [string]$it.EntryID
@@ -1123,8 +1127,18 @@ def prepare_calendar_write(cmd) -> dict:
     out["event"] = {
         "subject": subject, "location": location, "body": body,
         "startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
-        "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats}
+        "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats,
+        "reminder": _reminder_minutes(ev.get("reminderMinutes"))}
     return out
+
+
+# The hub's CAL_TURMA_REMINDERS (XERK-2988): minutes before the start, or None.
+CALENDAR_REMINDER_MINUTES = (0, 5, 15, 30, 60, 120, 720, 1440, 10080)
+
+
+def _reminder_minutes(v):
+    """A record's `reminderMinutes` -> an int from the fixed list, else None (no reminder)."""
+    return v if type(v) is int and v in CALENDAR_REMINDER_MINUTES else None
 
 
 def _write_result(r) -> dict:

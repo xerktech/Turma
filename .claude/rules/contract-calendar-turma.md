@@ -41,7 +41,7 @@ Events made IN Turma, owned by the hub. Every child of the epic
 - **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
   order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
   timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
-  sensitivity, recurrence, exceptions, createdBy, createdAt, updatedAt, version, outlook}`.
+  sensitivity, reminderMinutes, recurrence, exceptions, createdBy, createdAt, updatedAt, version, outlook}`.
   - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
     `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
   - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.
@@ -49,6 +49,11 @@ Events made IN Turma, owned by the hub. Every child of the epic
     meant, which a recurrence needs; `start`/`end` alone fix the instant.
   - Attendee `role` is `required|optional` only (the creator is the organizer); no `response`.
   - `busy` free|tentative|busy|outOfOffice|workingElsewhere (default busy).
+  - `reminderMinutes` (XERK-2988): null (none, the default and an older record's) or one of
+    `CAL_TURMA_REMINDERS` (0, 5, 15, 30, 60, 120, 720, 1440, 10080); anything else is a 400.
+    Clients default a NEW event to 15 (web `REMINDER_DEFAULT`, Android `CAL_REMINDER_DEFAULT`);
+    the three lists (hub, `calendar.js` `REMINDERS`, `CAL_REMINDERS`) move together, plus the
+    agent's `CALENDAR_REMINDER_MINUTES`. An occurrence may override it like any client field.
   - `recurrence`: a rule (below) or `null` for a single event; `exceptions` its per-occurrence edits.
   - `createdBy`: the creating principal (`user:<id>`, or its kind for open/legacy/break-glass).
     Stored only, never served (`turmaEventWire` drops it): it named the creator's hub user id to

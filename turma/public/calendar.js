@@ -708,6 +708,14 @@ const eventOrg = (ev) => (typeof ev.matchOrg === "string" ? ev.matchOrg
   : ev.org || (ev.source === "tenir" ? "" : hostOrg(ev.host)));
 const capKey = (c) => [c.site, c.meetingId].map(encodeURIComponent).join("/");
 const SHOW_AS = { free: "Free", tentative: "Tentative", busy: "Busy", outOfOffice: "Out of office", workingElsewhere: "Working elsewhere" };
+// A Turma event's reminder (XERK-2988): the hub's CAL_TURMA_REMINDERS, minutes before the
+// start; "" = none. Outlook on the org's writer host fires it, never the hub.
+const REMINDERS = [["", "None"], ["0", "At start time"], ["5", "5 minutes before"], ["15", "15 minutes before"],
+  ["30", "30 minutes before"], ["60", "1 hour before"], ["120", "2 hours before"], ["720", "12 hours before"],
+  ["1440", "1 day before"], ["10080", "1 week before"]];
+const REMINDER_DEFAULT = "15";   // a new event's, as Teams and Outlook default it
+const reminderKey = (v) => (Number.isInteger(v) && REMINDERS.some(([k]) => k === String(v)) ? String(v) : "");
+const reminderText = (v) => { const k = reminderKey(v); return k ? REMINDERS.find(([x]) => x === k)[1] : ""; };
 const RESPONSE = { organizer: "Organizer", accepted: "Accepted", tentative: "Tentative", declined: "Declined",
   notResponded: "Not responded", none: "No response needed" };
 const MY_RESPONSE = { organizer: "You organized it", accepted: "Accepted", tentative: "Tentative",
@@ -825,6 +833,7 @@ function detailHtml(ev, now, hasPanel = false) {
   const olk = outlookStates(ev);
   row("Calendar", tenir ? "Captured by Tenir — not on Outlook" : turma ? (olk ? "Made in Turma" : "Made in Turma — not on Outlook") : host ? `Outlook on ${host}` : "");
   // Each org's copy in Outlook (XERK-2987), the error in Outlook's own words, escaped.
+  if (turma) row("Reminder", reminderText(ev.reminderMinutes));
   if (olk && olk.length) {
     const one = olk.length === 1;
     row("Outlook", olk.map((x) => `<span class="cal-olk-row ${x.state}">${one ? "" : `${esc(orgLabel(x.org))}: `}${esc(x.text)}</span>`).join(""), true);
@@ -1399,7 +1408,7 @@ function blankForm(startMs, endMs, orgs = []) {
   const s = zoneParts(startMs, tz), e = zoneParts(endMs, tz);
   return { subject: "", startDate: ymdOf(s), startTime: `${pad(s.h)}:${pad(s.mi)}`, endDate: ymdOf(e),
     endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay: false, timeZone: tz, location: "", online: false, joinUrl: "",
-    body: "", busy: "busy", category: "", priv: false, sensitivity: "normal", orgs: orgs.slice(0, ORGS_MAX),
+    body: "", busy: "busy", reminder: REMINDER_DEFAULT, category: "", priv: false, sensitivity: "normal", orgs: orgs.slice(0, ORGS_MAX),
     required: [], optional: [], reqDraft: "", optDraft: "", repeat: blankRepeat() };
 }
 // The form for an event the hub served: its wall times in the zone it was made in.
@@ -1416,6 +1425,7 @@ function formFromEvent(ev) {
     endDate: ymdOf(e), endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay, timeZone: tz,
     location: typeof ev.location === "string" ? ev.location : "", online: ev.isOnlineMeeting === true || !!join, joinUrl: join,
     body: typeof ev.body === "string" ? ev.body : "", busy: Object.prototype.hasOwnProperty.call(SHOW_AS, ev.busy) ? ev.busy : "busy",
+    reminder: reminderKey(ev.reminderMinutes),
     category: (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string").join(", "),
     priv: sens === "private" || sens === "confidential", sensitivity: sens, orgs: evOrgs(ev).slice(0, ORGS_MAX),
     required: att.filter((a) => a.role === "required").map(({ name, email }) => ({ name, email })),
@@ -1631,7 +1641,8 @@ function formPayload(f, version, scope) {
   const body = { orgs: f.orgs.slice(), subject: String(f.subject || "").trim(), start: t.start, end: t.end, timeZone: f.timeZone,
     allDay: !!f.allDay, location: String(f.location || "").trim(), body: String(f.body || ""), attendees,
     joinUrl: f.online ? String(f.joinUrl || "").trim() : "", isOnlineMeeting: !!f.online, busy: f.busy,
-    categories: categoriesOf(f), sensitivity: f.priv ? keepPriv : (f.sensitivity === "personal" ? "personal" : "normal") };
+    categories: categoriesOf(f), sensitivity: f.priv ? keepPriv : (f.sensitivity === "personal" ? "personal" : "normal"),
+    reminderMinutes: f.reminder && REMINDERS.some(([k]) => k === f.reminder) ? Number(f.reminder) : null };
   if (scope !== "occurrence") body.recurrence = ruleFromRepeat(f.repeat, repDay(f));
   if (version !== undefined) body.version = version;
   if (scope) body.scope = scope;
@@ -1826,6 +1837,9 @@ function editorHtml() {
     + `<div class="cal-ed-row"><span class="k">Show as</span><div class="cal-ed-when"><select data-ed-field="busy" aria-label="Show as">${show}</select>`
     + `<input type="text" data-ed-field="category" class="cal-ed-grow" placeholder="Category" aria-label="Category" value="${esc(f.category)}"${inv("category")}>`
     + `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="priv"${f.priv ? " checked" : ""}> Private</label></div></div>${fieldErr("category")}`
+    + `<label class="cal-ed-row"><span class="k">Reminder</span><select data-ed-field="reminder" aria-label="Reminder">`
+    + REMINDERS.map(([k, l]) => `<option value="${k}"${k === (f.reminder || "") ? " selected" : ""}>${esc(l)}</option>`).join("")
+    + `</select></label>`
     + `<label class="cal-ed-row cal-ed-top"><span class="k">Details</span><textarea data-ed-field="body" rows="5" placeholder="Add details"${inv("body")}>${esc(f.body)}</textarea></label>${fieldErr("body")}`
     + `</div>`
     + (ed.err ? `<div class="mt-err cal-ed-err" role="alert">${esc(ed.err)}</div>` : "")

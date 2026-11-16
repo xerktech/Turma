@@ -34922,6 +34922,37 @@ test("XERK-2985: a create queues one upsert to each org's writer; its result mar
   }
 });
 
+test("XERK-2988: a reminder is validated, stored, served and rides the Outlook write", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    for (const bad of [7, -1, "15", 15.5, true, {}]) {
+      const r = await turma2968("POST", null, ev2968([S2985A], { reminderMinutes: bad }));
+      assert.equal(r.status, 400, `reminderMinutes ${JSON.stringify(bad)}`);
+      assert.match(r.body.error, /reminderMinutes/);
+    }
+    const none = await turma2968("POST", null, ev2968([S2985A]));
+    assert.equal(none.body.event.reminderMinutes, null, "absent = no reminder");
+    const c = await turma2968("POST", null, ev2968([S2985A], { reminderMinutes: 15 }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const id = c.body.event.id;
+    assert.equal(c.body.event.reminderMinutes, 15);
+    assert.equal((await served2968()).find((x) => x.id === id).reminderMinutes, 15);
+    assert.equal(writes2985(D2985A).find((w) => w.turmaId === id).event.reminderMinutes, 15);
+    const stored = hub.getCalendarTurmaEvents()[""];
+    assert.equal(JSON.stringify(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]), JSON.stringify(stored));
+    const p = await turma2968("PATCH", id, { version: 1, reminderMinutes: null });
+    assert.equal(p.status, 200, JSON.stringify(p.body));
+    assert.equal(p.body.event.reminderMinutes, null);
+    assert.equal(writes2985(D2985A).filter((w) => w.turmaId === id && w.version === 2)[0].event.reminderMinutes, null);
+    // An older record with no field (or a junk one) reads as no reminder.
+    assert.equal(hub.sanitizeTurmaEvent({ ...stored[id], reminderMinutes: 9 }, "").reminderMinutes, null);
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
 test("XERK-2987: an org with no Outlook writer is served noHost, until a writer holds the copy", async () => {
   cleanup2985(D2985B);
   try {

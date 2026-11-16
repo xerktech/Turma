@@ -23,6 +23,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.customActions
+import com.xerktech.turma.core.calReminderText
 import com.xerktech.turma.core.calSlotDp
 import com.xerktech.turma.core.calZoomClamp
 import com.xerktech.turma.core.calZoomStep
@@ -1212,6 +1213,7 @@ private fun CalendarDetail(
                     }
                 }
             }
+            if (ev.turma) calReminderText(ev.reminderMinutes).takeIf { it.isNotEmpty() }?.let { DetailRow("Reminder", it) }
             if (ev.turma && !ev.private && ev.sensitivity == "private") DetailRow("Privacy", "Private: only you see its details")
             val cats = ev.categories.filter { it.isNotEmpty() }
             if (cats.isNotEmpty()) DetailRow("Categories", cats.joinToString(", "))

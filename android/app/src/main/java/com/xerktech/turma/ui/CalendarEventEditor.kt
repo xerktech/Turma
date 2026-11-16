@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xerktech.turma.core.CAL_DAYS
 import com.xerktech.turma.core.CAL_REPEAT_UNITS
+import com.xerktech.turma.core.CAL_REMINDERS
 import com.xerktech.turma.core.CAL_SHOW_AS
 import com.xerktech.turma.core.RepeatForm
 import com.xerktech.turma.core.calAnchorNth
@@ -197,6 +198,13 @@ internal fun CalendarEventEditor(
                 Picker(
                     CAL_SHOW_AS.firstOrNull { it.first == d.busy }?.second ?: "Busy", CAL_SHOW_AS,
                     { set(d.copy(busy = it)) }, Modifier.testTag("cal-ed-busy"),
+                )
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Reminder", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Picker(
+                    CAL_REMINDERS.firstOrNull { it.first == d.reminder }?.second ?: "None", CAL_REMINDERS,
+                    { set(d.copy(reminder = it)) }, Modifier.testTag("cal-ed-reminder"),
                 )
             }
             OutlinedTextField(
