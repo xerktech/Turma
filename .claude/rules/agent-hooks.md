@@ -369,6 +369,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     (`TURMA_QUESTION_TIMEOUT_SEC`, 600s) sits under the settings-level `timeout`; passes through
     silently when env vars absent. Kill/delete/restart clear pending req/ans files. `multiSelect`
     accepts `optionIndices`.
+  - **A cancelled call (Esc) still removes its req/ans files** (XERK-2998): Claude Code signals the
+    blocked hook; `_install_signal_exit` (shell entry only) turns SIGTERM/INT/HUP into SystemExit
+    so `_ask_one`'s `finally` runs. A SIGKILL leaves them to the stale sweep.
+    Test: `test_cancelled_hook_removes_its_request_file`.
   - **A new manager reader of a SESSION-written file must use `_read_untrusted_json`** (XERK-1562):
     `O_NONBLOCK|O_NOFOLLOW`, regular file only, size-capped. `questions/` is session-writable, and
     `_hook_question` + `_dsh_pending_request_id` run on the beat — a plain `open()` of a planted

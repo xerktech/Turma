@@ -52,6 +52,11 @@ Split out of `agent.md` (size ceiling).
 - **Still-queued prompts ride beside entries, not inside them**: both feeds fold
   `queue-operation` FIFO (`_fold_queue_op`/`foldQueueOp`) and ship survivors as `queued[]`. Display
   filtering happens at REPORT time (`_queued_display`/`queuedDisplay`), never at fold time.
+- **The tail window widens past a big meta line** (XERK-2998, `_tail_entries` ↔ `tailWindowEntries`):
+  Claude Code 2.1.3xx writes 100-700 KB `api-request-blob`/`attachment` lines, so 128 KB could hold
+  no message. It grows 4x to `TAIL_READ_MAX_BYTES` (2 MiB) until `TAIL_WINDOW_MIN_ROWS` (6)
+  user/assistant entries. Keep the minimum small: the preview runs every beat for every session.
+  Tests: `test_xerk2998_*` in `TestTranscriptTail` ↔ the `XERK-2998` cases in `tunnel-agent.test.js`.
 - Blocks ride the live tail, `history` and the archive push at ONE fidelity (`BLOCK_CAPS`, mirrored
   in `tunnel-agent.js`) — a tool_result-only turn is kept when it has blocks.
   - **Never give the live path tighter caps again** (XERK-347) — a frame is bounded by the ~128 KB

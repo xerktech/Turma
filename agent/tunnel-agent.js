@@ -66,6 +66,12 @@ const TAIL_MSGS = Number(process.env.SESSION_TAIL_MSGS) || 30;
 // preview (SESSION_TAIL_MSG_CHARS); a client keeps whichever copy is longer.
 const TAIL_MSG_CHARS = Number(process.env.SESSION_TAIL_MSG_CHARS_FULL) || 16000;
 const TAIL_READ_BYTES = 1 << 17; // ~128 KB, matches _tail_entries
+// The window widens 4x, up to TAIL_READ_MAX_BYTES, until it holds
+// TAIL_WINDOW_MIN_ROWS user/assistant entries (XERK-2998): one Claude Code
+// api-request-blob/attachment line can fill 128 KB alone, leaving the live tail
+// empty. Mirror of hub-agent.py's constants of the same names.
+const TAIL_READ_MAX_BYTES = 1 << 21; // 2 MiB
+const TAIL_WINDOW_MIN_ROWS = 6;
 const MAX_WATCHERS = 16; // safety cap on concurrent live tails
 // eslint-disable-next-line no-control-regex
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
@@ -875,6 +881,26 @@ function queuedDisplay(queue) {
   return queue.filter((q) => !q.startsWith("<task-notification>")).slice(-QUEUED_PROMPTS_MAX);
 }
 
+// Parsed object entries of a transcript's tail window, widened until it holds
+// TAIL_WINDOW_MIN_ROWS messages (mirror of hub-agent.py _tail_entries).
+function tailWindowEntries(p, size) {
+  let windowBytes = TAIL_READ_BYTES;
+  for (;;) {
+    const entries = [];
+    let rows = 0;
+    for (const raw of readTailLines(p, windowBytes)) {
+      let entry;
+      try { entry = JSON.parse(raw); } catch { continue; }
+      if (!entry || typeof entry !== "object") continue;
+      entries.push(entry);
+      if (entry.type === "user" || entry.type === "assistant") rows++;
+    }
+    if (rows >= TAIL_WINDOW_MIN_ROWS || windowBytes >= size ||
+        windowBytes >= TAIL_READ_MAX_BYTES) return entries;
+    windowBytes = Math.min(windowBytes * 4, TAIL_READ_MAX_BYTES);
+  }
+}
+
 // Last TAIL_MSGS surviving messages of a worktree's newest transcript, oldest
 // first, plus the still-queued prompts: {entries: [{id: uuid, role, text,
 // blocks}], queued: [text]}. Empty both when there's no transcript yet.
@@ -975,10 +1001,7 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState, unsaved) 
   const tail = [];
   const queued = [];
   const parsed = [];
-  for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
-    let entry;
-    try { entry = JSON.parse(raw); } catch { continue; }
-    if (!entry || typeof entry !== "object") continue;
+  for (const entry of tailWindowEntries(p, st ? st.size : 0)) {
     // Live background agents, folded from the SAME parse (XERK-245). The state
     // persists across polls, so an entry scrolling out of the tail window never
     // un-does what it established; and because a launch always precedes its own
