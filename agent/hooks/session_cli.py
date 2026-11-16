@@ -1172,6 +1172,16 @@ def calendar_windows_ps(windows) -> str:
     return _windows_ps(pairs)
 
 
+# Runs the script sent as the first stdin line (base64 of UTF-16LE) in the
+# top-level scope; `_run_outlook_ps` is its only caller.
+_PS_STDIN_BOOTSTRAP = (
+    "$s = [Console]::In.ReadLine(); "
+    ". ([ScriptBlock]::Create([Text.Encoding]::Unicode.GetString("
+    "[Convert]::FromBase64String($s))))")
+_PS_STDIN_BOOTSTRAP_ENCODED = base64.b64encode(
+    _PS_STDIN_BOOTSTRAP.encode("utf-16-le")).decode("ascii")
+
+
 def _run_calendar_ps(windows_ps: str, max_events: int, timeout: int, powershell=None):
     """Run the calendar script for `windows_ps`; return its parsed JSON.
     Raises Refused when this host cannot (no PowerShell, interop off, a timeout)."""
@@ -1188,7 +1198,14 @@ def _run_outlook_ps(script: str, timeout: int, powershell=None, stdin: bytes = N
     if not ps:
         raise Refused("no powershell.exe here: the calendar is read only on a WSL or "
                       "Windows host with classic Outlook")
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    # The script rides STDIN, never the command line (XERK-3019): Windows caps a
+    # command line at 32767 chars, and the writer's -EncodedCommand (UTF-16 base64,
+    # ~2.7x the script) passed it, so CreateProcess refused and WSL printed only
+    # "powershell.exe: Invalid argument". The fixed bootstrap reads the script's
+    # base64 off the first stdin line and dot-sources it; the rest of stdin is
+    # left for the script's own [Console]::In read.
+    encoded = _PS_STDIN_BOOTSTRAP_ENCODED
+    stdin = base64.b64encode(script.encode("utf-16-le")) + b"\n" + (stdin or b"")
     # A Windows binary started from a Linux-filesystem cwd warns about UNC
     # paths; its own directory is always a Windows one.
     cwd = os.path.dirname(ps) if os.path.isdir(os.path.dirname(ps)) else None
@@ -1196,7 +1213,7 @@ def _run_outlook_ps(script: str, timeout: int, powershell=None, stdin: bytes = N
         proc = subprocess.run(
             [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-EncodedCommand", encoded],
-            input=stdin or b"", capture_output=True, cwd=cwd, timeout=timeout)
+            input=stdin, capture_output=True, cwd=cwd, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Refused(f"Outlook did not answer in {timeout}s (is a security "
                       "prompt open in Outlook on the Windows desktop?)")

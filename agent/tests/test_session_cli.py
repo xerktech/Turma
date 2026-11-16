@@ -588,7 +588,7 @@ class CalendarTest(unittest.TestCase):
         self.assertIn("interop looks off", self._interop_off("enabled"))
 
     def test_the_range_is_only_ever_two_integers(self):
-        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')
+        ps = self.fake_ps('IFS= read -r l; echo "$l" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')
         cli.read_calendar("tomorrow", powershell=ps)
         with open(os.path.join(self.tmp, "enc")) as fh:
             script = base64.b64decode(fh.read().strip()).decode("utf-16-le")
@@ -638,7 +638,7 @@ class CalendarTest(unittest.TestCase):
                 cli.normalize_calendar(bad)
 
     def script_for(self, *args, **kw):
-        ps = self.fake_ps('echo "$6" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')
+        ps = self.fake_ps('IFS= read -r l; echo "$l" > "$(dirname "$0")/enc"\necho \'{"ok":true,"windows":[{"events":[]}]}\'\n')
         cli.read_calendar(*args, powershell=ps, **kw)
         with open(os.path.join(self.tmp, "enc")) as fh:
             return base64.b64decode(fh.read().strip()).decode("utf-16-le")
@@ -763,7 +763,7 @@ class CalendarSyncReaderTest(unittest.TestCase):
         ps = os.path.join(tempfile.mkdtemp(prefix="cal-sync-"), "powershell.exe")
         self.addCleanup(shutil.rmtree, os.path.dirname(ps), ignore_errors=True)
         with open(ps, "w") as fh:
-            fh.write('#!/bin/sh\necho "$6" > "$(dirname "$0")/enc"\n'
+            fh.write('#!/bin/sh\nIFS= read -r l; echo "$l" > "$(dirname "$0")/enc"\n'
                      'echo \'{"ok":true,"windows":[{"events":[],"complete":true}]}\'\n')
         os.chmod(ps, 0o755)
         self.assertEqual(cli.read_calendar_windows([(self.MON, self.MON + 1)], powershell=ps),
@@ -959,6 +959,33 @@ class CalendarWriteTest(unittest.TestCase):
 
     MON = 1794787200000          # 2026-11-16T00:00Z, a Monday
     A, B, C, D, K = ("turma:" + c * 16 for c in "abcde")
+
+    def test_xerk3019_the_command_line_stays_under_windows_cap(self):
+        """The script rides stdin, so the command line is fixed and small: the
+        writer's -EncodedCommand once passed Windows' 32767-char cap and WSL
+        refused to start powershell.exe ("Invalid argument")."""
+        d = tempfile.mkdtemp(prefix="cal-argv-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        ps = os.path.join(d, "powershell.exe")
+        with open(ps, "w") as fh:
+            fh.write('#!/bin/sh\nprintf %s "$*" > "$(dirname "$0")/argv"\ncat > /dev/null\n'
+                     'echo \'{"ok":true,"results":[]}\'\n')
+        os.chmod(ps, 0o755)
+        cli._run_outlook_ps(cli._CALENDAR_WRITE_PS * 4, 30, ps, b"x")
+        with open(os.path.join(d, "argv")) as fh:
+            argv = fh.read()
+        self.assertLess(len(ps) + len(argv), 2000)
+        self.assertNotIn("TurmaId", base64.b64decode(argv.split()[-1]).decode("utf-16-le"))
+
+    def test_xerk3019_the_bootstrap_runs_the_script_and_leaves_its_stdin(self):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        script = ("function F($x) { $x + 1 }\n"
+                  "$raw = [Console]::In.ReadToEnd().Trim()\n"
+                  "@{ got = $raw; n = (F 41) } | ConvertTo-Json -Compress\n")
+        doc = cli._run_outlook_ps(script, 60, pwsh, b"payload-123")
+        self.assertEqual(doc, {"got": "payload-123", "n": 42})
 
     def up(self, tid, **ev):
         e = {"subject": "Plan", "start": "2026-11-16T09:00:00-05:00",
@@ -1198,7 +1225,7 @@ class CalendarWriteTest(unittest.TestCase):
         ps = os.path.join(tempfile.mkdtemp(prefix="cal-write-"), "powershell.exe")
         self.addCleanup(shutil.rmtree, os.path.dirname(ps), ignore_errors=True)
         with open(ps, "w") as fh:
-            fh.write('#!/bin/sh\ncat > "$(dirname "$0")/stdin"\necho "$6" > "$(dirname "$0")/enc"\n'
+            fh.write('#!/bin/sh\nIFS= read -r l; echo "$l" > "$(dirname "$0")/enc"\ncat > "$(dirname "$0")/stdin"\n'
                      f"echo '{json.dumps(doc)}'\n")
         os.chmod(ps, 0o755)
         cmds = [self.up(self.A), self.up(self.A, subject="x"), dict(self.up(self.B), outlookId="U1"),
