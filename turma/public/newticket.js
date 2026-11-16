@@ -294,6 +294,24 @@
     paintCreate();
   }
 
+  // Stage files from the picker or a paste: cap at CREATE_FILES_MAX and start
+  // their uploads. The first file picks the host; the rest follow it (`?host=`).
+  function addCreateFiles(fileList) {
+    const s = createState;
+    if (!s || s.busy) return;
+    syncCreateFields();
+    const max = board().CREATE_FILES_MAX || 10;
+    const room = max - s.files.length;
+    const picked = Array.from(fileList || []);
+    const take = picked.slice(0, Math.max(0, room));
+    (async () => {
+      if (!s.fileHost && take.length) await uploadFile(take.shift());
+      for (const f of take) uploadFile(f);
+    })();
+    s.filesNote = picked.length > room ? `At most ${max} files per ticket.` : "";
+    paintCreate();
+  }
+
   async function submitCreate() {
     const s = createState;
     if (!s || s.busy) return;
@@ -440,24 +458,31 @@
         return void paintCreate();
       }
     });
+    // A paste carrying files (a screenshot, a file copied in the OS file manager)
+    // stages them exactly as the picker does (XERK-3021). A paste of plain text
+    // is left alone so the title/description fields take it normally. Only while
+    // the form shows its Attachments row and can still take files — never on the
+    // created or discard screens, nor mid-create (the create already took its
+    // upload list, so a late file would be silently dropped).
+    panel.addEventListener("paste", (e) => {
+      const s = createState;
+      if (!s || s.busy || s.confirmDiscard || !panel.querySelector("[data-cf-file-input]")) return;
+      const cd = e.clipboardData;
+      const files = (cd && cd.files) || null;
+      if (!files || !files.length) return;
+      // Office and web-page copies carry text AND html plus a rendered bitmap of
+      // the same content; the operator meant the text, so let the field take it.
+      // A file-manager copy (plain-text name only) or a copied image (html only)
+      // has not both, and attaches.
+      const types = Array.from((cd && cd.types) || []);
+      if (types.includes("text/plain") && types.includes("text/html")) return;
+      e.preventDefault();
+      addCreateFiles(files);
+    });
     panel.addEventListener("change", (e) => {
       if (!createState) return;
       const picker = e.target.closest("[data-cf-file-input]");
-      if (picker) {
-        syncCreateFields();
-        const max = board().CREATE_FILES_MAX || 10;
-        const room = max - createState.files.length;
-        const picked = Array.from(picker.files || []);
-        const take = picked.slice(0, Math.max(0, room));
-        // The first file picks the host; the rest follow it (`?host=`).
-        (async () => {
-          if (!createState.fileHost && take.length) await uploadFile(take.shift());
-          for (const f of take) uploadFile(f);
-        })();
-        createState.filesNote = picked.length > room ? `At most ${max} files per ticket.` : "";
-        paintCreate();
-        return;
-      }
+      if (picker) return void addCreateFiles(picker.files);
       const org = e.target.closest("[data-cf-org]");
       if (org) {
         syncCreateFields();

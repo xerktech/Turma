@@ -1108,6 +1108,10 @@ test("XERK-3023: a Turma event's panel wears its block's gradient; an Outlook on
   // XERK-3025 QA: a plain button is transparent with --ink text, ~2.5:1 on the gradient in light.
   assert.match(css, /\.cal-detail\.turma button:not\(\.primary\):not\(\.linkish\)\s*\{\s*color:\s*#fff;\s*border-color:\s*rgba\(255,\s*255,\s*255,\s*0\.7\)/,
     "the panel's plain buttons are white, with a border that shows on the gradient");
+  assert.match(css, /\.cal-detail select:focus[^{]*\{\s*box-shadow:\s*0 0 0 2px var\(--accent\)/,
+    "a panel field's focus is a solid accent ring on the org tint, not the faint 30% halo");
+  assert.match(css, /\.cal-detail\.turma select:focus[^{]*\{\s*box-shadow:\s*0 0 0 1px rgba\(11, 11, 11, 0\.75\), 0 0 0 3px #fff/,
+    "on the gradient a white field keeps a dark edge inside its white ring");
 });
 
 test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {

@@ -96,7 +96,15 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.ui.graphics.LinearGradientShader
+import androidx.compose.ui.graphics.Shader
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -776,7 +784,7 @@ private fun WeekGrid(
                     for (ev in calBandEvents(range.events, d, zone)) {
                         val badge = calBadge(ev, fleet.meetingProposals)
                         EventBlock(
-                            Modifier.fillMaxWidth().height(22.dp), ev, now, colorOf(ev.org), badge, short = true,
+                            Modifier.fillMaxWidth().height(22.dp), ev, now, calOrgsOf(ev).map(colorOf), badge, short = true,
                             open = ev.key == detailKey,
                             aria = calAria(ev, d, orgsLabel(ev), badge, zone, locale),
                         ) { onOpen(ev) }
@@ -923,7 +931,7 @@ private fun WeekGrid(
                                 val badge = calBadge(ev, fleet.meetingProposals)
                                 val h = slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp
                                 EventBlock(
-                                    segModifier(seg, w, h, slot), ev, now, colorOf(ev.org), badge, short = h < SHORT_DP,
+                                    segModifier(seg, w, h, slot), ev, now, calOrgsOf(ev).map(colorOf), badge, short = h < SHORT_DP,
                                     open = ev.key == detailKey,
                                     aria = calAria(ev, d, orgsLabel(ev), badge, zone, locale),
                                     meta = listOf(calSpan(ev.startMs ?: 0, ev.endMs ?: 0, zone, locale), ev.location)
@@ -993,13 +1001,16 @@ private fun segModifier(seg: CalSeg, colWidth: Dp, height: Dp, slot: Dp): Modifi
  * (unassigned = neutral); tentative / not responded hatched; free / declined
  * outlined; canceled struck through; past dimmed; a Tenir-only capture marked by a
  * caption glyph; a capture's pending proposals (or a spinner while it is read) badged.
+ * A Turma-made event (XERK-3020, web `.cal-ev.turma`) wears the Turma icon's blue → purple
+ * gradient with white text whatever its response state, and its left bar is its orgs' colours
+ * stacked top to bottom (web `orgBarHtml`).
  */
 @Composable
 private fun EventBlock(
     modifier: Modifier,
     ev: CalendarEvent,
     now: Long,
-    orgColor: Color?,
+    orgColors: List<Color?>,
     badge: com.xerktech.turma.core.CalBadge,
     short: Boolean,
     open: Boolean,
@@ -1008,67 +1019,101 @@ private fun EventBlock(
     onClick: () -> Unit,
 ) {
     val st = calStyle(ev, now)
-    val c = orgColor ?: neutral()
+    val c = orgColors.firstOrNull() ?: neutral()
+    val bars = orgColors.ifEmpty { listOf(null) }.map { it ?: neutral() }
     val shape = RoundedCornerShape(4.dp)
+    val turma = ev.turma
     val fill = when {
+        turma -> Modifier.background(TURMA_EVENT_GRADIENT, shape)
         st.free -> Modifier.background(MaterialTheme.colorScheme.surface, shape).border(1.dp, c, shape)
         st.tentative -> Modifier.background(MaterialTheme.colorScheme.surface, shape).border(1.dp, c.copy(alpha = 0.6f), shape)
             .clip(shape).hatch(c.copy(alpha = 0.22f))
         else -> Modifier.background(c.copy(alpha = 0.22f), shape)
     }
     Row(
-        modifier.alpha(if (st.past) 0.6f else 1f).clip(shape).then(fill)
-            .then(if (open) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier)
+        modifier.alpha(if (st.past || (turma && st.canceled)) 0.6f else 1f).clip(shape).then(fill)
+            // The accent ring vanished into the gradient's blue end (QA): a Turma block is ringed in ink.
+            .then(if (open) Modifier.border(2.dp, if (turma) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary, shape) else Modifier)
             .clickable(onClick = onClick)
             .testTag("cal-ev")
             .clearAndSetSemantics { contentDescription = aria; role = Role.Button },
     ) {
-        Box(Modifier.width(4.dp).fillMaxHeight().background(c))
-        // A short block centres one line with no vertical padding, so a 15-minute meeting's title is whole.
-        Column(
-            Modifier.weight(1f).fillMaxHeight().padding(horizontal = 4.dp, vertical = if (short) 0.dp else 2.dp),
-            verticalArrangement = if (short) Arrangement.Center else Arrangement.Top,
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (st.tenir) {
-                    Icon(Icons.Outlined.ClosedCaption, null, Modifier.size(12.dp).padding(end = 2.dp))
-                }
-                // A repeating event wears the recurring glyph, an Outlook occurrence and a Turma series alike (XERK-2973).
-                if (ev.recurring) {
-                    Icon(Icons.Outlined.Repeat, null, Modifier.size(11.dp).padding(end = 1.dp).testTag("cal-recur"))
-                }
-                Text(
-                    calTitle(ev), Modifier.weight(1f, fill = false), fontSize = if (short) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold,
-                    maxLines = if (short) 1 else 2, overflow = TextOverflow.Ellipsis,
-                    lineHeight = if (short) 12.sp else 14.sp,
-                    textDecoration = if (st.canceled) TextDecoration.LineThrough else null,
-                )
-                Spacer(Modifier.weight(0.001f))
-                // Several orgs share this one block (XERK-2972): "+N" beside the title.
-                val more = calOrgsOf(ev).size - 1
-                if (more > 0) {
+        Column(Modifier.width(4.dp).fillMaxHeight().testTag("cal-orgbar")) {
+            for (b in bars) Box(Modifier.weight(1f).fillMaxWidth().background(b))
+        }
+        val subtle = if (turma) TURMA_EVENT_SUBTLE else MaterialTheme.colorScheme.onSurfaceVariant
+        CompositionLocalProvider(LocalContentColor provides if (turma) Color.White else LocalContentColor.current) {
+            // A short block centres one line with no vertical padding, so a 15-minute meeting's title is whole.
+            Column(
+                Modifier.weight(1f).fillMaxHeight().padding(horizontal = 4.dp, vertical = if (short) 0.dp else 2.dp),
+                verticalArrangement = if (short) Arrangement.Center else Arrangement.Top,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (st.tenir) {
+                        Icon(Icons.Outlined.ClosedCaption, null, Modifier.size(12.dp).padding(end = 2.dp))
+                    }
+                    // A repeating event wears the recurring glyph, an Outlook occurrence and a Turma series alike (XERK-2973).
+                    if (ev.recurring) {
+                        Icon(Icons.Outlined.Repeat, null, Modifier.size(11.dp).padding(end = 1.dp).testTag("cal-recur"))
+                    }
                     Text(
-                        "+$more", Modifier.padding(start = 2.dp).testTag("cal-multi-org"), fontSize = 10.sp,
-                        fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        calTitle(ev), Modifier.weight(1f, fill = false), fontSize = if (short) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold,
+                        maxLines = if (short) 1 else 2, overflow = TextOverflow.Ellipsis,
+                        lineHeight = if (short) 12.sp else 14.sp,
+                        textDecoration = if (st.canceled) TextDecoration.LineThrough else null,
                     )
+                    Spacer(Modifier.weight(0.001f))
+                    // Several orgs share this one block (XERK-2972): "+N" beside the title.
+                    val more = calOrgsOf(ev).size - 1
+                    if (more > 0) {
+                        Text(
+                            "+$more", Modifier.padding(start = 2.dp).testTag("cal-multi-org"), fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold, color = subtle,
+                        )
+                    }
+                    // A Turma event's Outlook copy failed or is being written (XERK-2987): web `.cal-olk`,
+                    // a white pill with a fixed dark glyph in both themes — a theme colour alone fell
+                    // to ~1.3:1 on the gradient (QA). White clears 3:1 on every stop.
+                    when (val m = com.xerktech.turma.core.calOutlookMark(ev)) {
+                        "failed", "pending" -> Text(
+                            if (m == "failed") "!" else "…",
+                            Modifier.padding(start = 3.dp).testTag("cal-olk-$m")
+                                .background(Color.White, RoundedCornerShape(7.dp))
+                                .defaultMinSize(minWidth = 14.dp).padding(horizontal = 3.dp),
+                            fontSize = 11.sp, fontWeight = FontWeight.ExtraBold, lineHeight = 14.sp,
+                            textAlign = TextAlign.Center,
+                            color = if (m == "failed") OLK_FAILED else OLK_PENDING,
+                        )
+                    }
+                    CalBadgeView(badge)
                 }
-                // A Turma event's Outlook copy failed or is being written (XERK-2987).
-                when (val m = com.xerktech.turma.core.calOutlookMark(ev)) {
-                    "failed", "pending" -> Text(
-                        if (m == "failed") "!" else "…", Modifier.padding(start = 2.dp).testTag("cal-olk-$m"),
-                        fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                        color = if (m == "failed") TurmaColors.criticalText() else MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                if (!short && meta.isNotEmpty()) {
+                    Text(meta, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, lineHeight = 13.sp,
+                        color = subtle)
                 }
-                CalBadgeView(badge)
-            }
-            if (!short && meta.isNotEmpty()) {
-                Text(meta, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, lineHeight = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
 }
+
+// The Turma icon's lit "T" (favicon.svg / ic_launcher_foreground): web `--turma-grad`.
+// CSS `135deg`: the bands stay at 45° whatever the block's shape, the line running through the
+// centre and just reaching both corners — not Compose's corner-to-corner default, which shades a
+// tall block vertically and a wide one horizontally (QA).
+private val TURMA_EVENT_GRADIENT = object : ShaderBrush() {
+    override fun createShader(size: Size): Shader {
+        val half = (size.width + size.height) / 4f   // half the CSS gradient line, per axis (÷√2 twice)
+        val c = Offset(size.width / 2f, size.height / 2f)
+        return LinearGradientShader(
+            from = c - Offset(half, half), to = c + Offset(half, half),
+            colors = listOf(Color(0xFF4A95F0), Color(0xFF6271DF), Color(0xFF7A4DCF)),
+            colorStops = listOf(0f, 0.55f, 1f),
+        )
+    }
+}
+private val OLK_FAILED = Color(0xFFB3261E)
+private val OLK_PENDING = Color(0xFF3D3C3A)
+private val TURMA_EVENT_SUBTLE = Color.White.copy(alpha = 0.88f)
 
 @Composable
 private fun CalBadgeView(b: com.xerktech.turma.core.CalBadge) {

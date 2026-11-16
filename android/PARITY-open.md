@@ -221,6 +221,8 @@ those are marked `[MODEL]`.
   ids as `uploadIds` on the create; the poll waits up to 5 min when files ride. Android's
   `CreateTicketSheet` creates without files. A port adds a file picker + those two calls; no new
   `/api/agents` key (the `ticketAttachments` capability is untyped and skipped).
+  - The web form also takes files pasted from the clipboard (XERK-3021); a port's picker is the
+    Android equivalent — no wire change.
 - Azure DevOps org support (XERK-43) is at parity for free: the agent reports Azure work items in the
   SAME `jira` heartbeat block, ticket shape and detail shape as Jira (with `source:"azure"`), so the
   board renders them unchanged. The only client-side change was `orgName` — now takes the last path
