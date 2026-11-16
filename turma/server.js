@@ -6068,6 +6068,7 @@ const CALENDAR_TURMA_ORGS_MAX = 20;
 const CALENDAR_TURMA_BODY_MAX = 64 << 10;         // a route's request body
 const CALENDAR_TURMA_ORG_GRACE_MS = 864e5;        // undecided this long -> dropped from orgs
 const CAL_TURMA_ID_RE = /^turma:[0-9a-f]{16}$/;
+const CAL_TURMA_SPLIT_FROM_MAX = 50;
 const CAL_TURMA_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere"]);
 const CAL_TURMA_ROLE = new Set(["required", "optional"]);
 // A reminder's minutes before the start (XERK-2988): Teams' list; null = none.
@@ -6145,6 +6146,13 @@ function sanitizeTurmaEvent(v, t) {
     version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
     outlook: calOutlookSanitize(v.outlook, orgs, t),
   };
+  // Every series a chain of "following" splits made this one from, nearest first
+  // (XERK-3014): an unsettled sent copy of any still covers these occurrences, and all
+  // are kept so deleting a middle one cannot cut the chain. Hub-internal: never
+  // served, never sent by a client.
+  const from = [...new Set((Array.isArray(v.splitFrom) ? v.splitFrom : [])
+    .filter((x) => typeof x === "string" && CAL_TURMA_ID_RE.test(x) && x !== id))].slice(0, CAL_TURMA_SPLIT_FROM_MAX);
+  if (from.length) out.splitFrom = from;
   // Exceptions: original start -> {deleted:true} | an override. Kept only while
   // the key is still an occurrence of the rule, so editing the rule (or moving
   // the series) drops the ones it no longer lands on. Sorted: a fixed point.
@@ -6195,6 +6203,7 @@ function calOutlookSanitize(v, orgs, t) {
     if (lm) x.lastModified = lm;
     const rc = calMs(e.recreatedAt);
     if (rc) x.recreatedAt = rc;
+    if (host && e.sent === true) x.sent = true;
     x.at = calMs(e.at);
     out[org] = x;
   }
@@ -6741,7 +6750,7 @@ function turmaEventWire(p, rec, served = rec.orgs, occKey = "") {
   // A series' exceptions ride its occurrences, never the wire; nor do its copies' hosts and ids.
   // Nor does `createdBy`: it names the creator's hub user id, which no client reads (`editable`
   // says who may change it), and a private event must not tell every org viewer who made it (XERK-2953).
-  const { exceptions, outlook, createdBy, ...fields } = rec;
+  const { exceptions, outlook, createdBy, splitFrom, ...fields } = rec;
   const out = { source: "turma", host: "", ...fields, orgs: served, org: served[0] || "",
     outlook: calOutlookWire(outlook, served),
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
@@ -7162,6 +7171,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     const se = turmaSeriesError(rec, !!rule);
     if (se) return { status: 400, body: { error: se } };
     if (calTurmaDropsPrivate(p, f.rec, rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
+    const resend = calTurmaResendError(f.t, f.rec, rec, now);
+    if (resend) return resend;
     const full = turmaEventCapError(f.t, rec);
     if (full) return full;
     calTurmaStore(f.t, rec);
@@ -7214,7 +7225,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   }
   const next = sanitizeTurmaEvent({ ...f.rec, start: calIsoZ(f.occ.startMs), end: calIsoZ(f.occ.endMs), ...fields,
     orgs, recurrence: rule, exceptions, id: calTurmaMintId(f.t), createdAt: now, updatedAt: now, version: 1,
-    outlook: {} }, f.t);
+    outlook: {}, splitFrom: [f.rec.id, ...(f.rec.splitFrom || [])] }, f.t);
   if (!next) return { status: 400, body: { error: "end must not be before start" } };
   const se = turmaSeriesError(next, !!rule);
   if (se) return { status: 400, body: { error: se } };
@@ -7223,6 +7234,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   // and the answer has no `previous`.
   const keep = calTurmaServesAny(prev);
   if (calTurmaDropsPrivate(p, f.rec, keep ? prev : null, next)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
+  const resend = calTurmaResendError(f.t, f.rec, next, now);
+  if (resend) return resend;
   const full = (keep && turmaEventCapError(f.t, prev)) || turmaEventCapError(f.t, next, keep ? null : f.rec.id);
   if (full) return full;
   if (keep) calTurmaStore(f.t, prev);
@@ -7483,7 +7496,7 @@ function calOutlookTombstonesCoerce(raw) {
       const org = typeof x.org === "string" && x.org && x.org.length <= 200 && tenantOfSite(x.org) === t ? x.org : "";
       if (!turmaId || !org || seen.has(turmaId)) continue;
       seen.add(turmaId);
-      keep.push({ turmaId, org, outlookId: meetingText(x.outlookId, 300), at: calMs(x.at) });
+      keep.push({ turmaId, org, outlookId: meetingText(x.outlookId, 300), at: calMs(x.at), ...(x.sent === true ? { sent: true } : {}) });
     }
     if (keep.length) out[k] = keep;
   }
@@ -7497,9 +7510,10 @@ const persistCalendarOutlookTombstones = registerExternalStore({
 });
 // Orphan host `key`'s copy of `turmaId` (one per host: a host is in one org), and
 // send its delete now when the host can take it.
-function calTombstoneAdd(key, turmaId, org, outlookId, now) {
+// `sent`: the copy was ever a sending one (XERK-3014), so its invitation may be live.
+function calTombstoneAdd(key, turmaId, org, outlookId, now, sent = false) {
   const list = (calendarOutlookTombstones[key] || []).filter((x) => x.turmaId !== turmaId);
-  list.push({ turmaId, org, outlookId, at: now });
+  list.push({ turmaId, org, outlookId, at: now, ...(sent ? { sent: true } : {}) });
   calendarOutlookTombstones[key] = list.slice(-CALENDAR_TOMBSTONES_MAX);
   persistCalendarOutlookTombstones();
   calOutlookFlushHost(key, now);
@@ -7554,6 +7568,9 @@ function calOutlookReconcile(t, rec, now, memo) {
     let e = rec.outlook[org];
     if (!e) e = rec.outlook[org] = { host: "", outlookId: "", version: 0, state: "pending", at: now };
     const holderOk = !!e.host && calWriteHolderOk(e.host, t, org, now);
+    // Marked before any upsert can go, and kept through invitations turned off: its
+    // tombstone must say its invitation may be live (XERK-3014).
+    if (e.host && calTurmaSends(rec, org)) e.sent = true;
     // A sending copy is never re-homed (XERK-3010): the new holder would invite every
     // attendee again from its own mailbox, and the old invitation is cancelled only if
     // its host ever returns. It stays with its host, failed, saying why. Held whether or
@@ -7568,10 +7585,11 @@ function calOutlookReconcile(t, rec, now, memo) {
     // Its host is back: retry at once, not on the hourly failure retry.
     if (holderOk && e.state === "failed" && calIsHeldError(e.error)) e.at = 0;
     if (e.host && !holderOk) {
-      calTombstoneAdd(e.host, rec.id, org, e.outlookId, now);
+      calTombstoneAdd(e.host, rec.id, org, e.outlookId, now, e.sent === true);
       Object.assign(e, { host: "", outlookId: "", state: "pending", at: now });
       delete e.error;
       delete e.lastModified;
+      delete e.sent;
     }
     if (!e.host) {
       const pick = calWritePick(t, org, now, memo);
@@ -7579,7 +7597,9 @@ function calOutlookReconcile(t, rec, now, memo) {
         e.host = pick;
         const tb = calTombstoneTake(pick, rec.id);
         if (tb) e.outlookId = tb.outlookId;
+        if (tb && tb.sent) e.sent = true;
       }
+      if (e.host && calTurmaSends(rec, org)) e.sent = true;
     }
     if (e.state === "written" && e.version === rec.version) continue;
     if (e.version !== rec.version) {
@@ -7601,6 +7621,41 @@ function calOutlookReconcile(t, rec, now, memo) {
   rec.outlook = calOutlookSanitize(rec.outlook, rec.orgs, t);
   return JSON.stringify(rec.outlook) !== before;
 }
+// A 409 when `after` would send invitations from a mailbox while a copy of `before`
+// (the event it is made from: itself, or the series a "following" split ends) that
+// may have sent is not settled (XERK-3014): a `sent` tombstone (cancelled only when
+// its host is back) or a sending copy held on a host that is away (XERK-3010). The
+// attendees would get a second invitation from another mailbox — reached by
+// invitations off (the copy moves) then on, by making another org the first, or by
+// splitting a held series.
+// `before`'s split sources (`splitFrom`) count too: a held copy is marked failed
+// whatever it holds, so the hub cannot tell whether the shortened old series reached
+// Outlook, and it never guesses. A split always counts, sending or not: its old
+// series' shortening would be held anyway.
+function calTurmaResendError(t, before, after, now = Date.now()) {
+  const org = after.orgs[0];
+  const split = before.id !== after.id;
+  if (!split && !calTurmaSends(after, org)) return null;
+  // Already sending from that org: its own copy is the one that sent.
+  if (!split && calTurmaSends(before, org)) return null;
+  const refuse = (host) => ({ status: 409, body: { error: `${split ? "this series cannot be split" :
+    "invitations cannot go out from this event"} yet: its Outlook copy on ${meetingText(baseOfKey(host), 80)} may ` +
+    "have sent invitations and has not been cancelled or updated, so attendees would get a second invitation from " +
+    "another mailbox. That goes when the host is back online; try again after that." } });
+  const bucket = calendarTurmaEvents[t] || {};
+  // A deleted source still names its id, for its tombstones.
+  const ids = new Set([before.id, ...(before.splitFrom || [])]);
+  for (const id of ids) {
+    const r = id === before.id ? before : Object.hasOwn(bucket, id) ? bucket[id] : null;
+    for (const [o, e] of Object.entries((r && r.outlook) || {})) {
+      if (e.sent && e.host && !calWriteHolderOk(e.host, t, o, now)) return refuse(e.host);
+    }
+  }
+  for (const [k, list] of Object.entries(calendarOutlookTombstones)) {
+    if (tenantOfKey(k) === t && list.some((x) => ids.has(x.turmaId) && x.sent)) return refuse(k);
+  }
+  return null;
+}
 const CAL_HELD_PREFIX = "Kept on ";
 // Built at its stored length (the device name cut first), so the held entry is a
 // fixed point and a long device name never rewrites the record every tick.
@@ -7614,7 +7669,7 @@ const calIsHeldError = (s) => typeof s === "string" && s.startsWith(CAL_HELD_PRE
 // record no longer names becomes a tombstone, then the rest are reconciled.
 function calOutlookAfterWrite(t, before, after, now = Date.now()) {
   for (const [org, e] of Object.entries((before && before.outlook) || {})) {
-    if (e.host && !(after && after.orgs.includes(org))) calTombstoneAdd(e.host, before.id, org, e.outlookId, now);
+    if (e.host && !(after && after.orgs.includes(org))) calTombstoneAdd(e.host, before.id, org, e.outlookId, now, e.sent === true);
   }
   if (after) calOutlookReconcile(t, after, now);
 }

@@ -59,6 +59,20 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - Its host back: the owed write goes at once (`at` reset), not on the hourly failure retry.
   - Ways out for the operator: bring the host back, or turn invitations off (the copy then moves
     and the old one is cancelled whenever its host returns).
+- **A write that would send from a new mailbox is 409'd while a SENT copy is unsettled** (XERK-3014):
+  `calTurmaResendError`, on series edits AND "following" splits (the split's source series counts).
+  - Unsettled = a `sent` tombstone of the source event (any org), or a `sent` copy held on a host
+    that cannot write. Else off-then-on, a new `orgs[0]`, or a split re-invites, dodging XERK-3010.
+  - `sent` is set on an entry whenever its host holds it while `calTurmaSends` (before any upsert,
+    kept through invitations off), carried onto its tombstone, and cleared on re-home.
+  - Only `sent` tombstones block: a copy that never sent leaves no live invitation to duplicate.
+  - A split's new series stores `splitFrom`: EVERY ancestor id, nearest first (hub-internal, never
+    served or client-set), so deleting a middle series cannot cut the chain (QA).
+  - An ancestor's held copy blocks even if its shortening was written: held marks it failed, so
+    the hub cannot tell. Conservative; it clears when that host returns.
+  - A split is refused while unsettled even if it sends nothing: the old series' shortening is held.
+  - The 24h org-grace drop can still make another org the sender with no request (XERK-3015).
+  - Tests: server.test.js "XERK-3014: …" (off-then-on, "following" split, another org the sender).
 
 ## Tombstones: deleting a copy a record no longer names
 
