@@ -1643,6 +1643,8 @@ function validateForm(f, pickable = null) {
   if (f.required.length + f.optional.length > ATTENDEES_MAX) err.reqDraft = `At most ${ATTENDEES_MAX} attendees.`;
   const cats = categoriesOf(f);
   if (cats.length > 20 || cats.some((c) => cps(c) > 100)) err.category = "At most 20 categories of at most 100 characters.";
+  // A ',' separates names here; a ';' would split the Outlook copy, so the hub refuses it (XERK-3013).
+  else if (cats.some((c) => c.includes(";"))) err.category = "A category name can't contain ';'.";
   const t = formTimes(f);
   if (t.error) Object.assign(err, t.error);
   const re = repeatError(f.repeat, repDay(f), splitDay(f));

@@ -45,6 +45,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
   createdBy, createdAt, updatedAt, version, outlook}` (the three invitation flags: XERK-2989).
   - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
     `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
+  - A category name with `,` or `;` is a 400 (XERK-3013): Outlook's Categories is one
+    separator-joined string, so the copy would split it. Both editors refuse `;` (`,` separates).
   - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.
   - `timeZone` an IANA zone the hub's Intl knows (≤64, else "UTC"): the wall clock the creator
     meant, which a recurrence needs; `start`/`end` alone fix the instant.

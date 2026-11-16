@@ -6885,6 +6885,9 @@ function turmaEventFieldError(b) {
       !b.categories.every((c) => typeof c === "string" && cps(c) <= 100))) {
     return "categories must be a list of at most 20 names of at most 100 characters";
   }
+  // Outlook's own rule: its Categories property is a list-separator-joined string, so a ',' or
+  // ';' inside a name splits it into several categories on the Outlook copy (XERK-3013).
+  if ("categories" in b && b.categories.some((c) => /[,;]/.test(c))) return "categories: a name must not contain ',' or ';' (Outlook splits on them)";
   if ("attendees" in b) {
     if (!Array.isArray(b.attendees) || b.attendees.length > 100) return "attendees must be a list of at most 100";
     for (const a of b.attendees) {
