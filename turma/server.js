@@ -6298,7 +6298,7 @@ function applyCalendarSync(key, row, now) {
   calendarEnforceTenant(tenantOfKey(key), now, { key, total, hostDropped: dropped });
   // Turma wins (XERK-2985): a copy this host holds that drifted or went missing is re-written.
   try {
-    calOutlookCheckSync(key, from, until, [...incoming.values()], now);
+    calOutlookCheckSync(key, from, until, [...incoming.values()], h.syncedAt, now);
   } catch (e) {
     console.error(`calendar write repair failed: ${e && e.message}`);
   }
@@ -6658,7 +6658,9 @@ function calTurmaDropsPrivate(p, before, ...after) {
 const CAL_TURMA_DROP_PRIVATE_REFUSAL = { status: 409, body: { error: "this would remove an occurrence its owner " +
   "made private; only they can change the whole series" } };
 const CAL_TURMA_MAKE_PRIVATE_REFUSAL = { status: 409, body: { error: "only the one who made an event can make it private" } };
-const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
+// The client's record, without the hub-owned `outlook` (XERK-2985): its growth as copies
+// are written must never turn a same-size edit into a 409. It is bounded by its own shape.
+const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify({ ...rec, outlook: undefined }));
 
 // The served form for principal `p`; `served` = the orgs still decided.
 function turmaEventWire(p, rec, served = rec.orgs) {
@@ -7197,7 +7199,8 @@ const CALENDAR_WRITE_INFLIGHT_MAX = 50;            // undelivered writes queued 
 const CALENDAR_WRITE_TICK_MS = 60e3;               // the leader's full reconcile, at most this often
 const CALENDAR_WRITE_MEMO_MAX = 20000;             // the in-memory sent/repair/org-loss maps
 const CALENDAR_TOMBSTONES_MAX = 1500;              // per host, oldest dropped first
-const CAL_WRITE_WITHHELD = { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "" };
+// The served withheld view's fields (turmaEventWire), categories included.
+const CAL_WRITE_WITHHELD = { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "", categories: [] };
 const calWriteCapable = (a) => !!(a && a.calendar && a.calendar.available === true && a.calendar.write === true);
 // In memory: a restart forgets them, and the first pass re-sends what is still pending
 // (the agent's upsert is idempotent, so that is safe).
@@ -7448,6 +7451,7 @@ function ingestCalendarWriteResults(key, rows, now = Date.now()) {
     if (!r || typeof r !== "object" || Array.isArray(r)) continue;
     const turmaId = typeof r.turmaId === "string" && CAL_TURMA_ID_RE.test(r.turmaId) ? r.turmaId : "";
     if (!turmaId || typeof r.org !== "string" || !r.org || (r.op !== "upsert" && r.op !== "delete")) continue;
+    if (stripSiteTenantSuffixes(r.org) !== r.org) continue;   // the agent names its org plain, never scoped
     const org = scopeSite(r.org, t);   // the agent names its org plain
     const ok = r.ok === true;
     const error = ok ? "" : meetingText(r.error, 300) || "Outlook did not say why the write failed";
@@ -7461,6 +7465,15 @@ function ingestCalendarWriteResults(key, rows, now = Date.now()) {
         if (!list.length) delete calendarOutlookTombstones[key];
         calWriteSent.delete(sk);
         tombs = true;
+        // Its stored copy is gone from Outlook too: drop it now, or it is served as an
+        // Outlook event (its stamp names nothing any more) until the host's next sync.
+        const h = calendarEvents[key];
+        const live = bucket && Object.hasOwn(bucket, turmaId);
+        if (h && !live && h.events.some((ev) => ev.turmaId === turmaId)) {
+          h.events = h.events.filter((ev) => ev.turmaId !== turmaId);
+          persistCalendarEvents();
+          broadcastCalendarSoon(key);
+        }
       } else {
         calMemoSet(calWriteSent, sk, { at: now, version: 0, op: "delete", failed: true });
       }
@@ -7497,7 +7510,7 @@ function ingestCalendarWriteResults(key, rows, now = Date.now()) {
 // Turma wins (on a GOOD sync row of host `key` for [from, until)): a copy this host
 // holds as written that drifted from what the record maps to, or that is missing from
 // the window, is re-written — at most once per copy per CALENDAR_WRITE_REPAIR_MIN_MS.
-function calOutlookCheckSync(key, from, until, events, now) {
+function calOutlookCheckSync(key, from, until, events, syncedAt, now) {
   const t = tenantOfKey(key);
   const bucket = calendarTurmaEvents[t];
   if (!bucket) return false;
@@ -7508,6 +7521,8 @@ function calOutlookCheckSync(key, from, until, events, now) {
     let repaired = false;
     for (const [org, e] of Object.entries(rec.outlook)) {
       if (e.host !== key || e.state !== "written" || e.version !== rec.version) continue;
+      // Read before the copy was last written: it cannot show that write (a stale row).
+      if (syncedAt <= e.at) continue;
       const rk = `${t}\u0000${rec.id}\u0000${org}`;
       if (now - (calWriteRepairAt.get(rk) || 0) < CALENDAR_WRITE_REPAIR_MIN_MS) continue;
       const copies = stamped.get(rec.id) || [];
@@ -31674,7 +31689,7 @@ if (process.env.TURMA_TEST) {
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     // XERK-2968: Turma-created events.
-    getCalendarOutlookTombstones: () => calendarOutlookTombstones, calOutlookTombstonesCoerce, calendarOutlookTick,
+    getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
     CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calOutlookTickAt = 0; },
     sanitizeTurmaEvent, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
