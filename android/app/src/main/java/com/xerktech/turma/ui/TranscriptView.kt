@@ -48,6 +48,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -86,6 +87,8 @@ import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.DataImage
 import com.xerktech.turma.core.parseProse
+import com.xerktech.turma.core.prMarkLabel
+import com.xerktech.turma.core.safeMeetingUrl
 import com.xerktech.turma.core.splitImages
 import com.xerktech.turma.model.SendFile
 import android.graphics.Color as AndroidColor
@@ -117,7 +120,24 @@ fun ChatItemView(item: ChatItem) {
         is ChatItem.Tool -> TranscriptTool(item)
         is ChatItem.TaskNote -> Pill("⚑ ${item.summary} (${item.status})")
         is ChatItem.Command -> TranscriptCommand(item)
+        is ChatItem.PrMark -> TranscriptPrMark(item)
     }
+}
+
+/**
+ * The inline "↗ Opened PR #N — repo" marker (chat.js `renderPrMarker`). The URL
+ * comes off the wire, so only an http(s) one is ever opened (web `safeUrl`).
+ */
+@Composable
+private fun TranscriptPrMark(p: ChatItem.PrMark) {
+    val uri = LocalUriHandler.current
+    val url = safeMeetingUrl(p.url)
+    Pill(
+        "↗ ${prMarkLabel(p)}",
+        // Link-tinted when it opens something, as the web marker is an anchor.
+        color = if (url.isNotEmpty()) MaterialTheme.colorScheme.primary else null,
+        modifier = Modifier.then(if (url.isNotEmpty()) Modifier.clickable { runCatching { uri.openUri(url) } } else Modifier),
+    )
 }
 
 /**

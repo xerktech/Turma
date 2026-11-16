@@ -154,6 +154,13 @@ Split out of `.claude/rules/turma.md` (shared chrome, org filter, notifications)
   `renderBashCard`; Android `TranscriptCommand`), in every verbosity — a collapsed chip hid where it
   ran and what it printed. `/slash` commands keep the chip. Tests: the `XERK-2112` cases in
   `chat.test.js`, `ChatItemsTest.kt`.
+- **`mergeTail` puts a NEW id just before the next incoming id the buffer holds at a LATER slot**,
+  else appends (XERK-3003; Android `Transcript.kt` mirrors it).
+  - Never anchor on the PREVIOUS incoming id: a live-tail delta omits unchanged entries, and a seed
+    repeats a restamped `pr-link:<url>` id, so either pulled newer turns above older ones (QA).
+  - Tests: the `XERK-3003` cases in `chat.test.js`, `TranscriptTest.kt`.
+- **A `pr_link` block is a "↗ Opened PR" marker, one per URL at its first occurrence**, in every
+  verbosity (web `renderPrMarker`, Android `ChatItem.PrMark`). Tests: `ChatItemsTest.kt` XERK-3003.
 - **Bubble prose is rendered by `renderProse`** — the markdown-to-HTML engine (fences, tables,
   headings/lists/quotes/rules, emphasis, inline code, links, inline images/SVGs), its LINEARITY
   and JS↔Kotlin port-parity invariants → `.claude/rules/chat-prose.md`.

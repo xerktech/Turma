@@ -17,6 +17,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonNames
 import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
 
 /**
  * Wire shapes mirrored from the Turma hub (turma/server.js `serializeAgent`,
@@ -1814,6 +1816,24 @@ data class CommandOutputBlock(
     val isError: Boolean = false,
     val truncated: Boolean = false,
 ) : Block()
+
+/**
+ * Claude Code's own record of a PR this session opened (agent `_entry_blocks`
+ * `pr_link`): drawn as an inline linked marker where it landed (chat.js `pr`).
+ */
+@Serializable
+@SerialName("pr_link")
+data class PrLinkBlock(
+    val url: String = "",
+    // Raw, read through [prNumber]: an Int field would make a `true`/`7.5`/huge
+    // number THROW, and one throwing block fails the whole atomic /api/agents
+    // decode (the hub does not coerce it, and /live frames are not coerced).
+    val number: JsonElement? = null,
+    val repo: String = "",
+) : Block() {
+    /** The PR number, or 0 when absent or not a plain integer. */
+    val prNumber: Int get() = (number as? JsonPrimitive)?.takeIf { !it.isString }?.intOrNull ?: 0
+}
 
 @Serializable
 @SerialName("__unknown")
