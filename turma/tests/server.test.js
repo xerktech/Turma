@@ -34531,6 +34531,7 @@ test("XERK-2985: a create queues one upsert to each org's writer; its result mar
     assert.equal(e.outlook[S2985A].state, "written");
     assert.deepEqual([e.outlook[S2985B].state, e.outlook[S2985B].error], ["failed", "Outlook is not open"]);
     assert.ok(!JSON.stringify(e).includes("EID-1") && !JSON.stringify(e.outlook).includes(D2985A));
+    assert.ok(!("noHost" in e.outlook[S2985B]), "a held copy is never served noHost");
     const stored = hub.getCalendarTurmaEvents()[""];
     assert.equal(JSON.stringify(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]), JSON.stringify(stored));
     // A route body never sets it, and an edit keeps it (a new version is owed again).
@@ -34545,6 +34546,24 @@ test("XERK-2985: a create queues one upsert to each org's writer; its result mar
   } finally {
     cleanup2985(D2985A, D2985A2, D2985B);
     forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-2987: an org with no Outlook writer is served noHost, until a writer holds the copy", async () => {
+  cleanup2985(D2985B);
+  try {
+    await beat1574(D2985B, S2985B, { sessions: [], calendar: { available: true } });  // reads only
+    const c = await turma2968("POST", null, ev2968([S2985B]));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    let [e] = await served2968();
+    assert.deepEqual([e.outlook[S2985B].state, e.outlook[S2985B].noHost], ["pending", true]);
+    await beat2985(D2985B, S2985B);  // now a writer: the reconnect beat picks it
+    [e] = await served2968();
+    assert.equal(e.outlook[S2985B].state, "pending");
+    assert.ok(!("noHost" in e.outlook[S2985B]));
+  } finally {
+    cleanup2985(D2985B);
+    forget2533(D2985B);
   }
 });
 

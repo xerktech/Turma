@@ -452,6 +452,13 @@
   .cal-ed .cal-ed-err { margin: 8px 0 0; }
   /* The recurring glyph (XERK-2973): on a block beside its title, in the panel's Repeats row. */
   .cal-recur { width: 11px; height: 11px; flex: none; margin-left: 3px; opacity: 0.85; }
+  /* A Turma event's Outlook copies (XERK-2987): the block's mark, and one line per org in the panel. */
+  .cal-olk { flex: none; margin-left: 3px; font-size: 11px; font-weight: 700; line-height: 1; }
+  .cal-olk.failed { color: var(--critical-text); }
+  .cal-olk.pending { color: var(--ink-2); }
+  .cal-olk-row { display: block; }
+  .cal-olk-row.failed { color: var(--critical-text); }
+  .cal-olk-row.pending, .cal-olk-row.nohost { color: var(--muted); }
   .cal-drow .cal-recur, .cal-ed-sum .cal-recur { width: 13px; height: 13px; margin: 0 5px 0 0; vertical-align: -2px; }
   .cal-ed-days { display: flex; flex-wrap: wrap; gap: 4px; }
   .cal-ed-day { position: relative; display: inline-flex; }

@@ -1002,6 +1002,14 @@ private fun EventBlock(
                         fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
+                // A Turma event's Outlook copy failed or is being written (XERK-2987).
+                when (val m = com.xerktech.turma.core.calOutlookMark(ev)) {
+                    "failed", "pending" -> Text(
+                        if (m == "failed") "!" else "…", Modifier.padding(start = 2.dp).testTag("cal-olk-$m"),
+                        fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                        color = if (m == "failed") TurmaColors.criticalText() else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 CalBadgeView(badge)
             }
             if (!short && meta.isNotEmpty()) {
@@ -1128,12 +1136,33 @@ private fun CalendarDetail(
                 if (ev.organizer.isNotEmpty() && ev.organizerEmail.isNotEmpty()) "${ev.organizer} (${ev.organizerEmail})" else ev.organizer,
             )
             DetailRow("You", calMyResponse(ev.myResponse))
+            val olk = com.xerktech.turma.core.calOutlookStates(ev)
             DetailRow(
                 "Calendar",
                 if (ev.tenir) "Captured by Tenir — not on Outlook"
-                else if (ev.turma) "Made in Turma — not on Outlook"
+                else if (ev.turma) (if (olk != null) "Made in Turma" else "Made in Turma — not on Outlook")
                 else if (ev.host.isNotEmpty()) "Outlook on ${bareKey(ev.host)}" else "",
             )
+            // Each org's copy in Outlook (XERK-2987), the error in Outlook's own words.
+            if (!olk.isNullOrEmpty()) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Outlook", Modifier.width(84.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Column(Modifier.weight(1f)) {
+                        for (x in olk) {
+                            Text(
+                                if (olk.size == 1) x.text else "${orgLabel(x.org)}: ${x.text}",
+                                Modifier.testTag("cal-olk-row"),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = when (x.state) {
+                                    "failed" -> onTint(TurmaColors.criticalText())
+                                    "written" -> MaterialTheme.colorScheme.onSurface
+                                    else -> onTint(MaterialTheme.colorScheme.onSurfaceVariant)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
             if (ev.turma && !ev.private && ev.sensitivity == "private") DetailRow("Privacy", "Private: only you see its details")
             val cats = ev.categories.filter { it.isNotEmpty() }
             if (cats.isNotEmpty()) DetailRow("Categories", cats.joinToString(", "))

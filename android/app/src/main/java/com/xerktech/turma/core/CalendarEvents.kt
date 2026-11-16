@@ -24,6 +24,50 @@ import kotlinx.serialization.json.put
 fun calOrgsOf(ev: CalendarEvent): List<String> =
     ev.orgs?.filter { it.isNotEmpty() }?.takeIf { it.isNotEmpty() } ?: listOfNotNull(ev.org.ifEmpty { null })
 
+/** One org's Outlook copy of a Turma event (XERK-2987); [state] written|pending|failed|nohost. */
+data class CalOutlookState(val org: String, val state: String, val text: String)
+
+/**
+ * Each org's Outlook copy of a Turma event, the web's `outlookStates`; null = an older hub
+ * serving no `outlook` (or a shape this build cannot read), so the panel reads as before.
+ */
+fun calOutlookStates(ev: CalendarEvent): List<CalOutlookState>? {
+    val ol = (if (ev.turma) ev.outlook else null) as? JsonObject ?: return null
+    return calOrgsOf(ev).map { org ->
+        val o = ol[org] as? JsonObject
+        val str = { k: String -> (o?.get(k) as? JsonPrimitive)?.takeIf { it.isString }?.content }
+        val raw = str("state")
+        val noHost = (o?.get("noHost") as? JsonPrimitive)?.takeIf { !it.isString }?.content == "true"
+        val recreated = ((o?.get("recreatedAt") as? JsonPrimitive)?.takeIf { !it.isString }?.content?.toDoubleOrNull() ?: 0.0) > 0
+        val state = when {
+            raw == "written" || raw == "failed" -> raw
+            noHost -> "nohost"
+            else -> "pending"
+        }
+        val err = jsTrim(str("error") ?: "")
+        val text = when (state) {
+            "written" -> if (recreated) "In Outlook (re-created after it was deleted there)" else "In Outlook"
+            "failed" -> "Failed: ${err.ifEmpty { "Outlook gave no reason" }}"
+            "nohost" -> "No Outlook host for this org"
+            else -> "Writing…"
+        }
+        CalOutlookState(org, state, text)
+    }
+}
+
+/**
+ * The block's mark, the web's `outlookMark`: "failed" outranks "pending"; no host marks
+ * nothing (it may wait for a writer forever and would mark every event of such an org).
+ */
+fun calOutlookMark(ev: CalendarEvent): String {
+    val s = calOutlookStates(ev) ?: return ""
+    return when {
+        s.any { it.state == "failed" } -> "failed"
+        s.any { it.state == "pending" } -> "pending"
+        else -> ""
+    }
+}
+
 /** The hub's `CAL_TURMA_BUSY`, with the words the editor's Show-as pick reads. */
 val CAL_SHOW_AS = listOf(
     "busy" to "Busy",

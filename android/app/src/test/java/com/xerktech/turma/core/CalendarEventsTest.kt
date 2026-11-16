@@ -184,4 +184,29 @@ class CalendarEventsTest {
         assertTrue(calDraftErrors(draft("o").copy(timeZone = "UT")).isNotEmpty())
         assertEquals("AB", calDraftPayload(draft("o").copy(subject = " A\u200bB\u202e ")) ["subject"]!!.jsonPrimitive.content)
     }
+
+    @Test fun `XERK-2987 each org's Outlook copy, the block mark, and an older hub reading as before`() {
+        val base = """"source": "turma", "id": "turma:0123456789abcdef", "orgs": ["a", "b"], "org": "a", "startMs": 1, "endMs": 2"""
+        val old = decode("""[{ $base }]""").single()
+        assertNull(calOutlookStates(old))
+        assertEquals("", calOutlookMark(old))
+        // Outlook's event never reads an `outlook` field as its own.
+        assertNull(calOutlookStates(decode("""[{ "source": "outlook", "id": "E1", "org": "a", "startMs": 1, "endMs": 2,
+            "outlook": { "a": { "state": "failed" } } }]""").single()))
+        val ev = decode("""[{ $base, "outlook": {
+            "a": { "state": "failed", "error": " Outlook is not open ", "at": 1 },
+            "b": { "state": "pending", "noHost": true, "at": 1 } } }]""").single()
+        assertEquals(listOf(CalOutlookState("a", "failed", "Failed: Outlook is not open"),
+            CalOutlookState("b", "nohost", "No Outlook host for this org")), calOutlookStates(ev))
+        assertEquals("failed", calOutlookMark(ev))
+        val writing = decode("""[{ $base, "outlook": { "a": { "state": "written", "recreatedAt": 5, "at": 5 },
+            "b": { "state": "pending", "at": 1 } } }]""").single()
+        assertEquals(listOf("In Outlook (re-created after it was deleted there)", "Writing…"), calOutlookStates(writing)!!.map { it.text })
+        assertEquals("pending", calOutlookMark(writing))
+        // No host alone marks nothing; a malformed entry reads as still writing, never a crash.
+        assertEquals("", calOutlookMark(decode("""[{ $base, "outlook": { "a": { "state": "pending", "noHost": true },
+            "b": { "state": "written" } } }]""").single()))
+        assertEquals("Writing…", calOutlookStates(decode("""[{ $base, "outlook": { "a": 7, "b": { "state": 3 } } }]""").single())!![0].text)
+        assertNull(calOutlookStates(decode("""[{ $base, "outlook": [1] }]""").single()))
+    }
 }

@@ -533,6 +533,34 @@ const TENIR_SVG = `<svg class="cal-tenir" viewBox="0 0 16 16" aria-hidden="true"
 // an Outlook occurrence and a Turma series alike (XERK-2973).
 const RECUR_SVG = `<svg class="cal-recur" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M12.6 6.2A5 5 0 0 0 3.3 5.6M3.4 9.8a5 5 0 0 0 9.3.6"/><path fill="currentColor" d="M2.2 2.8v4h4zM13.8 13.2v-4h-4z"/></svg>`;
 const recurHtml = (ev) => (ev && ev.recurring === true ? RECUR_SVG : "");
+// Each org's Outlook copy of a Turma event (XERK-2987): [{org, state, text}], state
+// written|pending|failed|nohost. null = an older hub serving no `outlook`: the panel reads as before.
+function outlookStates(ev) {
+  const ol = ev && ev.source === "turma" ? ev.outlook : null;
+  if (!ol || typeof ol !== "object" || Array.isArray(ol)) return null;
+  return evOrgs(ev).map((org) => {
+    const o = Object.prototype.hasOwnProperty.call(ol, org) && ol[org] && typeof ol[org] === "object" ? ol[org] : {};
+    let state = o.state === "written" || o.state === "failed" ? o.state : "pending";
+    if (state === "pending" && o.noHost === true) state = "nohost";
+    const err = typeof o.error === "string" ? o.error.trim() : "";
+    const text = state === "written" ? (Number.isFinite(o.recreatedAt) && o.recreatedAt > 0 ? "In Outlook (re-created after it was deleted there)" : "In Outlook")
+      : state === "failed" ? `Failed: ${err || "Outlook gave no reason"}`
+      : state === "nohost" ? "No Outlook host for this org" : "Writing…";
+    return { org, state, text };
+  });
+}
+// The block's mark: a failed copy outranks one still being written; no host marks nothing
+// (it waits for a writer that may never come, and would mark every event of such an org).
+function outlookMark(ev) {
+  const s = outlookStates(ev);
+  if (!s) return "";
+  return s.some((x) => x.state === "failed") ? "failed" : s.some((x) => x.state === "pending") ? "pending" : "";
+}
+const OUTLOOK_MARK = { failed: "!", pending: "…" };
+const outlookMarkHtml = (ev) => {
+  const m = outlookMark(ev);
+  return m ? `<span class="cal-olk ${m}" aria-hidden="true" title="${m === "failed" ? "An Outlook copy failed" : "Writing to Outlook"}">${OUTLOOK_MARK[m]}</span>` : "";
+};
 function ariaOf(ev, day) {
   const bits = [titleOf(ev)];
   // A timed event of 24h+ sits in the all-day band but keeps its times (XERK-2934).
@@ -546,6 +574,8 @@ function ariaOf(ev, day) {
   if (ev.myResponse === "declined") bits.push("declined");
   if (ev.source === "tenir") bits.push("captured by Tenir, not on Outlook");
   if (ev.source === "turma") bits.push("Turma event");
+  const olk = outlookMark(ev);
+  if (olk) bits.push(olk === "failed" ? "an Outlook copy failed" : "writing to Outlook");
   if (ev.recurring === true) bits.push("repeats");
   return bits.join(", ");
 }
@@ -606,7 +636,7 @@ function timedHtml(seg, day, colors, now) {
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
     + ` style="${evStyle(ev, colors)}top:${slots(seg.top / 30)};height:${slots((seg.bottom - seg.top) / 30, 2)};left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
     + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-    + orgBarHtml(ev, colors) + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${badgeHtml(b)}</span>`
+    + orgBarHtml(ev, colors) + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${outlookMarkHtml(ev)}${badgeHtml(b)}</span>`
     + `<span class="m">${esc(meta)}</span></span></button>`;
 }
 function bandHtml(day, events, holidays, colors, now) {
@@ -622,7 +652,7 @@ function bandHtml(day, events, holidays, colors, now) {
     const b = badgeOf(ev);
     bits.push(`<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="-1"`
       + ` style="${evStyle(ev, colors)}" aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-      + orgBarHtml(ev, colors) + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${badgeHtml(b)}</span></button>`);
+      + orgBarHtml(ev, colors) + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${outlookMarkHtml(ev)}${badgeHtml(b)}</span></button>`);
   }
   return bits.join("");
 }
@@ -792,7 +822,13 @@ function detailHtml(ev, now, hasPanel = false) {
   if (ev.busy === "outOfOffice") state.push("Out of office");
   if (turma && ev.busy === "workingElsewhere") state.push("Working elsewhere");
   const host = ev.host ? (typeof TurmaBoard !== "undefined" && TurmaBoard.hostName ? TurmaBoard.hostName(ev.host) : String(ev.host)) : "";
-  row("Calendar", tenir ? "Captured by Tenir — not on Outlook" : turma ? "Made in Turma — not on Outlook" : host ? `Outlook on ${host}` : "");
+  const olk = outlookStates(ev);
+  row("Calendar", tenir ? "Captured by Tenir — not on Outlook" : turma ? (olk ? "Made in Turma" : "Made in Turma — not on Outlook") : host ? `Outlook on ${host}` : "");
+  // Each org's copy in Outlook (XERK-2987), the error in Outlook's own words, escaped.
+  if (olk && olk.length) {
+    const one = olk.length === 1;
+    row("Outlook", olk.map((x) => `<span class="cal-olk-row ${x.state}">${one ? "" : `${esc(orgLabel(x.org))}: `}${esc(x.text)}</span>`).join(""), true);
+  }
   const cats = (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string" && c);
   if (cats.length) row("Categories", cats.map((c) => `<span class="cal-cat">${esc(c)}</span>`).join(""), true);
   const join = safeHttps(ev.joinUrl);
@@ -2304,7 +2340,7 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
-  detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
+  detailHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
   _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
   _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
