@@ -124,9 +124,14 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
     at once (served state is per served org, so a `deleting` state would never be shown).
   - `at` = the last state change; `recreatedAt` = the last repair that re-created a missing copy.
 - Hub-owned: route bodies cannot set it (dropped like `createdBy`), and a PATCH keeps it.
-- **Served** on `GET /api/calendar` per Turma event as `outlook: {<org>: {state, error?,
+- **Served** on `GET /api/calendar` per Turma event as `outlook: {<org>: {state, noHost?, error?,
   recreatedAt?, at}}`, only for orgs in the served `orgs`; never `host` or `outlookId`. Clients
   (XERK-2987) show it per org; absent = an older hub. Android types it with defaults.
+  - `noHost: true` = no host holds the copy (none of that org reports `write`); the entry stays
+    `pending` until one does. Clients say "No Outlook host for this org", never "Writing…".
+  - Clients render it per org on the event panel ("In Outlook" / "Writing…" / "Failed: <error>"),
+    and mark the block when a copy is failed, or pending with a host; `noHost` does not mark it.
+  - No retry route: a failed copy retries hourly and on the next edit, so clients offer no Retry.
 - Byte caps (`CALENDAR_TURMA_BYTES_MAX`) do NOT count it (`calTurmaBytes`): it grows as copies are
   written, which must never turn a same-size edit into a 409. Its shape bounds it (≤20 short entries).
 

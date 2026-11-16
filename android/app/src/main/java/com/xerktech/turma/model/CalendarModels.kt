@@ -103,6 +103,10 @@ data class CalendarEvent(
     val originalStart: String = "",
     // An occurrence's series' first instant (ISO with offset): the day an implicit rule day reads off.
     val seriesStart: String = "",
+    // A Turma event's Outlook copy per org (XERK-2987), read by core/CalendarEvents.kt's
+    // calOutlookStates; raw, so a shape this build cannot read shows no state, never a failed decode.
+    // null = an older hub: the panel reads as before.
+    val outlook: kotlinx.serialization.json.JsonElement? = null,
 ) {
     val tenir: Boolean get() = source == "tenir"
 

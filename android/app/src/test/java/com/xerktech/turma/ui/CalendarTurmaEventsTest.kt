@@ -346,4 +346,18 @@ class CalendarTurmaEventsTest {
         compose.onNodeWithTag("cal-ed-rep-summary").performScrollTo().assertTextContains("8 times in the whole series", substring = true)
         compose.onNodeWithText("occurrences in the whole series").performScrollTo().assertExists()
     }
+
+    @Test fun `XERK-2987 the sheet names each org's Outlook copy and the block wears the failed mark`() {
+        seed(turmaEvent(extra = """, "outlook": { "$a": { "state": "failed", "error": "Outlook is not open", "at": 1 },
+            "$b": { "state": "pending", "noHost": true, "at": 1 } }"""), outlook)
+        show()
+        awaitEvent("Joint planning")
+        compose.onNode(event("an Outlook copy failed")).assertExists()
+        compose.onNodeWithTag("cal-olk-failed", useUnmergedTree = true).assertExists()
+        compose.onNode(event("Joint planning")).performScrollTo().performClick()
+        compose.onNodeWithText("Made in Turma").assertExists()
+        compose.onNodeWithText("a: Failed: Outlook is not open").performScrollTo().assertExists()
+        compose.onNodeWithText("b: No Outlook host for this org").assertExists()
+        compose.onNodeWithText("Made in Turma — not on Outlook").assertDoesNotExist()
+    }
 }

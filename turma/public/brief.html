@@ -452,6 +452,17 @@
   .cal-ed .cal-ed-err { margin: 8px 0 0; }
   /* The recurring glyph (XERK-2973): on a block beside its title, in the panel's Repeats row. */
   .cal-recur { width: 11px; height: 11px; flex: none; margin-left: 3px; opacity: 0.85; }
+  /* A Turma event's Outlook copies (XERK-2987): the block's mark, and one line per org in the panel. */
+  /* A white pill with a fixed dark glyph in both themes: the Turma block is a blue-to-purple
+     gradient, where a theme colour alone fell to ~1.1:1 (QA). White clears 3:1 on every stop. */
+  .cal-olk { flex: none; margin-left: 3px; display: inline-flex; align-items: center; justify-content: center;
+    min-width: 14px; height: 14px; padding: 0 3px; box-sizing: border-box; border-radius: 7px;
+    background: #fff; font-size: 11px; font-weight: 800; line-height: 1; }
+  .cal-olk.failed { color: #b3261e; }
+  .cal-olk.pending { color: #3d3c3a; }
+  .cal-olk-row { display: block; }
+  .cal-olk-row.failed { color: var(--critical-text); }
+  .cal-olk-row.pending, .cal-olk-row.nohost { color: var(--muted); }
   .cal-drow .cal-recur, .cal-ed-sum .cal-recur { width: 13px; height: 13px; margin: 0 5px 0 0; vertical-align: -2px; }
   .cal-ed-days { display: flex; flex-wrap: wrap; gap: 4px; }
   .cal-ed-day { position: relative; display: inline-flex; }
