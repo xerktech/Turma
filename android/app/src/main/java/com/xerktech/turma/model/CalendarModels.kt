@@ -66,6 +66,8 @@ data class CalendarEvent(
     @Serializable(with = LenientStringsSerializer::class)
     val categories: List<String> = emptyList(),
     val sensitivity: String = "",
+    // A Turma event's reminder (XERK-2988), minutes before the start; null = none / an older hub.
+    val reminderMinutes: Int? = null,
     val isOnlineMeeting: Boolean = false,
     val private: Boolean = false,
     /** XERK-2936: the hub's "real meeting" verdict, judged before a private event is withheld; null = older hub. */

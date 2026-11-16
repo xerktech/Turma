@@ -52,6 +52,29 @@ class CalendarEventsTest {
         assertEquals("private", p["sensitivity"]!!.jsonPrimitive.content)
     }
 
+    @Test fun `XERK-2988 a reminder defaults to none, round-trips, and none sends null`() {
+        val d = draft("o")
+        assertEquals("", d.reminder)
+        assertEquals(kotlinx.serialization.json.JsonNull, calDraftPayload(d)["reminderMinutes"])
+        assertEquals(15, calDraftPayload(d.copy(reminder = "15"))["reminderMinutes"]!!.jsonPrimitive.content.toInt())
+        assertEquals(kotlinx.serialization.json.JsonNull, calDraftPayload(d.copy(reminder = ""))["reminderMinutes"])
+        assertEquals(kotlinx.serialization.json.JsonNull, calDraftPayload(d.copy(reminder = "7"))["reminderMinutes"])
+        assertEquals(1440, calDraftPayload(d.copy(reminder = "1440"))["reminderMinutes"]!!.jsonPrimitive.content.toInt())
+        val (on, none, old) = decode("""[
+            { "source": "turma", "host": "", "id": "turma:a", "org": "a", "startMs": 1, "endMs": 2, "reminderMinutes": 60 },
+            { "source": "turma", "host": "", "id": "turma:b", "org": "a", "startMs": 1, "endMs": 2, "reminderMinutes": null },
+            { "source": "turma", "host": "", "id": "turma:c", "org": "a", "startMs": 1, "endMs": 2 } ]""")
+        assertEquals(60, on.reminderMinutes)
+        assertEquals("1 hour before", calReminderText(on.reminderMinutes))
+        assertEquals("", calReminderText(none.reminderMinutes))
+        assertNull(old.reminderMinutes)
+        assertEquals("", calReminderKey(9))
+        // An occurrence edit that only changes the reminder sends only it.
+        val base = d.copy(scope = "occurrence", version = 2, id = "turma:a:x")
+        val sc = calScopedPayload(base, base.copy(reminder = "30"))!!
+        assertEquals(setOf("reminderMinutes", "version", "scope"), sc.keys)
+    }
+
     @Test fun `XERK-2989 invitations ride the payload, read back, and the panel tallies the answers`() {
         val d = draft("a.atlassian.net")
         assertEquals(listOf(false, true, true), listOf(d.invites, d.reqResp, d.allowFwd))

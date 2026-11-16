@@ -828,6 +828,7 @@ _FAKE_WRITE_OUTLOOK = r"""
   function NewItem($id) {
     $it = [pscustomobject]@{ EntryID = $id; Subject = ''; Location = ''; Body = ''; BusyStatus = 2
       Sensitivity = 0; Categories = ''; AllDayEvent = $false; ReminderSet = $true
+      ReminderMinutesBeforeStart = 15
       StartTimeZone = $null; EndTimeZone = $null; StartInStartTimeZone = $null; EndInEndTimeZone = $null
       StartUTC = [datetime]'2026-11-18T12:00:00'; EndUTC = [datetime]'2026-11-18T13:00:00'
       LastModificationTime = [datetime]'2026-11-16T09:30:00'; props = @{}; Parent = $script:cal
@@ -860,7 +861,7 @@ _FAKE_WRITE_OUTLOOK = r"""
       [Console]::Error.WriteLine('SAVE ' + (ConvertTo-Json -Compress -InputObject @{
         id = $this.EntryID; stamp = $st; subject = $this.Subject; location = $this.Location
         body = $this.Body; busy = $this.BusyStatus; sens = $this.Sensitivity; cats = $this.Categories
-        allDay = $this.AllDayEvent; reminder = $this.ReminderSet; tz = $this.StartTimeZone.ID
+        allDay = $this.AllDayEvent; reminder = $this.ReminderSet; mins = $this.ReminderMinutesBeforeStart; tz = $this.StartTimeZone.ID
         wall = $this.StartInStartTimeZone.ToString('s')
         startUtc = $this.StartUTC.ToString('s'); endUtc = $this.EndUTC.ToString('s')
         status = $this.MeetingStatus; sent = $sent; resp = $this.ResponseRequested
@@ -1105,6 +1106,33 @@ class CalendarWriteTest(unittest.TestCase):
         (save,) = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
         self.assertNotEqual(save["id"], "B7")
         self.assertEqual(got[0]["outlookId"], save["id"])
+
+    def test_xerk2988_a_reminder_is_set_on_the_copy(self):
+        """reminderMinutes from the fixed list sets ReminderSet + the minutes; null
+        (or anything off the list) clears it — Outlook on this host fires it."""
+        got, err, _ = self.run_write([self.up(self.A, reminderMinutes=1440), self.up(self.B, reminderMinutes=0),
+                                      self.up(self.C, reminderMinutes=None)])
+        a, b, c = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual([r["ok"] for r in got], [True, True, True])
+        self.assertEqual((a["reminder"], a["mins"]), (True, 1440))
+        self.assertEqual((b["reminder"], b["mins"]), (True, 0))
+        self.assertFalse(c["reminder"])
+
+    def test_xerk2988_a_reminder_change_never_resends_invitations(self):
+        """The reminder is the organizer's own: changing it must not move the sentKey,
+        or every reminder edit would send attendees a meeting update (XERK-2989)."""
+        inv = {"sendInvites": True, "attendees": [{"email": "ann@x.example", "role": "required"}]}
+        k = [cli.prepare_calendar_write(self.up(self.A, reminderMinutes=m, **inv))["event"]["sentKey"]
+             for m in (None, 15, 1440)]
+        self.assertTrue(k[0])
+        self.assertEqual(len(set(k)), 1)
+
+    def test_xerk2988_a_reminder_off_the_list_is_none(self):
+        for bad in (7, -5, "15", 15.0, True, None, 10 ** 9):
+            p = cli.prepare_calendar_write(self.up(self.A, reminderMinutes=bad))
+            self.assertIsNone(p["event"]["reminder"], bad)
+        self.assertIsNone(cli.prepare_calendar_write(self.up(self.A))["event"]["reminder"])
+        self.assertEqual(cli.prepare_calendar_write(self.up(self.A, reminderMinutes=30))["event"]["reminder"], 30)
 
     def test_one_unreadable_command_never_fails_the_batch(self):
         with mock.patch.object(cli, "_run_outlook_ps",

@@ -257,11 +257,12 @@ __ATTACH__
 # the `TurmaId` user property (PS_PUBLIC_STRINGS) — and an item only counts when
 # its stamp IS that id, so a stale or foreign EntryID never edits someone's own
 # appointment, and a re-sent upsert finds its copy instead of making a second.
-# Save() only, no reminder (XERK-2988's) — except the copy the hub names as the
+# Save() only — except the copy the hub names as the
 # invitation sender (XERK-2989, `event.send`): it becomes a meeting (MeetingStatus
 # olMeeting), its recipients are synced to the attendees, and Send() runs only when
 # the sent fields changed since the last send (`TurmaSent`). A sent copy is deleted,
 # or turned back into a plain copy, by a cancellation first.
+# A reminder is set only when the record names one (XERK-2988), else ReminderSet is cleared.
 # Delete() of a copy already gone is ok. Times arrive as UTC epoch ms plus a
 # WINDOWS zone id: the zone is set first, then StartUTC/EndUTC, so the reader's
 # StartUTC/EndUTC read back the same instants (a wall time could not tell the
@@ -371,7 +372,11 @@ __ATTACH__
         $it.BusyStatus = [int]$e.busy
         $it.Sensitivity = [int]$e.sensitivity
         $it.Categories = (@($e.categories) -join $sep)
-        $it.ReminderSet = $false
+        # A reminder (XERK-2988): Outlook on this host fires it; null = none.
+        if ($null -ne $e.reminder) {
+          $it.ReminderSet = $true
+          $it.ReminderMinutesBeforeStart = [int]$e.reminder
+        } else { $it.ReminderSet = $false }
         if ($e.send) {
           $it.MeetingStatus = 1
           $want = @{}
@@ -1213,7 +1218,8 @@ def prepare_calendar_write(cmd) -> dict:
     out["event"] = {
         "subject": subject, "location": location, "body": body,
         "startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
-        "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats}
+        "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats,
+        "reminder": _reminder_minutes(ev.get("reminderMinutes"))}
     # Invitations (XERK-2989): only the copy the hub names as the sender, never a
     # private one. Every other copy is a plain appointment with no recipients.
     send = ev.get("sendInvites") is True and sens not in ("private", "confidential")
@@ -1238,9 +1244,19 @@ def prepare_calendar_write(cmd) -> dict:
     # What was last SENT is stamped on the copy (`TurmaSent`): an upsert whose
     # sent fields are unchanged saves without sending, so a re-delivered or
     # repair write never sends attendees a second update.
+    # The reminder is the organizer's own and never sent, so it is not part of the key.
     out["event"]["sentKey"] = hashlib.sha256(json.dumps(
-        out["event"], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:32] if send else ""
+        {k: v for k, v in out["event"].items() if k != "reminder"}, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:32] if send else ""
     return out
+
+
+# The hub's CAL_TURMA_REMINDERS (XERK-2988): minutes before the start, or None.
+CALENDAR_REMINDER_MINUTES = (0, 5, 15, 30, 60, 120, 720, 1440, 10080)
+
+
+def _reminder_minutes(v):
+    """A record's `reminderMinutes` -> an int from the fixed list, else None (no reminder)."""
+    return v if type(v) is int and v in CALENDAR_REMINDER_MINUTES else None
 
 
 def _write_result(r) -> dict:

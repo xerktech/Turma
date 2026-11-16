@@ -8,6 +8,7 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -77,6 +78,29 @@ val CAL_SHOW_AS = listOf(
     "workingElsewhere" to "Working elsewhere",
 )
 
+/**
+ * A Turma event's reminder (XERK-2988): the hub's `CAL_TURMA_REMINDERS`, minutes before the
+ * start, with the words the editor's pick reads; "" = none. Outlook on the org's writer host
+ * fires it, never the hub. The web's `REMINDERS`.
+ */
+val CAL_REMINDERS = listOf(
+    "" to "None", "0" to "At start time", "5" to "5 minutes before", "15" to "15 minutes before",
+    "30" to "30 minutes before", "60" to "1 hour before", "120" to "2 hours before",
+    "720" to "12 hours before", "1440" to "1 day before", "10080" to "1 week before",
+)
+
+/**
+ * A new event's reminder: none. It fires in the writer host's Outlook, whose owner may be
+ * neither the creator nor an attendee, so it is set only when someone picks one (web `REMINDER_DEFAULT`).
+ */
+const val CAL_REMINDER_DEFAULT = ""
+
+/** A served `reminderMinutes` as the editor's key; "" for none or one off the list. */
+fun calReminderKey(v: Int?): String = v?.toString()?.takeIf { k -> k.isNotEmpty() && CAL_REMINDERS.any { it.first == k } } ?: ""
+
+/** The words for a served `reminderMinutes` ("1 hour before"), or "" for none. */
+fun calReminderText(v: Int?): String = calReminderKey(v).let { k -> if (k.isEmpty()) "" else CAL_REMINDERS.first { it.first == k }.second }
+
 /** One attendee as the editor holds it; [role] is `required` or `optional` (the creator organizes). */
 data class TurmaAttendee(val name: String, val email: String, val role: String)
 
@@ -102,6 +126,8 @@ data class TurmaEventDraft(
     val joinUrl: String = "",
     val body: String = "",
     val busy: String = "busy",
+    // XERK-2988: a CAL_REMINDERS key; "" = no reminder.
+    val reminder: String = "",
     val categories: String = "",
     val private: Boolean = false,
     // The stored sensitivity, so un-ticking Private on a confidential event keeps it.
@@ -153,7 +179,7 @@ fun calNewEventDraft(day: LocalDate, start: LocalTime, zone: ZoneId, orgs: Set<S
     val end = day.atTime(start).plusMinutes(CAL_NEW_EVENT_MIN.toLong())
     return TurmaEventDraft(
         startDate = day, startTime = start, endDate = end.toLocalDate(), endTime = end.toLocalTime(),
-        timeZone = zone.id, orgs = orgs,
+        timeZone = zone.id, orgs = orgs, reminder = CAL_REMINDER_DEFAULT,
     )
 }
 
@@ -194,6 +220,7 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
         allDay = ev.allDay, timeZone = zone.id, location = ev.location,
         online = ev.isOnlineMeeting, joinUrl = ev.joinUrl, body = ev.body,
         busy = ev.busy.takeIf { b -> CAL_SHOW_AS.any { it.first == b } } ?: "busy",
+        reminder = calReminderKey(ev.reminderMinutes),
         categories = ev.categories.joinToString(", "),
         private = ev.sensitivity == "private", sensitivity = ev.sensitivity.ifEmpty { "normal" },
         orgs = calOrgsOf(ev).toSet(),
@@ -488,6 +515,8 @@ fun calDraftPayload(d: TurmaEventDraft, orgsOrder: List<String> = emptyList()): 
         put("sendInvites", d.invites)
         put("responseRequested", d.reqResp)
         put("allowForward", d.allowFwd)
+        put("reminderMinutes", if (d.reminder.isNotEmpty() && CAL_REMINDERS.any { it.first == d.reminder })
+            JsonPrimitive(d.reminder.toInt()) else JsonNull)
         // One occurrence takes no rule (the hub refuses it): the series' stands (XERK-2973).
         if (!d.oneOccurrence) put("recurrence", calRuleJson(calRuleOfRepeat(d.repeat, calRepeatDay(d))))
         if (d.scope.isNotEmpty()) put("scope", d.scope)

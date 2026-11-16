@@ -184,11 +184,16 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 | `sendInvites`, `responseRequested`, `allowForward` | the sending copy only: `Send()`, `ResponseRequested`, `PidNameMeetingDoNotForward` |
 | `recurrence` + `exceptions` | `GetRecurrencePattern()` + per-occurrence edit/delete (XERK-2986) |
 | `isOnlineMeeting`, `createdBy`, `orgs`, `version` | not written |
-| — | `ReminderSet = false` until XERK-2988 defines reminders |
+| `reminderMinutes` | `ReminderSet = true` + `ReminderMinutesBeforeStart`; null → `ReminderSet = false` (XERK-2988) |
 
 - **A private/confidential record is written withheld**: `Subject` "Private event", no body,
   location or attendees, its `Sensitivity` and busy kept. The holder's mailbox owner is any user of
   that org, not the event's owner, so writing the real fields would leak them.
+- **A reminder fires from the writer host's Outlook only** (XERK-2988): the hub sends no
+  notification of its own. The agent re-checks the value against the same fixed list
+  (`_reminder_minutes`); anything else writes no reminder. It is not part of the drift check.
+  - It is not part of `sentKey` either: the reminder is the organizer's own, so changing it never
+    sends attendees a meeting update (`test_xerk2988_a_reminder_change_never_resends_invitations`).
 - Times round-trip: the reader's `start`/`end` of the copy must equal the record's instants (the
   drift check above relies on it).
 

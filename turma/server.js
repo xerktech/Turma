@@ -6070,11 +6070,15 @@ const CALENDAR_TURMA_ORG_GRACE_MS = 864e5;        // undecided this long -> drop
 const CAL_TURMA_ID_RE = /^turma:[0-9a-f]{16}$/;
 const CAL_TURMA_BUSY = new Set(["free", "tentative", "busy", "outOfOffice", "workingElsewhere"]);
 const CAL_TURMA_ROLE = new Set(["required", "optional"]);
+// A reminder's minutes before the start (XERK-2988): Teams' list; null = none.
+const CAL_TURMA_REMINDERS = [0, 5, 15, 30, 60, 120, 720, 1440, 10080];
+const calReminder = (v) => (CAL_TURMA_REMINDERS.includes(v) ? v : null);
 const CAL_TENANT_BUCKET_RE = /^(?:[0-9a-f]{32})?$/;
 const CAL_ACTOR_RE = /^[\w.:@-]{1,200}$/;
 // The fields a client writes; everything else on a record is the hub's.
 const CAL_TURMA_FIELDS = ["subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
-  "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "sendInvites", "responseRequested", "allowForward"];
+  "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "sendInvites", "responseRequested", "allowForward",
+  "reminderMinutes"];
 // The invitation options (XERK-2989) are the event's, never one occurrence's.
 const CAL_TURMA_SERIES_FLAGS = ["sendInvites", "responseRequested", "allowForward"];
 // The fields one occurrence of a series may override (XERK-2969): every client
@@ -6132,6 +6136,7 @@ function sanitizeTurmaEvent(v, t) {
     allowForward: v.allowForward !== false,
     busy: typeof v.busy === "string" && CAL_TURMA_BUSY.has(v.busy) ? v.busy : "busy", categories,
     sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
+    reminderMinutes: calReminder(v.reminderMinutes),
     // A rule (XERK-2969) only on an event no longer than recurrence.DURATION_MAX_MS.
     recurrence: endMs - startMs <= recurrence.DURATION_MAX_MS ? recurrence.sanitizeRule(v.recurrence) : null,
     exceptions: {},
@@ -6873,6 +6878,9 @@ function turmaEventFieldError(b) {
   if ("sensitivity" in b && !CAL_SENSITIVITY.has(b.sensitivity)) {
     return `sensitivity must be one of ${[...CAL_SENSITIVITY].join(", ")}`;
   }
+  if ("reminderMinutes" in b && b.reminderMinutes !== null && calReminder(b.reminderMinutes) === null) {
+    return `reminderMinutes must be null (no reminder) or one of ${CAL_TURMA_REMINDERS.join(", ")}`;
+  }
   if ("categories" in b && (!Array.isArray(b.categories) || b.categories.length > 20 ||
       !b.categories.every((c) => typeof c === "string" && cps(c) <= 100))) {
     return "categories must be a list of at most 20 names of at most 100 characters";
@@ -7397,7 +7405,7 @@ function calWriteEvent(rec, org) {
     location: rec.location, body: rec.body, attendees: rec.attendees, joinUrl: rec.joinUrl, busy: rec.busy,
     categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions,
     sendInvites: rec.sendInvites && org === rec.orgs[0] && !hide(rec.sensitivity),
-    responseRequested: rec.responseRequested, allowForward: rec.allowForward };
+    responseRequested: rec.responseRequested, allowForward: rec.allowForward, reminderMinutes: rec.reminderMinutes };
   return hide(rec.sensitivity) ? { ...ev, ...CAL_WRITE_WITHHELD } : ev;
 }
 // Whether a write of `op` at `version` for (host, turmaId) is still in flight: sent

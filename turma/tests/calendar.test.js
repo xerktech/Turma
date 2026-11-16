@@ -1286,13 +1286,33 @@ test("XERK-2971: form validation mirrors the hub — orgs, emails, times, https 
   }
 });
 
+test("XERK-2988: a reminder round-trips the form, defaults to none, and shows on the panel", () => {
+  const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme"] };
+  assert.equal(f.reminder, "", "a new event has no reminder until one is picked");
+  assert.equal(cal.formPayload(f).reminderMinutes, null);
+  assert.equal(cal.formPayload({ ...f, reminder: "15" }).reminderMinutes, 15);
+  assert.equal(cal.formPayload({ ...f, reminder: "" }).reminderMinutes, null, "None sends null");
+  assert.equal(cal.formPayload({ ...f, reminder: "7" }).reminderMinutes, null, "off the list sends none");
+  assert.equal(cal.formPayload({ ...f, reminder: "1440" }).reminderMinutes, 1440);
+  const ev = { source: "turma", id: "turma:aaaaaaaaaaaaaaaa", orgs: ["acme"], org: "acme", startMs: at(2027, 5, 4, 9),
+    endMs: at(2027, 5, 4, 10), timeZone: "America/New_York", subject: "Plan" };
+  assert.equal(cal.formFromEvent({ ...ev, reminderMinutes: 60 }).reminder, "60");
+  assert.equal(cal.formFromEvent({ ...ev, reminderMinutes: null }).reminder, "", "an event with none stays none");
+  assert.equal(cal.formFromEvent({ ...ev, reminderMinutes: 9 }).reminder, "");
+  assert.equal(cal.formFromEvent(ev).reminder, "", "an older hub's event has none");
+  assert.match(cal.detailHtml({ ...ev, reminderMinutes: 10080 }, 0), /Reminder<\/span><span class="v">1 week before/);
+  assert.doesNotMatch(cal.detailHtml({ ...ev, reminderMinutes: null }, 0), /Reminder/);
+  assert.doesNotMatch(cal.detailHtml({ host: "h", id: "x", startMs: 1, endMs: 2, reminderMinutes: 15 }, 0), /Reminder/,
+    "an Outlook event shows no Turma reminder");
+});
+
 test("XERK-2971: the payload is the route's shape — ISO with offset, all-day exclusive end, roles, privacy", () => {
   const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme", "globex"], subject: "  Plan  ",
     required: [{ name: "Ann", email: "ann@acme.com" }], optional: [{ name: "", email: "bob@globex.com" }],
     online: false, joinUrl: "https://meet.example/x", category: "Ops, ops2, Ops", priv: true, location: " R4 " };
   const b = cal.formPayload(f);
   assert.deepEqual(Object.keys(b), ["orgs", "subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
-    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "sendInvites", "responseRequested", "allowForward", "recurrence"]);
+    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "reminderMinutes", "sendInvites", "responseRequested", "allowForward", "recurrence"]);
   assert.deepEqual([b.subject, b.start, b.end, b.timeZone, b.location], ["Plan", "2027-05-04T09:00:00-04:00", "2027-05-04T10:00:00-04:00", "America/New_York", "R4"]);
   assert.deepEqual(b.attendees, [{ name: "Ann", email: "ann@acme.com", role: "required" }, { name: "", email: "bob@globex.com", role: "optional" }]);
   assert.equal(b.joinUrl, "", "no link without the online toggle");
