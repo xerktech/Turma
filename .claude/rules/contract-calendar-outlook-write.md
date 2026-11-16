@@ -46,7 +46,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   `[{turmaId, org, outlookId, at}]`. Written when a copy is orphaned: the record deleted, its org
   dropped from `orgs` (also by the 24h org grace), or the copy re-homed.
 - Each is sent as a `delete` command when that host is next online and reports `write`; removed
-  on an ok row (or "not found", which is ok). Kept `CALENDAR_HOST_RETAIN_MS` (30 days) at most,
+  on an ok row (or "not found", which is ok), which also drops that host's stored stamped copy:
+  left, it named nothing and was served as an Outlook event until the next sync (QA). Kept `CALENDAR_HOST_RETAIN_MS` (30 days) at most,
   ≤`CALENDAR_TOMBSTONES_MAX` (1500) per host, oldest dropped first.
 - A host key carries its tenant, so the store needs no tenant field; tenant purge drops a host's
   entries with the tenant (migration re-keys them like the event store).
@@ -89,7 +90,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - `outlookId` ≤300 and `lastModified` (the saved item's, ISO ≤40) on an ok upsert.
   - `error` in Outlook's own words, ≤300 code points, on `ok: false`.
 - Accepted only from the host the entry (or tombstone) names, for that org; another host's row
-  changes nothing.
+  changes nothing. `org` must be PLAIN: a tenant-suffixed one is dropped.
+- A private record's copy is withheld exactly like the served view, `categories` included.
 - A row whose `version` is older than the entry's leaves the state as it is, but records an ok
   row's `outlookId` (the copy exists; a newer upsert is already queued).
 
@@ -97,16 +99,17 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 
 - `outlook: {<org>: {host, outlookId, version, state, error?, lastModified?, recreatedAt?, at}}`,
   after `version` in `sanitizeTurmaEvent`'s field order, so the coerce stays a FIXED POINT.
-  - `state`: `pending` (queued/sent, no answer for this version) | `written` (an ok row for the
-    record's version) | `failed` (`error` set) | `deleting` (the org was dropped; its delete is
-    in flight, then the entry goes).
-  - An org the record does not name keeps an entry only while `deleting`.
+  - `state`: `pending` (owed or sent, no answer for this version) | `written` (an ok row for the
+    record's version) | `failed` (`error` set).
+  - An org the record does not name keeps NO entry: dropping it turns its copy into a tombstone
+    at once (served state is per served org, so a `deleting` state would never be shown).
   - `at` = the last state change; `recreatedAt` = the last repair that re-created a missing copy.
 - Hub-owned: route bodies cannot set it (dropped like `createdBy`), and a PATCH keeps it.
 - **Served** on `GET /api/calendar` per Turma event as `outlook: {<org>: {state, error?,
   recreatedAt?, at}}`, only for orgs in the served `orgs`; never `host` or `outlookId`. Clients
   (XERK-2987) show it per org; absent = an older hub. Android types it with defaults.
-- Byte caps (`CALENDAR_TURMA_BYTES_MAX`) count it: ≤20 orgs × a short entry.
+- Byte caps (`CALENDAR_TURMA_BYTES_MAX`) do NOT count it (`calTurmaBytes`): it grows as copies are
+  written, which must never turn a same-size edit into a 409. Its shape bounds it (≤20 short entries).
 
 ## Read-back dedup (hub ingest + serve)
 
@@ -132,6 +135,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   stamped event in that row was deleted by the user in Outlook. It is re-created (upsert with
   `outlookId: ""`) and `recreatedAt` is stamped, so the client can say "re-created in Outlook".
   A series: missing when the window holds an expected occurrence and no stamped one.
+- **A row read at or before the copy's last change (`syncedAt <= at`) judges nothing**: it cannot
+  show that write, so it read as missing/drifted and re-created a copy that existed (QA).
 - **At most one repair per entry per `CALENDAR_WRITE_REPAIR_MIN_MS` (10 min)**, so an Outlook
   rule that keeps changing the copy cannot loop the hub and the agent.
 - The authoritative window only says what Outlook holds; the hub never deletes a Turma record
@@ -159,6 +164,24 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   that org, not the event's owner, so writing the real fields would leak them.
 - Times round-trip: the reader's `start`/`end` of the copy must equal the record's instants (the
   drift check above relies on it).
+
+## Hub mechanics (XERK-2985, `server.js` "Turma events written to Outlook")
+
+- **One reconcile, `calOutlookReconcile`**, run at every record write (`calTurmaStore`, series
+  DELETE, `calendarTurmaTick`'s org loss, via `calOutlookAfterWrite`), on a writer's reconnect
+  beat (its tenant) and on the leader's `calendarOutlookTick` (≤ once a minute). Never add a
+  second path that queues writes on its own.
+- **Sent/repair/org-loss times are in memory** (`calWriteSent`, bounded): a restart re-sends every
+  pending write once — safe only because the agent's upsert finds before it creates.
+- At most `CALENDAR_WRITE_INFLIGHT_MAX` (50) undelivered writes per host; the rest wait a pass, so
+  a reconnect with 1500 owed copies never floods `queueCommand` (it re-measures the record each call).
+- Queued only to an ONLINE writer; an offline holder keeps its entry `pending` until it beats.
+- Re-picking a host that holds a tombstone for the event takes the tombstone back and reuses its
+  `outlookId`, so (host, turmaId) never has both a delete and an upsert owed.
+- The command's `org` and a result's `org` are converted by hand (`baseOfSite` / `scopeSite`):
+  the beat's `scopeSiteKeys` walk only rewrites fields named `siteKey`.
+- Drift is compared for single events only; a series is checked for a MISSING occurrence
+  (XERK-2986 owns writing series and comparing their occurrences).
 
 ## Tests
 
