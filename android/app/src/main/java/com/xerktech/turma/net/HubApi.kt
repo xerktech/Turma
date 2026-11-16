@@ -159,6 +159,13 @@ interface HubApi {
         @Body body: PanePromptAnswer,
     ): OkResponse
 
+    // A streamed SendUserFile video: the first call asks the host for the file.
+    @GET("api/agents/{host}/sessions/{id}/sendfile/{ref}")
+    suspend fun sendFileStatus(
+        @Path("host") host: String, @Path("id") id: String, @Path("ref") ref: String,
+        @Query("status") status: Int = 1,
+    ): com.xerktech.turma.model.SendFileStatus
+
     // 200 with entries, or 202 {pending, cmdId}; caller inspects the code.
     @GET("api/agents/{host}/sessions/{id}/history")
     suspend fun history(@Path("host") host: String, @Path("id") id: String): Response<HistoryResponse>

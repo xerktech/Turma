@@ -122,6 +122,19 @@ const SEND_FILE_IMG_MIME = {
 };
 const SEND_FILE_HTML_EXT = new Set([".html", ".htm"]);
 const SEND_FILE_VIDEO_MAX_BYTES = Number(process.env.SESSION_SEND_FILE_VIDEO_MAX_BYTES) || 4 * 1024 * 1024;
+// A video past the inline cap is streamed on demand (hub-agent.py
+// SEND_FILE_STREAM_MAX_BYTES): the block carries a ref, never bytes.
+const SEND_FILE_STREAM_MAX_BYTES = Number(process.env.SESSION_SEND_FILE_STREAM_MAX_BYTES) || 256 * 1024 * 1024;
+const sendFileRef = (p) => crypto.createHash("sha256").update(p, "utf8").digest("hex").slice(0, 32);
+function regularFileSize(p) {
+  const fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+  try {
+    const st = fs.fstatSync(fd);
+    return st.isFile() ? st.size : null;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 const SEND_FILE_VIDEO_MIME = {
   ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
   ".mov": "video/quicktime", ".ogv": "video/ogg",
@@ -642,6 +655,14 @@ function sendUserFileDetail(inp) {
     const renderHtml = SEND_FILE_HTML_EXT.has(ext) && display !== "attach";
     const cap = vmime ? SEND_FILE_VIDEO_MAX_BYTES : SEND_FILE_MAX_BYTES;
     let entry = { name, kind: "file" };
+    if (vmime) {
+      let size = null;
+      try { size = regularFileSize(p); } catch { size = null; }
+      if (size !== null && size > cap && size <= SEND_FILE_STREAM_MAX_BYTES) {
+        out.push({ name, kind: "video", stream: true, ref: sendFileRef(p), size });
+        continue;
+      }
+    }
     if (mime || vmime || renderHtml) {
       try {
         const data = readRegularFileBounded(p, cap);
@@ -3258,7 +3279,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { __setFrameBudget: (n) => { LIVE_FRAME_BUDGET_BYTES = n; }, shedFrameToBudget, mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { sendFileRef, __setFrameBudget: (n) => { LIVE_FRAME_BUDGET_BYTES = n; }, shedFrameToBudget, mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

@@ -159,6 +159,7 @@ process.env.PERMISSION_POLICIES_FILE = path.join(
 // /data/migrations, or one dir across test files, would have each sweep delete
 // the others' spools.
 process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-test-migrations-");
+process.env.SENDFILE_SPOOL_DIR = mkdtemp("turma-test-sendfiles-");
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = mkdtemp("turma-test-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -18782,7 +18783,7 @@ test("migrate: full move — export, relay, import, then kill the source", async
   const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
   const up = await requestRaw("POST", `/api/agents/mgA/migrations/${mid}/blob`,
     { body: blob, headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   const m = migrations.get(mid);
   assert.equal(m.phase, "importing");
   // It landed on DISK, not in the record — that is the whole point of XERK-263.
@@ -19566,7 +19567,7 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   const m = migrations.get(mid);
   const up = await requestRaw("POST", `/api/agents/toA/migrations/${mid}/blob`,
     { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   const spoolFile = m.blobPath;
   assert.ok(fs.existsSync(spoolFile));
   m.startedAt = Date.now() - 10 * 60 * 1000; // well past MIGRATE_TIMEOUT_MS
@@ -20260,7 +20261,7 @@ test("migrate: the blob relay's host scope holds for a proved caller", async () 
   // back — it is the raw transcript, and only the host resuming it needs it.
   const up = await requestRaw("POST", `/api/agents/scA/migrations/${mid}/blob`,
     { body: Buffer.from("SOURCE-BUNDLE"), headers: asHost("scA") });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   const bySrc = await requestRaw("GET", `/api/agents/scA/migrations/${mid}/blob`,
     { headers: asHost("scA") });
   assert.equal(bySrc.status, 404);
@@ -23238,7 +23239,7 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
   const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
   const up = await requestRaw("POST", `/api/agents/hsA/migrations/${mid}/blob`,
     { body: blob, headers: { ...agentTok, "content-type": "application/octet-stream" } });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
 
   // A host that is not the TARGET can't read the bundle — it is the raw
   // transcript of another host's conversation.
@@ -33261,7 +33262,7 @@ test("XERK-2935: a new ticket's files are staged for a capable host and ride its
   await jiraBeat("tf1", site, cap);
   const up = await requestRaw("POST", `/api/jira/${site}/uploads?name=${encodeURIComponent("shot.png")}`,
     { body: Buffer.from("PNGBYTES"), headers: userHeaders });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   assert.equal(up.body.name, "shot.png");
   // The host's agent can pull it; another host cannot.
   const blob = await requestRaw("GET", `/api/agents/tf1/uploads/${up.body.uploadId}/blob`, { headers: asHost("tf1") });
@@ -36222,4 +36223,87 @@ test("XERK-2953: a 'following' split that deletes the dead old series deletes it
     cleanup2985(D2985A);
     forget2533(D2985A);
   }
+});
+
+
+// ---- Streamed SendUserFile videos -------------------------------------------
+test("sendfile: play asks the host once, the agent's upload is served with ranges", async () => {
+  const { sendFiles } = require("../server.js");
+  const ref = "a".repeat(32);
+  await upHost("sfA", { sessions: [{ id: "s1", status: "running" }] });
+  const st = (q = "?status=1") => request("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}${q}`, { headers: userHeaders });
+
+  // Bytes before anything is fetched: 404, and nothing queued.
+  assert.equal((await st("")).status, 404);
+  // The first status poll queues ONE fetchSendFile; a second reuses it.
+  assert.deepEqual((await st()).body, { state: "pending" });
+  assert.deepEqual((await st()).body, { state: "pending" });
+  const beat = await upHost("sfA", { sessions: [{ id: "s1", status: "running" }] });
+  const fetches = (beat.body.commands || []).filter((c) => c.type === "fetchSendFile");
+  assert.equal(fetches.length, 1);
+  assert.equal(fetches[0].sessionId, "s1");
+  assert.equal(fetches[0].ref, ref);
+
+  // Another host's credential cannot answer it; an unknown fetch is a 404.
+  const body = Buffer.from("0123456789");
+  const vt = { "x-sendfile-type": "video/mp4", "content-type": "application/octet-stream" };
+  assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
+    { body, headers: { ...asHost("sfB"), ...vt } })).status, 403);
+  assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${"b".repeat(32)}`,
+    { body, headers: { ...asHost("sfA"), ...vt } })).status, 404);
+  // A type outside the video whitelist is refused and fails the fetch.
+  // (Checked on a second ref so the real one stays pending.)
+
+  const up = await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
+    { body, headers: { ...asHost("sfA"), ...vt } });
+  assert.equal(up.status, 200, up.buf.toString());
+  assert.deepEqual((await st()).body, { state: "ready", size: 10 });
+
+  const full = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`, { headers: userHeaders });
+  assert.equal(full.status, 200);
+  assert.equal(full.buf.toString(), "0123456789");
+  assert.equal(full.headers["content-type"], "video/mp4");
+  assert.equal(full.headers["x-content-type-options"], "nosniff");
+  assert.match(full.headers["content-security-policy"], /sandbox/);
+  const part = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=2-5" } });
+  assert.equal(part.status, 206);
+  assert.equal(part.buf.toString(), "2345");
+  assert.equal(part.headers["content-range"], "bytes 2-5/10");
+  const tail = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=-3" } });
+  assert.equal(tail.buf.toString(), "789");
+  const bad = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=20-30" } });
+  assert.equal(bad.status, 416);
+  // A second upload for a fetch already served is refused.
+  assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
+    { body, headers: { ...asHost("sfA"), ...vt } })).status, 404);
+  // Anonymous callers never reach the bytes.
+  assert.equal((await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`)).status, 401);
+  sendFiles.clear();
+});
+
+test("sendfile: an agent's error, a bad type and an unknown session settle as errors", async () => {
+  const { sendFiles } = require("../server.js");
+  await upHost("sfC", { sessions: [{ id: "s1", status: "running" }] });
+  const st = (ref, sid = "s1") => request("GET", `/api/agents/sfC/sessions/${sid}/sendfile/${ref}?status=1`, { headers: userHeaders });
+  const r1 = "c".repeat(32);
+  const r2 = "d".repeat(32);
+  assert.equal((await st(r1)).body.state, "pending");
+  const e1 = await requestRaw("POST", `/api/agents/sfC/sendfiles/s1/${r1}?error=${encodeURIComponent("the session never sent that file\u0007")}`,
+    { headers: asHost("sfC") });
+  assert.equal(e1.status, 200);
+  assert.deepEqual((await st(r1)).body, { state: "error", error: "the session never sent that file" });
+
+  assert.equal((await st(r2)).body.state, "pending");
+  const e2 = await requestRaw("POST", `/api/agents/sfC/sendfiles/s1/${r2}`,
+    { body: Buffer.from("<html>"), headers: { ...asHost("sfC"), "x-sendfile-type": "text/html" } });
+  assert.equal(e2.status, 400);
+  assert.equal((await st(r2)).body.state, "error");
+
+  assert.equal((await st("e".repeat(32), "nope")).body.state, "error");
+  assert.equal((await request("GET", "/api/agents/sfC/sessions/s1/sendfile/../../x?status=1", { headers: userHeaders })).status === 200, false);
+  assert.equal((await st("NOTHEX")).status, 400);
+  sendFiles.clear();
 });

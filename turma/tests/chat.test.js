@@ -1429,6 +1429,19 @@ test("carryVideos: an OLDER copy folded in above never takes the playing node", 
   assert.deepEqual(scroll.vids.map((v) => v.tag), ["older", "playing"]);
 });
 
+test("render: a streamed SendUserFile video is a play button carrying only its ref", () => {
+  const ref = "0123456789abcdef0123456789abcdef";
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "cut.mp4", kind: "video", stream: true, ref, size: 12 * 1024 * 1024 },
+    { name: "x.mp4", kind: "video", stream: true, ref: "../../etc" },
+  ])));
+  assert.match(html, new RegExp('<div class="md-video-stream" data-vkey="stream:' + ref + '" data-ref="' + ref + '" data-name="cut.mp4">'));
+  assert.match(html, /▶ Play video \(12\.0 MB\)/);
+  assert.doesNotMatch(html, /<video/);          // nothing loads until play
+  assert.doesNotMatch(html, /etc/);             // a malformed ref is no player
+  assert.match(html, /📎 x\.mp4/);
+});
+
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {
   const html = withVerbosity("normal", () => itemsToHtml(suItems([
     { name: "archive.zip", kind: "file" },

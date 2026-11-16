@@ -9610,6 +9610,134 @@ function sweepMigrationSpool() {
   }
 }
 
+// ---- Streamed SendUserFile videos ---------------------------------------------
+// A video a session sends that is too big to embed in the chat message rides the
+// block as a `ref` (the agent's hash of its path) and no bytes. When a client
+// presses play it polls `GET …/sessions/<id>/sendfile/<ref>?status=1`; the first
+// poll queues `fetchSendFile` on the host, whose agent resolves the ref against
+// the session's OWN SendUserFile calls and POSTs the file here; the hub spools it
+// to disk and serves it with Range support (seeking). Spooled per pod: under HA
+// the leader serves every request (XERK-919), so the POST and the GETs meet; a
+// failover loses the spool and the next play fetches it again.
+const SENDFILE_SPOOL_DIR = process.env.SENDFILE_SPOOL_DIR || "/data/sendfiles";
+const SENDFILE_MAX_BYTES = positiveEnv("SENDFILE_MAX_BYTES", 256 << 20);
+const SENDFILE_SPOOL_MAX_BYTES = positiveEnv("SENDFILE_SPOOL_MAX_BYTES", 1 << 30);
+const SENDFILE_IDLE_MS = positiveEnv("SENDFILE_IDLE_MS", 60 * 60 * 1000);
+const SENDFILE_PENDING_MS = positiveEnv("SENDFILE_PENDING_MS", 10 * 60 * 1000);
+const SENDFILE_ERROR_KEEP_MS = 60 * 1000;
+const SENDFILE_ENTRIES_MAX = 200;
+const SENDFILE_REF_RE = /^[0-9a-f]{32}$/;
+const SENDFILE_SPOOL_RE = /^sf-[0-9a-f]{40}\.(bin|part)$/;
+const SENDFILE_MIMES = new Set(["video/mp4", "video/webm", "video/quicktime", "video/ogg"]);
+// key -> {host, sessionId, ref, state: pending|ready|error, at, usedAt, path?,
+// size?, mime?, error?, uploading?}
+const sendFiles = new Map();
+
+function sendFileKey(host, sessionId, ref) { return JSON.stringify([host, sessionId, ref]); }
+
+// The spool name is a hash of the hub's own key, never a caller string.
+function sendFileSpoolPath(key, part) {
+  const h = crypto.createHash("sha256").update(key).digest("hex").slice(0, 40);
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  return path.join(SENDFILE_SPOOL_DIR, `sf-${h}.${part ? "part" : "bin"}`);
+}
+
+function dropSendFile(key) {
+  const e = sendFiles.get(key);
+  sendFiles.delete(key);
+  if (e && e.path) fs.unlink(e.path, () => {});
+}
+
+// Expire what nobody is watching, then keep the ready spool under its byte
+// budget, least recently played first. Cheap: at most SENDFILE_ENTRIES_MAX.
+function sweepSendFiles(now = Date.now()) {
+  for (const [k, e] of sendFiles) {
+    if (e.state === "pending" && !e.uploading && now - e.at > SENDFILE_PENDING_MS) {
+      e.state = "error"; e.error = "the host did not send the file in time"; e.at = now;
+    } else if (e.state === "error" && now - e.at > SENDFILE_ERROR_KEEP_MS) {
+      dropSendFile(k);
+    } else if (e.state === "ready" && now - e.usedAt > SENDFILE_IDLE_MS) {
+      dropSendFile(k);
+    }
+  }
+  let total = 0;
+  const ready = [];
+  for (const [k, e] of sendFiles) if (e.state === "ready") { total += e.size || 0; ready.push([k, e]); }
+  ready.sort((a, b) => a[1].usedAt - b[1].usedAt);
+  while (total > SENDFILE_SPOOL_MAX_BYTES && ready.length > 1) {
+    const [k, e] = ready.shift();
+    total -= e.size || 0;
+    dropSendFile(k);
+  }
+}
+
+// Boot: the index is in memory, so anything left in the spool belongs to no one.
+// Deletes ONLY names this hub writes (the migration spool's rule).
+function sweepSendFileSpool() {
+  let names;
+  try { names = fs.readdirSync(SENDFILE_SPOOL_DIR); } catch { return; }
+  for (const n of names) {
+    if (!SENDFILE_SPOOL_RE.test(n)) continue;
+    try { fs.unlinkSync(path.join(SENDFILE_SPOOL_DIR, n)); } catch {}
+  }
+}
+
+// One line of agent text for the client: control/format characters dropped.
+function sendFileErrorText(raw) {
+  // eslint-disable-next-line no-control-regex
+  return String(raw || "").replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, " ")
+    .trim().slice(0, 200) || "the host could not send the file";
+}
+
+// Serve a spooled video, honouring one byte range (what <video> seeking and
+// Android's player send). Never sniffable, never a document: nosniff + a
+// sandbox CSP, and only a whitelisted video type.
+function serveSendFile(req, res, e) {
+  let size;
+  try { size = fs.statSync(e.path).size; } catch {
+    return json(res, 404, { error: "the video is no longer cached; press play again" });
+  }
+  e.usedAt = Date.now();
+  const base = {
+    "Content-Type": e.mime,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "private, max-age=3600",
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox; default-src 'none'",
+    "Content-Disposition": "inline",
+  };
+  let start = 0;
+  let end = size - 1;
+  let status = 200;
+  const range = req.headers.range;
+  if (typeof range === "string" && range.startsWith("bytes=")) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    let ok = !!m && (m[1] !== "" || m[2] !== "");
+    if (ok) {
+      if (m[1] === "") { // suffix: the last N bytes
+        const n = Number(m[2]);
+        start = Math.max(0, size - n);
+      } else {
+        start = Number(m[1]);
+        if (m[2] !== "") end = Math.min(Number(m[2]), size - 1);
+      }
+      ok = Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end && start < size;
+    }
+    if (!ok) {
+      res.writeHead(416, { ...base, "Content-Range": `bytes */${size}` });
+      return res.end();
+    }
+    status = 206;
+    base["Content-Range"] = `bytes ${start}-${end}/${size}`;
+  }
+  res.writeHead(status, { ...base, "Content-Length": end - start + 1 });
+  if (size === 0) return res.end();
+  const stream = fs.createReadStream(e.path, { start, end });
+  stream.on("error", () => res.destroy());
+  res.on("close", () => stream.destroy());
+  stream.pipe(res);
+}
+
 // The wire shape (blob stripped) the /api/agents payload and SSE carry, so the
 // UI can follow a migration to its new host and surface a failure.
 function serializeMigration(m) {
@@ -26677,6 +26805,12 @@ const server = http.createServer(async (req, res) => {
       req.method === "GET" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "uploads" && parts[5] === "blob" && parts.length === 6;
 
+    // An agent uploading a streamed SendUserFile video the hub asked it for
+    // (`fetchSendFile`): agent-authed against <host>, like the upload blob.
+    const isSendFileBlob =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "sendfiles" && parts.length === 6;
+
     // An agent pulling the transcript of the meeting it was asked to read
     // (XERK-2508): agent-authed against <host>, like the upload blob above.
     const isMeetingTranscript =
@@ -26704,7 +26838,7 @@ const server = http.createServer(async (req, res) => {
       const gate = agentPresentedRefusal(req);
       if (gate) return json(res, gate.status, { error: gate.error });
     } else if (isArchiveIngest || isUpdatingSignal || isAliveSignal || isMigrationBlob ||
-               isUploadBlob || isMeetingTranscript) {
+               isUploadBlob || isMeetingTranscript || isSendFileBlob) {
       // These all carry the host they act as in `<host>`, so the credential is
       // checked AGAINST it rather than merely being a valid agent token. The
       // decode is the same expression each route runs on the same segment, so
@@ -26779,7 +26913,7 @@ const server = http.createServer(async (req, res) => {
     // agent-authed <host> routes above bound their caller to the host already.
     if (parts[0] === "api" && parts[1] === "agents" && parts.length >= 3 &&
         url.pathname !== "/api/heartbeat" && !(isArchiveIngest || isUpdatingSignal ||
-          isAliveSignal || isMigrationBlob || isUploadBlob || isMeetingTranscript)) {
+          isAliveSignal || isMigrationBlob || isUploadBlob || isMeetingTranscript || isSendFileBlob)) {
       let hostKey = null;
       try { hostKey = decodeURIComponent(parts[2]); } catch { /* the route 400s it */ }
       if (hostKey != null && !principalMayDriveHost(requestPrincipal(req), hostKey)) {
@@ -28752,6 +28886,59 @@ const server = http.createServer(async (req, res) => {
       return json(res, 404, { error: "no such meeting run" });
     }
 
+    // POST /api/agents/<host>/sendfiles/<sessionId>/<ref> — the agent answering a
+    // `fetchSendFile` with the video's bytes (header X-Sendfile-Type), or with
+    // `?error=<why>` and no body. Taken ONLY for a fetch this hub asked THIS host
+    // for (a pending entry under the proved <host>); anything else is a 404, so an
+    // agent cannot push arbitrary bytes into the spool.
+    if (isSendFileBlob) {
+      const host = decodeURIComponent(parts[2]);
+      const sessionId = decodeURIComponent(parts[4]);
+      const ref = parts[5];
+      const key = sendFileKey(host, sessionId, ref);
+      const e = SENDFILE_REF_RE.test(ref) ? sendFiles.get(key) : null;
+      if (!e || e.state !== "pending" || e.uploading) {
+        req.resume();
+        return json(res, 404, { error: "no such fetch" });
+      }
+      if (url.searchParams.has("error")) {
+        req.resume();
+        e.state = "error"; e.error = sendFileErrorText(url.searchParams.get("error")); e.at = Date.now();
+        return json(res, 200, { ok: true });
+      }
+      const mime = String(req.headers["x-sendfile-type"] || "");
+      if (!SENDFILE_MIMES.has(mime)) {
+        req.resume();
+        e.state = "error"; e.error = "the file is not a video the hub serves"; e.at = Date.now();
+        return json(res, 400, { error: "unsupported type" });
+      }
+      const part = sendFileSpoolPath(key, true);
+      e.uploading = true;
+      let size;
+      try {
+        size = await spoolRawBody(req, SENDFILE_MAX_BYTES, part);
+      } catch (err) {
+        e.uploading = false;
+        e.state = "error"; e.at = Date.now();
+        e.error = err && err.tooLarge
+          ? `the video is over the hub's ${SENDFILE_MAX_BYTES >> 20} MB limit`
+          : "the upload from the host failed";
+        if (err && err.tooLarge) return json(res, 413, { error: e.error, limit: SENDFILE_MAX_BYTES });
+        return json(res, 500, { error: e.error });
+      }
+      e.uploading = false;
+      if (sendFiles.get(key) !== e) { fs.unlink(part, () => {}); return json(res, 404, { error: "no such fetch" }); }
+      const final = sendFileSpoolPath(key, false);
+      try { fs.renameSync(part, final); } catch {
+        fs.unlink(part, () => {});
+        e.state = "error"; e.error = "the hub could not store the video"; e.at = Date.now();
+        return json(res, 500, { error: e.error });
+      }
+      Object.assign(e, { state: "ready", path: final, size, mime, usedAt: Date.now(), at: Date.now() });
+      sweepSendFiles();
+      return json(res, 200, { ok: true });
+    }
+
     // GET /api/agents/<host>/uploads/<id>/blob — the agent collecting a file the
     // operator attached to a message (XERK-234). Scoped to the host the upload
     // was staged for, and since `<host>` is proved at the gate above (XERK-268)
@@ -29623,6 +29810,44 @@ const server = http.createServer(async (req, res) => {
       }
 
       const sessionId = decodeURIComponent(parts[4] || "");
+      // GET /api/agents/<host>/sessions/<id>/sendfile/<ref>[?status=1] — a streamed
+      // SendUserFile video (see sendFiles). `?status=1` answers {state} and, the
+      // first time, asks the host for the file; without it, the bytes (Range ok)
+      // once ready, else 404.
+      if (req.method === "GET" && parts.length === 7 && parts[5] === "sendfile") {
+        const ref = parts[6];
+        if (!SENDFILE_REF_RE.test(ref)) return json(res, 400, { error: "bad file ref" });
+        sweepSendFiles();
+        const fkey = sendFileKey(key, sessionId, ref);
+        let e = sendFiles.get(fkey);
+        const wantStatus = url.searchParams.has("status");
+        if (!wantStatus) {
+          if (e && e.state === "ready") return serveSendFile(req, res, e);
+          return json(res, 404, { error: "not fetched yet" });
+        }
+        if (e && e.state === "ready") { e.usedAt = Date.now(); return json(res, 200, { state: "ready", size: e.size }); }
+        if (e && e.state === "error") return json(res, 200, { state: "error", error: e.error });
+        if (!e) {
+          const a = agents[key];
+          if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
+            return json(res, 200, { state: "error", error: "the host is offline" });
+          }
+          if (!(a.sessions || []).some((x) => x && x.id === sessionId)) {
+            return json(res, 200, { state: "error", error: "that session is no longer on its host" });
+          }
+          if (sendFiles.size >= SENDFILE_ENTRIES_MAX) {
+            // Drop the stalest finished entry; refuse only if every one is live.
+            const old = [...sendFiles].filter(([, x]) => x.state !== "pending")
+              .sort((x, y) => (x[1].usedAt || x[1].at) - (y[1].usedAt || y[1].at))[0];
+            if (!old) return json(res, 503, { error: "too many videos loading — try again shortly" });
+            dropSendFile(old[0]);
+          }
+          e = { host: key, sessionId, ref, state: "pending", at: Date.now(), usedAt: Date.now() };
+          sendFiles.set(fkey, e);
+          queueCommand(key, { type: "fetchSendFile", sessionId, ref });
+        }
+        return json(res, 200, { state: "pending" });
+      }
       // POST /api/agents/<host>/sessions/<id>/{kill|start|restart|resume}
       // (resume targets a KILLED session from the host's closedSessions list —
       // the agent re-registers it and relaunches its prior conversation.)
@@ -32131,6 +32356,7 @@ server.on("upgrade", async (req, socket, head) => {
 // sweepMigrationSpoolShared (run once the store is wired, in the boot branch
 // below) replaces it there (XERK-761).
 if (!MIGRATE_HA_ON) sweepMigrationSpool();
+sweepSendFileSpool();
 
 // Test hooks: when TURMA_TEST is set (never in the image — the Dockerfile
 // runs `node server.js` with it unset), export the internals for the test
@@ -32904,6 +33130,7 @@ if (process.env.TURMA_TEST) {
     // `armLiveWatcher`/`disarmLiveWatcher` are the `/live` machinery. Exported so a
     // test can drive the cross-replica paths with an injected relay (`__setRelay`).
     openChannel, openChannelLocal, openLiveForRelay, openLiveRelay, openMigrationBlobForRelay,
+    sendFiles, sweepSendFiles, SENDFILE_SPOOL_DIR,
     openUploadBlobForRelay, setUploadStore, UPLOAD_DIR_PREFIX, publishUploadDir,
     liveFanout, liveClients, liveRelayChannels, liveWatchArmed,
     armLiveWatcher, disarmLiveWatcher,

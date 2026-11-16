@@ -58,6 +58,7 @@ const ROUTES = [
   ["POST", "/api/agents/:host/archive/:tid/raw/:file", "agent"],
   ["GET POST", "/api/agents/:host/migrations/:id/blob", "agent"],
   ["GET", "/api/agents/:host/uploads/:id/blob", "agent"],
+  ["POST", "/api/agents/:host/sendfiles/:sid/:ref", "agent"],
   ["GET", "/api/agents/:host/meetings/:run/transcript", "agent"],
   // automation
   ["POST", "/api/trigger", "automation"],
