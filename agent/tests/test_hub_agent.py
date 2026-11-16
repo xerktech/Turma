@@ -4181,6 +4181,21 @@ class TestUnsavedRows(ProjectDirMixin, unittest.TestCase):
 
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
+    def test_a_pr_link_row_carries_the_same_id_the_live_tail_gives_it(self):
+        # XERK-2999: a pr-link entry has no uuid; the preview used to ship
+        # id None while tunnel-agent.js's transcriptTail and /history synthesize
+        # `pr-link:<url>`, so the two tails disagreed on 139 of 3165 real files.
+        path = os.path.join(self.proj, "pr.jsonl")
+        url = "https://github.com/o/r/pull/7"
+        write_jsonl(path, [
+            {"uuid": "u1", "type": "user", "message": {"content": "open a PR"}},
+            {"type": "pr-link", "prUrl": url, "prNumber": 7,
+             "prRepository": "o/r", "timestamp": "2026-11-15T00:00:00Z"},
+        ])
+        ids = [e["id"] for e in ha.transcript_tail(path)]
+        self.assertIn("pr-link:" + url, ids)
+        self.assertNotIn(None, ids)
+
     def test_missing_file(self):
         self.assertEqual(ha.transcript_tail(os.path.join(self.proj, "nope.jsonl")), [])
 
@@ -52157,6 +52172,20 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.rows()[-1]["toolUseId"], "toolu_A")
         self.assertEqual(ha.pending_tool_call([use("toolu_X", "ls", "m")])["toolUseId"],
                          "toolu_X")
+
+    def test_an_echoed_tool_use_in_a_request_blob_is_not_an_open_call(self):
+        # XERK-2999: an api-request-blob replays an old tool_use whose result
+        # fell outside the tail window; it must not read as a pending call.
+        echo = {"type": "api-request-blob", "message": {"role": "user", "content": [
+            {"type": "tool_use", "id": "toolu_OLD", "name": "Bash",
+             "input": {"command": "ls"}}]}}
+        self.assertIsNone(ha.pending_tool_call([echo]))
+        stray = {"type": "api-request-blob", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_A", "content": "ok"}]}}
+        self.assertEqual(
+            ha.pending_tool_call([self.tool_use("toolu_A"), stray])["toolUseId"],
+            "toolu_A")
+        self.assertIsNone(ha.tool_call_outcome([stray], "toolu_A"))
 
     # --- the beat wiring ------------------------------------------------------
 

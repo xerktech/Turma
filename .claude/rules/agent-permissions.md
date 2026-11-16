@@ -28,6 +28,9 @@ hook-log tail) + `agent/hooks/permlog.py`.
     assistant message (entries sharing `message.id`) with a `tool_use` lacking a `tool_result`, its
     OLDEST such call — Claude asks about parallel calls one at a time, in order. `head`/`digest` come
     from permlog.py's OWN functions (`_permlog_module`) so pane and hook rows aggregate together.
+  - **`_tool_calls` reads tool_use only from `assistant` entries, tool_result only from `user`**
+    (XERK-2999): `api-request-blob` entries echo old calls, and a tail window that cuts off the
+    echoed call's result read it as a phantom open call. dsh/qwen projections write only those types.
   - **A dialog is keyed on its whole face** (`_pane_dialog_identity`: question + detail + option
     labels), not its question: every tool prompt asks "Do you want to proceed?", and two prompts
     answered between beats never show "no dialog". A changed face closes the row and opens another.
