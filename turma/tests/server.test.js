@@ -34471,6 +34471,9 @@ test("XERK-2992: a feed fetch is covered by a host's regular sync window and que
   } finally {
     await request("DELETE", "/api/calendar/feed", { headers: userHeaders });
     forget2891(D);
+  }
+});
+
 // ---- XERK-2985: Turma events written to each org's Outlook, their state, the read-back -------
 const S2985A = "a2985.atlassian.net", S2985B = "b2985.atlassian.net";
 const D2985A = "cal2985a", D2985A2 = "cal2985a2", D2985B = "cal2985b";
