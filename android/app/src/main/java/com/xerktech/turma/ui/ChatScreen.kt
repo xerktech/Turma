@@ -473,7 +473,12 @@ fun ChatScreen(
                     if (state.hasMore) {
                         item { Text("· earlier history ·", Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
                     }
-                    items(items.size) { i -> ChatItemView(items[i]) }
+                    items(items.size) { i ->
+                        // A streamed SendUserFile video asks THIS session's host for its file.
+                        androidx.compose.runtime.CompositionLocalProvider(LocalSendFileSession provides (host to sessionId)) {
+                            ChatItemView(items[i])
+                        }
+                    }
                 }
             }
             // The "jump to latest" pill (web #chatJump): shown only while the

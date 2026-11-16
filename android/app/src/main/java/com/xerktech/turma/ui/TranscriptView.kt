@@ -76,6 +76,13 @@ import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.InlinePiece
 import com.xerktech.turma.core.isPreviewImageSrc
 import com.xerktech.turma.core.previewVideoData
+import com.xerktech.turma.core.videoSizeLabel
+import com.xerktech.turma.net.fetchStreamedVideo
+import com.xerktech.turma.TurmaApplication
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.staticCompositionLocalOf
+import kotlinx.coroutines.launch
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.DataImage
@@ -878,6 +885,7 @@ private fun SendFileView(f: SendFile) {
 // failed write, degrades to the name chip — nothing remote is ever fetched.
 @Composable
 private fun VideoPreview(f: SendFile) {
+    if (f.stream) { StreamVideoPreview(f); return }
     val ctx = LocalContext.current
     val file by produceState<File?>(null, f.src) {
         value = withContext(Dispatchers.IO) {
@@ -895,6 +903,59 @@ private fun VideoPreview(f: SendFile) {
     var failed by remember(f.src) { mutableStateOf(false) }
     val playable = file
     if (playable == null || failed) { FileChip(f.name, f.shed); return }
+    VideoPlayer(playable, f.name, autoStart = false) { failed = true }
+}
+
+/** The live session a streamed SendUserFile video belongs to, as (host, sessionId);
+ *  null in read-only views, where no running session can resolve the file. */
+val LocalSendFileSession = staticCompositionLocalOf<Pair<String, String>?> { null }
+
+// A video too big to embed (web parity: chat.js streamVideoClick). ▶ asks the
+// hub, which has the host upload the file; the app then downloads it through
+// its signed-in client into the cache and plays it from there (VideoView takes
+// no auth headers on every Android version, a local file always plays).
+@Composable
+private fun StreamVideoPreview(f: SendFile) {
+    val session = LocalSendFileSession.current
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var file by remember(f.ref) { mutableStateOf<File?>(null) }
+    var loading by remember(f.ref) { mutableStateOf(false) }
+    var note by remember(f.ref) { mutableStateOf("") }
+    var failed by remember(f.ref) { mutableStateOf(false) }
+    val playable = file
+    if (playable != null && !failed) {
+        VideoPlayer(playable, f.name, autoStart = true) { failed = true; note = "This device can't play this video." ; file = null }
+        return
+    }
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton(
+                enabled = session != null && !loading,
+                onClick = {
+                    val s = session ?: return@OutlinedButton
+                    loading = true
+                    note = "Fetching from the host…"
+                    scope.launch {
+                        val container = (ctx.applicationContext as TurmaApplication).container
+                        val result = fetchStreamedVideo(container, s.first, s.second, f, ctx.cacheDir)
+                        loading = false
+                        result.onSuccess { failed = false; note = ""; file = it }
+                            .onFailure { note = "Couldn't load: " + (it.message ?: "the host could not send it") }
+                    }
+                },
+            ) { Text("▶ Play video" + (if (f.size > 0) " (${videoSizeLabel(f.size)})" else ""), fontSize = scaledSp(13f)) }
+        }
+        val shown = if (session == null) "This video plays only while its session is running." else note
+        if (shown.isNotBlank()) {
+            Text(shown, fontSize = scaledSp(11f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+        }
+        Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+    }
+}
+
+@Composable
+private fun VideoPlayer(file: File, name: String, autoStart: Boolean, onFailed: () -> Unit) {
     Column {
         AndroidView(
             factory = { c ->
@@ -903,13 +964,13 @@ private fun VideoPreview(f: SendFile) {
                     controller.setAnchorView(this)
                     setMediaController(controller)
                     // Show the first frame instead of a black box until Play.
-                    setOnPreparedListener { it.isLooping = false; seekTo(1) }
+                    setOnPreparedListener { it.isLooping = false; if (autoStart) start() else seekTo(1) }
                     // Returning true suppresses VideoView's own error dialog.
-                    setOnErrorListener { _, _, _ -> failed = true; true }
+                    setOnErrorListener { _, _, _ -> onFailed(); true }
                 }
             },
             update = { v ->
-                val uri = android.net.Uri.fromFile(playable)
+                val uri = android.net.Uri.fromFile(file)
                 if (v.tag != uri) { v.tag = uri; v.setVideoURI(uri) }
             },
             onRelease = { it.stopPlayback() },
@@ -917,7 +978,7 @@ private fun VideoPreview(f: SendFile) {
                 .clip(RoundedCornerShape(6.dp))
                 .background(Color.Black),
         )
-        Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+        Text(name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
     }
 }
 

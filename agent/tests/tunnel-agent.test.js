@@ -145,7 +145,7 @@ test("entryBlocks: SendUserFile embeds image/SVG/HTML files, degrades the rest (
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("entryBlocks: SendUserFile embeds a video under its own cap, chips past it", () => {
+test("entryBlocks: SendUserFile embeds a video under its own cap, streams one past it", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "suf-"));
   const body = Buffer.alloc(600 * 1024); // over the 512 KiB IMAGE cap
   fs.writeFileSync(path.join(dir, "clip.mp4"), body);
@@ -155,7 +155,8 @@ test("entryBlocks: SendUserFile embeds a video under its own cap, chips past it"
       input: { files: [path.join(dir, "clip.mp4"), path.join(dir, "big.webm")] } }] } }, BLOCK_CAPS);
   assert.deepEqual(b.files, [
     { name: "clip.mp4", kind: "video", src: "data:video/mp4;base64," + body.toString("base64") },
-    { name: "big.webm", kind: "file" },
+    { name: "big.webm", kind: "video", stream: true,
+      ref: require("../tunnel-agent.js").sendFileRef(path.join(dir, "big.webm")), size: 4 * 1024 * 1024 + 1 },
   ]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -172,6 +173,14 @@ test("entryBlocks: a FIFO named like a video is a chip, never a blocking read", 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+// The same vector as hub-agent.py's TestEntryBlocks ref case: the live tail's
+// ref must equal the one the agent resolves, or a play from the live chat 404s.
+test("sendFileRef matches hub-agent.py's send_file_ref", () => {
+  const { sendFileRef } = require("../tunnel-agent.js");
+  assert.equal(sendFileRef("/a/b.mp4"), "66d72820a7cc62aca60424a5bc0f1256");
+  assert.equal(sendFileRef("/a/\ud800.mp4"), "d60c0c0376ed5b965d11300cb46cbce6");
+});
+
 test("SendUserFile video MIME map and cap match hub-agent.py", () => {
   const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
   const js = fs.readFileSync(path.join(__dirname, "..", "tunnel-agent.js"), "utf8");
@@ -182,6 +191,8 @@ test("SendUserFile video MIME map and cap match hub-agent.py", () => {
   assert.deepEqual(pairs(py, /SEND_FILE_VIDEO_MIME = \{([^}]*)\}/), pairs(js, /const SEND_FILE_VIDEO_MIME = \{([^}]*)\}/));
   assert.match(py, /_env_int\("SESSION_SEND_FILE_VIDEO_MAX_BYTES", 4 << 20\)/);
   assert.match(js, /SESSION_SEND_FILE_VIDEO_MAX_BYTES\) \|\| 4 \* 1024 \* 1024/);
+  assert.match(py, /_env_int\("SESSION_SEND_FILE_STREAM_MAX_BYTES", 256 << 20\)/);
+  assert.match(js, /SESSION_SEND_FILE_STREAM_MAX_BYTES\) \|\| 256 \* 1024 \* 1024/);
 });
 
 test("live tail: a frame over budget sheds the OLDEST entries' file payloads first", () => {

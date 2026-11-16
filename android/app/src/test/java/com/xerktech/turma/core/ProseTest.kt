@@ -708,6 +708,25 @@ class ProseTest {
             assertTrue(src, previewVideoData(src) == null)
     }
 
+    @Test fun `a streamed video's size reads like the web's button`() {
+        assertEquals("12.0 MB", videoSizeLabel(12L shl 20))
+        assertEquals("150 MB", videoSizeLabel(150L shl 20))
+        assertEquals("1 KB", videoSizeLabel(10))
+        assertEquals("500 KB", videoSizeLabel(500L * 1024))
+    }
+
+    @Test fun `a streamed SendUserFile entry decodes its ref and size`() {
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val f = json.decodeFromString(com.xerktech.turma.model.SendFile.serializer(),
+            """{"name":"cut.mp4","kind":"video","stream":true,"ref":"${"a".repeat(32)}","size":12582912}""")
+        assertTrue(f.stream)
+        assertEquals("a".repeat(32), f.ref)
+        assertEquals(12582912L, f.size)
+        // An older agent's entry carries none of them.
+        val old = json.decodeFromString(com.xerktech.turma.model.SendFile.serializer(), """{"name":"x.png","kind":"image","src":"data:image/png;base64,AA"}""")
+        assertTrue(!old.stream && old.ref.isEmpty() && old.size == 0L)
+    }
+
     // Expose parseInline for the linkify/inline-code cases (it's file-private).
     private fun parseInlineOnly(text: String): List<Span> = paras(text).single().spans
 }

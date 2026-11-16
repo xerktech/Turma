@@ -159,6 +159,7 @@ process.env.PERMISSION_POLICIES_FILE = path.join(
 // /data/migrations, or one dir across test files, would have each sweep delete
 // the others' spools.
 process.env.MIGRATE_SPOOL_DIR = mkdtemp("turma-test-migrations-");
+process.env.SENDFILE_SPOOL_DIR = mkdtemp("turma-test-sendfiles-");
 // Archive (durable, searchable ended-session store) writes under a throwaway dir.
 process.env.ARCHIVE_DIR = mkdtemp("turma-test-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
@@ -303,6 +304,7 @@ const {
   repoTiers, repoTier, repoTierRank, isRepoIgnored, setRepoTier,
   DEFAULT_REPO_TIER, REPO_TIERS,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
+  sendFiles, sweepSendFiles, SENDFILE_PENDING_MS, SENDFILE_SPOOL_MAX_BYTES, SENDFILE_SPOOL_DIR,
   dropMigrationBlob, migrationSpoolPath,
   // XERK-761: migration record/spool sharing across replicas.
   setMigrationStore, hydrateMigrations, sweepMigrationSpoolShared,
@@ -18782,7 +18784,7 @@ test("migrate: full move — export, relay, import, then kill the source", async
   const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
   const up = await requestRaw("POST", `/api/agents/mgA/migrations/${mid}/blob`,
     { body: blob, headers: { authorization: "Bearer agenttok", "content-type": "application/octet-stream" } });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   const m = migrations.get(mid);
   assert.equal(m.phase, "importing");
   // It landed on DISK, not in the record — that is the whole point of XERK-263.
@@ -19566,7 +19568,7 @@ test("migrate: a stalled move times out and frees its blob", async () => {
   const m = migrations.get(mid);
   const up = await requestRaw("POST", `/api/agents/toA/migrations/${mid}/blob`,
     { body: Buffer.from("BUNDLE"), headers: { authorization: "Bearer agenttok" } });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   const spoolFile = m.blobPath;
   assert.ok(fs.existsSync(spoolFile));
   m.startedAt = Date.now() - 10 * 60 * 1000; // well past MIGRATE_TIMEOUT_MS
@@ -20260,7 +20262,7 @@ test("migrate: the blob relay's host scope holds for a proved caller", async () 
   // back — it is the raw transcript, and only the host resuming it needs it.
   const up = await requestRaw("POST", `/api/agents/scA/migrations/${mid}/blob`,
     { body: Buffer.from("SOURCE-BUNDLE"), headers: asHost("scA") });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   const bySrc = await requestRaw("GET", `/api/agents/scA/migrations/${mid}/blob`,
     { headers: asHost("scA") });
   assert.equal(bySrc.status, 404);
@@ -23238,7 +23240,7 @@ test("migrate: the blob relay is scoped to the migration's own two hosts", async
   const blob = Buffer.from("PRETEND-GZIP-TAR-BYTES");
   const up = await requestRaw("POST", `/api/agents/hsA/migrations/${mid}/blob`,
     { body: blob, headers: { ...agentTok, "content-type": "application/octet-stream" } });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
 
   // A host that is not the TARGET can't read the bundle — it is the raw
   // transcript of another host's conversation.
@@ -33261,7 +33263,7 @@ test("XERK-2935: a new ticket's files are staged for a capable host and ride its
   await jiraBeat("tf1", site, cap);
   const up = await requestRaw("POST", `/api/jira/${site}/uploads?name=${encodeURIComponent("shot.png")}`,
     { body: Buffer.from("PNGBYTES"), headers: userHeaders });
-  assert.equal(up.status, 200);
+  assert.equal(up.status, 200, up.buf.toString());
   assert.equal(up.body.name, "shot.png");
   // The host's agent can pull it; another host cannot.
   const blob = await requestRaw("GET", `/api/agents/tf1/uploads/${up.body.uploadId}/blob`, { headers: asHost("tf1") });
@@ -36222,4 +36224,189 @@ test("XERK-2953: a 'following' split that deletes the dead old series deletes it
     cleanup2985(D2985A);
     forget2533(D2985A);
   }
+});
+
+
+// ---- Streamed SendUserFile videos -------------------------------------------
+test("sendfile: play asks the host once, the agent's upload is served with ranges", async () => {
+  const ref = "a".repeat(32);
+  await upHost("sfA", { sessions: [{ id: "s1", status: "running" }] });
+  const st = (q = "?status=1") => request("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}${q}`, { headers: userHeaders });
+
+  // Bytes before anything is fetched: 404, and nothing queued.
+  assert.equal((await st("")).status, 404);
+  // The first status poll queues ONE fetchSendFile; a second reuses it.
+  assert.deepEqual((await st()).body, { state: "pending" });
+  assert.deepEqual((await st()).body, { state: "pending" });
+  const beat = await upHost("sfA", { sessions: [{ id: "s1", status: "running" }] });
+  const fetches = (beat.body.commands || []).filter((c) => c.type === "fetchSendFile");
+  assert.equal(fetches.length, 1);
+  assert.equal(fetches[0].sessionId, "s1");
+  assert.equal(fetches[0].ref, ref);
+
+  // Another host's credential cannot answer it; an unknown fetch is a 404.
+  const body = Buffer.from("0123456789");
+  const vt = { "x-sendfile-type": "video/mp4", "content-type": "application/octet-stream", "content-length": "10" };
+  assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
+    { body, headers: { ...asHost("sfB"), ...vt } })).status, 403);
+  assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${"b".repeat(32)}`,
+    { body, headers: { ...asHost("sfA"), ...vt } })).status, 404);
+  // A type outside the video whitelist is refused and fails the fetch.
+  // (Checked on a second ref so the real one stays pending.)
+
+  const up = await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
+    { body, headers: { ...asHost("sfA"), ...vt } });
+  assert.equal(up.status, 200, up.buf.toString());
+  assert.deepEqual((await st()).body, { state: "ready", size: 10 });
+
+  const full = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`, { headers: userHeaders });
+  assert.equal(full.status, 200);
+  assert.equal(full.buf.toString(), "0123456789");
+  assert.equal(full.headers["content-type"], "video/mp4");
+  assert.equal(full.headers["x-content-type-options"], "nosniff");
+  assert.match(full.headers["content-security-policy"], /sandbox/);
+  const part = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=2-5" } });
+  assert.equal(part.status, 206);
+  assert.equal(part.buf.toString(), "2345");
+  assert.equal(part.headers["content-range"], "bytes 2-5/10");
+  const tail = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=-3" } });
+  assert.equal(tail.buf.toString(), "789");
+  const bad = await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=20-30" } });
+  assert.equal(bad.status, 416);
+  // A second upload for a fetch already served is refused.
+  assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
+    { body, headers: { ...asHost("sfA"), ...vt } })).status, 404);
+  // Anonymous callers never reach the bytes.
+  assert.equal((await requestRaw("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}`)).status, 401);
+  sendFiles.clear();
+});
+
+test("sendfile: an agent's error, a bad type and an unknown session settle as errors", async () => {
+  await upHost("sfC", { sessions: [{ id: "s1", status: "running" }] });
+  const st = (ref, sid = "s1") => request("GET", `/api/agents/sfC/sessions/${sid}/sendfile/${ref}?status=1`, { headers: userHeaders });
+  const r1 = "c".repeat(32);
+  const r2 = "d".repeat(32);
+  assert.equal((await st(r1)).body.state, "pending");
+  const e1 = await requestRaw("POST", `/api/agents/sfC/sendfiles/s1/${r1}?error=${encodeURIComponent("the session never sent that file\u0007")}`,
+    { headers: asHost("sfC") });
+  assert.equal(e1.status, 200);
+  assert.deepEqual((await st(r1)).body, { state: "error", error: "the session never sent that file" });
+
+  assert.equal((await st(r2)).body.state, "pending");
+  const e2 = await requestRaw("POST", `/api/agents/sfC/sendfiles/s1/${r2}`,
+    { body: Buffer.from("<html>"), headers: { ...asHost("sfC"), "x-sendfile-type": "text/html", "content-length": "6" } });
+  assert.equal(e2.status, 400);
+  assert.equal((await st(r2)).body.state, "error");
+
+  assert.equal((await st("e".repeat(32), "nope")).body.state, "error");
+  assert.equal((await request("GET", "/api/agents/sfC/sessions/s1/sendfile/../../x?status=1", { headers: userHeaders })).status === 200, false);
+  assert.equal((await st("NOTHEX")).status, 400);
+  sendFiles.clear();
+});
+
+
+test("sendfile: an unanswered fetch times out, the spool evicts least-played first and reserves uploads", async () => {
+  sendFiles.clear();
+  const now = Date.now();
+  // An older agent acks fetchSendFile and never answers: the fetch errors.
+  sendFiles.set("p", { state: "pending", at: now - SENDFILE_PENDING_MS - 1, usedAt: now });
+  // A stuck upload gets twice as long, then is given up too.
+  sendFiles.set("u", { state: "pending", uploading: true, reserved: 5, at: now - SENDFILE_PENDING_MS - 1, usedAt: now });
+  sweepSendFiles(now);
+  assert.equal(sendFiles.get("p").state, "error");
+  assert.match(sendFiles.get("p").error, /did not send the file in time/);
+  assert.equal(sendFiles.get("u").state, "pending");
+  sweepSendFiles(now + SENDFILE_PENDING_MS + 1);
+  assert.equal(sendFiles.get("u").state, "error");
+  sendFiles.clear();
+
+  // Over budget: the least recently played ready file goes first.
+  const mk = (n) => { const f = require("path").join(SENDFILE_SPOOL_DIR, `x${n}`); require("fs").writeFileSync(f, "x"); return f; };
+  const half = Math.floor(SENDFILE_SPOOL_MAX_BYTES / 2) + 1;
+  sendFiles.set("old", { state: "ready", size: half, usedAt: now - 1000, at: now, path: mk(1) });
+  sendFiles.set("new", { state: "ready", size: half, usedAt: now, at: now, path: mk(2) });
+  sweepSendFiles(now);
+  assert.equal(sendFiles.has("old"), false);
+  assert.equal(sendFiles.has("new"), true);
+  sendFiles.clear();
+});
+
+test("sendfile: room is reserved when play is asked, and an upload past it is refused after its body", async () => {
+  sendFiles.clear();
+  await upHost("sfD", { sessions: [{ id: "s1", status: "running" }] });
+  const ref = "f".repeat(32);
+  const st = (q) => request("GET", `/api/agents/sfD/sessions/s1/sendfile/${ref}?status=1${q}`, { headers: userHeaders });
+  // A full cache refuses BEFORE the host is asked, and remembers nothing.
+  sendFiles.set("busy", { state: "pending", reserved: SENDFILE_SPOOL_MAX_BYTES, at: Date.now(), usedAt: Date.now() });
+  const full = await st("&size=3");
+  assert.equal(full.body.state, "error");
+  assert.match(full.body.error, /cache is full/);
+  assert.equal(sendFiles.has(JSON.stringify(["sfD", "s1", ref])), false);
+  // A given-up fetch frees its room: the retry is admitted at once.
+  sendFiles.get("busy").state = "error";
+  assert.equal((await st("&size=3")).body.state, "pending");
+  // A request that cannot fit evicts nothing on its way to being refused.
+  sendFiles.get("busy").state = "pending";
+  const f = require("path").join(SENDFILE_SPOOL_DIR, "keep");
+  require("fs").writeFileSync(f, "x");
+  sendFiles.set("ready1", { state: "ready", size: 1, usedAt: Date.now(), at: Date.now(), path: f });
+  const other = "2".repeat(32);
+  const nf = await request("GET", `/api/agents/sfD/sessions/s1/sendfile/${other}?status=1&size=5`, { headers: userHeaders });
+  assert.match(nf.body.error, /cache is full/);
+  assert.equal(sendFiles.has("ready1"), true);
+  sendFiles.delete(JSON.stringify(["sfD", "s1", ref]));
+  sendFiles.delete("busy");
+  sendFiles.delete("ready1");
+  // A peek never starts a fetch.
+  const peekRef = "1".repeat(32);
+  const pk = await request("GET", `/api/agents/sfD/sessions/s1/sendfile/${peekRef}?status=1&peek=1`, { headers: userHeaders });
+  assert.deepEqual(pk.body, { state: "gone" });
+  assert.equal(sendFiles.has(JSON.stringify(["sfD", "s1", peekRef])), false);
+  // Past the hub's own limit is refused outright.
+  sendFiles.clear();
+  assert.match((await st(`&size=${2 ** 40}`)).body.error, /over the hub's/);
+  // An upload declaring more than reserved (a stale or missing size) grows the
+  // reservation when there is room...
+  assert.equal((await st("&size=3")).body.state, "pending");
+  const grown = await requestRaw("POST", `/api/agents/sfD/sendfiles/s1/${ref}`,
+    { body: Buffer.from("abcdef"), headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "content-length": "6" } });
+  assert.equal(grown.status, 200);
+  assert.equal((await st("")).body.state, "ready");
+  sendFiles.clear();
+  // ...and with none, is drained and answered 503 on its end.
+  assert.equal((await st("")).body.state, "pending");
+  sendFiles.set("busy", { state: "pending", reserved: SENDFILE_SPOOL_MAX_BYTES, at: Date.now(), usedAt: Date.now() });
+  const nofit = await requestRaw("POST", `/api/agents/sfD/sendfiles/s1/${ref}`,
+    { body: Buffer.from("abcdef"), headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "content-length": "6" } });
+  assert.equal(nofit.status, 503);
+  sendFiles.clear();
+  // No declared length: 411.
+  assert.equal((await st("&size=3")).body.state, "pending");
+  const http = require("http");
+  const status = await new Promise((resolve) => {
+    const r = http.request(baseUrl + `/api/agents/sfD/sendfiles/s1/${ref}`, { method: "POST",
+      headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "transfer-encoding": "chunked" } },
+    (res) => { res.resume(); resolve(res.statusCode); });
+    r.end("abc");
+  });
+  assert.equal(status, 411);
+  sendFiles.clear();
+});
+
+test("sendfile: a multi-range request is answered whole", async () => {
+  sendFiles.clear();
+  await upHost("sfE", { sessions: [{ id: "s1", status: "running" }] });
+  const ref = "9".repeat(32);
+  await request("GET", `/api/agents/sfE/sessions/s1/sendfile/${ref}?status=1`, { headers: userHeaders });
+  await requestRaw("POST", `/api/agents/sfE/sendfiles/s1/${ref}`,
+    { body: Buffer.from("abcdefgh"), headers: { ...asHost("sfE"), "x-sendfile-type": "video/webm", "content-length": "8" } });
+  const r = await requestRaw("GET", `/api/agents/sfE/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=0-1,5-6" } });
+  assert.equal(r.status, 200);
+  assert.equal(r.buf.toString(), "abcdefgh");
+  assert.equal(r.headers["content-type"], "video/webm");
+  sendFiles.clear();
 });

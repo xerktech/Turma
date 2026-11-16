@@ -1103,6 +1103,12 @@ SEND_FILE_VIDEO_MIME = {
     ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
     ".mov": "video/quicktime", ".ogv": "video/ogg",
 }
+# A video past the inline cap is STREAMED instead: the block carries a ref
+# (`send_file_ref`, a hash of its path) and no bytes, and a client that presses
+# play asks the hub, which queues `fetchSendFile`; this agent then uploads the
+# file to the hub, which serves it with Range support. Bounded so one delivery
+# can't fill the hub's disk spool. Mirror in tunnel-agent.js.
+SEND_FILE_STREAM_MAX_BYTES = _env_int("SESSION_SEND_FILE_STREAM_MAX_BYTES", 256 << 20)
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so a client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -11132,6 +11138,76 @@ def _tool_input_summary(inp):
     return str(inp)
 
 
+def send_file_ref(path):
+    """A streamed SendUserFile's handle: 32 hex of sha256(path). The hub and the
+    clients only ever see this; `fetchSendFile` resolves it back to a path by
+    re-reading the session's OWN SendUserFile calls, so a ref can never name a
+    file the session did not send. Mirror of tunnel-agent.js sendFileRef()."""
+    # A lone surrogate becomes U+FFFD first, as node's utf8 encoder does.
+    norm = path.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:32]
+
+
+def _regular_file_size(path):
+    """The size of a REGULAR file, else None — O_NONBLOCK + fstat, never a
+    blocking open (a FIFO named like a video must not hang the reader)."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        st = os.fstat(fd)
+        return st.st_size if stat.S_ISREG(st.st_mode) else None
+    finally:
+        os.close(fd)
+
+
+def _send_file_path_for_ref(tpath, ref):
+    """The VIDEO path one of this transcript's SendUserFile calls delivered whose
+    `send_file_ref` is `ref`, else None. The ref is client-supplied, so it is
+    only ever matched against paths the session itself sent — never joined onto
+    anything. A call the user REJECTED (its tool_result `is_error`) delivered
+    nothing and does not count. Read line by line (a transcript can be large;
+    this runs on the upload worker, never the beat)."""
+    if not tpath:
+        return None
+    try:
+        fh = open(tpath, "rb")
+    except OSError:
+        return None
+    hits = []        # (tool_use id, path) in transcript order
+    refused = set()  # tool_use ids whose result is an error
+    with fh:
+        for line in fh:
+            if b"SendUserFile" not in line and b'"is_error"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            msg = entry.get("message") if isinstance(entry, dict) else None
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_result" and b.get("is_error") is True:
+                    if isinstance(b.get("tool_use_id"), str):
+                        refused.add(b["tool_use_id"])
+                    continue
+                if not (b.get("type") == "tool_use" and b.get("name") == "SendUserFile"):
+                    continue
+                inp = b.get("input")
+                files = inp.get("files") if isinstance(inp, dict) else None
+                for p in files if isinstance(files, list) else []:
+                    if (isinstance(p, str) and p
+                            and os.path.splitext(p)[1].lower() in SEND_FILE_VIDEO_MIME
+                            and send_file_ref(p) == ref):
+                        hits.append((b.get("id"), p))
+    for tid, p in hits:
+        if tid is None or tid not in refused:
+            return p
+    return None
+
+
 def _read_regular_file_bounded(path, cap):
     """Up to cap+1 bytes of a REGULAR file, else None. Opened O_NONBLOCK and
     checked by fstat, so a FIFO (or device) named like a media file the
@@ -11158,7 +11234,9 @@ def _send_user_file_detail(inp):
     list of preview entries for its tool_use block (XERK-221), or None:
       image -> {"name", "kind":"image", "src": "data:<mime>;base64,<b64>"}
       video -> {"name", "kind":"video", "src": "data:video/<x>;base64,<b64>"}
-                                         (up to SEND_FILE_VIDEO_MAX_BYTES)
+                                         (up to SEND_FILE_VIDEO_MAX_BYTES), else
+               {"name", "kind":"video", "stream": True, "ref", "size"}
+                                         (up to SEND_FILE_STREAM_MAX_BYTES)
       html  -> {"name", "kind":"html",  "html": "<markup>"}   (display:"render" only)
       else  -> {"name", "kind":"file"}   (attach-mode HTML, oversize, unreadable, or
                                           a non-renderable type — a bare name chip)
@@ -11182,6 +11260,15 @@ def _send_user_file_detail(inp):
         render_html = ext in SEND_FILE_HTML_EXT and display != "attach"
         cap = SEND_FILE_VIDEO_MAX_BYTES if vmime else SEND_FILE_MAX_BYTES
         entry = {"name": name, "kind": "file"}
+        if vmime:
+            try:
+                size = _regular_file_size(path)
+            except OSError:
+                size = None
+            if size is not None and cap < size <= SEND_FILE_STREAM_MAX_BYTES:
+                out.append({"name": name, "kind": "video", "stream": True,
+                             "ref": send_file_ref(path), "size": size})
+                continue
         if mime or vmime or render_html:
             try:
                 data = _read_regular_file_bounded(path, cap)
@@ -37426,6 +37513,121 @@ class SessionManager:
     # export runs off the beat: ATTEMPTS × this ≈ the worst-case blocking time.
     MIGRATION_UPLOAD_TIMEOUT_SEC = 30
 
+    SEND_FILE_UPLOAD_TIMEOUT_SEC = 600
+
+    def _fetch_send_file_async(self, session_id, ref):
+        """`fetchSendFile` (a client pressed play on a streamed SendUserFile
+        video): resolve `ref` against THIS session's own SendUserFile calls and
+        upload the file to the hub, on a worker thread — the upload can take
+        minutes, never the beat (XERK-395). One upload per (session, ref) at a
+        time; a re-delivered command while one runs is dropped."""
+        if not isinstance(session_id, str) or not isinstance(ref, str) \
+                or not re.fullmatch(r"[0-9a-f]{32}", ref):
+            log(f"fetchSendFile: bad request {session_id!r}/{ref!r}")
+            return
+        sess = next((s for s in self.registry if s.get("id") == session_id), None)
+        if sess is None:
+            threading.Thread(target=self._send_file_report_error,
+                             args=(session_id, ref, "that session is not on this host"),
+                             name="sendfile-upload", daemon=True).start()
+            return
+        tpath = _session_transcript_path(sess)
+        key = (session_id, ref)
+        inflight = self.__dict__.setdefault("_send_file_inflight", set())
+        if key in inflight:
+            return
+        inflight.add(key)
+
+        def work():
+            try:
+                self._upload_send_file(session_id, ref, tpath)
+            except Exception as e:  # never let a worker die silently
+                log(f"fetchSendFile {session_id}/{ref}: {e}")
+                self._send_file_report_error(session_id, ref, "the agent could not send the file")
+            finally:
+                inflight.discard(key)
+        try:
+            threading.Thread(target=work, name="sendfile-upload", daemon=True).start()
+        except Exception as e:
+            inflight.discard(key)
+            log(f"fetchSendFile: could not start the upload worker: {e}")
+
+    def _send_file_url(self, session_id, ref, error=None):
+        url = (f"{TURMA_URL}/api/agents/{urllib.parse.quote(self.device, safe='')}"
+               f"/sendfiles/{urllib.parse.quote(session_id, safe='')}/{ref}")
+        if error:
+            url += "?" + urllib.parse.urlencode({"error": error[:200]})
+        return url
+
+    def _send_file_headers(self, extra=None):
+        headers = {"User-Agent": "hub-agent/1.0"}
+        if TURMA_TOKEN:
+            headers["Authorization"] = f"Bearer {TURMA_TOKEN}"
+        headers.update(extra or {})
+        return headers
+
+    def _send_file_report_error(self, session_id, ref, error):
+        try:
+            req = urllib.request.Request(self._send_file_url(session_id, ref, error), data=b"",
+                                         headers=self._send_file_headers(), method="POST")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+        except Exception as e:
+            log(f"fetchSendFile {session_id}/{ref}: could not report {error!r}: "
+                f"{_urlopen_error_detail(e)}")
+
+    def _upload_send_file(self, session_id, ref, tpath):
+        path = _send_file_path_for_ref(tpath, ref)
+        if path is None:
+            return self._send_file_report_error(
+                session_id, ref, "the session never sent that file")
+        mime = SEND_FILE_VIDEO_MIME.get(os.path.splitext(path)[1].lower())
+        # A link named like a video must lead to a video: never stream an
+        # arbitrary file under a .mp4 name.
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            real = ""
+        if os.path.splitext(real)[1].lower() not in SEND_FILE_VIDEO_MIME:
+            return self._send_file_report_error(session_id, ref, "the file is not a video")
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return self._send_file_report_error(session_id, ref, "the file is not a regular file")
+            if st.st_size > SEND_FILE_STREAM_MAX_BYTES:
+                return self._send_file_report_error(
+                    session_id, ref, f"the file is over {SEND_FILE_STREAM_MAX_BYTES >> 20} MB")
+            # Back to blocking reads for the upload (it is a regular file).
+            if hasattr(os, "set_blocking"):
+                os.set_blocking(fd, True)
+            fh = os.fdopen(fd, "rb")
+            fd = None
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            return self._send_file_report_error(session_id, ref, "the file is gone from the host")
+        with fh:
+            headers = self._send_file_headers({
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(st.st_size),
+                "X-Sendfile-Type": mime,
+            })
+            req = urllib.request.Request(self._send_file_url(session_id, ref), data=fh,
+                                         headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=self.SEND_FILE_UPLOAD_TIMEOUT_SEC) as resp:
+                    resp.read()
+                log(f"fetchSendFile {session_id}/{ref}: uploaded {st.st_size} bytes")
+            except Exception as e:
+                log(f"fetchSendFile {session_id}/{ref}: upload failed: {_urlopen_error_detail(e)}")
+                # The hub sets its own error for a refusal it answered; for a
+                # transport failure it never saw, tell it so the player stops
+                # waiting (a no-op 404 if the fetch is already settled).
+                if not isinstance(getattr(e, "code", None), int):
+                    self._send_file_report_error(session_id, ref, "the upload from the host failed")
+
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,
         agent-authed). Returns True on success; a failure is reported (never
@@ -49482,6 +49684,8 @@ class SessionManager:
                 elif ctype == "resumeTranscript":
                     self.resume_transcript(
                         cmd.get("transcriptId"), cmd.get("cwd"), cmd_id=cid)
+                elif ctype == "fetchSendFile":
+                    self._fetch_send_file_async(cmd.get("sessionId"), cmd.get("ref"))
                 elif ctype == "exportSession":
                     self._export_session_async(
                         cmd.get("sessionId"), cmd.get("migrationId"))

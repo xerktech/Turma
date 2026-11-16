@@ -113,6 +113,7 @@ Each spans components; the rule lives in the named file, which loads when any si
   `contract-calendar.md`; Turma-created events (XERK-2967) → `contract-calendar-turma.md`;
   Turma events written back to Outlook (XERK-2982) →
   `contract-calendar-outlook-write.md`.
+- **Streamed SendUserFile videos** (ref, `fetchSendFile`, the hub spool) → `contract-sendfile-stream.md`.
 - **"Working" is `paneBusy` OR live background WORK** (XERK-245, XERK-1570) → `session-working.md`.
 
 ## Conventions

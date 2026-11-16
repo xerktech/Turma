@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
+const { carryVideos, streamVideoClick, streamVideoFailed, mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -1452,6 +1452,84 @@ test("carryVideos: an OLDER copy folded in above never takes the playing node", 
   // History adds an older message holding the SAME clip above it.
   carryVideos(scroll, () => { scroll.vids = [mk("act:t0", "clip:9:x", "older"), mk("act:t2", "clip:9:x", "fresh")]; });
   assert.deepEqual(scroll.vids.map((v) => v.tag), ["older", "playing"]);
+});
+
+test("render: a streamed SendUserFile video is a play button carrying only its ref", () => {
+  const ref = "0123456789abcdef0123456789abcdef";
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "cut.mp4", kind: "video", stream: true, ref, size: 12 * 1024 * 1024 },
+    { name: "x.mp4", kind: "video", stream: true, ref: "../../etc" },
+  ])));
+  assert.match(html, new RegExp('<div class="md-video-stream" data-vkey="stream:' + ref + '" data-ref="' + ref + '" data-name="cut.mp4" data-size="12582912">'));
+  assert.match(html, /▶ Play video \(12\.0 MB\)/);
+  assert.doesNotMatch(html, /<video/);          // nothing loads until play
+  assert.doesNotMatch(html, /etc/);             // a malformed ref is no player
+  assert.match(html, /📎 x\.mp4/);
+});
+
+test("streamVideoClick: outside the live chat it explains, and never asks the hub", async () => {
+  const prevDoc = global.document, prevFetch = global.fetch;
+  let fetched = 0;
+  global.fetch = async () => { fetched++; return { ok: true, json: async () => ({ state: "pending" }) }; };
+  global.document = { getElementById: (id) => (id === "chatScroll" ? { contains: () => false } : null) };
+  const note = { textContent: "" };
+  const btn = { disabled: false };
+  const box = { querySelector: (sel) => (sel === ".md-video-note" ? note : btn), getAttribute: () => "a".repeat(32), isConnected: true };
+  // A live session IS selected: only the box sitting outside the live chat stops it.
+  __setHostKey("h1"); __setSess({ id: "s1" });
+  try {
+    await streamVideoClick(box);
+  } finally {
+    global.document = prevDoc; global.fetch = prevFetch;
+    __setHostKey(null); __setSess(null);
+  }
+  assert.equal(fetched, 0);
+  assert.match(note.textContent, /only while its session is running/);
+});
+
+test("streamVideoClick: the live chat asks the hub with the block's size", async () => {
+  const prevDoc = global.document, prevFetch = global.fetch;
+  const urls = [];
+  global.fetch = async (u) => { urls.push(u); return { ok: true, json: async () => ({ state: "error", error: "x" }) }; };
+  global.document = { getElementById: (id) => (id === "chatScroll" ? { contains: () => true } : null) };
+  const note = { textContent: "" };
+  const btn = { disabled: false };
+  const box = { querySelector: (sel) => (sel === ".md-video-note" ? note : btn),
+    getAttribute: (a) => (a === "data-ref" ? "a".repeat(32) : a === "data-size" ? "21446476" : null), isConnected: true };
+  __setHostKey("h1"); __setSess({ id: "s1" });
+  try {
+    await streamVideoClick(box);
+  } finally {
+    global.document = prevDoc; global.fetch = prevFetch;
+    __setHostKey(null); __setSess(null);
+  }
+  assert.equal(urls.length, 1);
+  assert.equal(urls[0], "/api/agents/h1/sessions/s1/sendfile/" + "a".repeat(32) + "?status=1&size=21446476");
+});
+
+test("streamVideoFailed: a copy still on the hub is the browser's codec, a gone one brings ▶ back", async () => {
+  const prevDoc = global.document, prevFetch = global.fetch;
+  const el = (tag) => ({ tag, className: "", textContent: "", type: "" });
+  global.document = { createElement: el };
+  const box = () => ({ kids: null, getAttribute: (a) => (a === "data-name" ? "cut.mp4" : null),
+    replaceChildren(...k) { this.kids = k; } });
+  const v = { getAttribute: () => "/api/agents/h/sessions/s/sendfile/" + "a".repeat(32) };
+  try {
+    const asked = [];
+    global.fetch = async (u) => { asked.push(u); return { ok: true, json: async () => ({ state: "ready", size: 9 }) }; };
+    const b1 = box();
+    await streamVideoFailed(b1, v);
+    assert.match(b1.kids[0].textContent, /can't play it/);
+    // Only a PEEK: checking why it failed must never start a new fetch.
+    assert.deepEqual(asked, ["/api/agents/h/sessions/s/sendfile/" + "a".repeat(32) + "?status=1&peek=1"]);
+    global.fetch = async () => ({ ok: true, json: async () => ({ state: "pending" }) });
+    const b2 = box();
+    await streamVideoFailed(b2, v);
+    assert.equal(b2.kids[0].className, "md-video-play");
+    assert.match(b2.kids[1].textContent, /cached copy is gone/);
+  } finally {
+    global.document = prevDoc; global.fetch = prevFetch;
+  }
 });
 
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {

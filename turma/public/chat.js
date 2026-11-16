@@ -1857,10 +1857,11 @@
     return (card ? card.getAttribute("data-dkey") + "\u0000" + (card.getAttribute("data-uuid") || "") : "") +
       "\u0000" + v.getAttribute("data-vkey");
   }
+  const CARRIED_VIDEOS = "video.md-video[data-vkey], .md-video-stream[data-vkey]";
   function carryVideos(scroll, write) {
     const old = new Map();
     if (scroll.querySelectorAll) {
-      for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
+      for (const v of scroll.querySelectorAll(CARRIED_VIDEOS)) {
         const k = videoSlot(v);
         if (!old.has(k)) old.set(k, []);
         old.get(k).push(v);
@@ -1868,11 +1869,100 @@
     }
     write();
     if (!old.size) return;
-    for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
+    for (const v of scroll.querySelectorAll(CARRIED_VIDEOS)) {
       const list = old.get(videoSlot(v));
       const prev = list && list.shift();
       if (prev && prev !== v) v.replaceWith(prev);
     }
+  }
+  function fmtVideoSize(n) {
+    return n >= 1 << 20 ? (n / (1 << 20)).toFixed(n >= 100 << 20 ? 0 : 1) + " MB"
+      : Math.max(1, Math.round(n / 1024)) + " KB";
+  }
+  function resetStreamBox(box, msg) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "md-video-play";
+    btn.textContent = "▶ Play video";
+    const note = document.createElement("span");
+    note.className = "md-video-note";
+    note.textContent = msg || "";
+    box.replaceChildren(btn, note);
+  }
+  // A streamed player errored: either its hub copy is gone (restart, eviction —
+  // ▶ again fetches it) or the browser can't decode it (a phone's HEVC clip in
+  // Chrome — the chip, as for an inline clip). Ask the hub which.
+  async function streamVideoFailed(box, v) {
+    let st = null;
+    try {
+      const r = await fetch(v.getAttribute("src") + "?status=1&peek=1", { cache: "no-store" });
+      st = r.ok ? await r.json() : null;
+    } catch (_) { st = null; }
+    if (st && st.state === "ready") {
+      const chip = document.createElement("span");
+      chip.className = "tool-file-name";
+      chip.textContent = "📎 " + (box.getAttribute("data-name") || "video") + " (this browser can't play it)";
+      box.replaceChildren(chip);
+      return;
+    }
+    resetStreamBox(box, "The video's cached copy is gone — press play to fetch it again.");
+  }
+  const STREAM_POLL_MS = 1500;
+  const STREAM_WAIT_MS = 5 * 60 * 1000;
+  // ▶ on a streamed video: poll the hub (the first poll asks the host for the
+  // file) until it is ready, then swap in a player whose src is the hub's
+  // Range-serving URL. Only in the LIVE chat: an ended session's transcript has
+  // no running session for the host to resolve the file against.
+  async function streamVideoClick(box) {
+    const note = box.querySelector(".md-video-note");
+    const btn = box.querySelector(".md-video-play");
+    const say = (t) => { if (note) note.textContent = t; };
+    const live = $("chatScroll");
+    if (!live || !live.contains(box) || !hostKey || !sessionId) {
+      say("This video plays only while its session is running.");
+      return;
+    }
+    const ref = box.getAttribute("data-ref");
+    const base = "/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/sendfile/" + ref;
+    if (btn) btn.disabled = true;
+    say("Fetching from the host…");
+    const until = Date.now() + STREAM_WAIT_MS;
+    while (Date.now() < until) {
+      let st = null;
+      try {
+        const size = Number(box.getAttribute("data-size")) || 0;
+        const r = await fetch(base + "?status=1" + (size > 0 ? "&size=" + size : ""), { cache: "no-store" });
+        st = r.ok ? await r.json() : { state: "error", error: "the hub answered HTTP " + r.status };
+      } catch (_) { st = null; }
+      if (!box.isConnected) return;
+      if (st && st.state === "ready") {
+        const v = document.createElement("video");
+        v.className = "md-video";
+        v.controls = true;
+        v.playsInline = true;
+        v.preload = "metadata";
+        v.setAttribute("data-name", box.getAttribute("data-name") || "video");
+        v.src = base;
+        box.replaceChildren(v);
+        v.play().catch(() => {});
+        return;
+      }
+      if (st && st.state === "error") {
+        say("Couldn't load: " + (st.error || "the host could not send it"));
+        if (btn) btn.disabled = false;
+        return;
+      }
+      await new Promise((r) => setTimeout(r, STREAM_POLL_MS));
+    }
+    say("The host didn't send the video in time.");
+    if (btn) btn.disabled = false;
+  }
+  if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("click", (ev) => {
+      const btn = ev.target && ev.target.closest ? ev.target.closest(".md-video-play") : null;
+      const box = btn && btn.closest(".md-video-stream");
+      if (box) { ev.preventDefault(); streamVideoClick(box); }
+    });
   }
   // A clip the browser can't decode (.mov or Theora .ogv in Chrome) shows the
   // same name chip as any other file instead of a dead black player. Media
@@ -1881,6 +1971,11 @@
     document.addEventListener("error", (ev) => {
       const v = ev.target;
       if (!v || v.tagName !== "VIDEO" || !v.classList || !v.classList.contains("md-video")) return;
+      // A STREAMED clip that errors has most likely lost its hub copy (hub
+      // restart, failover, eviction): bring ▶ back to fetch it again — never
+      // the "can't play" chip, which would be wrong.
+      const box = v.closest && v.closest(".md-video-stream");
+      if (box) { streamVideoFailed(box, v); return; }
       const chip = document.createElement("div");
       chip.className = "tool-file file";
       const span = document.createElement("span");
@@ -1901,6 +1996,17 @@
         const svg = /^data:image\/svg\+xml/i.test(f.src);
         out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
           '" src="' + esc(f.src) + '" alt="' + name + '"' + svgSizeAttrs(f.src) + ' loading="lazy">' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else if (f.kind === "video" && f.stream === true && typeof f.ref === "string" && /^[0-9a-f]{32}$/.test(f.ref)) {
+        // Too big to embed: a ▶ that asks the hub for the file (streamVideoClick).
+        // Carried across repaints like an inline clip, so a loading or playing
+        // video survives new transcript lines.
+        out += '<figure class="tool-file"><div class="md-video-stream" data-vkey="stream:' + f.ref +
+          '" data-ref="' + f.ref + '" data-name="' + name + '"' +
+          (Number.isSafeInteger(f.size) && f.size > 0 ? ' data-size="' + f.size + '"' : "") + '>' +
+          '<button type="button" class="md-video-play">▶ Play video' +
+          (Number.isSafeInteger(f.size) && f.size > 0 ? " (" + esc(fmtVideoSize(f.size)) + ")" : "") +
+          '</button><span class="md-video-note"></span></div>' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else if (f.kind === "video" && typeof f.src === "string" && /^data:video\//i.test(f.src)) {
         // A delivered clip plays inline. Only a data:video/* URI the agent built
@@ -4248,7 +4354,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
+      carryVideos, streamVideoClick, streamVideoFailed, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, backgroundBarVerb, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,

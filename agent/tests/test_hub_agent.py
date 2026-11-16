@@ -4838,11 +4838,46 @@ class TestEntryBlocks(unittest.TestCase):
             self.assertEqual(block["files"], [
                 {"name": "clip.mp4", "kind": "video",
                  "src": "data:video/mp4;base64," + base64.b64encode(body).decode()},
-                {"name": "big.webm", "kind": "file"},
+                {"name": "big.webm", "kind": "video", "stream": True,
+                 "ref": ha.send_file_ref(big), "size": ha.SEND_FILE_VIDEO_MAX_BYTES + 1},
             ])
             # The archive's shed turns it into a flagged chip like an image.
             ha._shed_block_payloads([block])
             self.assertEqual(block["files"][0], {"name": "clip.mp4", "kind": "file", "shed": True})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_send_file_ref_matches_the_tunnel_mirror(self):
+        # Same vectors as tunnel-agent.test.js "sendFileRef matches …".
+        self.assertEqual(ha.send_file_ref("/a/b.mp4"), "66d72820a7cc62aca60424a5bc0f1256")
+        self.assertEqual(ha.send_file_ref("/a/\ud800.mp4"), "d60c0c0376ed5b965d11300cb46cbce6")
+
+    def test_a_video_past_the_inline_cap_streams_by_ref(self):
+        # Too big to embed: the block carries a ref + size, never bytes, and the
+        # ref resolves back only to a path the session's own SendUserFile sent.
+        d = tempfile.mkdtemp()
+        try:
+            big = os.path.join(d, "cut.mp4")
+            with open(big, "wb") as fh:
+                fh.write(b"\x00" * (ha.SEND_FILE_VIDEO_MAX_BYTES + 1))
+            entry = {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "SendUserFile",
+                 "input": {"files": [big]}}]}}
+            block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
+            ref = ha.send_file_ref(big)
+            self.assertEqual(block["files"], [{"name": "cut.mp4", "kind": "video", "stream": True,
+                                               "ref": ref, "size": ha.SEND_FILE_VIDEO_MAX_BYTES + 1}])
+            tpath = os.path.join(d, "t.jsonl")
+            with open(tpath, "w") as fh:
+                fh.write(json.dumps(entry) + "\n")
+            self.assertEqual(ha._send_file_path_for_ref(tpath, ref), big)
+            self.assertIsNone(ha._send_file_path_for_ref(tpath, "0" * 32))
+            # A ref for a path the session never sent resolves to nothing.
+            self.assertIsNone(ha._send_file_path_for_ref(tpath, ha.send_file_ref("/etc/passwd")))
+            # Past the stream ceiling it is a chip again.
+            with mock.patch.object(ha, "SEND_FILE_STREAM_MAX_BYTES", ha.SEND_FILE_VIDEO_MAX_BYTES):
+                block = ha._entry_blocks(entry, ha.BLOCK_CAPS)[0]
+            self.assertEqual(block["files"], [{"name": "cut.mp4", "kind": "file"}])
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -59453,3 +59488,135 @@ class TestRepoDelete(ManagerMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFetchSendFile(ManagerMixin, unittest.TestCase):
+    """A client pressed play on a streamed SendUserFile video: the agent resolves
+    the ref against the session's own SendUserFile calls and uploads the file to
+    the hub, or reports why it cannot."""
+
+    def _setup(self, size=64):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = os.path.join(d, "cut.mp4")
+        with open(clip, "wb") as fh:
+            fh.write(b"V" * size)
+        tpath = os.path.join(d, "t.jsonl")
+        with open(tpath, "w") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "SendUserFile", "input": {"files": [clip]}}]}}) + "\n")
+        return clip, tpath
+
+    def _capture(self):
+        seen = []
+
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return b"{}"
+
+        def fake_urlopen(req, timeout=None):
+            data = req.data.read() if hasattr(req.data, "read") else req.data
+            seen.append({"url": req.full_url, "headers": dict(req.header_items()),
+                         "data": data, "method": req.get_method()})
+            return Resp()
+        return seen, mock.patch.object(ha.urllib.request, "urlopen", fake_urlopen)
+
+    def test_uploads_the_file_the_session_sent(self):
+        sm = self.make_manager()
+        clip, tpath = self._setup()
+        seen, patch = self._capture()
+        with patch:
+            sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0]["url"].endswith(f"/sendfiles/s1/{ha.send_file_ref(clip)}"))
+        self.assertNotIn("?error", seen[0]["url"])
+        hdrs = {k.lower(): v for k, v in seen[0]["headers"].items()}
+        self.assertEqual(hdrs["x-sendfile-type"], "video/mp4")
+        self.assertEqual(hdrs["content-length"], "64")
+        self.assertEqual(seen[0]["data"], b"V" * 64)
+
+    def test_a_ref_the_session_never_sent_is_reported_not_read(self):
+        sm = self.make_manager()
+        _, tpath = self._setup()
+        seen, patch = self._capture()
+        with patch:
+            sm._upload_send_file("s1", ha.send_file_ref("/etc/shadow"), tpath)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("?error=", seen[0]["url"])
+        self.assertIn(b"", [seen[0]["data"]])
+
+    def test_a_fifo_at_the_path_is_reported_never_blocking(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        sm = self.make_manager()
+        clip, tpath = self._setup()
+        os.unlink(clip)
+        os.mkfifo(clip)
+        seen, patch = self._capture()
+        with patch:
+            sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
+        self.assertIn("?error=", seen[0]["url"])
+
+    def test_a_send_the_user_rejected_never_resolves(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = os.path.join(d, "cut.mp4")
+        open(clip, "wb").close()
+        tpath = os.path.join(d, "t.jsonl")
+        with open(tpath, "w") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tu1", "name": "SendUserFile", "input": {"files": [clip]}}]}}) + "\n")
+            fh.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "is_error": True,
+                 "content": "The user doesn't want to proceed with this tool use."}]}}) + "\n")
+        self.assertIsNone(ha._send_file_path_for_ref(tpath, ha.send_file_ref(clip)))
+        # A later accepted send of the same file does resolve.
+        with open(tpath, "a") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tu2", "name": "SendUserFile", "input": {"files": [clip]}}]}}) + "\n")
+        self.assertEqual(ha._send_file_path_for_ref(tpath, ha.send_file_ref(clip)), clip)
+
+    def test_a_video_named_link_to_another_file_is_refused(self):
+        sm = self.make_manager()
+        clip, tpath = self._setup()
+        secret = clip + ".txt"
+        with open(secret, "w") as fh:
+            fh.write("not a video")
+        os.unlink(clip)
+        os.symlink(secret, clip)
+        seen, patch = self._capture()
+        with patch:
+            sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("?error=", seen[0]["url"])
+
+    def test_a_transport_failure_is_reported_to_the_hub(self):
+        sm = self.make_manager()
+        clip, tpath = self._setup()
+        calls = []
+
+        def boom(req, timeout=None):
+            calls.append(req.full_url)
+            if len(calls) == 1:
+                raise ConnectionResetError("reset")
+
+            class R:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def read(self): return b""
+            return R()
+        with mock.patch.object(ha.urllib.request, "urlopen", boom):
+            sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("?error=", calls[1])
+
+    def test_a_bad_ref_or_unknown_session_never_uploads(self):
+        sm = self.make_manager()
+        seen, patch = self._capture()
+        with patch, mock.patch.object(ha.threading, "Thread") as T:
+            sm._fetch_send_file_async("s1", "../../etc/passwd")
+            T.assert_not_called()
+            sm._fetch_send_file_async("nope", "a" * 32)
+            # An unknown session is reported, on a worker.
+            self.assertEqual(T.call_args.kwargs["target"], sm._send_file_report_error)

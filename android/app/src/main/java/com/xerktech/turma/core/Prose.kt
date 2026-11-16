@@ -695,6 +695,14 @@ fun previewVideoData(src: String): Pair<ByteArray, String>? {
     return if (bytes.isEmpty()) null else bytes to ext
 }
 
+/** A streamed video's size for its ▶ button (web parity: chat.js fmtVideoSize). */
+fun videoSizeLabel(n: Long): String =
+    if (n >= 1L shl 20) {
+        val mb = n.toDouble() / (1L shl 20)
+        if (n >= 100L shl 20) String.format(java.util.Locale.ROOT, "%.0f MB", mb)
+        else String.format(java.util.Locale.ROOT, "%.1f MB", mb)
+    } else "${maxOf(1L, Math.round(n / 1024.0))} KB"
+
 /** [s] holds lower-case ASCII [lit] at [at], ASCII-case-insensitively (JS `/i`; see [SVG_NAME]). */
 private fun asciiRegionMatches(s: String, at: Int, lit: String): Boolean {
     if (at < 0 || at + lit.length > s.length) return false

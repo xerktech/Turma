@@ -1755,7 +1755,15 @@ data class SendFile(
     // Dropped to fit the reply (agent `_shed_block_payloads`), rather than never
     // renderable — the chip says which, as the web's does (XERK-347).
     val shed: Boolean = false,
+    // A video too big to embed: no [src], a [ref] the hub fetches on play.
+    val stream: Boolean = false,
+    val ref: String = "",
+    val size: Long = 0,
 )
+
+/** `GET …/sessions/<id>/sendfile/<ref>?status=1`: pending | ready | error. */
+@Serializable
+data class SendFileStatus(val state: String = "", val error: String = "", val size: Long = 0)
 
 @Serializable
 @SerialName("tool_use")

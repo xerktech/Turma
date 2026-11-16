@@ -28,6 +28,7 @@ Split out of `agent.md` (size ceiling).
     `SEND_FILE_VIDEO_MAX_BYTES` (4 MiB raw): its base64 must stay under `HISTORY_MAX_BYTES` (6 MiB)
     or `history` sheds it. Clients play ONLY a `data:video/` src (web `<video controls>`, Android a
     cached-file `VideoView`); anything else is a chip — never a remote fetch.
+  - A bigger video streams on demand by ref (`contract-sendfile-stream.md`).
   - **Every SendUserFile read is O_NONBLOCK + fstat regular-file only** (`_read_regular_file_bounded`
     ↔ `readRegularFileBounded`): a FIFO named `x.mp4`/`x.png` hung the history worker and the tunnel's
     event loop (every terminal on the host). Tests: the `fifo` cases in both suites.
