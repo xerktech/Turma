@@ -51,9 +51,11 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   `failed`, error "Kept on <device>: …" (`calHeldError`), no tombstone, nothing to another host.
   - Why: the new holder's first upsert invites every attendee again from ANOTHER mailbox, and the
     old copy's cancellation runs only if its host ever returns — two meetings, two organizers.
-  - "Sending" = `calTurmaSends` for that org AND the copy may already have mailed
-    (`calCopyMaySend`: an `outlookId`, a `written` state, or an upsert sent this process). A copy
-    that provably sent nothing still moves.
+  - "Sending" = `calTurmaSends` for that org, whether or not it has mailed yet: the hub cannot prove
+    it has not (`calWriteSent` dies with a restart; a timed-out write is `ok:false` though `Send()`
+    may have run). Never re-add a "provably sent nothing" exception on in-memory or result evidence.
+  - The reason is built at its stored length (`calHeldError`, device cut to 80), so the held entry
+    is a coerce fixed point; a 300-char cut of a long name rewrote the record every tick (QA).
   - Its host back: the owed write goes at once (`at` reset), not on the hourly failure retry.
   - Ways out for the operator: bring the host back, or turn invitations off (the copy then moves
     and the old one is cancelled whenever its host returns).

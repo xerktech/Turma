@@ -35167,7 +35167,51 @@ test("XERK-3010: a sending copy is never re-homed; it stays failed with its host
   }
 });
 
-test("XERK-3010: a copy that sends nothing, or never reached its host, still re-homes", async () => {
+test("XERK-3010: a sending copy is held with no result, after a hub restart, or after a failed write", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const inv = { sendInvites: true, attendees: [{ name: "Bo", email: "bo@x.com" }] };
+    // (1) The upsert was collected, no result came back, and the hub restarted (its
+    // in-memory sent-memo gone): the copy may have sent, so it stays.
+    const a = (await turma2968("POST", null, ev2968([S2985A], inv))).body.event.id;
+    const holder = rec2985(a).outlook[S2985A].host;
+    const other = holder === D2985A ? D2985A2 : D2985A;
+    await beat2985(holder, S2985A);
+    // (2) The first write failed in words that do not prove nothing was sent.
+    const b = (await turma2968("POST", null, ev2968([S2985A], { ...inv, subject: "B" }))).body.event.id;
+    assert.equal(rec2985(b).outlook[S2985A].host, holder);
+    await beat2985(holder, S2985A, { calendarWriteResults: [{ turmaId: b, org: S2985A, version: 1, op: "upsert",
+      ok: false, error: "Outlook did not answer within 120 s" }] });
+    assert.equal(rec2985(b).outlook[S2985A].outlookId, "");
+    hub.__resetCalendarWriteMemo();
+    const saved = agents[holder];
+    delete agents[holder];
+    hub.calendarOutlookTick(Date.now(), true);
+    for (const id of [a, b]) {
+      assert.deepEqual([rec2985(id).outlook[S2985A].host, rec2985(id).outlook[S2985A].state], [holder, "failed"], id);
+      assert.ok(!(writes2985(other) || []).some((x) => x.turmaId === id), "nothing to another mailbox");
+    }
+    agents[holder] = saved;
+  } finally {
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
+test("XERK-3010: the held reason names the device and is a fixed point", () => {
+  const t = "a".repeat(32);
+  const err = hub.calHeldError(`devx@${t}`);
+  assert.ok(err.startsWith("Kept on devx: "), err);
+  assert.ok(!err.includes(t), "never the tenant id");
+  const long = hub.calHeldError("d".repeat(190));
+  assert.ok(long.length <= 300);
+  const rec = { outlook: { s: { host: "h", outlookId: "", version: 1, state: "failed", error: long, at: 5 } } };
+  assert.equal(hub.calOutlookSanitize(rec.outlook, ["s"], "").s.error, long, "stored exactly as built");
+});
+
+test("XERK-3010: a copy that sends nothing still re-homes", async () => {
   cleanup2985(D2985A, D2985A2);
   try {
     await beat2985(D2985A, S2985A);
@@ -35182,13 +35226,6 @@ test("XERK-3010: a copy that sends nothing, or never reached its host, still re-
     hub.calendarOutlookTick(Date.now(), true);
     assert.equal(rec2985(plain).outlook[S2985A].host, other);
     assert.ok(hub.getCalendarOutlookTombstones()[holder].some((x) => x.turmaId === plain));
-    // A sending copy that provably sent nothing (no id, no ok row, no upsert reached
-    // its host) may move; any of the three holds it.
-    hub.__resetCalendarWriteMemo();
-    const e = { host: holder, outlookId: "", state: "pending" };
-    assert.equal(hub.calCopyMaySend(e, plain), false);
-    assert.equal(hub.calCopyMaySend({ ...e, outlookId: "EID-9" }, plain), true);
-    assert.equal(hub.calCopyMaySend({ ...e, state: "written" }, plain), true);
     agents[holder] = saved;
   } finally {
     cleanup2985(D2985A, D2985A2);
