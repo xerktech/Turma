@@ -1064,6 +1064,38 @@ test("XERK-2939: the detail panel's tint is exactly the session card's mix", () 
   assert.equal(mix(read("brief.html"), "\\.cal-detail"), card, "the panel matches the session card (operator's rule)");
 });
 
+test("XERK-3023: a Turma event's panel wears its block's gradient; an Outlook one keeps the org tint", async () => {
+  replies = { "/api/calendar": () => ({ hosts: [], events: [
+    { host: "", id: "turma:0123456789abcdef", org: "acme", orgs: ["acme"], source: "turma", meetings: [],
+      subject: "Made here", startMs: at(2027, 4, 8, 9), endMs: at(2027, 4, 8, 10) },
+    { host: "h1", id: "o9", org: "acme", source: "outlook", meetings: [], subject: "From Outlook",
+      startMs: at(2027, 4, 8, 11), endMs: at(2027, 4, 8, 12) },
+    { host: "", id: "tenir:m9", org: "acme", source: "tenir", site: "acme", meetingId: "m9", subject: "Impromptu",
+      participants: [], status: "ok", startMs: at(2027, 4, 8, 14), endMs: at(2027, 4, 8, 15) },
+  ] }) };
+  cal.refetch();
+  const { side } = cal._els();
+  await openEvent(at(2027, 4, 8), "Made here");
+  assert.equal(side.className, "cal-detail turma");
+  await openEvent(at(2027, 4, 8), "From Outlook");
+  assert.equal(side.className, "cal-detail", "moving to an Outlook event drops the gradient");
+  await openEvent(at(2027, 4, 8), "Made here");
+  await openEvent(at(2027, 4, 8), "Impromptu");
+  assert.equal(side.className, "cal-detail", "a Tenir-only entry keeps the org tint");
+  const fs = require("node:fs");
+  const css = fs.readFileSync(require("node:path").join(__dirname, "..", "public", "brief.html"), "utf8");
+  const grad = (sel) => (new RegExp(`${sel}\\s*\\{[^}]*?(linear-gradient\\([^;]*\\))`).exec(css) || [])[1];
+  assert.ok(grad("\\.cal-ev\\.turma"), "the block has a gradient");
+  assert.equal(grad("\\.cal-detail\\.turma"), grad("\\.cal-ev\\.turma"), "the panel's gradient is the block's");
+  const rule = /\.cal-detail\.turma\s*\{([^}]*)\}/.exec(css)[1];
+  assert.match(rule, /(^|[\s;])color:\s*#fff/, "the panel's text is white on the gradient");
+  for (const tok of ["--muted", "--ink-2", "--accent-text"]) {
+    assert.match(rule, new RegExp(`${tok}:\\s*#fff;`), `${tok} is solid white (translucent fell under 3:1)`);
+  }
+  assert.match(css, /\.cal-detail\.turma :focus-visible\s*\{\s*outline-color:\s*#fff/, "the focus ring shows on the gradient");
+  assert.match(rule, /--focus-ring:\s*#fff/, "a field's focus halo shows on the gradient too");
+});
+
 test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {
   NOW = at(2026, 11, 12, 10, 30);
   replies = { "/api/calendar": () => ({ hosts: [], events: [] }) };

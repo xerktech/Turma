@@ -226,6 +226,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   - **Turma-made events (XERK-2971 web, XERK-2972 Android)**: both clients create, edit and
     delete them and draw them in the Turma blue → purple with the org-colour bar (split for
     several orgs on the web; a "+N" mark on Android). Details in the next bullet.
+  - XERK-3023 (web): a Turma event's detail panel wears the same blue → purple gradient as its
+    block. Android's detail keeps the org tint for every event: open gap, not ported here.
   - XERK-2943 (web) needs no Android change: a wide web window now narrows the week while the
     detail panel is open, which Android already does by placing the detail beside the grid. The web
     also hides a block's time line by the block's drawn height (`SHORT_DP` against the zoomed row

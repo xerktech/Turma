@@ -1208,6 +1208,8 @@ function paintDetail(force = false) {
   // The panel wears its event's org color (XERK-2939), like the event it opened from.
   const c = safeColor(detail.org ? colorMap().get(detail.org) : "");
   if (c) $side.style.setProperty("--org", c); else $side.style.removeProperty("--org");
+  // A Turma-made event's panel wears its block's blue → purple gradient instead (XERK-3023).
+  $side.className = detail.source === "turma" ? "cal-detail turma" : "cal-detail";
   if (!force && (sidePress || fieldFocused($info))) { sidePending = true; return; }
   sidePending = false;
   if (M) {

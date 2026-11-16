@@ -239,6 +239,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     and `MeetingPart(textOn=)` for the capture's own status lines). On the plain token, muted fell
     to 2.4:1, critical to 3.2:1 and the decision chip to 2.8:1 on a light tint (QA). A new text
     colour in the panel needs the same treatment. Tests: `CalendarPanelTintTest`.
+- **A Turma-made event's panel wears its block's blue → purple instead** (XERK-3023, `.cal-detail.turma`,
+  set in `paintDetail`): white text, every panel text token re-pointed light. The gradient is the
+  block's own (`.cal-ev.turma`), pinned equal by test. Tests: `XERK-3023:` in `calendar.test.js`.
 - **An event counts for the org the hub's matcher reads** (`eventOrg` = the served `matchOrg`;
   an older hub: assigned org, else the host's): for the daily brief and relink candidates (QA:
   another org's unassigned event was offered).
