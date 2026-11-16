@@ -34,7 +34,7 @@ suspend fun fetchStreamedVideo(
         if (dest.isFile && f.size > 0 && dest.length() == f.size) return@runCatching dest
         val until = System.currentTimeMillis() + STREAM_WAIT_MS
         while (true) {
-            val st = container.client.api.sendFileStatus(host, sessionId, f.ref)
+            val st = container.client.api.sendFileStatus(host, sessionId, f.ref, size = f.size.takeIf { it > 0 })
             when (st.state) {
                 "ready" -> break
                 "error" -> throw IOException(st.error.ifBlank { "the host could not send it" })

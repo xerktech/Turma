@@ -36334,22 +36334,32 @@ test("sendfile: an unanswered fetch times out, the spool evicts least-played fir
   sendFiles.clear();
 });
 
-test("sendfile: an upload must declare its length, and one past the spool's room is refused", async () => {
+test("sendfile: room is reserved when play is asked, and an upload past it is refused after its body", async () => {
   sendFiles.clear();
   await upHost("sfD", { sessions: [{ id: "s1", status: "running" }] });
   const ref = "f".repeat(32);
-  const st = () => request("GET", `/api/agents/sfD/sessions/s1/sendfile/${ref}?status=1`, { headers: userHeaders });
-  assert.equal((await st()).body.state, "pending");
-  // Every in-flight byte counts: an upload already reserving the whole budget
-  // leaves no room for this one.
-  sendFiles.set("busy", { state: "pending", uploading: true, reserved: SENDFILE_SPOOL_MAX_BYTES, at: Date.now(), usedAt: Date.now() });
-  const full = await requestRaw("POST", `/api/agents/sfD/sendfiles/s1/${ref}`,
-    { body: Buffer.from("abc"), headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "content-length": "3" } });
-  assert.equal(full.status, 503);
-  assert.match((await st()).body.error, /cache is full/);
+  const st = (q) => request("GET", `/api/agents/sfD/sessions/s1/sendfile/${ref}?status=1${q}`, { headers: userHeaders });
+  // A full cache refuses BEFORE the host is asked, and remembers nothing.
+  sendFiles.set("busy", { state: "pending", reserved: SENDFILE_SPOOL_MAX_BYTES, at: Date.now(), usedAt: Date.now() });
+  const full = await st("&size=3");
+  assert.equal(full.body.state, "error");
+  assert.match(full.body.error, /cache is full/);
+  assert.equal(sendFiles.has(JSON.stringify(["sfD", "s1", ref])), false);
+  // A given-up fetch frees its room: the retry is admitted at once.
+  sendFiles.get("busy").state = "error";
+  assert.equal((await st("&size=3")).body.state, "pending");
+  // Past the hub's own limit is refused outright.
   sendFiles.clear();
-  // No declared length: refused with 411.
-  assert.equal((await st()).body.state, "pending");
+  assert.match((await st(`&size=${2 ** 40}`)).body.error, /over the hub's/);
+  // An upload declaring more than the reserved size is drained, then 413.
+  assert.equal((await st("&size=3")).body.state, "pending");
+  const big = await requestRaw("POST", `/api/agents/sfD/sendfiles/s1/${ref}`,
+    { body: Buffer.from("abcdef"), headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "content-length": "6" } });
+  assert.equal(big.status, 413);
+  assert.match((await st("")).body.error, /larger than the hub was told/);
+  sendFiles.clear();
+  // No declared length: 411.
+  assert.equal((await st("&size=3")).body.state, "pending");
   const http = require("http");
   const status = await new Promise((resolve) => {
     const r = http.request(baseUrl + `/api/agents/sfD/sendfiles/s1/${ref}`, { method: "POST",

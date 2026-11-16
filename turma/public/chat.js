@@ -1869,6 +1869,24 @@
     note.textContent = msg || "";
     box.replaceChildren(btn, note);
   }
+  // A streamed player errored: either its hub copy is gone (restart, eviction —
+  // ▶ again fetches it) or the browser can't decode it (a phone's HEVC clip in
+  // Chrome — the chip, as for an inline clip). Ask the hub which.
+  async function streamVideoFailed(box, v) {
+    let st = null;
+    try {
+      const r = await fetch(v.getAttribute("src") + "?status=1", { cache: "no-store" });
+      st = r.ok ? await r.json() : null;
+    } catch (_) { st = null; }
+    if (st && st.state === "ready") {
+      const chip = document.createElement("span");
+      chip.className = "tool-file-name";
+      chip.textContent = "📎 " + (box.getAttribute("data-name") || "video") + " (this browser can't play it)";
+      box.replaceChildren(chip);
+      return;
+    }
+    resetStreamBox(box, "The video's cached copy is gone — press play to fetch it again.");
+  }
   const STREAM_POLL_MS = 1500;
   const STREAM_WAIT_MS = 5 * 60 * 1000;
   // ▶ on a streamed video: poll the hub (the first poll asks the host for the
@@ -1892,7 +1910,8 @@
     while (Date.now() < until) {
       let st = null;
       try {
-        const r = await fetch(base + "?status=1", { cache: "no-store" });
+        const size = Number(box.getAttribute("data-size")) || 0;
+        const r = await fetch(base + "?status=1" + (size > 0 ? "&size=" + size : ""), { cache: "no-store" });
         st = r.ok ? await r.json() : { state: "error", error: "the hub answered HTTP " + r.status };
       } catch (_) { st = null; }
       if (!box.isConnected) return;
@@ -1936,7 +1955,7 @@
       // restart, failover, eviction): bring ▶ back to fetch it again — never
       // the "can't play" chip, which would be wrong.
       const box = v.closest && v.closest(".md-video-stream");
-      if (box) { resetStreamBox(box, "The video's cached copy is gone — press play to fetch it again."); return; }
+      if (box) { streamVideoFailed(box, v); return; }
       const chip = document.createElement("div");
       chip.className = "tool-file file";
       const span = document.createElement("span");
@@ -1963,7 +1982,8 @@
         // Carried across repaints like an inline clip, so a loading or playing
         // video survives new transcript lines.
         out += '<figure class="tool-file"><div class="md-video-stream" data-vkey="stream:' + f.ref +
-          '" data-ref="' + f.ref + '" data-name="' + name + '">' +
+          '" data-ref="' + f.ref + '" data-name="' + name + '"' +
+          (Number.isSafeInteger(f.size) && f.size > 0 ? ' data-size="' + f.size + '"' : "") + '>' +
           '<button type="button" class="md-video-play">▶ Play video' +
           (Number.isSafeInteger(f.size) && f.size > 0 ? " (" + esc(fmtVideoSize(f.size)) + ")" : "") +
           '</button><span class="md-video-note"></span></div>' +
@@ -4314,7 +4334,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      carryVideos, streamVideoClick, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
+      carryVideos, streamVideoClick, streamVideoFailed, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, backgroundBarVerb, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,

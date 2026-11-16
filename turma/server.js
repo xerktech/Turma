@@ -9665,13 +9665,13 @@ function sweepSendFiles(now = Date.now()) {
   sendFileMakeRoom(0);
 }
 
-// Bytes the spool holds or has promised: ready files plus uploads in flight
-// (their declared length, reserved before the body is read).
+// Bytes the spool holds or has promised: ready files plus every pending fetch
+// (the size the client named, reserved when the fetch was asked for).
 function sendFileSpoolBytes() {
   let total = 0;
   for (const e of sendFiles.values()) {
     if (e.state === "ready") total += e.size || 0;
-    else if (e.uploading) total += e.reserved || 0;
+    else if (e.state === "pending") total += e.reserved || 0; // a given-up fetch frees its room
   }
   return total;
 }
@@ -28933,23 +28933,27 @@ const server = http.createServer(async (req, res) => {
         e.state = "error"; e.error = "the file is not a video the hub serves"; e.at = Date.now();
         return json(res, 400, { error: "unsupported type" });
       }
+      // The room was reserved when the fetch was asked for (the client names the
+      // size), so the normal upload is never refused here. A body declaring MORE
+      // than that is: drained first and answered on its end, never refused on
+      // the declaration (urllib writes the whole body before it reads, and would
+      // lose the answer — contract-agent-hub.md).
       const declared = Number(req.headers["content-length"]);
-      if (!Number.isSafeInteger(declared) || declared < 0) {
-        req.resume();
-        e.state = "error"; e.error = "the host sent the video without a length"; e.at = Date.now();
-        return json(res, 411, { error: "content-length required" });
-      }
-      if (declared > SENDFILE_MAX_BYTES || !sendFileMakeRoom(declared)) {
-        req.resume();
+      const cap = Math.min(e.reserved || SENDFILE_MAX_BYTES, SENDFILE_MAX_BYTES);
+      if (!Number.isSafeInteger(declared) || declared < 0 || declared > cap) {
         e.state = "error"; e.at = Date.now();
-        e.error = declared > SENDFILE_MAX_BYTES
-          ? `the video is over the hub's ${SENDFILE_MAX_BYTES >> 20} MB limit`
-          : "the hub's video cache is full — try again shortly";
-        return json(res, declared > SENDFILE_MAX_BYTES ? 413 : 503, { error: e.error });
+        e.error = !Number.isSafeInteger(declared) || declared < 0
+          ? "the host sent the video without a length"
+          : "the video is larger than the hub was told";
+        const status = e.error.includes("length") ? 411 : 413;
+        let drained = 0;
+        req.on("data", (c) => { drained += c.length; if (drained > cap + RAW_BODY_DRAIN_SLACK) req.destroy(); });
+        req.on("end", () => json(res, status, { error: e.error }));
+        req.on("error", () => {});
+        return;
       }
       const part = sendFileSpoolPath(key, true);
       e.uploading = true;
-      e.reserved = declared;
       let size;
       try {
         size = await spoolRawBody(req, SENDFILE_MAX_BYTES, part);
@@ -29881,7 +29885,18 @@ const server = http.createServer(async (req, res) => {
             if (!old) return json(res, 503, { error: "too many videos loading — try again shortly" });
             dropSendFile(old[0]);
           }
-          e = { host: key, sessionId, ref, state: "pending", at: Date.now(), usedAt: Date.now() };
+          // The size the block named (the client passes it): reserved now, so a
+          // full cache is refused BEFORE the host uploads anything, and is not
+          // remembered (a retry once room frees succeeds at once).
+          const want = Number(url.searchParams.get("size"));
+          const reserve = Number.isSafeInteger(want) && want > 0 ? want : SENDFILE_MAX_BYTES;
+          if (reserve > SENDFILE_MAX_BYTES) {
+            return json(res, 200, { state: "error", error: `the video is over the hub's ${SENDFILE_MAX_BYTES >> 20} MB limit` });
+          }
+          if (!sendFileMakeRoom(reserve)) {
+            return json(res, 200, { state: "error", error: "the hub's video cache is full — try again shortly" });
+          }
+          e = { host: key, sessionId, ref, state: "pending", reserved: reserve, at: Date.now(), usedAt: Date.now() };
           sendFiles.set(fkey, e);
           queueCommand(key, { type: "fetchSendFile", sessionId, ref });
         }

@@ -164,6 +164,8 @@ interface HubApi {
     suspend fun sendFileStatus(
         @Path("host") host: String, @Path("id") id: String, @Path("ref") ref: String,
         @Query("status") status: Int = 1,
+        // The block's size: the hub reserves room for it before asking the host.
+        @Query("size") size: Long? = null,
     ): com.xerktech.turma.model.SendFileStatus
 
     // 200 with entries, or 202 {pending, cmdId}; caller inspects the code.

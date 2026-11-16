@@ -36,11 +36,14 @@ both clients.
 - Spool: `SENDFILE_SPOOL_DIR` (`/data/sendfiles`, shared with the archive), per pod; under HA the
   leader serves the POST and the GETs (XERK-919). Bounded by `SENDFILE_SPOOL_MAX_BYTES`,
   `SENDFILE_IDLE_MS`, `SENDFILE_ENTRIES_MAX`; boot deletes only `sf-*` names.
-  - **The budget counts uploads IN FLIGHT**: an upload must declare its length (411 without), which
-    is reserved before the body is read; least-played ready files are evicted to make room, else
-    503 "cache is full". Counting only ready files let concurrent plays overshoot it (QA).
-  - A copy lost under a playing client (restart, failover, eviction, idle) makes the web player
-    show ▶ again (`resetStreamBox`), never the "can't play" codec chip.
+  - **Room is reserved when play is ASKED**: the client sends the block's `size` on its first
+    `?status=1`; the hub reserves it (evicting least-played ready files) or answers "cache is full"
+    without caching the error, so nothing is uploaded into a full spool. Every PENDING fetch counts;
+    a given-up one frees its room. Counting only ready files let concurrent plays overshoot (QA).
+  - An upload declaring more than was reserved (or no length) is DRAINED, then 413/411 — never
+    refused on its declaration (`contract-agent-hub.md`: urllib loses an early answer).
+  - A streamed player that errors asks `?status=1`: still `ready` = the browser can't decode it
+    (the codec chip); otherwise the copy is gone and ▶ comes back (`streamVideoFailed`).
   - An agent upload that fails in transport posts `?error=`, so the player stops waiting; an
     upload stuck past 2 x `SENDFILE_PENDING_MS` is given up.
 - Web: ▶ polls, then swaps in `<video src=…/sendfile/<ref>>`; only in the LIVE chat (an ended
