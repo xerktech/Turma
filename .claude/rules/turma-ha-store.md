@@ -106,7 +106,15 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
     skips, and `persist()` skips (logged) for in-process callers.
   - A failed load RETRIES (`storeLoadRetryMs`), never gives up: a store down at boot keeps
     the replica unready, by design — never loosen that to "serve the empty mirror".
-  - A watch event carrying a value also counts as loaded. HA off: no gate at all.
+  - A watch event carrying a value also counts as loaded, and the GET reply that lands after
+    it is DROPPED: it is the same or older, and installing it deleted the other replica's
+    write on the next persist (QA-reproduced on Valkey).
+  - A value that does not parse (`SyntaxError`) is NOT retried: it counts as loaded, logged
+    ERROR, and the next write replaces it. Retrying held every replica unready with no route
+    left to repair it.
+  - The elector's `canLead` also waits for the load: a leader still loading would 503 every
+    request its followers forward to it.
+  - HA off: no gate at all.
   - Tests: `turma/tests/store-hydration.test.js`.
 - **Accepted residual (low-churn):** `watch` carries the value SET, not a re-read, so
   two replicas writing the SAME key in the same millisecond can briefly disagree with

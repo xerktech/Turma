@@ -3219,6 +3219,10 @@ function wireExternalStores(store) {
   // keeps this replica out of service rather than letting it clobber shared state.
   const load = (desc) => {
     Promise.resolve(store.ready?.()).then(() => store.get(desc.key)).then((raw) => {
+        // A watch value that landed while this GET was in flight is the same or
+        // NEWER than its reply: installing the reply would roll the mirror back, and
+        // the next whole-mirror write would delete the other replica's change (QA).
+        if (!externalStoresLoading.has(desc.key)) return;
         if (raw == null) {
           // Nothing stored yet — publish our file/seed-primed mirror up, if it
           // carries data (migrates existing single-process state into the store).
@@ -3236,6 +3240,15 @@ function wireExternalStores(store) {
         }
         externalStoresLoading.delete(desc.key);
       }).catch((e) => {
+        // A value that does not parse will never parse: retrying would hold every
+        // replica unready forever with no route left to repair it. It is unreadable
+        // either way, so keep the mirror and let the next write replace it — the
+        // pre-XERK-2995 behaviour, for this case only.
+        if (e instanceof SyntaxError) {
+          console.error(`store ${desc.name}: ERROR the stored value is not valid JSON; serving without it — the next write replaces it: ${e.message}`);
+          externalStoresLoading.delete(desc.key);
+          return;
+        }
         console.error(`store ${desc.name}: load failed, retrying: ${e && e.message}`);
         setTimeout(() => { if (externalStoresLoading.has(desc.key)) load(desc); }, storeLoadRetryMs).unref?.();
       });
@@ -31825,6 +31838,7 @@ if (process.env.TURMA_TEST) {
     // drive the per-host write-through and hydration, and pin the non-HA path off.
     __setLiveStore(store, on) { liveStore = store; HA_ON = !!on; },
     __setStoreLoadRetryMs(ms) { storeLoadRetryMs = ms; },
+    externalStoresPending: () => externalStoresPending(),
     __setDailyBriefDefault(s) { dailyBriefDefault = s; },
     __getHaOn() { return HA_ON; },
     // XERK-763: leader election + the shared single-flight guards. Exported so a
@@ -32760,7 +32774,9 @@ if (process.env.TURMA_TEST) {
     // then ABSTAINS (drops + backdates the lease) so a healthy-store replica promotes.
     // Same signal the forwarder's storeHealthy uses; the lease itself lives in the k8s
     // API, not the store, so it stays writable to hand over.
-    canLead: () => !liveStore.health || liveStore.health === "ready",
+    // XERK-2995: nor may one that has not read the shared stores — it would serve
+    // nothing but 503s while every follower forwards to it.
+    canLead: () => (!liveStore.health || liveStore.health === "ready") && !externalStoresPending(),
     onChange: (leader) => {
       if (leader) {
         console.log("leader: this replica is now the leader — running the singleton sweeps");

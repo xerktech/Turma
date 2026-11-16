@@ -159,3 +159,76 @@ test("XERK-2995: with HA off nothing is gated", async () => {
   release();
   await tick(50);
 });
+
+// A raw upgrade: the first line the hub writes back.
+function upgradeStatus(pathName) {
+  return new Promise((resolve, reject) => {
+    const net = require("net");
+    const { port } = server.address();
+    const sock = net.connect(port, "127.0.0.1", () => {
+      sock.write(`GET ${pathName} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: Upgrade\r\n` +
+        "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n");
+    });
+    let buf = "";
+    sock.on("data", (d) => { buf += d; });
+    sock.on("close", () => resolve(buf.split("\r\n")[0]));
+    sock.on("error", reject);
+  });
+}
+
+test("XERK-2995: an upgrade is refused while loading, and handled again after", async () => {
+  const { store, release } = await heldStore();
+  hub.__setLiveStore(store, true);
+  X.wireExternalStores(store);
+  await tick();
+  assert.equal(hub.externalStoresPending(), true);
+  assert.match(await upgradeStatus("/agent/control?name=h1&token=bad"), / 503 /);
+  release();
+  await tick(80);
+  assert.equal(hub.externalStoresPending(), false);
+  assert.doesNotMatch(await upgradeStatus("/agent/control?name=h1&token=bad"), / 503 /);
+});
+
+test("XERK-2995: a watch value clears the wait, and the older GET reply never rolls it back", async () => {
+  const { store, inner, release } = await heldStore();
+  // The GET is issued before the other replica's write, so it answers the OLD value.
+  const old = await inner.get("policy:tenancy");
+  let releaseOld;
+  const oldReply = new Promise((r) => { releaseOld = r; });
+  store.get = (key) => (key === "policy:tenancy" ? oldReply.then(() => old) : inner.get(key));
+  hub.__setLiveStore(store, true);
+  X.wireExternalStores(store);
+  await tick();
+  // Another replica writes while this one's GET is still in flight.
+  const newer = tenancy.createLocalUser(tenancy.coerceTenancy(old), {
+    username: "gina", passwordHash: await tenancy.hashPassword("gina-password"), groups: ["turma-users"],
+  }).state;
+  await inner.set("policy:tenancy", newer);
+  await tick();
+  assert.deepEqual(usernames(hub.tenancyState()), ["alice", "gina"], "the watch installed the newer value");
+  assert.equal(hub.externalStoresPending(), false, "and cleared the wait");
+  release();
+  releaseOld();
+  await tick(80);
+  assert.deepEqual(usernames(hub.tenancyState()), ["alice", "gina"], "the late reply did not roll it back");
+});
+
+test("XERK-2995: a stored value that does not parse does not hold the replica unready", async () => {
+  const inner = new FileLiveStore({ persistent: {} });
+  const store = Object.create(inner);
+  store.get = (key) => (key === "policy:orgColors"
+    ? Promise.reject(new SyntaxError("Unexpected token")) : inner.get(key));
+  hub.__setStoreLoadRetryMs(20);
+  hub.__setLiveStore(store, true);
+  X.wireExternalStores(store);
+  await tick(80);
+  assert.equal(hub.externalStoresPending(), false);
+  assert.equal((await request("GET", "/readyz")).status, 200);
+});
+
+test("XERK-2995: the leader's sweeps and the lease both wait for the load (source pin)", () => {
+  const src = require("fs").readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const tickBody = src.slice(src.indexOf("function masterOrchestrationTick()"));
+  assert.match(tickBody.slice(0, 600), /if \(externalStoresPending\(\)\) return;/);
+  assert.match(src, /canLead: \(\) => \([^\n]*\) && !externalStoresPending\(\)/);
+});
