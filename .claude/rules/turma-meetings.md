@@ -241,7 +241,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     colour in the panel needs the same treatment. Tests: `CalendarPanelTintTest`.
 - **A Turma-made event's panel wears its block's blue → purple instead** (XERK-3023, `.cal-detail.turma`,
   set in `paintDetail`): white text, every panel text token re-pointed light. The gradient is the
-  block's own (`.cal-ev.turma`), pinned equal by test. Tests: `XERK-3023:` in `calendar.test.js`.
+  block's stops darkened 25% (XERK-3025) so white text clears 4.5:1; pinned to the block by
+  test. Tests: `XERK-3023:` in `calendar.test.js`.
   - Panel fields show focus by a SOLID ring (accent on the tint; white with a dark inner line on
     the gradient), never app.css's 30% halo: it read ~1.45:1 on the tint (QA).
 - **An event counts for the org the hub's matcher reads** (`eventOrg` = the served `matchOrg`;
