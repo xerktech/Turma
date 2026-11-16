@@ -12,6 +12,7 @@ import java.io.IOException
 private const val STREAM_POLL_MS = 1500L
 private const val STREAM_WAIT_MS = 5 * 60 * 1000L
 private val REF_RE = Regex("[0-9a-f]{32}")
+private const val CACHE_KEEP_MS = 24 * 60 * 60 * 1000L
 
 /**
  * A streamed SendUserFile video (web parity: chat.js streamVideoClick): poll the
@@ -27,6 +28,9 @@ suspend fun fetchStreamedVideo(
         val ext = f.name.substringAfterLast('.', "mp4").lowercase().takeIf { it.matches(Regex("[a-z0-9]{1,5}")) } ?: "mp4"
         val dir = File(cacheDir, "sendfile-video").apply { mkdirs() }
         val dest = File(dir, "stream-${f.ref}.$ext")
+        // Streamed copies are re-fetchable: keep the cache from growing forever.
+        val cutoff = System.currentTimeMillis() - CACHE_KEEP_MS
+        dir.listFiles()?.forEach { if (it.name.startsWith("stream-") && it != dest && it.lastModified() < cutoff) it.delete() }
         if (dest.isFile && f.size > 0 && dest.length() == f.size) return@runCatching dest
         val until = System.currentTimeMillis() + STREAM_WAIT_MS
         while (true) {

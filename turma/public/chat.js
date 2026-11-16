@@ -1859,6 +1859,16 @@
     return n >= 1 << 20 ? (n / (1 << 20)).toFixed(n >= 100 << 20 ? 0 : 1) + " MB"
       : Math.max(1, Math.round(n / 1024)) + " KB";
   }
+  function resetStreamBox(box, msg) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "md-video-play";
+    btn.textContent = "▶ Play video";
+    const note = document.createElement("span");
+    note.className = "md-video-note";
+    note.textContent = msg || "";
+    box.replaceChildren(btn, note);
+  }
   const STREAM_POLL_MS = 1500;
   const STREAM_WAIT_MS = 5 * 60 * 1000;
   // ▶ on a streamed video: poll the hub (the first poll asks the host for the
@@ -1922,6 +1932,11 @@
     document.addEventListener("error", (ev) => {
       const v = ev.target;
       if (!v || v.tagName !== "VIDEO" || !v.classList || !v.classList.contains("md-video")) return;
+      // A STREAMED clip that errors has most likely lost its hub copy (hub
+      // restart, failover, eviction): bring ▶ back to fetch it again — never
+      // the "can't play" chip, which would be wrong.
+      const box = v.closest && v.closest(".md-video-stream");
+      if (box) { resetStreamBox(box, "The video's cached copy is gone — press play to fetch it again."); return; }
       const chip = document.createElement("div");
       chip.className = "tool-file file";
       const span = document.createElement("span");
@@ -4299,7 +4314,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
+      carryVideos, streamVideoClick, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, backgroundBarVerb, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,

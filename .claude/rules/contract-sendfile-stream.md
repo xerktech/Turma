@@ -24,6 +24,8 @@ both clients.
   surrogate hashes as U+FFFD).
 - **The ref resolves ONLY to a path the session itself sent** (`_send_file_path_for_ref` re-reads
   its transcript's SendUserFile calls, video extensions only). Never join a ref onto a path.
+  - A call the user REJECTED (its tool_result `is_error`) delivered nothing and never resolves.
+  - The upload refuses a path whose REALPATH is not a video extension (a `.mp4` link to any file).
 - Flow: a client's `GET …/sessions/<id>/sendfile/<ref>?status=1` → `{state: pending|ready|error}`;
   the first one queues `fetchSendFile {sessionId, ref}`. The agent uploads on a worker (never the
   beat) to `POST /api/agents/<host>/sendfiles/<sid>/<ref>` (agent-authed, `X-Sendfile-Type`), or
@@ -31,13 +33,21 @@ both clients.
 - **The hub takes an upload only for a fetch it asked THAT host for** (a pending entry under the
   proved `<host>`), else 404 — an agent cannot push bytes into the spool.
 - Served `nosniff` + `Content-Security-Policy: sandbox`, type from a video whitelist only.
-- Spool: `SENDFILE_SPOOL_DIR` (`/data/sendfiles`), per pod; under HA the leader serves the POST
-  and the GETs (XERK-919), a failover just refetches. Bounded by `SENDFILE_SPOOL_MAX_BYTES`
-  (LRU), `SENDFILE_IDLE_MS`, `SENDFILE_ENTRIES_MAX`; boot deletes only `sf-*` names.
+- Spool: `SENDFILE_SPOOL_DIR` (`/data/sendfiles`, shared with the archive), per pod; under HA the
+  leader serves the POST and the GETs (XERK-919). Bounded by `SENDFILE_SPOOL_MAX_BYTES`,
+  `SENDFILE_IDLE_MS`, `SENDFILE_ENTRIES_MAX`; boot deletes only `sf-*` names.
+  - **The budget counts uploads IN FLIGHT**: an upload must declare its length (411 without), which
+    is reserved before the body is read; least-played ready files are evicted to make room, else
+    503 "cache is full". Counting only ready files let concurrent plays overshoot it (QA).
+  - A copy lost under a playing client (restart, failover, eviction, idle) makes the web player
+    show ▶ again (`resetStreamBox`), never the "can't play" codec chip.
+  - An agent upload that fails in transport posts `?error=`, so the player stops waiting; an
+    upload stuck past 2 x `SENDFILE_PENDING_MS` is given up.
 - Web: ▶ polls, then swaps in `<video src=…/sendfile/<ref>>`; only in the LIVE chat (an ended
   transcript has no running session to resolve against). `carryVideos` carries the box too.
 - Android: polls via `HubApi.sendFileStatus`, downloads through the signed-in OkHttp client to the
-  cache, plays the local file (`LocalSendFileSession` is provided by `ChatScreen` only).
+  cache, plays the local file (`LocalSendFileSession` is provided by `ChatScreen` only); streamed
+  copies older than a day are pruned.
 - An older agent acks `fetchSendFile` and does nothing: the fetch errors after
   `SENDFILE_PENDING_MS` (10 min) with "the host did not send the file in time".
 - Tests: `TestFetchSendFile`, `test_a_video_past_the_inline_cap_streams_by_ref`; the

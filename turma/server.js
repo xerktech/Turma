@@ -9652,7 +9652,9 @@ function dropSendFile(key) {
 // budget, least recently played first. Cheap: at most SENDFILE_ENTRIES_MAX.
 function sweepSendFiles(now = Date.now()) {
   for (const [k, e] of sendFiles) {
-    if (e.state === "pending" && !e.uploading && now - e.at > SENDFILE_PENDING_MS) {
+    if (e.state === "pending" && now - e.at > (e.uploading ? 2 * SENDFILE_PENDING_MS : SENDFILE_PENDING_MS)) {
+      // An upload stuck past twice the wait (a body shorter than it declared) is
+      // given up too; its late finish finds the entry no longer pending.
       e.state = "error"; e.error = "the host did not send the file in time"; e.at = now;
     } else if (e.state === "error" && now - e.at > SENDFILE_ERROR_KEEP_MS) {
       dropSendFile(k);
@@ -9660,15 +9662,33 @@ function sweepSendFiles(now = Date.now()) {
       dropSendFile(k);
     }
   }
+  sendFileMakeRoom(0);
+}
+
+// Bytes the spool holds or has promised: ready files plus uploads in flight
+// (their declared length, reserved before the body is read).
+function sendFileSpoolBytes() {
   let total = 0;
-  const ready = [];
-  for (const [k, e] of sendFiles) if (e.state === "ready") { total += e.size || 0; ready.push([k, e]); }
-  ready.sort((a, b) => a[1].usedAt - b[1].usedAt);
-  while (total > SENDFILE_SPOOL_MAX_BYTES && ready.length > 1) {
+  for (const e of sendFiles.values()) {
+    if (e.state === "ready") total += e.size || 0;
+    else if (e.uploading) total += e.reserved || 0;
+  }
+  return total;
+}
+
+// Evict ready files, least recently played first, until `need` more bytes fit
+// the budget. Returns whether they do (uploads in flight are never evicted).
+function sendFileMakeRoom(need) {
+  let total = sendFileSpoolBytes();
+  if (total + need <= SENDFILE_SPOOL_MAX_BYTES) return true;
+  const ready = [...sendFiles].filter(([, e]) => e.state === "ready")
+    .sort((a, b) => a[1].usedAt - b[1].usedAt);
+  while (total + need > SENDFILE_SPOOL_MAX_BYTES && ready.length) {
     const [k, e] = ready.shift();
     total -= e.size || 0;
     dropSendFile(k);
   }
+  return total + need <= SENDFILE_SPOOL_MAX_BYTES;
 }
 
 // Boot: the index is in memory, so anything left in the spool belongs to no one.
@@ -9710,7 +9730,8 @@ function serveSendFile(req, res, e) {
   let end = size - 1;
   let status = 200;
   const range = req.headers.range;
-  if (typeof range === "string" && range.startsWith("bytes=")) {
+  // One range only; a multi-range request is answered whole (RFC 9110 allows it).
+  if (typeof range === "string" && range.startsWith("bytes=") && !range.includes(",")) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
     let ok = !!m && (m[1] !== "" || m[2] !== "");
     if (ok) {
@@ -28912,8 +28933,23 @@ const server = http.createServer(async (req, res) => {
         e.state = "error"; e.error = "the file is not a video the hub serves"; e.at = Date.now();
         return json(res, 400, { error: "unsupported type" });
       }
+      const declared = Number(req.headers["content-length"]);
+      if (!Number.isSafeInteger(declared) || declared < 0) {
+        req.resume();
+        e.state = "error"; e.error = "the host sent the video without a length"; e.at = Date.now();
+        return json(res, 411, { error: "content-length required" });
+      }
+      if (declared > SENDFILE_MAX_BYTES || !sendFileMakeRoom(declared)) {
+        req.resume();
+        e.state = "error"; e.at = Date.now();
+        e.error = declared > SENDFILE_MAX_BYTES
+          ? `the video is over the hub's ${SENDFILE_MAX_BYTES >> 20} MB limit`
+          : "the hub's video cache is full — try again shortly";
+        return json(res, declared > SENDFILE_MAX_BYTES ? 413 : 503, { error: e.error });
+      }
       const part = sendFileSpoolPath(key, true);
       e.uploading = true;
+      e.reserved = declared;
       let size;
       try {
         size = await spoolRawBody(req, SENDFILE_MAX_BYTES, part);
@@ -28927,7 +28963,10 @@ const server = http.createServer(async (req, res) => {
         return json(res, 500, { error: e.error });
       }
       e.uploading = false;
-      if (sendFiles.get(key) !== e) { fs.unlink(part, () => {}); return json(res, 404, { error: "no such fetch" }); }
+      if (sendFiles.get(key) !== e || e.state !== "pending") {
+        fs.unlink(part, () => {});
+        return json(res, 404, { error: "no such fetch" });
+      }
       const final = sendFileSpoolPath(key, false);
       try { fs.renameSync(part, final); } catch {
         fs.unlink(part, () => {});
@@ -33130,7 +33169,7 @@ if (process.env.TURMA_TEST) {
     // `armLiveWatcher`/`disarmLiveWatcher` are the `/live` machinery. Exported so a
     // test can drive the cross-replica paths with an injected relay (`__setRelay`).
     openChannel, openChannelLocal, openLiveForRelay, openLiveRelay, openMigrationBlobForRelay,
-    sendFiles, sweepSendFiles, SENDFILE_SPOOL_DIR,
+    sendFiles, sweepSendFiles, SENDFILE_SPOOL_DIR, SENDFILE_PENDING_MS, SENDFILE_SPOOL_MAX_BYTES,
     openUploadBlobForRelay, setUploadStore, UPLOAD_DIR_PREFIX, publishUploadDir,
     liveFanout, liveClients, liveRelayChannels, liveWatchArmed,
     armLiveWatcher, disarmLiveWatcher,

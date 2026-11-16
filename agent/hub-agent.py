@@ -11163,17 +11163,20 @@ def _send_file_path_for_ref(tpath, ref):
     """The VIDEO path one of this transcript's SendUserFile calls delivered whose
     `send_file_ref` is `ref`, else None. The ref is client-supplied, so it is
     only ever matched against paths the session itself sent — never joined onto
-    anything. Read line by line (a transcript can be large; this runs on the
-    upload worker, never the beat)."""
+    anything. A call the user REJECTED (its tool_result `is_error`) delivered
+    nothing and does not count. Read line by line (a transcript can be large;
+    this runs on the upload worker, never the beat)."""
     if not tpath:
         return None
     try:
         fh = open(tpath, "rb")
     except OSError:
         return None
+    hits = []        # (tool_use id, path) in transcript order
+    refused = set()  # tool_use ids whose result is an error
     with fh:
         for line in fh:
-            if b"SendUserFile" not in line:
+            if b"SendUserFile" not in line and b'"is_error"' not in line:
                 continue
             try:
                 entry = json.loads(line)
@@ -11184,8 +11187,13 @@ def _send_file_path_for_ref(tpath, ref):
             if not isinstance(content, list):
                 continue
             for b in content:
-                if not (isinstance(b, dict) and b.get("type") == "tool_use"
-                        and b.get("name") == "SendUserFile"):
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_result" and b.get("is_error") is True:
+                    if isinstance(b.get("tool_use_id"), str):
+                        refused.add(b["tool_use_id"])
+                    continue
+                if not (b.get("type") == "tool_use" and b.get("name") == "SendUserFile"):
                     continue
                 inp = b.get("input")
                 files = inp.get("files") if isinstance(inp, dict) else None
@@ -11193,7 +11201,10 @@ def _send_file_path_for_ref(tpath, ref):
                     if (isinstance(p, str) and p
                             and os.path.splitext(p)[1].lower() in SEND_FILE_VIDEO_MIME
                             and send_file_ref(p) == ref):
-                        return p
+                        hits.append((b.get("id"), p))
+    for tid, p in hits:
+        if tid is None or tid not in refused:
+            return p
     return None
 
 
@@ -37571,6 +37582,14 @@ class SessionManager:
             return self._send_file_report_error(
                 session_id, ref, "the session never sent that file")
         mime = SEND_FILE_VIDEO_MIME.get(os.path.splitext(path)[1].lower())
+        # A link named like a video must lead to a video: never stream an
+        # arbitrary file under a .mp4 name.
+        try:
+            real = os.path.realpath(path)
+        except (OSError, ValueError):
+            real = ""
+        if os.path.splitext(real)[1].lower() not in SEND_FILE_VIDEO_MIME:
+            return self._send_file_report_error(session_id, ref, "the file is not a video")
         fd = None
         try:
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
@@ -37603,6 +37622,11 @@ class SessionManager:
                 log(f"fetchSendFile {session_id}/{ref}: uploaded {st.st_size} bytes")
             except Exception as e:
                 log(f"fetchSendFile {session_id}/{ref}: upload failed: {_urlopen_error_detail(e)}")
+                # The hub sets its own error for a refusal it answered; for a
+                # transport failure it never saw, tell it so the player stops
+                # waiting (a no-op 404 if the fetch is already settled).
+                if not isinstance(getattr(e, "code", None), int):
+                    self._send_file_report_error(session_id, ref, "the upload from the host failed")
 
     def _migration_upload(self, migration_id, blob):
         """POST a transcript bundle to the hub's migration relay (octet-stream,

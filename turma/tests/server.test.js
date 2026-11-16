@@ -304,6 +304,7 @@ const {
   repoTiers, repoTier, repoTierRank, isRepoIgnored, setRepoTier,
   DEFAULT_REPO_TIER, REPO_TIERS,
   migrations, advanceMigrations, MIGRATE_SPOOL_DIR, sweepMigrationSpool,
+  sendFiles, sweepSendFiles, SENDFILE_PENDING_MS, SENDFILE_SPOOL_MAX_BYTES, SENDFILE_SPOOL_DIR,
   dropMigrationBlob, migrationSpoolPath,
   // XERK-761: migration record/spool sharing across replicas.
   setMigrationStore, hydrateMigrations, sweepMigrationSpoolShared,
@@ -36228,7 +36229,6 @@ test("XERK-2953: a 'following' split that deletes the dead old series deletes it
 
 // ---- Streamed SendUserFile videos -------------------------------------------
 test("sendfile: play asks the host once, the agent's upload is served with ranges", async () => {
-  const { sendFiles } = require("../server.js");
   const ref = "a".repeat(32);
   await upHost("sfA", { sessions: [{ id: "s1", status: "running" }] });
   const st = (q = "?status=1") => request("GET", `/api/agents/sfA/sessions/s1/sendfile/${ref}${q}`, { headers: userHeaders });
@@ -36246,7 +36246,7 @@ test("sendfile: play asks the host once, the agent's upload is served with range
 
   // Another host's credential cannot answer it; an unknown fetch is a 404.
   const body = Buffer.from("0123456789");
-  const vt = { "x-sendfile-type": "video/mp4", "content-type": "application/octet-stream" };
+  const vt = { "x-sendfile-type": "video/mp4", "content-type": "application/octet-stream", "content-length": "10" };
   assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${ref}`,
     { body, headers: { ...asHost("sfB"), ...vt } })).status, 403);
   assert.equal((await requestRaw("POST", `/api/agents/sfA/sendfiles/s1/${"b".repeat(32)}`,
@@ -36285,7 +36285,6 @@ test("sendfile: play asks the host once, the agent's upload is served with range
 });
 
 test("sendfile: an agent's error, a bad type and an unknown session settle as errors", async () => {
-  const { sendFiles } = require("../server.js");
   await upHost("sfC", { sessions: [{ id: "s1", status: "running" }] });
   const st = (ref, sid = "s1") => request("GET", `/api/agents/sfC/sessions/${sid}/sendfile/${ref}?status=1`, { headers: userHeaders });
   const r1 = "c".repeat(32);
@@ -36298,12 +36297,81 @@ test("sendfile: an agent's error, a bad type and an unknown session settle as er
 
   assert.equal((await st(r2)).body.state, "pending");
   const e2 = await requestRaw("POST", `/api/agents/sfC/sendfiles/s1/${r2}`,
-    { body: Buffer.from("<html>"), headers: { ...asHost("sfC"), "x-sendfile-type": "text/html" } });
+    { body: Buffer.from("<html>"), headers: { ...asHost("sfC"), "x-sendfile-type": "text/html", "content-length": "6" } });
   assert.equal(e2.status, 400);
   assert.equal((await st(r2)).body.state, "error");
 
   assert.equal((await st("e".repeat(32), "nope")).body.state, "error");
   assert.equal((await request("GET", "/api/agents/sfC/sessions/s1/sendfile/../../x?status=1", { headers: userHeaders })).status === 200, false);
   assert.equal((await st("NOTHEX")).status, 400);
+  sendFiles.clear();
+});
+
+
+test("sendfile: an unanswered fetch times out, the spool evicts least-played first and reserves uploads", async () => {
+  sendFiles.clear();
+  const now = Date.now();
+  // An older agent acks fetchSendFile and never answers: the fetch errors.
+  sendFiles.set("p", { state: "pending", at: now - SENDFILE_PENDING_MS - 1, usedAt: now });
+  // A stuck upload gets twice as long, then is given up too.
+  sendFiles.set("u", { state: "pending", uploading: true, reserved: 5, at: now - SENDFILE_PENDING_MS - 1, usedAt: now });
+  sweepSendFiles(now);
+  assert.equal(sendFiles.get("p").state, "error");
+  assert.match(sendFiles.get("p").error, /did not send the file in time/);
+  assert.equal(sendFiles.get("u").state, "pending");
+  sweepSendFiles(now + SENDFILE_PENDING_MS + 1);
+  assert.equal(sendFiles.get("u").state, "error");
+  sendFiles.clear();
+
+  // Over budget: the least recently played ready file goes first.
+  const mk = (n) => { const f = require("path").join(SENDFILE_SPOOL_DIR, `x${n}`); require("fs").writeFileSync(f, "x"); return f; };
+  const half = Math.floor(SENDFILE_SPOOL_MAX_BYTES / 2) + 1;
+  sendFiles.set("old", { state: "ready", size: half, usedAt: now - 1000, at: now, path: mk(1) });
+  sendFiles.set("new", { state: "ready", size: half, usedAt: now, at: now, path: mk(2) });
+  sweepSendFiles(now);
+  assert.equal(sendFiles.has("old"), false);
+  assert.equal(sendFiles.has("new"), true);
+  sendFiles.clear();
+});
+
+test("sendfile: an upload must declare its length, and one past the spool's room is refused", async () => {
+  sendFiles.clear();
+  await upHost("sfD", { sessions: [{ id: "s1", status: "running" }] });
+  const ref = "f".repeat(32);
+  const st = () => request("GET", `/api/agents/sfD/sessions/s1/sendfile/${ref}?status=1`, { headers: userHeaders });
+  assert.equal((await st()).body.state, "pending");
+  // Every in-flight byte counts: an upload already reserving the whole budget
+  // leaves no room for this one.
+  sendFiles.set("busy", { state: "pending", uploading: true, reserved: SENDFILE_SPOOL_MAX_BYTES, at: Date.now(), usedAt: Date.now() });
+  const full = await requestRaw("POST", `/api/agents/sfD/sendfiles/s1/${ref}`,
+    { body: Buffer.from("abc"), headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "content-length": "3" } });
+  assert.equal(full.status, 503);
+  assert.match((await st()).body.error, /cache is full/);
+  sendFiles.clear();
+  // No declared length: refused with 411.
+  assert.equal((await st()).body.state, "pending");
+  const http = require("http");
+  const status = await new Promise((resolve) => {
+    const r = http.request(baseUrl + `/api/agents/sfD/sendfiles/s1/${ref}`, { method: "POST",
+      headers: { ...asHost("sfD"), "x-sendfile-type": "video/mp4", "transfer-encoding": "chunked" } },
+    (res) => { res.resume(); resolve(res.statusCode); });
+    r.end("abc");
+  });
+  assert.equal(status, 411);
+  sendFiles.clear();
+});
+
+test("sendfile: a multi-range request is answered whole", async () => {
+  sendFiles.clear();
+  await upHost("sfE", { sessions: [{ id: "s1", status: "running" }] });
+  const ref = "9".repeat(32);
+  await request("GET", `/api/agents/sfE/sessions/s1/sendfile/${ref}?status=1`, { headers: userHeaders });
+  await requestRaw("POST", `/api/agents/sfE/sendfiles/s1/${ref}`,
+    { body: Buffer.from("abcdefgh"), headers: { ...asHost("sfE"), "x-sendfile-type": "video/webm", "content-length": "8" } });
+  const r = await requestRaw("GET", `/api/agents/sfE/sessions/s1/sendfile/${ref}`,
+    { headers: { ...userHeaders, range: "bytes=0-1,5-6" } });
+  assert.equal(r.status, 200);
+  assert.equal(r.buf.toString(), "abcdefgh");
+  assert.equal(r.headers["content-type"], "video/webm");
   sendFiles.clear();
 });

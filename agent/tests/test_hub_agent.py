@@ -59558,6 +59558,59 @@ class TestFetchSendFile(ManagerMixin, unittest.TestCase):
             sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
         self.assertIn("?error=", seen[0]["url"])
 
+    def test_a_send_the_user_rejected_never_resolves(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        clip = os.path.join(d, "cut.mp4")
+        open(clip, "wb").close()
+        tpath = os.path.join(d, "t.jsonl")
+        with open(tpath, "w") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tu1", "name": "SendUserFile", "input": {"files": [clip]}}]}}) + "\n")
+            fh.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tu1", "is_error": True,
+                 "content": "The user doesn't want to proceed with this tool use."}]}}) + "\n")
+        self.assertIsNone(ha._send_file_path_for_ref(tpath, ha.send_file_ref(clip)))
+        # A later accepted send of the same file does resolve.
+        with open(tpath, "a") as fh:
+            fh.write(json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tu2", "name": "SendUserFile", "input": {"files": [clip]}}]}}) + "\n")
+        self.assertEqual(ha._send_file_path_for_ref(tpath, ha.send_file_ref(clip)), clip)
+
+    def test_a_video_named_link_to_another_file_is_refused(self):
+        sm = self.make_manager()
+        clip, tpath = self._setup()
+        secret = clip + ".txt"
+        with open(secret, "w") as fh:
+            fh.write("not a video")
+        os.unlink(clip)
+        os.symlink(secret, clip)
+        seen, patch = self._capture()
+        with patch:
+            sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("?error=", seen[0]["url"])
+
+    def test_a_transport_failure_is_reported_to_the_hub(self):
+        sm = self.make_manager()
+        clip, tpath = self._setup()
+        calls = []
+
+        def boom(req, timeout=None):
+            calls.append(req.full_url)
+            if len(calls) == 1:
+                raise ConnectionResetError("reset")
+
+            class R:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def read(self): return b""
+            return R()
+        with mock.patch.object(ha.urllib.request, "urlopen", boom):
+            sm._upload_send_file("s1", ha.send_file_ref(clip), tpath)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("?error=", calls[1])
+
     def test_a_bad_ref_or_unknown_session_never_uploads(self):
         sm = self.make_manager()
         seen, patch = self._capture()

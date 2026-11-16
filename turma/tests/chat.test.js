@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
+const { carryVideos, streamVideoClick, mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -1440,6 +1440,23 @@ test("render: a streamed SendUserFile video is a play button carrying only its r
   assert.doesNotMatch(html, /<video/);          // nothing loads until play
   assert.doesNotMatch(html, /etc/);             // a malformed ref is no player
   assert.match(html, /📎 x\.mp4/);
+});
+
+test("streamVideoClick: outside the live chat it explains, and never asks the hub", async () => {
+  const prevDoc = global.document, prevFetch = global.fetch;
+  let fetched = 0;
+  global.fetch = async () => { fetched++; return { ok: true, json: async () => ({ state: "pending" }) }; };
+  global.document = { getElementById: (id) => (id === "chatScroll" ? { contains: () => false } : null) };
+  const note = { textContent: "" };
+  const btn = { disabled: false };
+  const box = { querySelector: (sel) => (sel === ".md-video-note" ? note : btn), getAttribute: () => "a".repeat(32), isConnected: true };
+  try {
+    await streamVideoClick(box);
+  } finally {
+    global.document = prevDoc; global.fetch = prevFetch;
+  }
+  assert.equal(fetched, 0);
+  assert.match(note.textContent, /only while its session is running/);
 });
 
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {
