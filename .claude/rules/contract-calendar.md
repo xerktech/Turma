@@ -369,6 +369,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
       that tenant's user (`calTurmaOwner`), or nobody could ever change or delete it.
     - So is one whose creator `user:<id>` is gone or of another tenant (XERK-2978); untenanted,
       any admin-role principal owns it (not `legacy`). A disabled creator still counts as live.
+    - "Gone" is judged only once the users store has loaded (`tenancyHydrated`, XERK-2993): an
+      HA replica's `/data` is empty until then, so an absent creator reads as live, never orphaned.
     - Only the owner may make an event private/confidential: a non-owner hiding one locked every
       other viewer out, itself included, with no way back. Both refusals carry no `event`.
 - **Clients send `recurrence` (the rule, or null) and an occurrence's `scope`** (XERK-2973): never a

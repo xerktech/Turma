@@ -3144,10 +3144,10 @@ const asFlagMap = (raw) => {
 // store's setter AFTER mutating the mirror. `read` returns the current mirror
 // value; `install` replaces the mirror with a coerced value (boot-load / remote
 // watch); `coerce` validates a raw value to the store's shape.
-function registerExternalStore({ name, file, coerce, read, install, afterLoad, debounceMs = 5000, mode }) {
+function registerExternalStore({ name, file, coerce, read, install, afterLoad, onLoaded, debounceMs = 5000, mode }) {
   const key = STORE_KEY_PREFIX + name;
   STORE_PERSISTENT[key] = mode ? { file, debounceMs, mode } : { file, debounceMs };
-  externalizedStores.push({ key, name, coerce, read, install, afterLoad });
+  externalizedStores.push({ key, name, coerce, read, install, afterLoad, onLoaded });
   return function persist() {
     // `liveStore` is the module-load backend (file/in-memory off, Valkey on). On
     // the file backend it writes this store's /data file (via STORE_PERSISTENT);
@@ -3210,6 +3210,9 @@ function wireExternalStores(store) {
           applyExternalStoreValue(desc, raw);
           desc.afterLoad?.();
         }
+        // The backend's value is now this replica's (stored or seeded up), on
+        // either branch — `afterLoad` runs on the stored one only.
+        desc.onLoaded?.();
       }).catch((e) => console.error(`store ${desc.name}: load failed: ${e && e.message}`));
     }
   }).catch(() => {});
@@ -3343,9 +3346,15 @@ const persistAgentIdentities = registerExternalStore({
 // tenancy.coerceTenancy. No debounce: a login or an account change is human-rate,
 // and a 200 must mean the record is kept.
 let tenancyState = tenancy.coerceTenancy(readJsonFile(TENANCY_FILE));
+// Under HA /data is a per-pod emptyDir, so until the shared store's users land a
+// replica holds NONE: a user absent from `tenancyState.users` then proves nothing
+// about that user being gone (XERK-2993). HA off, the file IS the store.
+let tenancyHydrated = !HA_ON;
 const persistTenancy = registerExternalStore({
   name: "tenancy", file: TENANCY_FILE, debounceMs: 0, mode: 0o600, // holds password hashes
-  coerce: tenancy.coerceTenancy, read: () => tenancyState, install: (v) => { tenancyState = v; endStaleUserStreams(); },
+  coerce: tenancy.coerceTenancy, read: () => tenancyState,
+  install: (v) => { tenancyState = v; tenancyHydrated = true; endStaleUserStreams(); },
+  onLoaded: () => { tenancyHydrated = true; },
 });
 function setTenancy(next) {
   tenancyState = next;
@@ -6633,6 +6642,9 @@ function calTurmaOwner(p, rec) {
   const t = tenantOfSite(rec.orgs[0] || "");
   const by = String(rec.createdBy);
   if (!by.startsWith("user:")) return !!t && p.kind === "user" && p.tenantId === t;
+  // Before the users store has hydrated, an absent creator may just not be loaded
+  // yet: read it as a live owner (withheld from everyone else), never as orphaned.
+  if (!tenancyHydrated) return false;
   const uid = by.slice(5);
   const creator = Object.hasOwn(tenancyState.users, uid) ? tenancyState.users[uid] : null;
   if (creator && (!t || creator.tenantId === t)) return false;   // a live owner
@@ -31773,6 +31785,7 @@ if (process.env.TURMA_TEST) {
     __setLiveStore(store, on) { liveStore = store; HA_ON = !!on; },
     __setDailyBriefDefault(s) { dailyBriefDefault = s; },
     __getHaOn() { return HA_ON; },
+    __setTenancyHydrated(v) { tenancyHydrated = !!v; },
     // XERK-763: leader election + the shared single-flight guards. Exported so a
     // test can inject a leader (drive isLeader() true/false), drive the guard
     // write-through + hydration against an injected FileLiveStore, and pin the
