@@ -52,10 +52,11 @@ class CalendarEventsTest {
         assertEquals("private", p["sensitivity"]!!.jsonPrimitive.content)
     }
 
-    @Test fun `XERK-2988 a reminder defaults to 15 minutes, round-trips, and none sends null`() {
+    @Test fun `XERK-2988 a reminder defaults to none, round-trips, and none sends null`() {
         val d = draft("o")
-        assertEquals("15", d.reminder)
-        assertEquals(15, calDraftPayload(d)["reminderMinutes"]!!.jsonPrimitive.content.toInt())
+        assertEquals("", d.reminder)
+        assertEquals(kotlinx.serialization.json.JsonNull, calDraftPayload(d)["reminderMinutes"])
+        assertEquals(15, calDraftPayload(d.copy(reminder = "15"))["reminderMinutes"]!!.jsonPrimitive.content.toInt())
         assertEquals(kotlinx.serialization.json.JsonNull, calDraftPayload(d.copy(reminder = ""))["reminderMinutes"])
         assertEquals(kotlinx.serialization.json.JsonNull, calDraftPayload(d.copy(reminder = "7"))["reminderMinutes"])
         assertEquals(1440, calDraftPayload(d.copy(reminder = "1440"))["reminderMinutes"]!!.jsonPrimitive.content.toInt())

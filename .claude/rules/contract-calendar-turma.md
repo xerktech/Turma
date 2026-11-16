@@ -51,7 +51,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
   - `busy` free|tentative|busy|outOfOffice|workingElsewhere (default busy).
   - `reminderMinutes` (XERK-2988): null (none, the default and an older record's) or one of
     `CAL_TURMA_REMINDERS` (0, 5, 15, 30, 60, 120, 720, 1440, 10080); anything else is a 400.
-    Clients default a NEW event to 15 (web `REMINDER_DEFAULT`, Android `CAL_REMINDER_DEFAULT`);
+    A NEW event defaults to none (web `REMINDER_DEFAULT`, Android `CAL_REMINDER_DEFAULT`): it
+    fires in the writer host's Outlook, whose owner may be neither creator nor attendee;
     the three lists (hub, `calendar.js` `REMINDERS`, `CAL_REMINDERS`) move together, plus the
     agent's `CALENDAR_REMINDER_MINUTES`. An occurrence may override it like any client field.
   - `recurrence`: a rule (below) or `null` for a single event; `exceptions` its per-occurrence edits.

@@ -254,7 +254,8 @@ __ATTACH__
 # the `TurmaId` user property (PS_PUBLIC_STRINGS) — and an item only counts when
 # its stamp IS that id, so a stale or foreign EntryID never edits someone's own
 # appointment, and a re-sent upsert finds its copy instead of making a second.
-# Save() only: never Send(), never a MeetingItem, no reminder (XERK-2988's).
+# Save() only: never Send(), never a MeetingItem. A reminder is set only when the
+# record names one (XERK-2988), else ReminderSet is cleared.
 # Delete() of a copy already gone is ok. Times arrive as UTC epoch ms plus a
 # WINDOWS zone id: the zone is set first, then StartUTC/EndUTC, so the reader's
 # StartUTC/EndUTC read back the same instants (a wall time could not tell the

@@ -713,7 +713,9 @@ const SHOW_AS = { free: "Free", tentative: "Tentative", busy: "Busy", outOfOffic
 const REMINDERS = [["", "None"], ["0", "At start time"], ["5", "5 minutes before"], ["15", "15 minutes before"],
   ["30", "30 minutes before"], ["60", "1 hour before"], ["120", "2 hours before"], ["720", "12 hours before"],
   ["1440", "1 day before"], ["10080", "1 week before"]];
-const REMINDER_DEFAULT = "15";   // a new event's, as Teams and Outlook default it
+// A new event's: none. The reminder fires in the writer host's Outlook, whose owner may be
+// neither the creator nor an attendee, so it is set only when someone picks one.
+const REMINDER_DEFAULT = "";
 const reminderKey = (v) => (Number.isInteger(v) && REMINDERS.some(([k]) => k === String(v)) ? String(v) : "");
 const reminderText = (v) => { const k = reminderKey(v); return k ? REMINDERS.find(([x]) => x === k)[1] : ""; };
 const RESPONSE = { organizer: "Organizer", accepted: "Accepted", tentative: "Tentative", declined: "Declined",

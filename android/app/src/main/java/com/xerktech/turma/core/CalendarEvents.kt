@@ -89,8 +89,11 @@ val CAL_REMINDERS = listOf(
     "720" to "12 hours before", "1440" to "1 day before", "10080" to "1 week before",
 )
 
-/** A new event's reminder, as Teams and Outlook default it. */
-const val CAL_REMINDER_DEFAULT = "15"
+/**
+ * A new event's reminder: none. It fires in the writer host's Outlook, whose owner may be
+ * neither the creator nor an attendee, so it is set only when someone picks one (web `REMINDER_DEFAULT`).
+ */
+const val CAL_REMINDER_DEFAULT = ""
 
 /** A served `reminderMinutes` as the editor's key; "" for none or one off the list. */
 fun calReminderKey(v: Int?): String = v?.toString()?.takeIf { k -> k.isNotEmpty() && CAL_REMINDERS.any { it.first == k } } ?: ""

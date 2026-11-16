@@ -1286,10 +1286,11 @@ test("XERK-2971: form validation mirrors the hub — orgs, emails, times, https 
   }
 });
 
-test("XERK-2988: a reminder round-trips the form, defaults to 15 minutes, and shows on the panel", () => {
+test("XERK-2988: a reminder round-trips the form, defaults to none, and shows on the panel", () => {
   const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme"] };
-  assert.equal(f.reminder, "15", "a new event defaults like Teams");
-  assert.equal(cal.formPayload(f).reminderMinutes, 15);
+  assert.equal(f.reminder, "", "a new event has no reminder until one is picked");
+  assert.equal(cal.formPayload(f).reminderMinutes, null);
+  assert.equal(cal.formPayload({ ...f, reminder: "15" }).reminderMinutes, 15);
   assert.equal(cal.formPayload({ ...f, reminder: "" }).reminderMinutes, null, "None sends null");
   assert.equal(cal.formPayload({ ...f, reminder: "7" }).reminderMinutes, null, "off the list sends none");
   assert.equal(cal.formPayload({ ...f, reminder: "1440" }).reminderMinutes, 1440);
