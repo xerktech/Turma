@@ -5997,10 +5997,14 @@ function sanitizeCalendarEvent(v) {
 const calEventOrder = (a, b) => a.startMs - b.startMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 function sanitizeCalendarHost(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
-  const out = { syncedAt: calMs(v.syncedAt), windowFrom: calMs(v.windowFrom),
-    windowUntil: calMs(v.windowUntil), ranges: [] };
+  // A window past year 10000 (CALENDAR_SERVE_UNTIL_MAX, inline: this runs at restore) was
+  // stored by an older hub; the sync refuses it now, so a kept one reads as none (XERK-2953).
+  const until = (x) => (calMs(x) <= 253402300800000 ? calMs(x) : 0);
+  const windowUntil = until(v.windowUntil);
+  const out = { syncedAt: calMs(v.syncedAt), windowFrom: windowUntil ? calMs(v.windowFrom) : 0,
+    windowUntil, ranges: [] };
   for (const r of Array.isArray(v.ranges) ? v.ranges.slice(0, CALENDAR_RANGES_MAX) : []) {
-    if (Array.isArray(r) && calMs(r[0]) && calMs(r[1]) > r[0]) out.ranges.push([r[0], r[1]]);
+    if (Array.isArray(r) && calMs(r[0]) && until(r[1]) > r[0]) out.ranges.push([r[0], r[1]]);
   }
   const err = meetingText(v.lastError, 300);
   if (err) {
@@ -6332,7 +6336,7 @@ function applyCalendarSync(key, row, now) {
   if (!from || until <= from || until - from > CALENDAR_SPAN_MAX_MS || until > CALENDAR_SERVE_UNTIL_MAX) {
     return calendarRecordError(key, "the hub refused a calendar sync: its window must be epoch ms " +
       `with until after from, at most ${CALENDAR_SPAN_MAX_MS / CALENDAR_WEEK_MS} weeks long, ` +
-      "ending by the year 10000", now);
+      "ending by the year 9999", now);
   }
   if (!Array.isArray(row.events)) {
     return calendarRecordError(key, meetingText(row.error, 300) || "the agent sent no events list", now);
