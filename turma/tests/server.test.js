@@ -35568,8 +35568,11 @@ test("XERK-3014: a copy's sent mark and a tombstone's survive coercion", () => {
 async function drop3015() {
   await beat2985(D2985A, S2985A);
   await beat2985(D2985B, S2985B);
-  const id = (await turma2968("POST", null, ev2968([S2985A, S2985B],
+  // A two-org sending record from before XERK-3016 (the API now refuses one): made in A,
+  // then given B straight in the store, as an older hub kept it.
+  const id = (await turma2968("POST", null, ev2968([S2985A],
     { sendInvites: true, attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+  hub.__calTurmaStore("", { ...rec2985(id), orgs: [S2985A, S2985B] });
   assert.equal(writes2985(D2985A).at(-1).event.sendInvites, true);
   assert.equal(writes2985(D2985B).at(-1).event.sendInvites, false);
   await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
@@ -35999,6 +36002,68 @@ test("XERK-2985: the Daily Brief lists a Turma event once, never its Outlook cop
   }
 });
 
+// ---- XERK-3016: an event that sends invitations belongs to exactly one org --------------------
+test("XERK-3016: invitations need exactly one org; no write hands the sending role to a second org", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    const inv = { sendInvites: true, attendees: [{ name: "Bo", email: "bo@x.com" }] };
+    const one = /sends invitations belongs to exactly one org/;
+    // Created in two orgs: refused, nothing stored, nothing written.
+    const two = await turma2968("POST", null, ev2968([S2985A, S2985B], inv));
+    assert.equal(two.status, 400);
+    assert.match(two.body.error, one);
+    assert.ok(!(writes2985(D2985A) || []).length && !(writes2985(D2985B) || []).length);
+    // One org: sends. Adding a second (the ticket's re-add) or putting another first (the reorder): 400.
+    const id = (await turma2968("POST", null, ev2968([S2985A], inv))).body.event.id;
+    for (const orgs of [[S2985A, S2985B], [S2985B, S2985A]]) {
+      const r = await turma2968("PATCH", id, { version: 1, orgs });
+      assert.equal(r.status, 400, JSON.stringify(orgs));
+      assert.match(r.body.error, one);
+    }
+    assert.deepEqual([rec2985(id).orgs, rec2985(id).version], [[S2985A], 1], "the refused writes changed nothing");
+    assert.ok(!(writes2985(D2985B) || []).some((x) => x.turmaId === id), "the second org got no copy");
+    // Moving the one org is allowed (the old copy is cancelled by its tombstone, as for a drop).
+    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985B] })).status, 200);
+    // Two orgs with invitations off is fine; turning them on there is the same 400.
+    const plain = (await turma2968("POST", null, ev2968([S2985A, S2985B]))).body.event.id;
+    const on = await turma2968("PATCH", plain, { version: 1, sendInvites: true });
+    assert.equal(on.status, 400);
+    assert.match(on.body.error, one);
+    // A "this and following" split carries the rule too.
+    const ser = (await turma2968("POST", null, ev2968([S2985A, S2985B], { recurrence: { freq: "daily", interval: 1, count: 5 } }))).body.event.id;
+    const occ = `${ser}:${iso2968(T2968 + 2 * 864e5)}`;
+    const fol = await turma2968("PATCH", occ, { version: 1, scope: "following", sendInvites: true });
+    assert.equal(fol.status, 400);
+    assert.match(fol.body.error, one);
+    // A private event is held to it too (it sends nothing now, but its flag stays on).
+    assert.equal((await turma2968("POST", null, ev2968([S2985A, S2985B], { ...inv, sensitivity: "private" }))).status, 400);
+    // An older two-org sending series: an occurrence edit passes (it changes neither), a series edit doesn't.
+    const old = (await turma2968("POST", null, ev2968([S2985A], { ...inv, recurrence: { freq: "daily", interval: 1, count: 3 } }))).body.event.id;
+    rec2985(old).orgs = [S2985A, S2985B];
+    const oneOcc = await turma2968("PATCH", `${old}:${iso2968(T2968 + 864e5)}`, { version: 1, scope: "occurrence", subject: "Moved" });
+    assert.equal(oneOcc.status, 200, JSON.stringify(oneOcc.body));
+    assert.match((await turma2968("PATCH", old, { version: 2, subject: "All" })).body.error, one);
+    // An org no host is in is kept and not served: the refusal names it (QA: it read "pick one").
+    const hid = (await turma2968("POST", null, ev2968([S2985A, S2985B]))).body.event.id;
+    const fs = (await turma2968("POST", null, ev2968([S2985A, S2985B], { recurrence: { freq: "daily", interval: 1, count: 4 } }))).body.event.id;
+    const savedB = agents[D2985B];
+    delete agents[D2985B];
+    try {
+      const r = await turma2968("PATCH", hid, { version: 1, orgs: [S2985A], sendInvites: true });
+      assert.equal(r.status, 400);
+      assert.match(r.body.error, /keeps 1 org no host is in until the 24h grace drops it/);
+      const f2 = await turma2968("PATCH", `${fs}:${iso2968(T2968 + 2 * 864e5)}`, { version: 1, scope: "following", orgs: [S2985A], sendInvites: true });
+      assert.equal(f2.status, 400);
+      assert.match(f2.body.error, /keeps 1 org no host is in/, "the following split names it too");
+    } finally { agents[D2985B] = savedB; }
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
 // ---- XERK-2989: invitations from the first org's copy, and the responses served back ----------
 test("XERK-2989: only the first org's copy sends invitations; its responses are served on the event", async () => {
   cleanup2985(D2985A, D2985B);
@@ -36006,14 +36071,16 @@ test("XERK-2989: only the first org's copy sends invitations; its responses are 
     await beat2985(D2985A, S2985A);
     await beat2985(D2985B, S2985B);
     const people = [{ name: "Ann", email: "Ann@x.com", role: "required" }, { name: "Bo", email: "bo@x.com", role: "optional" }];
-    const c = await turma2968("POST", null, ev2968([S2985A, S2985B], { attendees: people, sendInvites: true, allowForward: false }));
+    const c = await turma2968("POST", null, ev2968([S2985A], { attendees: people, sendInvites: true, allowForward: false }));
     assert.equal(c.status, 200, JSON.stringify(c.body));
     const id = c.body.event.id;
     assert.deepEqual([c.body.event.sendInvites, c.body.event.responseRequested, c.body.event.allowForward], [true, true, false]);
-    const [wa] = writes2985(D2985A), [wb] = writes2985(D2985B);
+    const [wa] = writes2985(D2985A);
     assert.deepEqual([wa.event.sendInvites, wa.event.responseRequested, wa.event.allowForward], [true, true, false]);
     assert.equal(wa.event.attendees.length, 2);
-    assert.equal(wb.event.sendInvites, false, "every other org's copy is a plain appointment");
+    // A two-org record from before XERK-3016 still sends from its first org alone.
+    const legacy = { ...rec2985(id), orgs: [S2985A, S2985B] };
+    assert.deepEqual([hub.calTurmaSends(legacy, S2985A), hub.calTurmaSends(legacy, S2985B)], [true, false]);
     // Defaults: off, responses requested, forwarding allowed; an older record coerces to them.
     const plain = (await turma2968("POST", null, ev2968([S2985A]))).body.event;
     assert.deepEqual([plain.sendInvites, plain.responseRequested, plain.allowForward], [false, true, true]);

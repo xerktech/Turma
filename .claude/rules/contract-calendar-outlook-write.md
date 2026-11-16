@@ -321,8 +321,17 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - **Only `orgs[0]`'s copy sends** (operator decision): the command's `event.sendInvites` is true for
   that org alone, so an event in N orgs reaches an attendee once. The others are plain appointments.
   - Its holder's mailbox is the ORGANIZER the attendees see, not necessarily the event's creator.
-  - `orgs[0]` changing (org dropped, 24h grace) cancels from the old copy (its tombstone delete)
-    and sends afresh from the new one: attendees get a cancellation and a new invitation.
+  - **An event that sends belongs to exactly ONE org** (XERK-3016, operator rule: an invited
+    meeting's people are one org's). `turmaInvitesError` 400s create, series and following writes
+    of a record with `sendInvites` and 2+ orgs; both editors say so first. A second org let a
+    reorder or a re-add move the sending role while the first invitation stayed live.
+  - A refusal caused by an org no host is in (kept, not served) names it, since the client sees one.
+  - So `orgs[0]` is that one org. A two-org sending record from before XERK-3016 still sends from
+    `orgs[0]` alone; a series or following edit of it is refused until it drops an org or turns
+    invitations off. An occurrence edit or a DELETE passes, and both editors allow "This event".
+  - Moving the one org, or (on such an older record) `orgs[0]` dropped by the 24h grace, cancels
+    from the old copy (its tombstone delete) and sends afresh from the new one: attendees get a
+    cancellation and a new invitation.
   - **No copy sends while a dropped sending copy's cancellation is owed** (XERK-3015, operator
     decision): its tombstone carries `sent: true`, and `calTurmaSends` is false for that event
     until the delete is answered ok/"not found", or the tombstone ages out or is evicted by the
@@ -370,5 +379,5 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   against a fake Outlook object model, and `calendar_write_fixture.json`, a reply recorded from it);
   the reader's `turmaId` in `CalendarSyncReaderTest`. Recurrence: `XERK-2986:` in `server.test.js`,
   `CalendarRecurrenceWriteTest` (`test_session_cli.py`), `test_xerk2986_*` (`test_hub_agent.py`).
-- Invitations: `XERK-2989:` in `server.test.js` and `calendar.test.js`; the `xerk2989` cases in
+- Invitations: `XERK-2989:`/`XERK-3016:` in `server.test.js` and `calendar.test.js`; the `xerk2989` cases in
   `CalendarWriteTest`; Android `CalendarEventsTest`.

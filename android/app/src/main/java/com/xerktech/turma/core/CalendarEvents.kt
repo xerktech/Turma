@@ -133,7 +133,7 @@ data class TurmaEventDraft(
     // The stored sensitivity, so un-ticking Private on a confidential event keeps it.
     val sensitivity: String = "normal",
     val orgs: Set<String> = emptySet(),
-    // XERK-2989: send invitations from the first org's Outlook, and its two options.
+    // XERK-2989: send invitations from the event's one org's Outlook (XERK-3016), and its two options.
     val invites: Boolean = false,
     val reqResp: Boolean = true,
     val allowFwd: Boolean = true,
@@ -306,7 +306,7 @@ fun calInvitesText(ev: CalendarEvent, orgLabel: (String) -> String): String {
 /** The editor's note under Invitations (the web's invitesRowHtml). */
 fun calInvitesNote(d: TurmaEventDraft): String =
     if (d.private) "A private event sends no invitations: its details are withheld from Outlook."
-    else "Sent once, from the Outlook host of the event's first org; updates and a delete reach the attendees too."
+    else "Sent once, from the Outlook host of the event's org; updates and a delete reach the attendees too."
 
 /**
  * The day a served occurrence's rule is read from: its ORIGINAL start (a moved
@@ -475,6 +475,10 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
     if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d), calSplitDay(d) ?: calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
     if (d.orgs.isEmpty()) add("Pick at least one org.")
     if (d.orgs.size > CAL_TURMA_ORGS_MAX) add("An event belongs to at most $CAL_TURMA_ORGS_MAX orgs.")
+    // Invitations go out from one org's Outlook (XERK-3016): the hub refuses them on two orgs.
+    // Not for one occurrence: its orgs and invitations are the series' (both controls disabled),
+    // and the hub takes it even on an older two-org sending series.
+    if (d.invites && d.orgs.size > 1 && !d.oneOccurrence) add("An event that sends invitations belongs to one org: pick one, or turn invitations off.")
 }
 
 /** The hub's `CALENDAR_BODY_MAX` and `CALENDAR_TURMA_ORGS_MAX`. */
