@@ -218,6 +218,37 @@ test("XERK-757: boot load adopts the store's value; a fresh store is SEEDED from
   store.close();
 });
 
+test("XERK-2993: the tenancy store marks itself loaded on every boot-load branch and on install", async () => {
+  // Under HA the users mirror starts empty, so the flag starts false there
+  // (`!HA_ON`, pinned on the source: this process runs HA off) and only the
+  // backend's answer may flip it — stored, seeded up, or a later watch install.
+  const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.match(src, /let tenancyHydrated = !HA_ON;/);
+  const settle = () => new Promise((r) => setTimeout(r, 50));
+  const tdesc = X.list().find((d) => d.name === "tenancy");
+  const run = async (prep) => {
+    srv.__setTenancyHydrated(false);
+    const store = fileStore({ ...X.persistentConfig() });
+    await prep(store);
+    X.wireExternalStores(store);
+    await settle();
+    const v = X.tenancyHydrated();
+    store.close();
+    return v;
+  };
+  // Key absent: the seed branch (no afterLoad) still marks it loaded.
+  assert.equal(await run(async () => {}), true, "seed branch");
+  // Stored value equal to the mirror: the dedup skips install, onLoaded still fires.
+  assert.equal(await run((s) => s.set(tdesc.key, tdesc.read())), true, "equal stored value");
+  // A different stored value installs it.
+  const other = { users: {} };
+  assert.equal(await run((s) => s.set(tdesc.key, other)), true, "different stored value");
+  // A remote replica's watch install marks it loaded after a failed boot load.
+  srv.__setTenancyHydrated(false);
+  tdesc.install(tdesc.coerce({ users: {} }));
+  assert.equal(X.tenancyHydrated(), true, "install");
+});
+
 // ---- XERK-769: epic-run / epic-builder stores are externalized -------------
 // The epic auto-orchestration run store (epicRuns) and the Epic Builder store
 // (epicBuilders) moved off "a /data file in one process" onto the SAME adapter,

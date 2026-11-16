@@ -31770,6 +31770,7 @@ if (process.env.TURMA_TEST) {
       asPlainObject,
       asFlagMap,
       list: () => externalizedStores,
+      tenancyHydrated: () => tenancyHydrated,
       persistentConfig: () => STORE_PERSISTENT,
       repoTiers: () => repoTiers,
       setRepoTier,
