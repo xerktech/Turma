@@ -74,6 +74,7 @@ import com.xerktech.turma.core.CellAlign
 import com.xerktech.turma.core.ChatItem
 import com.xerktech.turma.core.InlinePiece
 import com.xerktech.turma.core.isPreviewImageSrc
+import com.xerktech.turma.core.previewVideoData
 import com.xerktech.turma.core.ProseBlock
 import com.xerktech.turma.core.Span
 import com.xerktech.turma.DataImage
@@ -82,6 +83,13 @@ import com.xerktech.turma.core.splitImages
 import com.xerktech.turma.model.SendFile
 import android.graphics.Color as AndroidColor
 import android.webkit.WebView
+import android.widget.MediaController
+import android.widget.VideoView
+import androidx.compose.runtime.produceState
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.layout.ContentScale
@@ -832,6 +840,7 @@ private fun SendFileView(f: SendFile) {
             }
             if (showFull) ImageLightbox(model, f.name) { showFull = false }
         }
+        "video" -> VideoPreview(f)
         "html" -> Column {
             HtmlPreview(f.html, Modifier.fillMaxWidth().height(360.dp)
                 .clip(RoundedCornerShape(6.dp))
@@ -839,6 +848,51 @@ private fun SendFileView(f: SendFile) {
             Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
         }
         else -> FileChip(f.name, f.shed)
+    }
+}
+
+// A SendUserFile clip (web parity: renderToolFiles' <video controls>). VideoView
+// can't play a data: URI, so the bytes go to a per-content cache file (written
+// off the main thread, reused across recompositions) and play from there with
+// the platform MediaController. A src that isn't a base64 data:video/ URI, or a
+// failed write, degrades to the name chip — nothing remote is ever fetched.
+@Composable
+private fun VideoPreview(f: SendFile) {
+    val ctx = LocalContext.current
+    val file by produceState<File?>(null, f.src) {
+        value = withContext(Dispatchers.IO) {
+            val (bytes, ext) = previewVideoData(f.src) ?: return@withContext null
+            try {
+                val dir = File(ctx.cacheDir, "sendfile-video").apply { mkdirs() }
+                val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+                val name = digest.take(16).joinToString("") { "%02x".format(it) } + "." + ext
+                File(dir, name).also { if (!it.isFile || it.length() != bytes.size.toLong()) it.writeBytes(bytes) }
+            } catch (e: java.io.IOException) { null }
+        }
+    }
+    val playable = file
+    if (playable == null) { FileChip(f.name, f.shed); return }
+    Column {
+        AndroidView(
+            factory = { c ->
+                VideoView(c).apply {
+                    val controller = MediaController(c)
+                    controller.setAnchorView(this)
+                    setMediaController(controller)
+                    // Show the first frame instead of a black box until Play.
+                    setOnPreparedListener { it.isLooping = false; seekTo(1) }
+                }
+            },
+            update = { v ->
+                val uri = android.net.Uri.fromFile(playable)
+                if (v.tag != uri) { v.tag = uri; v.setVideoURI(uri) }
+            },
+            onRelease = { it.stopPlayback() },
+            modifier = Modifier.fillMaxWidth().height(260.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(Color.Black),
+        )
+        Text(f.name, fontSize = scaledSp(10f), color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
     }
 }
 

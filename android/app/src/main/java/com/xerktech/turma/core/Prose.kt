@@ -676,6 +676,25 @@ fun isPreviewImageSrc(src: String): Boolean =
     asciiRegionMatches(src, 0, "data:image/") || asciiRegionMatches(src, 0, "http:") ||
         asciiRegionMatches(src, 0, "https:")
 
+/**
+ * The bytes + file extension of a SendUserFile video the web plays (chat.js
+ * `renderToolFiles`: only `/^data:video\//i` reaches a <video>), or null for any
+ * other src — a remote URL is never fetched, so it stays a name chip.
+ */
+fun previewVideoData(src: String): Pair<ByteArray, String>? {
+    if (!asciiRegionMatches(src, 0, "data:video/")) return null
+    val comma = src.indexOf(',')
+    if (comma < 0) return null
+    val header = src.substring(5, comma).lowercase(java.util.Locale.ROOT)
+    if (!header.endsWith(";base64")) return null
+    val ext = when (header.removeSuffix(";base64")) {
+        "video/webm" -> "webm"; "video/quicktime" -> "mov"; "video/ogg" -> "ogv"; else -> "mp4"
+    }
+    val bytes = try { java.util.Base64.getMimeDecoder().decode(src.substring(comma + 1)) }
+        catch (e: IllegalArgumentException) { return null }
+    return if (bytes.isEmpty()) null else bytes to ext
+}
+
 /** [s] holds lower-case ASCII [lit] at [at], ASCII-case-insensitively (JS `/i`; see [SVG_NAME]). */
 private fun asciiRegionMatches(s: String, at: Int, lit: String): Boolean {
     if (at < 0 || at + lit.length > s.length) return false

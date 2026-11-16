@@ -121,6 +121,11 @@ const SEND_FILE_IMG_MIME = {
   ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon",
 };
 const SEND_FILE_HTML_EXT = new Set([".html", ".htm"]);
+const SEND_FILE_VIDEO_MAX_BYTES = Number(process.env.SESSION_SEND_FILE_VIDEO_MAX_BYTES) || 4 * 1024 * 1024;
+const SEND_FILE_VIDEO_MIME = {
+  ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+  ".mov": "video/quicktime", ".ogv": "video/ogg",
+};
 
 // Claude Code's project-dir slug for a worktree cwd: every non-alphanumeric
 // char -> '-' (mirrors hub-agent.py _project_slug — a plain '/'->'-' map is
@@ -564,6 +569,7 @@ function toolInputSummary(inp) {
 // Read the image/SVG/HTML files a SendUserFile call delivered and return preview
 // entries for its tool_use block (XERK-221), or null. Mirror of hub-agent.py
 // _send_user_file_detail(): image -> {name, kind:"image", src:data URI};
+// video -> {name, kind:"video", src:data URI} (own cap);
 // html (render only) -> {name, kind:"html", html}; else -> {name, kind:"file"}.
 function sendUserFileDetail(inp) {
   const files = inp.files;
@@ -574,16 +580,18 @@ function sendUserFileDetail(inp) {
     if (typeof p !== "string" || !p) continue;
     const name = path.basename(p);
     const ext = path.extname(p).toLowerCase();
-    const mime = SEND_FILE_IMG_MIME[ext];
+    const mime = Object.hasOwn(SEND_FILE_IMG_MIME, ext) ? SEND_FILE_IMG_MIME[ext] : undefined;
+    const vmime = Object.hasOwn(SEND_FILE_VIDEO_MIME, ext) ? SEND_FILE_VIDEO_MIME[ext] : undefined;
     const renderHtml = SEND_FILE_HTML_EXT.has(ext) && display !== "attach";
+    const cap = vmime ? SEND_FILE_VIDEO_MAX_BYTES : SEND_FILE_MAX_BYTES;
     let entry = { name, kind: "file" };
-    if (mime || renderHtml) {
+    if (mime || vmime || renderHtml) {
       try {
-        if (fs.statSync(p).size <= SEND_FILE_MAX_BYTES) { // bound the read (mirrors Python's read(cap+1))
+        if (fs.statSync(p).size <= cap) { // bound the read (mirrors Python's read(cap+1))
           const data = fs.readFileSync(p);
-          if (data.length <= SEND_FILE_MAX_BYTES) {
-            entry = mime
-              ? { name, kind: "image", src: "data:" + mime + ";base64," + data.toString("base64") }
+          if (data.length <= cap) {
+            entry = (mime || vmime)
+              ? { name, kind: mime ? "image" : "video", src: "data:" + (mime || vmime) + ";base64," + data.toString("base64") }
               : { name, kind: "html", html: data.toString("utf8") };
           }
         }

@@ -23,7 +23,11 @@ Split out of `agent.md` (size ceiling).
   AskUserQuestion titled by its question text, not the input JSON.
   - **SendUserFile → `files[]`+`caption`** (XERK-221, oversize past `SEND_FILE_MAX_BYTES` → name-only
     chip): image/SVG as base64 data URI, a `render` page
-    as raw markup, else a name chip (never opened). Only image/html paths are read and bounded.
+    as raw markup, else a name chip (never opened). Only image/video/html paths are read and bounded.
+  - **A video (mp4/m4v/webm/mov/ogv) is `kind:"video"`, a `data:video/*` URI, under its OWN cap**
+    `SEND_FILE_VIDEO_MAX_BYTES` (4 MiB raw): its base64 must stay under `HISTORY_MAX_BYTES` (6 MiB)
+    or `history` sheds it. Clients play ONLY a `data:video/` src (web `<video controls>`, Android a
+    cached-file `VideoView`); anything else is a chip — never a remote fetch.
 - **A plugin's prompt is not the operator's** (XERK-2135, `_plugin_message`/`pluginMessage`): a
   user entry with `origin.kind == "plugin"` becomes ONE `text` block with Claude Code's
   "The <name> plugin sent a message:" frame stripped and `origin` set — `"turma"` for the bridge

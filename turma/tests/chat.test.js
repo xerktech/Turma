@@ -1377,6 +1377,18 @@ test("render: a preview DROPPED to fit says so; one that never rendered does not
   assert.doesNotMatch(plainHtml, /preview dropped/);
 });
 
+test("render: a SendUserFile video plays inline; a non-data src is a chip", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "clip.mp4", kind: "video", src: "data:video/mp4;base64,AAAA" },
+    { name: "evil.mp4", kind: "video", src: "https://ex.com/x.mp4" },
+    { name: "bad.mp4", kind: "video", src: "javascript:alert(1)" },
+  ])));
+  assert.match(html, /<video class="md-video" controls playsinline preload="metadata" src="data:video\/mp4;base64,AAAA"/);
+  assert.match(html, /📎 evil\.mp4/);
+  assert.match(html, /📎 bad\.mp4/);
+  assert.doesNotMatch(html, /javascript:alert|ex\.com/);
+});
+
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {
   const html = withVerbosity("normal", () => itemsToHtml(suItems([
     { name: "archive.zip", kind: "file" },

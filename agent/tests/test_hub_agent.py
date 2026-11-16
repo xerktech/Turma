@@ -4819,6 +4819,33 @@ class TestEntryBlocks(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_send_user_file_embeds_a_video_under_its_own_cap(self):
+        # A delivered clip renders as a player: kind "video", a data:video/* URI,
+        # under SEND_FILE_VIDEO_MAX_BYTES (larger than the image cap); past it a chip.
+        d = tempfile.mkdtemp()
+        try:
+            clip = os.path.join(d, "clip.mp4")
+            body = b"\x00" * (ha.SEND_FILE_MAX_BYTES + 10)  # over the IMAGE cap
+            with open(clip, "wb") as fh:
+                fh.write(body)
+            big = os.path.join(d, "big.webm")
+            with open(big, "wb") as fh:
+                fh.write(b"\x00" * (ha.SEND_FILE_VIDEO_MAX_BYTES + 1))
+            block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "SendUserFile",
+                 "input": {"files": [clip, big]}},
+            ]}}, ha.BLOCK_CAPS)[0]
+            self.assertEqual(block["files"], [
+                {"name": "clip.mp4", "kind": "video",
+                 "src": "data:video/mp4;base64," + base64.b64encode(body).decode()},
+                {"name": "big.webm", "kind": "file"},
+            ])
+            # The archive's shed turns it into a flagged chip like an image.
+            ha._shed_block_payloads([block])
+            self.assertEqual(block["files"][0], {"name": "clip.mp4", "kind": "file", "shed": True})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_description_arg_rides_as_desc(self):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {

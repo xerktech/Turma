@@ -1810,7 +1810,7 @@
   }
   function actionKey(a, gk, idx) { return a.id ? ("act:" + a.id) : ("act:" + gk + ":" + idx); }
 
-  // SendUserFile inline previews (XERK-221): the image/SVG/HTML files a session
+  // SendUserFile inline previews (XERK-221): the image/SVG/video/HTML files a session
   // delivered, embedded on the block by the agent. An image renders through the
   // same <img> path as prose images (a data:image/svg+xml SVG in secure static
   // mode); an HTML page renders in a FULLY sandboxed iframe — `sandbox` with no
@@ -1828,6 +1828,12 @@
         const svg = /^data:image\/svg\+xml/i.test(f.src);
         out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
           '" src="' + esc(f.src) + '" alt="' + name + '"' + svgSizeAttrs(f.src) + ' loading="lazy">' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else if (f.kind === "video" && typeof f.src === "string" && /^data:video\//i.test(f.src)) {
+        // A delivered clip plays inline. Only a data:video/* URI the agent built
+        // reaches src= (no remote fetch); preload=metadata keeps a long chat cheap.
+        out += '<figure class="tool-file"><video class="md-video" controls playsinline preload="metadata" src="' +
+          esc(f.src) + '" title="' + name + '"></video>' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else if (f.kind === "html" && typeof f.html === "string") {
         out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +

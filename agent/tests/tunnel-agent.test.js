@@ -145,6 +145,21 @@ test("entryBlocks: SendUserFile embeds image/SVG/HTML files, degrades the rest (
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("entryBlocks: SendUserFile embeds a video under its own cap, chips past it", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "suf-"));
+  const body = Buffer.alloc(600 * 1024); // over the 512 KiB IMAGE cap
+  fs.writeFileSync(path.join(dir, "clip.mp4"), body);
+  fs.writeFileSync(path.join(dir, "big.webm"), Buffer.alloc(4 * 1024 * 1024 + 1));
+  const [b] = entryBlocks(
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "SendUserFile",
+      input: { files: [path.join(dir, "clip.mp4"), path.join(dir, "big.webm")] } }] } }, BLOCK_CAPS);
+  assert.deepEqual(b.files, [
+    { name: "clip.mp4", kind: "video", src: "data:video/mp4;base64," + body.toString("base64") },
+    { name: "big.webm", kind: "file" },
+  ]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("entryBlocks: over-cap text/result get truncated:true and are clipped", () => {
   const big = "x".repeat(BLOCK_CAPS.text + 500);
   const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS);
