@@ -18,7 +18,7 @@ paths:
 
 # Turma events written to Outlook (epic XERK-2982; contract XERK-2983)
 
-A Turma-created event (`contract-calendar.md` "Turma-created events") is written as an appointment
+A Turma-created event (`contract-calendar-turma.md`) is written as an appointment
 into the classic Outlook of ONE host per org in its `orgs`. Turma stays the source of truth; the
 Outlook copy is a projection the hub keeps in step. Every child builds to this file; change it here
 first. Children: agent writer XERK-2984, hub queue/state/dedup XERK-2985, recurrence XERK-2986,
