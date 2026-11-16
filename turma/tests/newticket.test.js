@@ -456,3 +456,129 @@ test("XERK-2935: picked files make the form dirty and gate Create while uploadin
   const full = B.createFilesHtml(Array.from({ length: B.CREATE_FILES_MAX }, () => ({ name: "f", status: "ready" })));
   assert.match(full, /data-cf-attach="1" disabled/);
 });
+
+// ---- paste-to-attach (XERK-3021) --------------------------------------------
+
+// Opens the form against a hub stub: uploads answer {uploadId}, a create never
+// settles (so the form stays busy), anything else answers create-meta.
+async function openPasteForm() {
+  const urls = [];
+  global.fetch = (u, opts) => {
+    urls.push(String(u));
+    if (/\/uploads\?/.test(String(u))) {
+      return Promise.resolve({ status: 200, ok: true,
+        json: () => Promise.resolve({ uploadId: "u" + urls.length, name: "f", host: "h1" }) });
+    }
+    if (opts && opts.method === "POST") return new Promise(() => {});
+    return Promise.resolve({ status: 200, ok: true,
+      json: () => Promise.resolve({ projects: [{ key: "A" }], labels: [], types: [{ id: "1", name: "Bug" }] }) });
+  };
+  const { body, button } = mountNT();
+  NT.update({ agents: [agent("h1", "acme.atlassian.net")] });
+  for (const fn of button._listeners.click || []) fn({});
+  const panel = body.children[0].children[0];
+  const fields = { "[data-cf-file-input]": {} };
+  panel.querySelector = (sel) => fields[sel] || null;
+  const paste = (files, types) => {
+    const ev = { clipboardData: { files, types: types || (files.length ? ["Files"] : ["text/plain"]) },
+      prevented: false, preventDefault() { this.prevented = true; } };
+    for (const fn of panel._listeners.paste || []) fn(ev);
+    return ev;
+  };
+  const fire = (type, sel, value) => {
+    const target = { value, closest: (q) => (q === sel ? target : null) };
+    for (const fn of panel._listeners[type] || []) fn({ target });
+  };
+  const settle = async () => { for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 5)); };
+  const uploads = () => urls.filter((u) => /\/uploads\?/.test(u));
+  const chips = () => (panel.innerHTML.match(/class="cf-file[ "]/g) || []).length;
+  await settle();
+  return { panel, fields, paste, fire, settle, uploads, chips, urls };
+}
+const file = (name) => ({ name, size: 3 });
+
+test("newticket: pasting files stages and uploads them; a text paste is left alone (XERK-3021)", async () => {
+  const prev = global.fetch;
+  try {
+    const f = await openPasteForm();
+    assert.equal(f.paste([]).prevented, false, "plain text: the field takes it");
+    // No Attachments row painted (the created screen): not ours.
+    const row = f.fields["[data-cf-file-input]"];
+    delete f.fields["[data-cf-file-input]"];
+    assert.equal(f.paste([file("x")]).prevented, false, "no Attachments row");
+    f.fields["[data-cf-file-input]"] = row;
+    // One paste of several files: the first picks the host, the rest follow it.
+    const ev = f.paste([file("image.png"), file("b.txt"), file("c.txt")]);
+    assert.equal(ev.prevented, true);
+    await f.settle();
+    assert.deepEqual(f.uploads(), ["/api/jira/acme.atlassian.net/uploads?name=image.png",
+      "/api/jira/acme.atlassian.net/uploads?name=b.txt&host=h1",
+      "/api/jira/acme.atlassian.net/uploads?name=c.txt&host=h1"]);
+    assert.equal(f.chips(), 3);
+    // A later paste follows that host too.
+    f.paste([file("d.txt")]);
+    await f.settle();
+    assert.equal(f.uploads()[3], "/api/jira/acme.atlassian.net/uploads?name=d.txt&host=h1");
+  } finally { global.fetch = prev; }
+});
+
+test("newticket: an Office/web copy (text + html + bitmap) pastes as text, not a file (XERK-3021)", async () => {
+  const prev = global.fetch;
+  try {
+    const f = await openPasteForm();
+    assert.equal(f.paste([file("image.png")], ["text/plain", "text/html", "Files"]).prevented, false);
+    // A file-manager copy (name as text/plain) and a copied image (html only) still attach.
+    assert.equal(f.paste([file("a.pdf")], ["text/plain", "Files"]).prevented, true);
+    assert.equal(f.paste([file("b.png")], ["text/html", "Files"]).prevented, true);
+    await f.settle();
+    assert.equal(f.uploads().length, 2);
+  } finally { global.fetch = prev; }
+});
+
+test("newticket: paste and picker share the 10-file cap and its note (XERK-3021)", async () => {
+  const prev = global.fetch;
+  try {
+    const f = await openPasteForm();
+    f.fire("change", "[data-cf-file-input]", undefined);   // empty pick: nothing
+    const picker = { files: [file("p.txt")], closest: (q) => (q === "[data-cf-file-input]" ? picker : null) };
+    for (const fn of f.panel._listeners.change || []) fn({ target: picker });
+    await f.settle();
+    assert.deepEqual(f.uploads(), ["/api/jira/acme.atlassian.net/uploads?name=p.txt"], "picker still uploads");
+    f.paste(Array.from({ length: 11 }, (_, i) => file(`f${i}`)));
+    await f.settle();
+    assert.equal(f.uploads().length, 10);
+    assert.equal(f.chips(), 10);
+    assert.match(f.panel.innerHTML, /At most 10 files per ticket/);
+    f.paste([file("late")]);
+    await f.settle();
+    assert.equal(f.uploads().length, 10, "full: nothing more");
+  } finally { global.fetch = prev; }
+});
+
+test("newticket: no paste-attach on the discard screen or mid-create (XERK-3021)", async () => {
+  const prev = global.fetch;
+  try {
+    const f = await openPasteForm();
+    // Dirty the form, then Cancel → "Discard this ticket?".
+    f.fields["[data-cf-summary]"] = { value: "Title" };
+    f.fire("input", "[data-cf-summary],[data-cf-desc],[data-cf-labels]");
+    f.fire("click", "[data-cf-cancel]");
+    assert.match(f.panel.innerHTML, /data-cf-discard/, "on the discard screen");
+    assert.equal(f.paste([file("x")]).prevented, false, "discard screen");
+    f.fire("click", "[data-cf-keep]");
+    // Fill the form and submit; the create never settles, so it stays busy.
+    f.fire("change", "[data-cf-project]", "A");
+    await f.settle();
+    f.fire("change", "[data-cf-type]", "1");
+    f.fire("click", "[data-cf-submit]");
+    await f.settle();
+    assert.ok(f.urls.includes("/api/jira/acme.atlassian.net/tickets"), f.urls.join(" "));
+    assert.equal(f.paste([file("x")]).prevented, false, "mid-create");
+    // The picker too: a native dialog opened before Create can still answer.
+    const picker = { files: [file("late.txt")], closest: (q) => (q === "[data-cf-file-input]" ? picker : null) };
+    for (const fn of f.panel._listeners.change || []) fn({ target: picker });
+    assert.match(f.panel.innerHTML, /data-cf-attach="1" disabled/);
+    await f.settle();
+    assert.equal(f.uploads().length, 0);
+  } finally { global.fetch = prev; }
+});
