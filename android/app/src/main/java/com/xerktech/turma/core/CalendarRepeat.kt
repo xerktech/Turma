@@ -12,7 +12,7 @@ import kotlinx.serialization.json.put
 
 /*
  * The editor's Repeat control ⇄ the hub's recurrence rule, and its one-line
- * summary (XERK-2973; contract-calendar.md "Recurring Turma events"). A port of
+ * summary (XERK-2973; contract-calendar-turma.md "Recurring Turma events"). A port of
  * calendar.js's repeat block: both read turma/tests/fixtures/calendar-repeat-vectors.json
  * (CalendarRepeatTest), so a pick sends the same rule and reads the same line on
  * the phone as on the web. Pure. [LocalDate] `start` is the series' first day in

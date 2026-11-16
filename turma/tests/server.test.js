@@ -34507,6 +34507,51 @@ test("XERK-2953: a 'following' edit moving the occurrence to another date moves 
       start: "2027-07-30T09:00:00Z", end: "2027-07-30T10:00:00Z", recurrence: { freq: "monthly", interval: 1, byMonthDay: 15 } });
     assert.equal(cm.status, 200, JSON.stringify(cm.body));
     assert.equal(cm.body.event.recurrence.byMonthDay, 15);
+    // Every 2 weeks, a move carrying the days across a week boundary is no rule: a 400 in words,
+    // the series untouched (FR,SA Sat -> Sun; SU,TU Sun -> Sat).
+    for (const [start, rule, key, to] of [["2027-07-02T09:00:00Z", ["FR", "SA"], "2027-07-31T09:00:00Z", "2027-08-01"],
+      ["2027-07-04T09:00:00Z", ["SU", "TU"], "2027-08-01T09:00:00Z", "2027-07-31"]]) {
+      const x = await mk(start, { freq: "weekly", interval: 2, byDay: rule });
+      for (const scope of ["following", "series"]) {
+        const r = await turma2968("PATCH", `${x.id}:${key}`, { version: 1, scope, start: `${to}T09:00:00Z`, end: `${to}T10:00:00Z` });
+        assert.equal(r.status, 400, `${rule} ${scope}: ${JSON.stringify(r.body)}`);
+        assert.match(r.body.error, /across a week boundary; change the repeat days instead/);
+      }
+      assert.equal(hub.getCalendarTurmaEvents()[""][x.id].version, 1);
+    }
+    // ...within the week it re-anchors, every 2 weeks too.
+    const w2 = await mk("2027-07-05T09:00:00Z", { freq: "weekly", interval: 2, byDay: ["MO", "WE"] });
+    const w2m = await turma2968("PATCH", `${w2.id}:2027-07-19T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-07-20T09:00:00Z", end: "2027-07-20T10:00:00Z" });
+    assert.equal(w2m.status, 200, JSON.stringify(w2m.body));
+    assert.deepEqual(await range(w2m.body.event.id, "2027-07-19T00:00:00Z", "2027-08-08T00:00:00Z"),
+      ["2027-07-20T09:00:00Z", "2027-07-22T09:00:00Z", "2027-08-03T09:00:00Z", "2027-08-05T09:00:00Z"]);
+    // An implicit "monthly" whose day the client sends outright (31, the series' own) is unchanged: re-anchored.
+    const im = await mk("2027-01-31T09:00:00Z", { freq: "monthly" });
+    const imm = await turma2968("PATCH", `${im.id}:2027-07-31T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-07-30T09:00:00Z", end: "2027-07-30T10:00:00Z", recurrence: { freq: "monthly", interval: 1, byMonthDay: 31 } });
+    assert.equal(imm.status, 200, JSON.stringify(imm.body));
+    assert.equal(imm.body.event.recurrence.byMonthDay, 30);
+    // A SERIES move (through an occurrence, "following" from the first, or the series id) carries
+    // the explicit day too.
+    const s1 = await mk("2027-07-05T09:00:00Z", { freq: "weekly", byDay: ["MO", "WE"] });
+    const s1m = await turma2968("PATCH", `${s1.id}:2027-07-05T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-07-06T09:00:00Z", end: "2027-07-06T10:00:00Z" });
+    assert.equal(s1m.status, 200, JSON.stringify(s1m.body));
+    assert.equal(s1m.body.event.id, s1.id, "following from the first is the series");
+    assert.deepEqual(await range(s1.id, "2027-07-04T00:00:00Z", "2027-07-16T00:00:00Z"),
+      ["2027-07-06T09:00:00Z", "2027-07-08T09:00:00Z", "2027-07-13T09:00:00Z", "2027-07-15T09:00:00Z"]);
+    const s2 = await mk("2027-07-05T09:00:00Z", { freq: "weekly", byDay: ["MO", "WE"] });
+    const s2m = await turma2968("PATCH", `${s2.id}:2027-07-12T09:00:00Z`, { version: 1, scope: "series",
+      start: "2027-07-13T09:00:00Z", end: "2027-07-13T10:00:00Z" });
+    assert.equal(s2m.status, 200, JSON.stringify(s2m.body));
+    assert.deepEqual(await range(s2.id, "2027-07-04T00:00:00Z", "2027-07-16T00:00:00Z"),
+      ["2027-07-06T09:00:00Z", "2027-07-08T09:00:00Z", "2027-07-13T09:00:00Z", "2027-07-15T09:00:00Z"]);
+    const s3 = await mk("2027-01-31T09:00:00Z", { freq: "monthly", byMonthDay: 31 });
+    const s3m = await turma2968("PATCH", s3.id, { version: 1, start: "2027-01-30T09:00:00Z", end: "2027-01-30T10:00:00Z" });
+    assert.equal(s3m.status, 200, JSON.stringify(s3m.body));
+    assert.deepEqual(await range(s3.id, "2027-01-01T00:00:00Z", "2027-04-01T00:00:00Z"),
+      ["2027-01-30T09:00:00Z", "2027-02-28T09:00:00Z", "2027-03-30T09:00:00Z"]);
     // Same date, another time: the explicit day stays.
     const t = await mk("2027-01-31T09:00:00Z", { freq: "monthly", byMonthDay: 31 });
     const tm = await turma2968("PATCH", `${t.id}:2027-07-31T09:00:00Z`, { version: 1, scope: "following",
@@ -34537,7 +34582,9 @@ test("XERK-2953: Turma expansion STOPS at CALENDAR_SERVE_MAX, never expands ever
     assert.equal(r.body.truncated, true);
     // 60 daily series x 100 days = 6000 occurrences in range; the walk stops at the cap
     // (each series may also yield the one look-back occurrence before the range).
-    assert.ok(yielded <= hub.CALENDAR_SERVE_MAX + 60, `${yielded} occurrences expanded for a ${hub.CALENDAR_SERVE_MAX} cap`);
+    // No series starts before the range, so nothing is looked back at: the cap + 1 (the one that
+    // says "cut") is all, and no later series is even started.
+    assert.ok(yielded <= hub.CALENDAR_SERVE_MAX + 1, `${yielded} occurrences expanded for a ${hub.CALENDAR_SERVE_MAX} cap`);
   } finally {
     rec.eachOccurrence = orig;
     cleanup2968(D2968A);
@@ -34639,6 +34686,37 @@ test("XERK-2953: a served Turma event never carries its creator's id, private or
     assert.equal(served.private, true);
     assert.ok(!("createdBy" in served), "a withheld event does not name its creator");
     assert.ok(!JSON.stringify(served).includes("0123456789abcdef0123456789abcdef"));
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2953: a Turma event before 1970 is refused in words, so every stored one is served", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const at = (iso, extra = {}) => ev2968([S2968A], { timeZone: "UTC", start: iso, end: iso, ...extra });
+    for (const [start, end] of [["1969-12-31T23:00:00Z", "1970-01-01T01:00:00Z"], ["1960-01-01T09:00:00Z", "1960-01-01T10:00:00Z"],
+      ["1970-01-01T00:00:00Z", "1970-01-01T01:00:00Z"]]) {
+      const r = await turma2968("POST", null, at(start, { end }));
+      assert.equal(r.status, 400, start);
+      assert.match(r.body.error, /start must be after 1970-01-01T00:00:00Z/);
+    }
+    // The earliest it takes is served (GET ranges are epoch ms > 0), editable and deletable.
+    const c = await turma2968("POST", null, at("1970-01-01T00:00:01Z", { end: "1970-01-01T01:00:00Z" }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const got = (await calGet2891(1, 864e5)).body.events.filter((e) => e.id === c.body.event.id);
+    assert.equal(got.length, 1);
+    assert.equal((await turma2968("PATCH", c.body.event.id, { version: 1, start: "1969-06-01T00:00:00Z" })).status, 400);
+    // A series moved back through a later occurrence may not drag its first one before 1970.
+    const s = (await turma2968("POST", null, at("1970-01-01T00:00:01Z", { end: "1970-01-01T01:00:00Z",
+      recurrence: { freq: "daily" } }))).body.event;
+    const mv = await turma2968("PATCH", `${s.id}:1970-01-03T00:00:01Z`, { version: 1, scope: "series",
+      start: "1970-01-02T00:00:01Z", end: "1970-01-02T01:00:00Z" });
+    assert.equal(mv.status, 400, JSON.stringify(mv.body));
+    assert.match(mv.body.error, /before 1970/);
+    assert.equal((await turma2968("DELETE", c.body.event.id)).status, 200);
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);

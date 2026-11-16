@@ -70,7 +70,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   caller may not see, is a 404 (never says which tenant holds it); `orgs: []` is a 400 (an event
   must belong to an org); an id the caller's tenants do not hold is a 404.
 - Malformed fields are a 400 naming the field, never coerced into a different event: `start`/`end`
-  must parse with an offset, `end ≥ start`, `orgs` must not repeat an org, a given `timeZone` must be a known zone, a given
+  must parse with an offset and be after 1970 (GET ranges are epoch ms > 0, `calMs`: an earlier
+  event was stored but never served, so nobody could reach it; XERK-2953), `end ≥ start`, `orgs` must not repeat an org, a given `timeZone` must be a known zone, a given
   `joinUrl` https, `busy`/`sensitivity` from their enums.
 - **Served on `GET /api/calendar`** beside the Outlook events, each ONCE (not per org):
   `{source:"turma", host:"", ...record, orgs, org: orgs[0], editable, meeting}`.
@@ -203,7 +204,12 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
     XERK-2953) when the rule's day fields are the series' own (unsent or resent unchanged): "the
     31st" moved to Jul 30 is the 30th; byDay shifts by the weekday delta (MO,WE moved a day is
     TU,TH); byWeekday takes the new date's nth (a 5th = last). Why: kept as is, the new series'
-    first instance was not one of its own occurrences. A day the client changed is kept as sent.
+    first instance was not one of its own occurrences. A day the client changed is kept as sent;
+    one equal to the series' implicit day (`withAnchorDays`) counts as unchanged.
+  - **A `series` move to another date re-anchors the same way** (`calTurmaMovedRule`): through an
+    occurrence id, "following" from the first occurrence, or the series' own start.
+  - **Every N > 1 weeks, a move carrying the days across different week boundaries is a 400**
+    in words (weeks start Sunday): FR,SA every 2 weeks moved Sat -> Sun is no one week's days.
   - `version` is the SERIES' (one version per series; every scope bumps it). Occurrence PATCH
     answers the occurrence, series PATCH the series record.
 - Tests: `recurrence.test.js` (DST both ways and east of +12, month-end, nth/last weekday,

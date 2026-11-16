@@ -16,7 +16,7 @@ import kotlinx.serialization.json.put
 /*
  * Turma-created calendar events (epic XERK-2967, Android XERK-2972): the editor's
  * draft, its validation, and the exact body `POST|PATCH /api/calendar/events`
- * takes (contract-calendar.md "Turma-created events"). Pure, so the payloads are
+ * takes (contract-calendar-turma.md "Turma-created events"). Pure, so the payloads are
  * JVM-tested; the editor (ui/CalendarEventEditor.kt) only renders a draft.
  */
 

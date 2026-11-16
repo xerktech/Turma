@@ -6613,6 +6613,9 @@ function turmaEventFieldError(b) {
   const cps = (s) => [...s].length;
   for (const k of ["start", "end"]) {
     if (k in b && !calIso(b[k])) return `${k} must be an ISO 8601 time with its offset, e.g. 2026-11-16T09:00:00-05:00`;
+    // GET /api/calendar serves epoch-ms ranges after 1970 only (calMs): an earlier event was
+    // stored but never served, so nobody could see, edit or delete it (XERK-2953).
+    if (k in b && !(Date.parse(b[k]) > 0)) return `${k} must be after 1970-01-01T00:00:00Z`;
   }
   if ("timeZone" in b && !calTimeZone(b.timeZone)) return "timeZone must be an IANA time zone, e.g. America/New_York";
   for (const [k, max] of [["subject", 300], ["location", 300], ["body", CALENDAR_BODY_MAX], ["joinUrl", 500]]) {
@@ -6797,6 +6800,21 @@ function calTurmaEndBefore(rec, occ, t, now) {
     { ...rule, until: recurrence.localDate(occ.startMs, rec.timeZone, -1) },
   updatedAt: Math.max(now, rec.updatedAt), version: rec.version + 1 }, t);
 }
+// The rule `sent` (what an edit asks the series to run) once the series' anchor moves from
+// local date `from` to `to`: an EXPLICIT day the edit left as series `rec` had it moves along
+// (XERK-2953), so the moved first instance is one of its own occurrences — "the 31st" moved
+// to Jul 30 is the 30th, MO,WE moved a day is TU,TH. A sent day equal to the series' implicit
+// one counts as left. A day the client changed stays as sent. -> {rule} | {status, body}.
+const CAL_TURMA_WEEK_REFUSAL = { status: 400, body: { error: "moving this occurrence would carry an every-few-weeks " +
+  "pattern across a week boundary; change the repeat days instead" } };
+function calTurmaMovedRule(sent, rec, from, to) {
+  if (!sent || !rec.recurrence || from === to) return { rule: sent };
+  const anchor = recurrence.localDate(rec.startMs, rec.timeZone);
+  if (!recurrence.sameDays(recurrence.withAnchorDays(recurrence.sanitizeRule(sent), anchor),
+    recurrence.withAnchorDays(rec.recurrence, anchor))) return { rule: sent };
+  const rule = recurrence.reanchorDays(sent, from, to);
+  return rule ? { rule } : CAL_TURMA_WEEK_REFUSAL;
+}
 function patchTurmaEvent(p, id, body, now = Date.now()) {
   const f = calTurmaTarget(p, id);
   if (f.status) return f;
@@ -6848,6 +6866,10 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     // Moving one occurrence "for the series" moves the series by the same amount.
     if ("start" in body && calIso(body.start)) fields.start = calIsoZ(f.rec.startMs + Date.parse(body.start) - shown.startMs);
     if ("end" in body && calIso(body.end)) fields.end = calIsoZ(f.rec.endMs + Date.parse(body.end) - shown.endMs);
+    // Moving a later occurrence back by its delta can take the FIRST one before 1970.
+    if (!(Date.parse(fields.start || f.rec.start) > 0)) {
+      return { status: 400, body: { error: "this would move the series' first occurrence before 1970-01-01T00:00:00Z" } };
+    }
   }
   // An org no host is decided into is not served, so a client cannot resend it:
   // an edit keeps it (the 24h grace in calendarTurmaTick decides its fate).
@@ -6858,7 +6880,14 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
       `${undecided.length} it keeps while no host is in them` } };
   }
   if (sc.scope === "series") {
-    const rule = "recurrence" in body ? body.recurrence : f.rec.recurrence;
+    // A series moved to another date (through an occurrence, "following" from the first
+    // one, or its own start) carries an explicit day along, as a "following" split does.
+    const tz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
+    const startMs = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.rec.startMs;
+    const mr = calTurmaMovedRule("recurrence" in body ? body.recurrence : f.rec.recurrence, f.rec,
+      recurrence.localDate(f.rec.startMs, f.rec.timeZone), recurrence.localDate(startMs, tz));
+    if (mr.status) return mr;
+    const rule = mr.rule;
     const rec = sanitizeTurmaEvent({ ...f.rec, ...fields, orgs, recurrence: rule,
       updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
     if (!rec) return { status: 400, body: { error: "end must not be before start" } };
@@ -6895,8 +6924,9 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   //   moves with a moved occurrence (XERK-2953): kept as is, "the 31st" moved to Jul 30
   //   started the new series on Jul 31, its first instance not one of its own occurrences.
   //   A day the client CHANGED is the one it asked for.
-  const keptDays = sent && recurrence.sameDays(recurrence.sanitizeRule(sent), f.rec.recurrence);
-  const moved = keptDays && newDate !== oldDate ? recurrence.reanchorDays(sent, oldDate, newDate) : sent;
+  const mr = calTurmaMovedRule(sent, f.rec, oldDate, newDate);
+  if (mr.status) return mr;
+  const moved = mr.rule;
   const rest = sent && count && Number.isSafeInteger(sent.count) ? { count: sent.count - prev.recurrence.count } : {};
   if (rest.count !== undefined && rest.count < 1) {
     return { status: 400, body: { error: `${prev.recurrence.count} of this series' occurrences come before this one: ` +

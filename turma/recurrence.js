@@ -252,6 +252,18 @@ function occurrenceAt(series, key) {
 // byWeekday; absent = the anchor's). Both through sanitizeRule, so byDay order agrees.
 const DAY_FIELDS = ["byDay", "byMonthDay", "byWeekday"];
 const sameDays = (a, b) => !!a && !!b && DAY_FIELDS.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+// Stored rule `rule` with its implicit day spelled out as the day anchor date `anchor`
+// (YYYY-MM-DD) gives it: weekly byDay = its weekday, monthly/yearly byMonthDay = its day.
+// So a client sending the series' implicit day outright reads as "unchanged".
+function withAnchorDays(rule, anchor) {
+  const dn = dateDay(anchor);
+  if (!isObj(rule) || !Number.isFinite(dn)) return rule;
+  if (rule.freq === "weekly" && !rule.byDay) return { ...rule, byDay: [DAYS[(((dn + 4) % 7) + 7) % 7]] };
+  if ((rule.freq === "monthly" || rule.freq === "yearly") && !has(rule, "byMonthDay") && !rule.byWeekday) {
+    return { ...rule, byMonthDay: Number(anchor.slice(8)) };
+  }
+  return rule;
+}
 // `rule` with its EXPLICIT day moved along with an anchor moved from local date `from`
 // to `to` (YYYY-MM-DD), so the moved first instance is an occurrence of its own rule:
 // - byDay shifts every day by the move's weekday delta (the pattern moves, as re-timing
@@ -260,11 +272,21 @@ const sameDays = (a, b) => !!a && !!b && DAY_FIELDS.every((k) => JSON.stringify(
 // - byWeekday takes the new date's weekday and its nth (5th = last; a "last" rule stays
 //   last when the new date is its month's last such weekday).
 // An implicit day already reads off the anchor; a same-date move changes nothing.
+// null when the moved pattern cannot be a rule: an every-N-weeks (N > 1) byDay whose days
+// the move carries across DIFFERENT week boundaries (weeks start Sunday): FR,SA every 2
+// weeks moved a day is Sat + Sun of the NEXT week, which no byDay of one week says.
 function reanchorDays(rule, from, to) {
   const a = dateDay(from), b = dateDay(to);
   if (!isObj(rule) || !Number.isFinite(a) || !Number.isFinite(b) || a === b) return rule;
   const out = { ...rule };
   if (Array.isArray(rule.byDay)) {
+    const iv = has(rule, "interval") ? rule.interval : 1;
+    if (rule.freq === "weekly" && iv > 1) {
+      // Which week (from the old one) each day lands in: all alike modulo the interval, or the
+      // dates are not every-N-weeks of one week's days any more.
+      const weeks = rule.byDay.map((d) => (((Math.floor((DAYS.indexOf(d) + b - a) / 7) % iv) + iv) % iv));
+      if (new Set(weeks).size > 1) return null;
+    }
     const shift = (((b - a) % 7) + 7) % 7;
     out.byDay = DAYS.filter((_, i) => rule.byDay.includes(DAYS[(i - shift + 7) % 7]));
   }
@@ -282,5 +304,5 @@ const localDate = (ms, tz, days = 0) => dayDate(Math.floor(wallOf(ms, tz) / DAY_
 
 module.exports = {
   FREQS, DAYS, INTERVAL_MAX, COUNT_MAX, PERIODS_MAX, DURATION_MAX_MS, KEY_RE,
-  ruleError, sanitizeRule, eachOccurrence, occurrences, occurrenceAt, localDate, wallOf, instantOf, sameDays, reanchorDays,
+  ruleError, sanitizeRule, eachOccurrence, occurrences, occurrenceAt, localDate, wallOf, instantOf, sameDays, withAnchorDays, reanchorDays,
 };

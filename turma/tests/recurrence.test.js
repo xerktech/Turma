@@ -193,12 +193,23 @@ test("XERK-2953: reanchorDays moves an explicit day with a moved anchor, so it i
   assert.equal(r.reanchorDays(same, "2027-07-31", "2027-07-31"), same);
   // Every re-anchored rule names its new anchor as an occurrence.
   for (const [rule, from, to] of [[{ freq: "monthly", interval: 1, byMonthDay: 31 }, "2027-07-31", "2027-07-30"],
-    [{ freq: "weekly", interval: 2, byDay: ["MO", "WE"] }, "2027-07-26", "2027-07-24"],
+    [{ freq: "weekly", interval: 1, byDay: ["MO", "WE"] }, "2027-07-26", "2027-07-24"],
+    [{ freq: "weekly", interval: 2, byDay: ["MO", "WE"] }, "2027-07-26", "2027-07-27"],
+    [{ freq: "weekly", interval: 2, byDay: ["MO", "WE"] }, "2027-07-26", "2027-08-02"],
     [{ freq: "yearly", interval: 1, byWeekday: { n: -1, day: "FR" } }, "2027-07-30", "2027-07-28"]]) {
     const re = r.sanitizeRule(r.reanchorDays(rule, from, to));
     const s = series(`${to}T09:00:00Z`, `${to}T10:00:00Z`, re, "UTC");
     assert.equal(keys(s, s.startMs, Infinity, 1)[0], `${to}T09:00:00Z`, JSON.stringify(re));
   }
+  // Every N > 1 weeks, days carried across DIFFERENT week boundaries (weeks start Sunday) are
+  // no one week's days: refused (null). Interval 1, or all days in the same week, re-anchor.
+  assert.equal(r.reanchorDays({ freq: "weekly", interval: 2, byDay: ["FR", "SA"] }, "2027-07-31", "2027-08-01"), null);
+  assert.equal(r.reanchorDays({ freq: "weekly", interval: 2, byDay: ["SU", "TU"] }, "2027-08-01", "2027-07-31"), null);
+  assert.deepEqual(r.reanchorDays({ freq: "weekly", interval: 2, byDay: ["FR", "SA"] }, "2027-07-30", "2027-08-06").byDay, ["FR", "SA"]);
+  assert.deepEqual(r.reanchorDays({ freq: "weekly", interval: 3, byDay: ["SA"] }, "2027-07-31", "2027-08-01").byDay, ["SU"]);
+  // The series' implicit day spelled out reads as the same days.
+  assert.deepEqual(r.withAnchorDays({ freq: "monthly", interval: 1 }, "2027-01-31"), { freq: "monthly", interval: 1, byMonthDay: 31 });
+  assert.deepEqual(r.withAnchorDays({ freq: "weekly", interval: 1 }, "2027-07-26"), { freq: "weekly", interval: 1, byDay: ["MO"] });
   assert.equal(r.sameDays(r.sanitizeRule({ freq: "weekly", byDay: ["WE", "MO"] }), r.sanitizeRule({ freq: "weekly", byDay: ["MO", "WE"] })), true);
   assert.equal(r.sameDays({ freq: "monthly", interval: 1 }, { freq: "monthly", interval: 1, byMonthDay: 3 }), false);
 });
