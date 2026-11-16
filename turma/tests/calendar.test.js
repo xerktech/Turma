@@ -1369,6 +1369,10 @@ test("XERK-2989: invitations — the form round-trips them, the editor offers th
   assert.equal(cal.invitesText({ ...ev, recurring: true, seriesId: "turma:ab" }),
     "Sent from acme's Outlook · forwarding off · 1 accepted, 1 declined, 1 not responded");
   assert.equal(cal.invitesText(tev({ recurring: true })), "", "a series that sends none shows none");
+  // Its owner is served the sensitivity, never `private`; the hub sends no invitations for it (QA).
+  for (const sensitivity of ["private", "confidential"]) {
+    assert.equal(cal.invitesText({ ...ev, recurring: true, sensitivity }), "", sensitivity);
+  }
   assert.match(cal.detailHtml(ev), /Invitations/);
 });
 

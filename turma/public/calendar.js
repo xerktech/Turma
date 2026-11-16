@@ -746,8 +746,9 @@ function linesHtml(t) {
 // A Turma event's invitations (XERK-2989): which org's Outlook sends them, the options,
 // and a tally of the answers the hub read off that copy. "" when it sends none.
 function invitesText(ev) {
-  // A series sends them too (XERK-2986): one invitation for the whole series (XERK-3012).
-  if (ev.sendInvites !== true || ev.private === true) return "";
+  // A series sends them too (XERK-2986, XERK-3012). A private/confidential event sends none
+  // (the hub writes it with sendInvites off); its owner is served `sensitivity`, not `private`.
+  if (ev.sendInvites !== true || ev.private === true || ev.sensitivity === "private" || ev.sensitivity === "confidential") return "";
   const orgs = evOrgs(ev);
   const bits = [orgs.length ? `Sent from ${orgLabel(orgs[0])}'s Outlook` : "Sent from Outlook"];
   if (ev.responseRequested === false) bits.push("no responses requested");

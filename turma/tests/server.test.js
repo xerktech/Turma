@@ -35447,16 +35447,18 @@ test("XERK-3012: an invited series serves its sending copy's responses on every 
       { name: "Ann", email: "ann@x.com", role: "required", response: "accepted" },
       { name: "Bo", email: "bo@x.com", role: "optional", response: "none" }];
     const k0 = iso2968(T2968), k1 = iso2968(T2968 + 864e5);
+    // Ann declined only the second occurrence (QA): each occurrence reads its own copy.
+    const declined = answers.map((a) => (a.email === "ann@x.com" ? { ...a, response: "declined" } : a));
     await beat2985(D2985A, S2985A, sync2985([
       copy2985(rec2985(id), { id: `GID-S:${k0}`, seriesId: "GID-S", recurring: true, attendees: answers }),
       copy2985(rec2985(id), { id: `GID-S:${k1}`, seriesId: "GID-S", recurring: true, start: k1,
-        end: iso2968(T2968 + 864e5 + 3.6e6), attendees: answers })]));
-    const occ = (await served2968()).filter((e) => e.seriesId === id);
-    assert.ok(occ.length >= 1, "an occurrence is served");
-    for (const e of occ) {
-      assert.equal(e.sendInvites, true);
-      assert.deepEqual(e.attendees.map((a) => [a.email, a.response]), [["ann@x.com", "accepted"], ["bo@x.com", "notResponded"]]);
-    }
+        end: iso2968(T2968 + 864e5 + 3.6e6), attendees: declined })]));
+    const window = await calGet2891(T2968 - 864e5, T2968 + 3 * 864e5, userHeaders, "");
+    const occ = window.body.events.filter((e) => e.source === "turma" && e.seriesId === id);
+    const byKey = Object.fromEntries(occ.map((e) => [e.originalStart, e.attendees.map((a) => [a.email, a.response])]));
+    assert.equal(occ.every((e) => e.sendInvites === true), true);
+    assert.deepEqual(byKey[k0], [["ann@x.com", "accepted"], ["bo@x.com", "notResponded"]]);
+    assert.deepEqual(byKey[k1], [["ann@x.com", "declined"], ["bo@x.com", "notResponded"]]);
   } finally {
     cleanup2985(D2985A);
     forget2533(D2985A);
