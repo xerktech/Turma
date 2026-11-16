@@ -56641,6 +56641,14 @@ class TestDailyBrief(unittest.TestCase):
 
     def test_zero_width_split_and_long_text(self):
         self.assertEqual(ha._brief_text("go https\u200b://evil.com/x"), "go [link]")
+        # XERK-2953: control chars can't split a URL/email past the scrub, and a
+        # lone surrogate (unencodable into the argv) is dropped.
+        self.assertEqual(ha._brief_text("go https\x00://evil.com/x"), "go [link]")
+        self.assertEqual(ha._brief_text("mail bob@evil\x7f.com"), "mail [email]")
+        self.assertEqual(ha._brief_text("a\tb\x00c\nd"), "a bc d")
+        self.assertEqual(ha._brief_text("Stand\ud800up"), "Standup")
+        prompt = ha.daily_brief_input({"open": [{"key": "X-\ud800"}]})
+        prompt.encode("utf-8")   # would raise UnicodeEncodeError before the fix
         start = time.monotonic()
         out = ha._brief_text("a" * 200000)
         self.assertLess(time.monotonic() - start, 1.0)
@@ -58480,6 +58488,19 @@ class TestLockdownOneshotStdin(ManagerMixin, unittest.TestCase):
         self.assertEqual(out, text)
         self.assertEqual(sm._run_lockdown_oneshot(["false"], "meeting-", 10, 100, "t",
                                                   stdin_text="x"), None)
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
+
+    def test_a_lone_surrogate_neither_raises_nor_leaks_the_temp_file(self):
+        # XERK-2953: json.loads accepts "\ud800"; encoding it raised past the OSError guard.
+        sm = self.make_manager()
+        out = sm._run_lockdown_oneshot(["cat"], "meeting-", 10, 1 << 20, "t",
+                                       stdin_text="Stand\ud800up")
+        self.assertEqual(out, "Stand?up")
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
+
+    def test_an_unencodable_argv_is_a_launch_failure_not_a_raise(self):
+        sm = self.make_manager()
+        self.assertIsNone(sm._run_lockdown_oneshot(["echo", "a\x00b"], "meeting-", 10, 100, "t"))
         self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
 
 

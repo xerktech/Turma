@@ -41,8 +41,9 @@ progress) and `next` (To Do candidates). Board mechanics it reuses: `agent-board
   `counts.blocked` use it, and a To Do ticket with any open blocker is left out of `next`.
 - **ADO carries no `blockedBy`** (the board reads no ADO links), so its candidates come from shared
   parents alone. The output SHAPE is still identical (XERK-43, pinned by `test_azure_parity`).
-- **This text goes to a model**: summaries only, no descriptions. `_brief_text` drops format
-  chars (a zero-width split), then replaces any `scheme://`, `mailto:`/`file:`, scp-style
+- **This text goes to a model**: summaries only, no descriptions. `_brief_text` drops format,
+  surrogate and non-space control chars (a `https\x00://` split; a lone surrogate can't be encoded
+  into the argv), then replaces any `scheme://`, `mailto:`/`file:`, scp-style
   `git@host:path` and `www.` with `[link]`, and any email with `[email]` — a display name can BE
   an email (ADO guests). Every list is row-capped and the whole JSON char-capped
   (`DAILY_BRIEF_MAX_CHARS`), shedding the longest list's last rows, then `scope` itself
