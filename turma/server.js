@@ -7903,8 +7903,13 @@ function calOutlookDrifted(rec, org, e, c) {
 }
 // Whether `org`'s copy of `rec` is the one that sends invitations (XERK-2989).
 // Not while a dropped org's sending copy still waits for its cancellation (XERK-3015).
+// A copy that may already have sent (`sent`, XERK-3014) is not held back: its invitation
+// is live, so it keeps sending updates, and it stays the held sender (XERK-3010) rather
+// than being re-homed as if plain. The hold only stops a NEW sender.
 const calTurmaSends = (rec, org) => rec.sendInvites === true && org === rec.orgs[0] &&
-  !CAL_TURMA_HIDDEN.has(rec.sensitivity) && !calSendTombstoned(tenantOfSite(org), rec.id);
+  !CAL_TURMA_HIDDEN.has(rec.sensitivity) &&
+  (!calSendTombstoned(tenantOfSite(org), rec.id) || calOutlookSentHere(rec, org));
+const calOutlookSentHere = (rec, org) => !!rec.outlook && Object.hasOwn(rec.outlook, org) && rec.outlook[org].sent === true;
 // The attendee responses Outlook tracked on the sending copy (XERK-2989): its holder's
 // synced copy (stamped with the record's id) -> lowercased email -> response. Null when
 // nothing is known yet. Indexed per stored event list, rebuilt when a sync replaces it.

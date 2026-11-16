@@ -74,6 +74,9 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - The 409 judges "asked to send" (`sendInvites`, `orgs[0]`, not hidden), NOT `calTurmaSends`: that
     is false while a sent tombstone waits (XERK-3015), which would turn the 409 into a silent hold.
   - Re-homing a `sent` copy writes a SENT tombstone, so XERK-3015's hold also covers it.
+  - XERK-3015's hold never applies to a copy already `sent` (`calTurmaSends`): its invitation is
+    live, so it keeps sending updates and stays held on its host. Else a FORMER sender's sent
+    tombstone made the current sender read as plain and get re-homed, re-inviting (QA).
   - Tests: server.test.js "XERK-3014: …" (off-then-on, "following" split, another org the sender).
 
 ## Tombstones: deleting a copy a record no longer names
