@@ -172,9 +172,14 @@ class MeetingsScreenTest {
         }
         compose.onNodeWithText("1:02:05  Bo: Agreed.").assertExists()
         compose.onNodeWithText("▾ Full transcript").performScrollTo().performClick()
-        compose.onNodeWithText("1:02:05  Bo: Agreed.").assertDoesNotExist()
+        // Wait for the collapse to settle: asserting the very next frame flaked on CI.
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("1:02:05  Bo: Agreed.").fetchSemanticsNodes().isEmpty()
+        }
         compose.onNodeWithText("▸ Full transcript").performScrollTo().performClick()
-        compose.onNodeWithText("1:02:05  Bo: Agreed.").assertExists()
+        compose.waitUntil(10_000) {
+            compose.onAllNodesWithText("1:02:05  Bo: Agreed.").fetchSemanticsNodes().isNotEmpty()
+        }
         // One read: the second open reuses it.
         hub.findRequest("/m2/transcript")
         org.junit.Assert.assertNull(hub.findRequestOrNull("/m2/transcript"))
