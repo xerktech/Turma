@@ -10499,6 +10499,79 @@ def _tail_entries(path):
     return entries
 
 
+# The rows Claude Code has kept but not yet written (XERK-2959). It files a
+# response's rows only once every tool call in it has finished, so while an
+# AskUserQuestion waits on the operator (ask.py blocks in PreToolUse) that
+# response's text, a SendUserFile beside it and its result are on the session's
+# screen and in no transcript. The bridge mod mirrors the current turn's rows
+# from the engine's `session.append` into MOD_REQUESTS_DIR/<sid>/unsaved.json,
+# under the uuids the transcript later files them by. Mirrored in
+# tunnel-agent.js (readUnsaved / mergeUnsaved).
+UNSAVED_MAX_BYTES = 4 << 20
+
+
+def unsaved_rows_path(session_id):
+    """MOD_REQUESTS_DIR/<session_id>/unsaved.json, or None for an unusable id."""
+    folder = mod_request_dir(session_id)
+    return os.path.join(folder, "unsaved.json") if folder else None
+
+
+def _merge_unsaved(entries, doc, claude_session_id):
+    """The unsaved rows to show after `entries` (a transcript's tail, file
+    order). Pure. A row rides only when the doc names THIS conversation, its
+    uuid is not in `entries` already, and it is no older than their newest
+    message: a row the transcript filed and the read window has since dropped
+    must not come back at the end."""
+    if (not isinstance(doc, dict) or doc.get("v") != 1 or not claude_session_id
+            or doc.get("claudeSessionId") != claude_session_id
+            or not isinstance(doc.get("rows"), list)):
+        return []
+    seen = set()
+    newest = None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        if isinstance(e.get("uuid"), str):
+            seen.add(e["uuid"])
+        if e.get("type") not in ("user", "assistant"):
+            continue
+        t = _ts_ms(e.get("timestamp"))
+        if t is not None and (newest is None or t > newest):
+            newest = t
+    out = []
+    for r in doc["rows"]:
+        if not isinstance(r, dict) or r.get("type") not in ("user", "assistant"):
+            continue
+        uuid = r.get("uuid")
+        if not isinstance(uuid, str) or not uuid or uuid in seen:
+            continue
+        msg = r.get("message")
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
+            continue
+        t = _ts_ms(r.get("timestamp"))
+        if t is None or (newest is not None and t < newest):
+            continue
+        seen.add(uuid)
+        out.append({"type": r["type"], "uuid": uuid, "timestamp": r["timestamp"],
+                    "message": {"role": r["type"], "content": msg["content"]}})
+    return out
+
+
+def _with_unsaved(entries, path, unsaved):
+    """`entries` plus the unsaved rows of `unsaved` (a path, or None) that
+    belong after them. Never raises: a missing, planted or malformed file adds
+    nothing."""
+    if not unsaved or not path:
+        return entries
+    try:
+        doc = _read_untrusted_json(unsaved, UNSAVED_MAX_BYTES)
+        base = os.path.basename(path)
+        csid = base[:-len(".jsonl")] if base.endswith(".jsonl") else base
+        return entries + _merge_unsaved(entries, doc, csid)
+    except Exception:
+        return entries
+
+
 # A background Task/agent finishing injects a `<task-notification>…` payload as a
 # user-role turn (origin.kind == "task-notification"), an XML-ish blob carrying a
 # <summary>, <status>, optional <note> boilerplate and the child's <result>.
@@ -13436,7 +13509,7 @@ def _blocks_weight(blocks):
     return total
 
 
-def transcript_tail(path):
+def transcript_tail(path, unsaved=None):
     """Last TAIL_MSGS surviving messages of a transcript, oldest first, as the
     heartbeat's per-session preview: [{"id": entry uuid, "role": "user"/
     "assistant", "text": text, "truncated"?: True, "blocks"?: [...]}, ...].
@@ -13489,7 +13562,8 @@ def transcript_tail(path):
     # Dropping the OLDEST rows instead costs nothing real: they are exactly what
     # `/history` serves, at looser caps, on demand. What must never be lossy is
     # what is on screen right now.
-    for entry in reversed(_tail_entries(path)):
+    # `unsaved`: the bridge mod's not-yet-written rows (XERK-2959).
+    for entry in reversed(_with_unsaved(_tail_entries(path), path, unsaved)):
         if len(rows) >= TAIL_MSGS:
             break
         # The NEWEST row always rides, whatever it costs. It is the message the
@@ -14072,7 +14146,7 @@ def _operator_units(rows):
     return units
 
 
-def _history_entries(path):
+def _history_entries(path, unsaved=None):
     """On-demand `history` read of a transcript: bounded to the last 4 MiB
     (1 << 22, same cap the PR-URL scan uses) rather than transcript_tail's
     ~128 KB, tolerant JSONL parse, entries mapped through _history_row (no
@@ -14096,13 +14170,16 @@ def _history_entries(path):
         byte_capped = False
     entries = []
     queued = []
+    parsed = []
     for raw in _read_tail_lines(path, read_cap):
         try:
             entry = json.loads(raw)
         except ValueError:
             continue
-        if not isinstance(entry, dict):
-            continue
+        if isinstance(entry, dict):
+            parsed.append(entry)
+    # `unsaved`: the bridge mod's not-yet-written rows (XERK-2959).
+    for entry in _with_unsaved(parsed, path, unsaved):
         if entry.get("type") == "queue-operation":
             _fold_queue_op(entry, queued)
             continue
@@ -22196,7 +22273,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # raises below, so a raise must not latch a false qaPartial (XERK-1858).
         state["qaComplete"] = True
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
-    report["tail"] = transcript_tail(newest)
+    report["tail"] = transcript_tail(newest, unsaved_rows_path(session_id))
     if not primed:
         qa_from = offsets.get(newest, 0)
         # The prime set this transcript's offset to EOF, possibly mid-line;
@@ -41178,7 +41255,7 @@ class SessionManager:
             return
         # _history_entries caps internally (operator messages exempt, XERK-186)
         # — re-slicing here would evict the exempt rows it folded back in.
-        entries, truncated, queued = _history_entries(path)
+        entries, truncated, queued = _history_entries(path, unsaved_rows_path(sid))
         self.history_results.append({
             "sessionId": sid,
             "entries": entries,

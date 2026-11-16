@@ -598,3 +598,57 @@ test("a malformed status file prints, it never throws", async () => {
   h.files.set("/r/status.json", "null");
   assert.match(await h.turma("status"), /^\/turma status failed: /, "a throw prints, never escapes");
 });
+
+// XERK-2959: Claude Code files a response's rows only once every tool call in
+// it finished, so a pending AskUserQuestion keeps its turn's text and a
+// SendUserFile beside it out of the transcript. The mod mirrors them.
+test("XERK-2959: the turn's kept rows are mirrored to unsaved.json, main loop only", async () => {
+  const h = await harness();
+  const unsaved = () => JSON.parse(h.files.get("/r/unsaved.json"));
+  assert.deepEqual(unsaved(), { v: 1, claudeSessionId: "conv-1", rows: [] });
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  const row = (uuid, type, content, extra = {}) => ({
+    uuid, door: type === "assistant" ? "response" : "tool-result",
+    origin: { kind: "model", model: "m" }, message: { type, role: type, content }, ...extra });
+  await h.event("session.append", row("u1", "assistant", [{ type: "text", text: "Here they are" }]));
+  await h.event("session.append", row("u2", "assistant",
+    [{ type: "tool_use", id: "tu1", name: "SendUserFile", input: { files: ["/x/shot.png"] } }]));
+  await h.event("session.append", row("u3", "user",
+    [{ type: "tool_result", tool_use_id: "tu1", content: "sent" }]));
+  // A subagent's row, an attachment and a notice are not the main chat.
+  await h.event("session.append", row("s1", "assistant", [{ type: "text", text: "sub" }], { agentId: "a" }));
+  await h.event("session.append", { uuid: "n1", door: "attachment", origin: { kind: "model", model: "m" },
+    message: { type: "attachment", content: [{ type: "text", text: "x" }] } });
+  const got = unsaved();
+  assert.equal(got.claudeSessionId, "conv-1");
+  assert.deepEqual(got.rows.map(r => [r.uuid, r.type]), [["u1", "assistant"], ["u2", "assistant"], ["u3", "user"]]);
+  assert.equal(got.rows[1].message.content[0].name, "SendUserFile");
+  assert.match(got.rows[0].timestamp, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/);
+  // A new main-loop turn starts over, and says so at once (before any row).
+  await h.event("turn.start", { text: "next", turnId: "t2" });
+  assert.deepEqual(unsaved().rows, []);
+  await h.event("session.append", row("u4", "assistant", [{ type: "text", text: "new" }]));
+  assert.deepEqual(unsaved().rows.map(r => r.uuid), ["u4"]);
+});
+
+test("XERK-2959: unsaved.json stays bounded and an oversized row is left out", async () => {
+  const h = await harness();
+  await h.event("turn.start", { text: "go", turnId: "t1" });
+  const big = "x".repeat(300 * 1024);
+  await h.event("session.append", { uuid: "big", door: "tool-result", origin: { kind: "tool", tool: "Read" },
+    message: { type: "user", role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: big }] } });
+  // Left out on its own, not merely pushed out by later rows.
+  assert.deepEqual(JSON.parse(h.files.get("/r/unsaved.json")).rows, []);
+  for (let i = 0; i < 80; i++) {
+    await h.hooks["session.append"](h.$, { uuid: `r${i}`, door: "response", origin: { kind: "model", model: "m" },
+      message: { type: "assistant", role: "assistant", content: [{ type: "text", text: "y".repeat(50 * 1024) }] } },
+      async x => x);
+  }
+  await new Promise(r => setTimeout(r, 20));
+  const body = h.files.get("/r/unsaved.json");
+  assert.ok(body.length <= 1024 * 1024, `${body.length}`);
+  const rows = JSON.parse(body).rows;
+  assert.ok(rows.length <= 60);
+  assert.ok(!rows.some(r => r.uuid === "big"));
+  assert.equal(rows[rows.length - 1].uuid, "r79");
+});
