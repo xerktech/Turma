@@ -6328,9 +6328,11 @@ function calendarRecordError(key, msg, now) {
 function applyCalendarSync(key, row, now) {
   const from = calMs(row.windowFrom);
   const until = calMs(row.windowUntil);
-  if (!from || until <= from || until - from > CALENDAR_SPAN_MAX_MS) {
+  // Past year 10000 the zone math the Outlook repair expands with throws (XERK-2953).
+  if (!from || until <= from || until - from > CALENDAR_SPAN_MAX_MS || until > CALENDAR_SERVE_UNTIL_MAX) {
     return calendarRecordError(key, "the hub refused a calendar sync: its window must be epoch ms " +
-      `with until after from, at most ${CALENDAR_SPAN_MAX_MS / CALENDAR_WEEK_MS} weeks long`, now);
+      `with until after from, at most ${CALENDAR_SPAN_MAX_MS / CALENDAR_WEEK_MS} weeks long, ` +
+      "ending by the year 10000", now);
   }
   if (!Array.isArray(row.events)) {
     return calendarRecordError(key, meetingText(row.error, 300) || "the agent sent no events list", now);

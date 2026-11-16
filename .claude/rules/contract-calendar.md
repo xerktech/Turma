@@ -43,7 +43,8 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
     the record is stored (never on `/api/agents`).
 - Row: `{windowFrom, windowUntil, syncedAt, events[]}` — a read that worked — or
   `{windowFrom, windowUntil, syncedAt, error}` — one that did not ("Outlook is not open", ≤300).
-  - Times are epoch ms; `windowUntil > windowFrom`, span ≤ `CALENDAR_SPAN_MAX_MS` (40 weeks).
+  - Times are epoch ms; `windowUntil > windowFrom`, span ≤ `CALENDAR_SPAN_MAX_MS` (40 weeks),
+    `windowUntil` ≤ `CALENDAR_SERVE_UNTIL_MAX` (year 10000: the repair's zone math throws past it).
   - **The host is the beat's own key**, never a field of the row (a `host` sent is ignored).
 - **A sync is AUTHORITATIVE for its window**: every stored event of that host whose start lies in
   `[windowFrom, windowUntil)` and is absent from the row is DELETED. That is how a meeting

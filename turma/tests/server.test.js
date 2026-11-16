@@ -32348,6 +32348,10 @@ test("XERK-2891: size caps refuse a sync in the hub's words and keep the last go
   assert.deepEqual(h.events.map((e) => e.id), ["keep"]);
   await calBeat2891(D, { calendarSync: [{ windowFrom: now, windowUntil: now - 1, events: [] }] });
   assert.match(hub.getCalendarEvents()[D].lastError, /window must be epoch ms/);
+  // XERK-2953: a window past year 10000 is refused (the Outlook repair's zone math throws there).
+  const far = hub.CALENDAR_SERVE_UNTIL_MAX;
+  await calBeat2891(D, { calendarSync: [{ windowFrom: far - 24 * H2891, windowUntil: far + 1, events: [] }] });
+  assert.match(hub.getCalendarEvents()[D].lastError, /ending by the year 10000/);
   // A good sync clears the error.
   await calBeat2891(D, { calendarSync: [{ ...win, syncedAt: now + 3, events: [ev2891("keep", now + H2891)] }] });
   assert.equal(hub.getCalendarEvents()[D].lastError, undefined);
