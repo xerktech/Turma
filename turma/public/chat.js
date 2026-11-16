@@ -1828,18 +1828,23 @@
   // each new transcript line. Carry the existing <video> elements over by key;
   // moving a media element within one task keeps it playing.
   function carryVideos(scroll, write) {
+    // Key -> the old nodes IN DOCUMENT ORDER: one clip sent twice shares a key,
+    // and the Nth new copy takes the Nth old one (entries only append, so the
+    // order holds), never the first copy for every slot.
     const old = new Map();
     if (scroll.querySelectorAll) {
       for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
         const k = v.getAttribute("data-vkey");
-        if (!old.has(k)) old.set(k, v);
+        if (!old.has(k)) old.set(k, []);
+        old.get(k).push(v);
       }
     }
     write();
     if (!old.size) return;
     for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
-      const prev = old.get(v.getAttribute("data-vkey"));
-      if (prev && prev !== v) { v.replaceWith(prev); old.delete(v.getAttribute("data-vkey")); }
+      const list = old.get(v.getAttribute("data-vkey"));
+      const prev = list && list.shift();
+      if (prev && prev !== v) v.replaceWith(prev);
     }
   }
   // A clip the browser can't decode (.mov or Theora .ogv in Chrome) shows the

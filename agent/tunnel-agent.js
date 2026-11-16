@@ -595,9 +595,12 @@ function readRegularFileBounded(p, cap) {
 // the OLDEST entries in the frame lose their file payloads (the `shed` chip the
 // archive uses). `sent` still records the full weight, so the shed copy is not
 // re-sent every poll; /history (its own byte budget) serves the full one.
-const LIVE_FRAME_BUDGET_BYTES = Number(process.env.SESSION_LIVE_FRAME_BUDGET_BYTES) || 8 * 1024 * 1024;
+// Measured in UTF-8 BYTES (what the hub's ceiling counts), never `.length`:
+// multibyte HTML previews are up to 3x their character count on the wire.
+let LIVE_FRAME_BUDGET_BYTES = Number(process.env.SESSION_LIVE_FRAME_BUDGET_BYTES) || 8 * 1024 * 1024;
+const jsonBytes = (v) => Buffer.byteLength(JSON.stringify(v), "utf8");
 function shedFrameToBudget(entries, budget) {
-  const sizes = entries.map((e) => JSON.stringify(e).length);
+  const sizes = entries.map(jsonBytes);
   let total = sizes.reduce((a, b) => a + b, 0);
   for (let i = 0; i < entries.length && total > budget; i++) {
     const e = entries[i];
@@ -614,7 +617,7 @@ function shedFrameToBudget(entries, budget) {
     });
     if (!touched) continue;
     entries[i] = { ...e, blocks };
-    const size = JSON.stringify(entries[i]).length;
+    const size = jsonBytes(entries[i]);
     total -= sizes[i] - size;
     sizes[i] = size;
   }
@@ -3255,7 +3258,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { shedFrameToBudget, mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { __setFrameBudget: (n) => { LIVE_FRAME_BUDGET_BYTES = n; }, shedFrameToBudget, mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

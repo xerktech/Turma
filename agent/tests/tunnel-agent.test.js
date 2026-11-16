@@ -2255,6 +2255,40 @@ test("control channel: a hub that never app-pings is left alone (no reconnect lo
   }
 });
 
+// The budget must be WIRED into pollWatcher (a test of the helper alone stayed
+// green with the call deleted), and measured in bytes: CJK HTML is ~3x its
+// character count, and the hub's ws ceiling counts bytes.
+test("watch -> frame: the live tail sheds to its BYTE budget (multibyte HTML)", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wire-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "21111111-2222-3333-4444-555555555555";
+  const html = path.join(dir, "page.html");
+  fs.writeFileSync(html, "漢".repeat(3000)); // 3000 chars, 9000 bytes
+  const send = (id) => JSON.stringify({ type: "assistant", uuid: id, message: { content: [
+    { type: "tool_use", id: "t" + id, name: "SendUserFile", input: { files: [html], display: "render" } }] } });
+  fs.writeFileSync(path.join(proj, `${tid}.jsonl`), [send("a1"), send("a2")].join("\n") + "\n");
+  const frames = [];
+  mod.__setControlSink((o) => { frames.push(o); return true; });
+  mod.__setFrameBudget(12000); // one entry's BYTES fit, two don't; by chars both would
+  try {
+    mod.startWatch("sess-budget", work, tid);
+    const tail = frames.find((f) => f.tail === "sess-budget");
+    assert.ok(tail, "a tail frame was emitted");
+    const files = tail.entries.map((e) => e.blocks[0].files[0]);
+    assert.deepEqual(files[0], { name: "page.html", kind: "file", shed: true });
+    assert.equal(files[1].kind, "html");
+  } finally {
+    mod.stopWatch("sess-budget");
+    mod.__setControlSink(null);
+    mod.__setFrameBudget(8 * 1024 * 1024);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ---- the whole wire path: watch -> transcript -> `turn` frame ---------------
 // A mutation pass severed this in four independent places — the agentState
 // threading into transcriptTail, the watcher's seed, pollWatcher reading the
