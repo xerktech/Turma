@@ -1294,20 +1294,40 @@
     const next = mergeTail(buf, seed);
     return { buffer: next, changed: reseedSig(next) !== before };
   }
+  // A NEW incoming id lands where it happened, not at the end -- but ONLY when
+  // the batch itself proves where: it goes just before the next incoming id the
+  // buffer already holds at a LATER slot than any seen so far. Appending them
+  // all made a heartbeat seed carrying an id the buffer lacked (a pr-link row)
+  // draw it below newer turns. Two shapes must still APPEND, which is why the
+  // anchor is the next known id and never the previous one:
+  //  - a live-tail DELTA omits unchanged entries, so [grown X, new N] says N is
+  //    newer than X, not that it sits right after X;
+  //  - a seed repeats a restamped pr-link id (`pr-link:<url>`) several times, so
+  //    a backward jump to its first slot must not pull later turns up.
+  // Android Transcript.kt mergeTail mirrors this.
   function mergeTail(existing, incoming) {
     const byId = new Map();
     const order = [];
     for (const e of existing || []) {
       if (e && e.id != null && !byId.has(e.id)) { byId.set(e.id, e); order.push(e.id); }
     }
+    let prev = -1;      // highest slot in `order` an incoming known id held
+    let run = [];       // new ids waiting for a later known id to anchor them
     for (const inc of incoming || []) {
       if (!inc || inc.id == null) continue;
       const cur = byId.get(inc.id);
-      if (!cur) { byId.set(inc.id, inc); order.push(inc.id); continue; }
+      if (!cur) { byId.set(inc.id, inc); run.push(inc.id); continue; }
+      const at = order.indexOf(inc.id);
+      // at < 0: a repeat of an id still waiting in `run`; byId upgrades it below.
+      if (at > prev) {
+        if (run.length) { order.splice(at, 0, ...run); run = []; }
+        prev = order.indexOf(inc.id);
+      }
       const incHasBlocks = inc.blocks && inc.blocks.length;
       const curHasBlocks = cur.blocks && cur.blocks.length;
       if (weight(inc) >= weight(cur) || (incHasBlocks && !curHasBlocks)) byId.set(inc.id, inc);
     }
+    if (run.length) order.push(...run);
     return order.map((id) => byId.get(id));
   }
 

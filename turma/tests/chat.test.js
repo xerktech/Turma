@@ -33,6 +33,28 @@ test("mergeTail: appends new ids oldest-first, dedups, preserves order", () => {
   assert.deepEqual(b.map((e) => e.id), ["u1", "a1", "a2"]);
 });
 
+test("mergeTail: a new incoming id lands where it happened, not at the end (XERK-3003)", () => {
+  const e = (id) => ({ id, role: "assistant", text: id });
+  // A heartbeat seed carrying a pr-link row the buffer lacks, between two it holds.
+  const mid = mergeTail([e("a"), e("b"), e("c")], [e("a"), e("pr"), e("b")]);
+  assert.deepEqual(mid.map((x) => x.id), ["a", "pr", "b", "c"]);
+  // A new run LEADING the batch goes before the first id the buffer holds.
+  const lead = mergeTail([e("c"), e("d")], [e("a"), e("b"), e("c")]);
+  assert.deepEqual(lead.map((x) => x.id), ["a", "b", "c", "d"]);
+  // A batch sharing no id is appended (the live tail's normal case).
+  assert.deepEqual(mergeTail([e("a")], [e("x"), e("y")]).map((x) => x.id), ["a", "x", "y"]);
+  // A seed repeating a restamped pr-link id must not pull a later turn up.
+  const restamp = mergeTail(["u1", "a1", "P", "u2", "a2"].map(e), ["P", "u2", "a2", "P", "u3"].map(e));
+  assert.deepEqual(restamp.map((x) => x.id), ["u1", "a1", "P", "u2", "a2", "u3"]);
+  // A live DELTA [grown X, new N] omits unchanged entries: N is appended.
+  const delta = mergeTail(["X", "Y", "Z"].map(e), [{ id: "X", role: "assistant", text: "X grown" }, e("N")]);
+  assert.deepEqual(delta.map((x) => x.id), ["X", "Y", "Z", "N"]);
+  // A repeat of a waiting lead id neither duplicates nor drops it.
+  const rep = mergeTail([e("c")], [e("a"), { id: "a", role: "assistant", text: "longer a" }, e("c")]);
+  assert.deepEqual(rep.map((x) => x.id), ["a", "c"]);
+  assert.equal(rep[0].text, "longer a");
+});
+
 test("mergeTail: rich (has blocks) upgrades a text-only seed at equal text length", () => {
   const seed = [{ id: "a1", role: "assistant", text: "answer" }]; // heartbeat seed, no blocks
   const rich = [{ id: "a1", role: "assistant", text: "answer", blocks: [{ t: "text", text: "answer" }] }];
@@ -66,7 +88,7 @@ test("foldHistory: a reload never drops the grow-only buffer's pre-window entrie
     ({ id, role: "assistant", text: id }));
   const historyWindow = ["e3", "e4", "e5"].map((id) => ({ id, role: "assistant", text: id }));
   assert.deepEqual(mergeTail(historyWindow, buffer).map((e) => e.id),
-    ["e3", "e4", "e5", "e1", "e2"], "old behavior scrambled — the bug this fixes");
+    ["e1", "e2", "e3", "e4", "e5"], "mergeTail places a leading run in order too (XERK-3003)");
   assert.deepEqual(foldHistory(historyWindow, buffer).map((e) => e.id),
     ["e1", "e2", "e3", "e4", "e5"], "foldHistory keeps transcript order");
 });

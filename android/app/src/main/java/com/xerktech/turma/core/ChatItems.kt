@@ -3,6 +3,7 @@ package com.xerktech.turma.core
 import com.xerktech.turma.model.Block
 import com.xerktech.turma.model.CommandBlock
 import com.xerktech.turma.model.CommandOutputBlock
+import com.xerktech.turma.model.PrLinkBlock
 import com.xerktech.turma.model.SendFile
 import com.xerktech.turma.model.TailEntry
 import com.xerktech.turma.model.TaskNotificationBlock
@@ -148,7 +149,22 @@ sealed interface ChatItem {
         val result: String,
         val clipped: Boolean = false,
     ) : ChatItem
+
+    /**
+     * A PR this session opened, at the point it landed (chat.js `pr` item). Never
+     * hidden by a verbosity, as on the web.
+     */
+    data class PrMark(
+        override val entryKey: String,
+        val url: String,
+        val number: Int,
+        val repo: String,
+    ) : ChatItem
 }
+
+/** The marker's label — chat.js `renderPrMarker`. */
+fun prMarkLabel(p: ChatItem.PrMark): String =
+    "Opened PR" + (if (p.number != 0) " #${p.number}" else "") + (if (p.repo.isNotEmpty()) " — ${p.repo}" else "")
 
 /**
  * Build display items from [entries] under [prefs]. Every bubble renders in
@@ -204,6 +220,10 @@ fun buildItems(
     // output arrives as the NEXT entry, so this spans entries, and any other
     // block between the two drops it (chat.js `openCmd`).
     var openCmd = -1
+    // ONE PR marker per URL, at its FIRST occurrence: Claude Code re-stamps a
+    // session's PR links at the top of every user turn, so a long session logs
+    // the same PR many times (chat.js `prSeen`).
+    val prSeen = HashSet<String>()
     for (entry in entries) {
         // Older agents / the text-only heartbeat seed carry no blocks: synthesize
         // them, splitting a trailing run of tool markers off into name-only
@@ -324,6 +344,15 @@ fun buildItems(
                         )
                     }
                     openCmd = -1
+                }
+                is PrLinkBlock -> {
+                    flushText()
+                    // Only a FIRST occurrence is an item in the web stream, so only
+                    // it ends a hidden-thinking run; a repeat renders nothing.
+                    if (prSeen.add(block.url)) {
+                        flushFold()
+                        out.add(ChatItem.PrMark(entry.key, block.url, block.prNumber, block.repo))
+                    }
                 }
                 is TaskNotificationBlock -> {
                     flushText()

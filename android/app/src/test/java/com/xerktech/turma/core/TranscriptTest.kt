@@ -19,6 +19,28 @@ class TranscriptTest {
         assertEquals(listOf("1", "2"), a.map { it.key })
     }
 
+    // XERK-3003: chat.js mergeTail twin — a new key lands where the batch proves.
+    @Test fun `mergeTail places a new key before the next known key, else appends`() {
+        fun a(id: String, text: String = id) = e(id, "assistant", text)
+        fun m(buf: List<String>, inc: List<TailEntry>) = mergeTail(buf.map { a(it) }, inc).map { it.key }
+        assertEquals(listOf("a", "pr", "b", "c"), m(listOf("a", "b", "c"), listOf(a("a"), a("pr"), a("b"))))
+        assertEquals(listOf("a", "b", "c", "d"), m(listOf("c", "d"), listOf(a("a"), a("b"), a("c"))))
+        assertEquals(listOf("a", "x", "y"), m(listOf("a"), listOf(a("x"), a("y"))))
+        // A seed repeating a restamped pr-link id must not pull a later turn up.
+        assertEquals(listOf("u1", "a1", "P", "u2", "a2", "u3"),
+            m(listOf("u1", "a1", "P", "u2", "a2"), listOf(a("P"), a("u2"), a("a2"), a("P"), a("u3"))))
+        // A live DELTA [grown X, new N] omits unchanged entries: N is appended.
+        assertEquals(listOf("X", "Y", "Z", "N"), m(listOf("X", "Y", "Z"), listOf(a("X", "X grown"), a("N"))))
+        val rep = mergeTail(listOf(a("c")), listOf(a("a"), a("a", "longer a"), a("c")))
+        assertEquals(listOf("a", "c"), rep.map { it.key })
+        assertEquals("longer a", rep[0].text)
+    }
+
+    @Test fun `entryWeight counts a pr_link url, as chat js weight does`() {
+        val e = TailEntry(id = "p", role = "assistant", blocks = listOf(com.xerktech.turma.model.PrLinkBlock("https://x")))
+        assertEquals("https://x".length, entryWeight(e))
+    }
+
     @Test fun `mergeTail grows an entry but never shrinks it`() {
         val base = mergeTail(emptyList(), listOf(e("1", "assistant", "full answer here")))
         val shorter = mergeTail(base, listOf(e("1", "assistant", "full")))
@@ -84,8 +106,8 @@ class TranscriptTest {
         // pre-window entries BELOW history — older text out of order.
         val buffer = listOf("1", "2", "3", "4", "5").map { e(it, "assistant", it) }
         val historyWindow = listOf("3", "4", "5").map { e(it, "assistant", it) }
-        // Old behavior scrambled: [3,4,5,1,2].
-        assertEquals(listOf("3", "4", "5", "1", "2"), mergeTail(historyWindow, buffer).map { it.key })
+        // mergeTail now places a leading run in order too (XERK-3003; was [3,4,5,1,2]).
+        assertEquals(listOf("1", "2", "3", "4", "5"), mergeTail(historyWindow, buffer).map { it.key })
         // Fixed: transcript order preserved.
         val (merged, _) = prependHistory(buffer, historyWindow, truncated = false)
         assertEquals(listOf("1", "2", "3", "4", "5"), merged.map { it.key })

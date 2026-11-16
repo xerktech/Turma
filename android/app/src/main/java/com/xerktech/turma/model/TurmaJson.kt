@@ -29,6 +29,7 @@ val TurmaJson: Json = Json {
             subclass(TaskNotificationBlock::class)
             subclass(CommandBlock::class)
             subclass(CommandOutputBlock::class)
+            subclass(PrLinkBlock::class)
             subclass(UnknownBlock::class)
             defaultDeserializer { UnknownBlock.serializer() }
         }
