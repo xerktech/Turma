@@ -1,0 +1,40 @@
+{
+ "results": [
+  {
+   "outlookId": "E1",
+   "startMs": 1794837600000,
+   "lastModified": "2026-11-16T09:30:00+00:00",
+   "ok": true
+  },
+  {
+   "outlookId": "E1",
+   "startMs": 1794837600000,
+   "lastModified": "2026-11-16T09:30:00+00:00",
+   "ok": true
+  },
+  {
+   "outlookId": "E2",
+   "startMs": 1794837600000,
+   "lastModified": "2026-11-16T09:30:00+00:00",
+   "ok": true
+  },
+  {
+   "outlookId": "E3",
+   "startMs": 1794837600000,
+   "lastModified": "2026-11-16T09:30:00+00:00",
+   "ok": true
+  },
+  {
+   "error": "Outlook has no time zone Russia Time Zone 11",
+   "ok": false
+  },
+  {
+   "startMs": 1794837600000,
+   "ok": true
+  },
+  {
+   "ok": true
+  }
+ ],
+ "ok": true
+}
