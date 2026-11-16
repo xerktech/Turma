@@ -36,9 +36,16 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   offline. A NEW pick (no holder, or re-homing) takes the candidate with no `calendar` `lastError`,
   then the smallest host key — deterministic, so two hub passes never pick two hosts.
 - **Re-homing**: the holder goes away when it is removed from the registry, decided into another
-  org (or none), stops reporting `write`, or has been offline `CALENDAR_WRITE_REHOME_MS` (2h; a
-  beat's blip must not move a copy). Only then: a new holder gets an `upsert`, and the old copy
-  becomes a TOMBSTONE for the old host.
+  org (or none), drops `write` (absent: an older agent), or has been offline — or reporting
+  `write: false` — for `CALENDAR_WRITE_REHOME_MS` (2h; a beat's blip must not move a copy). Only
+  then: a new holder gets an `upsert`, and the old copy becomes a TOMBSTONE for the old host.
+  - `write: false` (Outlook failed its last run: closed, restarting, a read timing out on a prompt)
+    is kept distinct from absent by `normalizeCalendarCapability`. Re-homing on it at once moved a
+    SENDING copy on one Outlook restart, cancelling and re-inviting every attendee (XERK-2990).
+  - When the holder reports `write: true` again, its `failed` copies retry at once
+    (`calOutlookRetryHost`): a write sent just before Outlook closed fails, and the hourly retry
+    left that edit out of Outlook for up to an hour.
+    Tests: server.test.js "XERK-2990: a holder whose Outlook fails a run keeps its copy".
   - Org loss is judged on `decidedOrgOf` held for the same 2h (a brief drift re-homes nothing).
 
 ## Tombstones: deleting a copy a record no longer names
@@ -68,6 +75,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - **A sent-but-unanswered write is re-queued after `CALENDAR_WRITE_RESULT_MS` (10 min)**: an
   agent restart or a dropped outbox loses the row. Safe because the agent's upsert is idempotent.
 - A `failed` entry retries hourly and on any record write; never a tight loop on a permanent error.
+  - Also on its holder's return to `write: true` (XERK-2990): at most once per read cycle, even
+    when every write run is refused while reads succeed.
 
 ## Agent: the write (XERK-2984)
 

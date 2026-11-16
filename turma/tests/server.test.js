@@ -35077,6 +35077,56 @@ test("XERK-2985: the writer is sticky through a blip and re-homed once gone; the
   }
 });
 
+test("XERK-2990: a holder whose Outlook fails a run keeps its copy for the re-home grace", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A]))).body.event.id;
+    const holder = rec2985(id).outlook[S2985A].host;
+    const other = holder === D2985A ? D2985A2 : D2985A;
+    await beat2985(holder, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // One failed Outlook run (write:false): the copy stays put, and an edit waits for it.
+    await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
+    assert.deepEqual(agents[holder].calendar, { available: true, write: false });
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, holder, "a transient failure re-homes nothing");
+    const n = writes2985(holder).length;
+    assert.equal((await turma2968("PATCH", id, { version: 1, subject: "Moved" })).status, 200);
+    assert.deepEqual([rec2985(id).outlook[S2985A].host, rec2985(id).outlook[S2985A].state], [holder, "pending"]);
+    assert.equal(writes2985(holder).length, n, "nothing queued to a host not writing");
+    assert.ok(!(writes2985(other) || []).some((x) => x.turmaId === id), "no copy on the other host");
+    // Outlook answers again: the owed write goes to the same holder.
+    await beat2985(holder, S2985A);
+    assert.equal(writes2985(holder).filter((x) => x.turmaId === id && x.version === 2).length, 1);
+    // A write that failed while Outlook was closed retries as soon as it is back,
+    // not after the hourly retry.
+    await beat2985(holder, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 2, op: "upsert",
+      ok: false, error: "classic Outlook is not open" }] });
+    assert.equal(rec2985(id).outlook[S2985A].state, "failed");
+    await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
+    const before = writes2985(holder).filter((x) => x.turmaId === id).length;
+    await beat2985(holder, S2985A);
+    assert.equal(writes2985(holder).filter((x) => x.turmaId === id).length, before + 1, "re-sent on Outlook's return");
+    assert.equal(rec2985(id).outlook[S2985A].state, "pending");
+    // Down past the grace, both hosts still beating: only the grace can move the copy.
+    await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
+    const t0 = Date.now();
+    hub.calendarOutlookTick(t0, true);   // first seen not writing
+    const later = t0 + hub.CALENDAR_WRITE_REHOME_MS + 1000;
+    hub.calendarOutlookTick(t0 + hub.CALENDAR_WRITE_REHOME_MS - 60e3, true);
+    assert.equal(rec2985(id).outlook[S2985A].host, holder, "kept inside the grace");
+    agents[holder].lastSeen = later;
+    agents[other].lastSeen = later;
+    hub.calendarOutlookTick(later, true);
+    assert.equal(rec2985(id).outlook[S2985A].host, other);
+    assert.ok(hub.getCalendarOutlookTombstones()[holder].some((x) => x.turmaId === id));
+  } finally {
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
 test("XERK-2985: a Turma event's own Outlook copy is hidden, so it is served once", async () => {
   cleanup2985(D2985A);
   try {
