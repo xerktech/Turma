@@ -177,6 +177,39 @@ class CalendarTest {
         assertEquals(560.0, s.bottom, 0.0)
     }
 
+    @Test fun `XERK-3026 a short event lays out by its drawn floor so it never covers the next`() {
+        val d = LocalDate.of(2026, 11, 10)
+        // 10h zoom on a phone: a 20-minute row is taller than the floor, so 20 minutes stands.
+        assertEquals(20.0, calMinLayoutMin(30f, 10f), 0.0)
+        // 24h zoom: rows at their 10dp minimum, a 20-minute block (6.7dp) grows to its 10dp floor.
+        val m = calMinLayoutMin(10f, 10f)
+        assertEquals(30.0, m, 1e-9)
+        val segs = calDaySegments(
+            listOf(
+                ev("a", at(2026, 11, 10, 9), at(2026, 11, 10, 9, 15)),
+                ev("b", at(2026, 11, 10, 9, 30), at(2026, 11, 10, 10)),
+            ),
+            d, ny, m,
+        ).associateBy { it.ev.id }
+        // a's floored block ends exactly at 9:30: b, starting then, shares the column (touching).
+        assertEquals(1, segs["a"]!!.cols)
+        assertEquals(10.0, 10.0 * (segs["a"]!!.bottom - segs["a"]!!.top) / 30, 1e-9)
+        // b at 9:25 would lie under a's floored block: it takes its own column.
+        val near = calDaySegments(
+            listOf(ev("a", at(2026, 11, 10, 9), at(2026, 11, 10, 9, 15)), ev("b", at(2026, 11, 10, 9, 25), at(2026, 11, 10, 10))),
+            d, ny, m,
+        ).associateBy { it.ev.id }
+        assertEquals(2, near["a"]!!.cols)
+        assertEquals(1, near["b"]!!.col)
+        // The default keeps the 20-minute rule: the same two events stay in one column.
+        assertEquals(1, calDaySegments(
+            listOf(ev("a", at(2026, 11, 10, 9), at(2026, 11, 10, 9, 15)), ev("b", at(2026, 11, 10, 9, 25), at(2026, 11, 10, 10))),
+            d, ny,
+        ).first().cols)
+        // A zero-sized row never divides by zero.
+        assertEquals(20.0, calMinLayoutMin(0f, 10f), 0.0)
+    }
+
     @Test fun `an event in the repeated fall-back hour lays out by its length and names both zones`() {
         val d = LocalDate.of(2026, 11, 1)
         val s = java.time.Instant.parse("2026-11-01T05:30:00Z").toEpochMilli()
