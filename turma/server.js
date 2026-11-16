@@ -6731,7 +6731,7 @@ const CAL_TURMA_MAKE_PRIVATE_REFUSAL = { status: 409, body: { error: "only the o
 const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify({ ...rec, outlook: undefined }));
 
 // The served form for principal `p`; `served` = the orgs still decided.
-function turmaEventWire(p, rec, served = rec.orgs) {
+function turmaEventWire(p, rec, served = rec.orgs, occKey = "") {
   // A series' exceptions ride its occurrences, never the wire; nor do its copies' hosts and ids.
   // Nor does `createdBy`: it names the creator's hub user id, which no client reads (`editable`
   // says who may change it), and a private event must not tell every org viewer who made it (XERK-2953).
@@ -6741,7 +6741,7 @@ function turmaEventWire(p, rec, served = rec.orgs) {
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
     editable: calTurmaMayEdit(p, rec) && !calTurmaWithheld(p, rec), meeting: calendarLinkCandidate(rec) };
   // Each invitee's answer, read off the sending copy (XERK-2989); absent = not known.
-  const resp = calTurmaResponses(rec);
+  const resp = calTurmaResponses(rec, occKey);
   if (resp && resp.size) {
     out.attendees = rec.attendees.map((a) => (resp.has(a.email.toLowerCase()) ? { ...a, response: resp.get(a.email.toLowerCase()) } : a));
   }
@@ -6764,7 +6764,7 @@ function turmaOccurrenceRecord(rec, o, ex) {
 // (`turma:<hex>:<original start>`, the Outlook convention), `seriesId` the series'.
 function turmaOccurrenceWire(p, rec, o, served = rec.orgs) {
   const ex = rec.exceptions[o.key];
-  const w = { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served), id: `${rec.id}:${o.key}`,
+  const w = { ...turmaEventWire(p, turmaOccurrenceRecord(rec, o, ex), served, o.key), id: `${rec.id}:${o.key}`,
     seriesId: rec.id, originalStart: o.key, exception: !!ex, seriesStart: rec.start };
   // Writes are refused while the SERIES is withheld (calTurmaHiddenFrom), even on an
   // occurrence its owner made public: never offer an editor the route refuses.
@@ -7733,19 +7733,26 @@ const calTurmaSends = (rec, org) => rec.sendInvites === true && org === rec.orgs
 // The attendee responses Outlook tracked on the sending copy (XERK-2989): its holder's
 // synced copy (stamped with the record's id) -> lowercased email -> response. Null when
 // nothing is known yet. Indexed per stored event list, rebuilt when a sync replaces it.
+// A series (XERK-3012) reads occurrence `occKey`'s own copy (`<GID>:<original start>`),
+// since an invitee may answer one occurrence alone; else the series' first stamped copy.
 const calStampIndex = new WeakMap();
-function calTurmaResponses(rec) {
-  if (rec.recurrence || !calTurmaSends(rec, rec.orgs[0])) return null;
+function calTurmaResponses(rec, occKey) {
+  if (!calTurmaSends(rec, rec.orgs[0])) return null;
   const e = rec.outlook && Object.hasOwn(rec.outlook, rec.orgs[0]) ? rec.outlook[rec.orgs[0]] : null;
   const h = e && e.host && Object.hasOwn(calendarEvents, e.host) ? calendarEvents[e.host] : null;
   if (!h || !Array.isArray(h.events)) return null;
   let idx = calStampIndex.get(h.events);
   if (!idx) {
     idx = new Map();
-    for (const ev of h.events) if (ev.turmaId && !idx.has(ev.turmaId)) idx.set(ev.turmaId, ev);
+    for (const ev of h.events) {
+      if (!ev.turmaId) continue;
+      if (!idx.has(ev.turmaId)) idx.set(ev.turmaId, ev);
+      const m = CAL_OCCURRENCE_KEY_TAIL.exec(ev.id);
+      if (m) idx.set(`${ev.turmaId}\u0000${m[1]}`, ev);
+    }
     calStampIndex.set(h.events, idx);
   }
-  const copy = idx.get(rec.id);
+  const copy = (occKey && idx.get(`${rec.id}\u0000${occKey}`)) || idx.get(rec.id);
   if (!copy) return null;
   const out = new Map();
   for (const a of copy.attendees || []) {

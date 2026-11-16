@@ -289,8 +289,9 @@ fun calScopedPayload(base: TurmaEventDraft, draft: TurmaEventDraft, orgsOrder: L
  * Outlook sends them, the options, a tally of the answers the hub read back; "" = none sent.
  */
 fun calInvitesText(ev: CalendarEvent, orgLabel: (String) -> String): String {
-    // A series is not written to Outlook yet (XERK-2986), so it sends nothing either.
-    if (!ev.sendInvites || ev.private || ev.recurring) return ""
+    // A series sends them too (XERK-2986, XERK-3012). A private/confidential event sends none
+    // (the hub writes it with sendInvites off); its owner is served `sensitivity`, not `private`.
+    if (!ev.sendInvites || ev.private || ev.sensitivity == "private" || ev.sensitivity == "confidential") return ""
     val orgs = calOrgsOf(ev)
     val bits = mutableListOf(if (orgs.isNotEmpty()) "Sent from ${orgLabel(orgs[0])}'s Outlook" else "Sent from Outlook")
     if (!ev.responseRequested) bits += "no responses requested"

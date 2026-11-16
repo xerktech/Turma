@@ -91,7 +91,12 @@ class CalendarEventsTest {
         assertEquals("Sent from A's Outlook · no responses requested · 1 accepted, 1 declined",
             calInvitesText(ev) { "A" })
         assertEquals("", calInvitesText(ev.copy(sendInvites = false)) { "A" })
-        assertEquals("", calInvitesText(ev.copy(recurring = true)) { "A" })
+        // XERK-3012: a series sends invitations too, and shows its sending copy's answers.
+        assertEquals("Sent from A's Outlook · no responses requested · 1 accepted, 1 declined",
+            calInvitesText(ev.copy(recurring = true)) { "A" })
+        assertEquals("", calInvitesText(ev.copy(recurring = true, sendInvites = false)) { "A" })
+        // Its owner is served the sensitivity, never `private`; the hub sends none for it (QA).
+        for (s in listOf("private", "confidential")) assertEquals("", calInvitesText(ev.copy(sensitivity = s)) { "A" })
         // An older hub sends none of the three: the defaults.
         val (old) = decode("""[{"source":"turma","id":"turma:0123456789abcdef","subject":"P","start":"2026-11-16T09:00:00-05:00",
             "end":"2026-11-16T09:30:00-05:00","startMs":1,"endMs":2}]""")

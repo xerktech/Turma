@@ -35442,6 +35442,41 @@ test("XERK-2989: only the first org's copy sends invitations; its responses are 
   }
 });
 
+test("XERK-3012: an invited series serves its sending copy's responses on every occurrence", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const people = [{ name: "Ann", email: "ann@x.com", role: "required" }, { name: "Bo", email: "bo@x.com", role: "optional" }];
+    const c = await turma2968("POST", null, ev2968([S2985A], { attendees: people, sendInvites: true,
+      recurrence: { freq: "daily", interval: 1, count: 2 } }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const id = c.body.event.id;
+    assert.equal(writes2985(D2985A).at(-1).event.sendInvites, true);
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    await later2985();
+    // The reader stamps each occurrence with the series' id; Outlook keeps one recipient list.
+    const answers = [{ name: "Me", email: "me@x.com", role: "organizer", response: "organizer" },
+      { name: "Ann", email: "ann@x.com", role: "required", response: "accepted" },
+      { name: "Bo", email: "bo@x.com", role: "optional", response: "none" }];
+    const k0 = iso2968(T2968), k1 = iso2968(T2968 + 864e5);
+    // Ann declined only the second occurrence (QA): each occurrence reads its own copy.
+    const declined = answers.map((a) => (a.email === "ann@x.com" ? { ...a, response: "declined" } : a));
+    await beat2985(D2985A, S2985A, sync2985([
+      copy2985(rec2985(id), { id: `GID-S:${k0}`, seriesId: "GID-S", recurring: true, attendees: answers }),
+      copy2985(rec2985(id), { id: `GID-S:${k1}`, seriesId: "GID-S", recurring: true, start: k1,
+        end: iso2968(T2968 + 864e5 + 3.6e6), attendees: declined })]));
+    const window = await calGet2891(T2968 - 864e5, T2968 + 3 * 864e5, userHeaders, "");
+    const occ = window.body.events.filter((e) => e.source === "turma" && e.seriesId === id);
+    const byKey = Object.fromEntries(occ.map((e) => [e.originalStart, e.attendees.map((a) => [a.email, a.response])]));
+    assert.equal(occ.every((e) => e.sendInvites === true), true);
+    assert.deepEqual(byKey[k0], [["ann@x.com", "accepted"], ["bo@x.com", "notResponded"]]);
+    assert.deepEqual(byKey[k1], [["ann@x.com", "declined"], ["bo@x.com", "notResponded"]]);
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
 test("XERK-2989: an occurrence takes no invitation option of its own", async () => {
   cleanup2985(D2985A);
   try {
