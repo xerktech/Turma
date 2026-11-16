@@ -210,6 +210,7 @@ import kotlinx.serialization.json.put
  */
 
 private val SHORT_DP = 34.dp          // shorter than this, a block shows its title alone
+private val SHORT_LINE = 12.sp        // a short block's one title line; a block is never shorter (XERK-3024)
 
 /** The neutral colour of an unassigned event (the web's `--muted`). */
 @Composable
@@ -929,7 +930,12 @@ private fun WeekGrid(
                             for (seg in calDaySegments(range.events, d, zone)) {
                                 val ev = seg.ev
                                 val badge = calBadge(ev, fleet.meetingProposals)
-                                val h = slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp
+                                // A 640dp phone's 10 hours give a 15-minute meeting less than its title
+                                // line: the block grows to hold it (in sp, so a large font is whole too).
+                                val h = maxOf(
+                                    slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp,
+                                    with(density) { SHORT_LINE.toDp() } + 2.dp,
+                                )
                                 EventBlock(
                                     segModifier(seg, w, h, slot), ev, now, calOrgsOf(ev).map(colorOf), badge, short = h < SHORT_DP,
                                     open = ev.key == detailKey,
@@ -1059,7 +1065,7 @@ private fun EventBlock(
                     Text(
                         calTitle(ev), Modifier.weight(1f, fill = false), fontSize = if (short) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold,
                         maxLines = if (short) 1 else 2, overflow = TextOverflow.Ellipsis,
-                        lineHeight = if (short) 12.sp else 14.sp,
+                        lineHeight = if (short) SHORT_LINE else 14.sp,
                         textDecoration = if (st.canceled) TextDecoration.LineThrough else null,
                     )
                     Spacer(Modifier.weight(0.001f))

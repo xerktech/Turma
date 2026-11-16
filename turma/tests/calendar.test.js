@@ -1020,6 +1020,8 @@ test("XERK-2943: brief.html keeps the CSS that sizes short blocks and clears the
   const css = require("fs").readFileSync(require("path").join(__dirname, "..", "public", "brief.html"), "utf8");
   assert.match(css, /\.wrap\.tri-wrap \{ --tri-wrap: 1280px; max-width: var\(--tri-wrap\);/);
   assert.match(css, /\.cal-ev:not\(\.allday\) \{ container-type: size;/);
+  // XERK-3024: a 15-minute block on a small phone still holds its whole title line.
+  assert.match(css, /\.cal-ev:not\(\.allday\) \{[^}]*min-height: calc\(1\.25em \+ 2px\);/);
   assert.match(css, /@container \(height < 34px\) \{[^}]*\.cal-evb \{[^}]*\}\s*\.cal-evb \.m \{ display: none; \}/);
   assert.match(css, /\.cal:has\(> \.cal-detail:not\(\[hidden\]\)\) > \.cal-main \{\s*margin-right: max\(0px, 447px - max\(0px, \(100vw - var\(--tri-wrap\)\) \/ 2\)\);/);
 });

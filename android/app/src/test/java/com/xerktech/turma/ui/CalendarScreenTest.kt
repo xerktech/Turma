@@ -21,6 +21,7 @@ import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.pinch
 import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.swipeLeft
@@ -745,5 +746,30 @@ class CalendarScreenTest {
         compose.onNodeWithTag("cal-series-org").assertDoesNotExist()
         compose.onNodeWithText("for the whole series").assertDoesNotExist()
         compose.onNodeWithText("Automatic", substring = true).assertDoesNotExist()
+    }
+    // XERK-3024: on a 640dp-tall phone the default 10 hours give a 15-minute meeting less than its
+    // one title line, which was clipped. The block grows to hold the line, at any font scale.
+    @Test
+    @Config(sdk = [35], qualifiers = "w360dp-h640dp")
+    fun `a 15-minute meeting's block holds its whole title line on a small phone (XERK-3024)`() = shortBlockHoldsItsLine()
+
+    @Test
+    @Config(sdk = [35], qualifiers = "w360dp-h640dp", fontScale = 1.3f)
+    fun `a 15-minute meeting's title line is whole at a large font too (XERK-3024)`() = shortBlockHoldsItsLine()
+
+    private fun shortBlockHoldsItsLine() {
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ], "meetingProposals": { "$site": [ ${meeting()} ] } }""")
+        serve(true, """
+            { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "Q1", "source": "outlook", "subject": "Standup",
+              "startMs": ${t(today, 9)}, "endMs": ${t(today, 9, 15)}, "busy": "busy", "myResponse": "accepted" }""")
+        hub.json("/api/holidays", "[]")
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent("Standup")
+        assertEquals(10f, cvm.zoom.value)
+        val node = compose.onNode(event("Standup")).fetchSemanticsNode()
+        val line = with(node.layoutInfo.density) { 12.sp.toPx() }
+        val room = with(node.layoutInfo.density) { 2.dp.toPx() }   // the line plus a 1dp margin each side
+        assertTrue("block ${node.size.height}px < title line ${line}px + ${room}px", node.size.height >= line + room)
     }
 }
