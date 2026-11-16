@@ -289,9 +289,14 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 
 ## The calendar reader (XERK-2884)
 
-- Reads classic Outlook's default calendar over COM by running Windows PowerShell 5.1 with
-  `-EncodedCommand` — through WSL interop on a WSL host, directly on native Windows. As the
+- Reads classic Outlook's default calendar over COM by running Windows PowerShell 5.1
+  — through WSL interop on a WSL host, directly on native Windows. As the
   logged-in Windows user, so no Entra ID app, token or shared calendar is involved (operator).
+- **The script rides STDIN, never the command line** (XERK-3019): `-EncodedCommand` carries only a
+  fixed bootstrap that reads the script's base64 off stdin's first line and dot-sources it; the rest
+  of stdin is the script's own input (the writer's batch). Windows caps a command line at 32767
+  chars and the writer passed it, so WSL refused to start powershell.exe ("Invalid argument").
+  Never move a script back onto the command line. Tests: `test_xerk3019_*` (`test_session_cli.py`).
 - **An ENOEXEC from powershell.exe is WSL interop, and the error names the fix** (XERK-2938):
   `wsl_interop_hint` reads `/proc/sys/fs/binfmt_misc/WSLInterop` — missing (systemd on WSL can
   drop it after boot) → re-run the installer, which persists + re-registers it
