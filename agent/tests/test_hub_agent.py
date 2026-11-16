@@ -58490,6 +58490,19 @@ class TestLockdownOneshotStdin(ManagerMixin, unittest.TestCase):
                                                   stdin_text="x"), None)
         self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
 
+    def test_a_lone_surrogate_neither_raises_nor_leaks_the_temp_file(self):
+        # XERK-2953: json.loads accepts "\ud800"; encoding it raised past the OSError guard.
+        sm = self.make_manager()
+        out = sm._run_lockdown_oneshot(["cat"], "meeting-", 10, 1 << 20, "t",
+                                       stdin_text="Stand\ud800up")
+        self.assertEqual(out, "Stand?up")
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
+
+    def test_an_unencodable_argv_is_a_launch_failure_not_a_raise(self):
+        sm = self.make_manager()
+        self.assertIsNone(sm._run_lockdown_oneshot(["echo", "a\x00b"], "meeting-", 10, 100, "t"))
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR) if n.startswith("meeting-")], [])
+
 
 @unittest.skipUnless(hasattr(os, "killpg") and os.path.isdir("/proc"), "POSIX /proc only")
 class TestOneshotTimeoutKillsRealGroup(ManagerMixin, unittest.TestCase):

@@ -45845,7 +45845,9 @@ class SessionManager:
             try:
                 ifd, in_path = tempfile.mkstemp(prefix=prefix, suffix=".in", dir=REGISTRY_DIR)
                 inf = os.fdopen(ifd, "w+b")
-                inf.write(stdin_text.encode("utf-8"))
+                # "replace": a lone surrogate (json.loads accepts "\ud800") would raise
+                # UnicodeEncodeError past the OSError guard and leak this file.
+                inf.write(stdin_text.encode("utf-8", "replace"))
                 inf.flush()
                 inf.seek(0)
             except OSError as e:
@@ -45873,7 +45875,7 @@ class SessionManager:
                                         stdout=outf,
                                         stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
                                         env=_session_env(), start_new_session=True)
-            except OSError as e:
+            except (OSError, ValueError) as e:   # ValueError: NUL or unencodable argv
                 log(f"{what} launch failed: {e}")
                 return None
             finally:
