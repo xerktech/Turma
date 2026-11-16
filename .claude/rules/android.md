@@ -206,6 +206,13 @@ A pure-core/adapter-shell split:
       it again through `hubErrorMessage`, which would see an empty body.
     - The empty-slot tap is a `detectTapGestures` on the day column: an event block's own click
       consumes its tap first, so the column only hears the gaps.
+    - **Look = the web's `.cal-ev.turma`** (XERK-3020): the gradient in every response state, white
+      text, the orgs stacked in the bar. The gradient is CSS `135deg` (a custom `ShaderBrush`), never
+      Compose's corner-to-corner default, which tilts the bands with the block's shape (QA).
+    - The Outlook mark is the web's white `.cal-olk` pill with a FIXED glyph colour: a theme colour on
+      the gradient read ~1.3:1 (QA). An open Turma block is ringed in ink: `primary` vanished into it.
+    - Robolectric NATIVE composites only part of an `alpha()` layer, so a canceled/past dim cannot be
+      pinned in pixels there. Tests: `ui/CalendarTurmaGradientTest`.
     - Tests: `core/CalendarEventsTest`, `ui/CalendarTurmaEventsTest`.
   - Tests: `core/CalendarTest`, `ui/CalendarScreenTest`.
 
