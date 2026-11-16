@@ -92,12 +92,59 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - An `outlookId` hit outside the default calendar (the user deleted it to Deleted Items) is no copy.
 - **A command the CLI refuses never started PowerShell**, so it says nothing about Outlook: it
   never sets `calendar.write`, and one unreadable command never fails the rest of its batch.
-- **Single events only** until XERK-2986: a non-null `recurrence` is a failed row in words, never a
-  copy of the first instance. A non-sending copy carries no recipients.
+- A non-sending copy carries no recipients.
+- **A recurring record is ONE Outlook series** (XERK-2986): "Agent: recurring series" below.
 - **After a write the worker owes a forced sync of the weeks it touched** (from the saved item's
   `StartUTC`, so a delete re-syncs the week its copy left); wider than 40 weeks → the default window.
 - **`calendar.write` is true only while Outlook answered the last read or write**
   (`_cal_outlook_ok`; false before the first one): a closed Outlook stops the host being a writer.
+
+## Agent: recurring series (XERK-2986, `outlook_recurrence`)
+
+- **The read-back must name exactly what `turma/recurrence.js` expands** — same occurrence ids
+  (original start, UTC) and starts — or the read-back dedup and the series check break.
+  Pinned by `CalendarRecurrenceWriteTest`: the real script under pwsh, the pattern it SET expanded
+  by Outlook's rules (`_outlook_dates`), compared to `recurrence.js` over 12 rules.
+- Mapping: daily → olRecursDaily; weekly → olRecursWeekly + `DayOfWeekMask`; monthly → olRecursMonthly
+  `DayOfMonth` or olRecursMonthNth (`Instance` 5 = last); yearly → monthly every 12N months (no
+  olRecursYearly `Interval` units to get wrong). An implicit day (mask/dayOfMonth 0) is read off the
+  anchor's wall start in the event's zone by the script. `count` → `Occurrences`, `until` →
+  `PatternEndDate`, neither → `NoEndDate`.
+- **"A day past a month's end is its last day" is Outlook's own monthly rule** ("Some months have
+  fewer than 31 days…"), so the 31st needs no explicit exceptions. Host-unverified on a live
+  Outlook: a copy that showed otherwise would be re-written by the series check every repair.
+- **A rule Outlook cannot say exactly is a failed row in words, never approximated**: daily with
+  byDay every N days (N ≠ 1, not a multiple of 7); weekly every N > 1 weeks with SUNDAY and another
+  day (Outlook's weeks start on the mailbox's first day, which no pattern property sets; Turma's on
+  Sunday); yearly past every 8 years (Outlook's 99-month Interval cap).
+- Pattern times are WALL times in the event's zone (`StartTimeZone` set first): DST keeps 9:00 as
+  `recurrence.js` does. A start in a spring-forward gap is host-unverified.
+- **An upsert rewrites the whole series**: an existing copy is `ClearRecurrencePattern()`ed first
+  (drops every old exception), then the pattern, `Save()`, then each exception by
+  `GetOccurrence(<original start>)` (local time; an all-day one by its date in the event's zone):
+  `Delete()`, or set only the overridden fields + `Save()`. A moved occurrence keeps its id because
+  the reader reads `PidLidExceptionReplaceTime`.
+- An edit Outlook cannot apply (no occurrence there, a move past a neighbour) fails the row in
+  Outlook's words ("N of M occurrence edits failed: …"); the series itself is already saved.
+- A private occurrence edit is written withheld like a private record.
+- An occurrence's body is written whole: an override of `body` or `joinUrl` alone keeps the series'
+  other half, as the hub's occurrence view merges them.
+- **Every edited occurrence is stamped `TurmaId` itself**, and the reader gives an unstamped item
+  the stamp another item of its series carries in the same window: whether Outlook copies the
+  master's user property to an exception is unverified, and an unstamped one would read as an
+  untagged Outlook event (served twice) and its occurrence as missing.
+- A batch is split into PowerShell runs of ≤`CALENDAR_WRITE_EDITS_PER_RUN` (200) occurrence edits:
+  a run that times out fails and re-sends every command in it.
+- Residuals (host-unverified): Outlook refuses moving an occurrence past a neighbour, which the hub
+  allows — that row fails in Outlook's words and retries hourly. `GetOccurrence` is passed
+  machine-local time while the pattern is set in the event's zone. A Saturday-first-day mailbox has
+  the Sunday week-grouping problem for SA with other days, unrefused.
+- A result carries `series: true`; the worker then owes the whole default sync window, not a week.
+- **With invitations (XERK-2989)**: the rule and exceptions are hashed into `sentKey`, so a rule or
+  exception change re-sends and a repair rewrite of an unchanged series does not. A failed
+  occurrence edit sends nothing (attendees never get a series that differs from the record).
+  The send runs on a fresh `GetItemFromID` of the master: its occurrences were saved after it.
+  Host-unverified: `ClearRecurrencePattern` + Save on an already-sent meeting with no Send.
 
 ## Agent → hub: the `calendarWriteResults` outbox
 
@@ -182,7 +229,7 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 | `categories` | `Categories`, joined by the locale's list separator |
 | `attendees` | the sending copy only: `Recipients` synced to them (`Type` olRequired 1 / olOptional 2), `MeetingStatus` olMeeting |
 | `sendInvites`, `responseRequested`, `allowForward` | the sending copy only: `Send()`, `ResponseRequested`, `PidNameMeetingDoNotForward` |
-| `recurrence` + `exceptions` | `GetRecurrencePattern()` + per-occurrence edit/delete (XERK-2986) |
+| `recurrence` + `exceptions` | `GetRecurrencePattern()` + `GetOccurrence` edit/delete (above) |
 | `isOnlineMeeting`, `createdBy`, `orgs`, `version` | not written |
 | `reminderMinutes` | `ReminderSet = true` + `ReminderMinutesBeforeStart`; null → `ReminderSet = false` (XERK-2988) |
 
@@ -212,8 +259,18 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   `outlookId`, so (host, turmaId) never has both a delete and an upsert owed.
 - The command's `org` and a result's `org` are converted by hand (`baseOfSite` / `scopeSite`):
   the beat's `scopeSiteKeys` walk only rewrites fields named `siteKey`.
-- Drift is compared for single events only; a series is checked for a MISSING occurrence
-  (XERK-2986 owns writing series and comparing their occurrences).
+- **A series is compared occurrence by occurrence** (`calOutlookSeriesDrifted`), keyed on the
+  read-back id's `:<original start>` tail, over occurrences STARTING in the window: one missing, one
+  extra or one whose compared fields moved re-writes the series IN PLACE (outlookId kept).
+  - A series with NO stamped copy in the row is re-written in place too, never "re-created": the
+    agent sends only changed weeks, so a one-week row of a weekly series looks like a deleted one
+    (QA). The agent finds the series by outlookId/stamp and creates it only if it is gone.
+  - Each occurrence is compared to what was SENT (`calWriteEvent`), never the raw record: a private
+    series' occurrence made public alone still reads "Private event", and comparing the real text
+    re-wrote it every repair, forever (QA).
+  - Only occurrences STARTING in the row are judged, on both sides: the reader lists overlapping
+    ones, so one straddling the window start would read as extra or missing.
+  - Its `lastModified` is not compared: the writer saves the series, then each occurrence edit.
 
 ## Invitations (XERK-2989)
 
@@ -259,6 +316,7 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - Hub: the `XERK-2985:` cases in `server.test.js`; agent: `TestCalendarWrite` (`test_hub_agent.py`,
   the `xerk2984` cases) and `CalendarWriteTest` (`test_session_cli.py`: the real script under `pwsh`
   against a fake Outlook object model, and `calendar_write_fixture.json`, a reply recorded from it);
-  the reader's `turmaId` in `CalendarSyncReaderTest`. `XERK-2986:` cases for recurrence.
+  the reader's `turmaId` in `CalendarSyncReaderTest`. Recurrence: `XERK-2986:` in `server.test.js`,
+  `CalendarRecurrenceWriteTest` (`test_session_cli.py`), `test_xerk2986_*` (`test_hub_agent.py`).
 - Invitations: `XERK-2989:` in `server.test.js` and `calendar.test.js`; the `xerk2989` cases in
   `CalendarWriteTest`; Android `CalendarEventsTest`.

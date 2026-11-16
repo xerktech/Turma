@@ -35139,6 +35139,114 @@ test("XERK-2985: Turma wins — a drifted copy is re-written and a deleted one r
   }
 });
 
+test("XERK-2986: a series' copy is compared occurrence by occurrence; a gap is re-written, not re-created", async () => {
+  cleanup2985(D2985A);
+  const recur = require("../recurrence.js");
+  const from = T2968 - 864e5;
+  const until = T2968 + 3 * 864e5;
+  const sync = (events) => ({ calendarSync: [{ windowFrom: from, windowUntil: until, syncedAt: Date.now(), events }] });
+  // The reader's copy of each occurrence: id `<gid>:<original start>`, the series' stamp.
+  const copies = (rec, edit = {}) => recur.occurrences({ startMs: rec.startMs, endMs: rec.endMs,
+    timeZone: rec.timeZone, rule: rec.recurrence }, from, until, 10).map((o) => {
+    const ex = rec.exceptions[o.key];
+    if (ex && ex.deleted) return null;
+    const start = ex && ex.start ? ex.start : iso2968(o.startMs);
+    const end = ex && ex.end ? ex.end : iso2968(o.endMs);
+    return copy2985(rec, { id: `GID-S:${o.key}`, seriesId: "GID-S", recurring: true, start, end,
+      subject: (ex && ex.subject) || rec.subject, ...(edit[o.key] || {}) });
+  }).filter(Boolean);
+  const settle = async (id) => {
+    hub.__resetCalendarWriteMemo();
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, rec2985(id).version)] });
+    await later2985();
+    return writes2985(D2985A).length;
+  };
+  try {
+    await beat2985(D2985A, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A], { subject: "Standup",
+      recurrence: { freq: "daily", interval: 1, count: 3 } }))).body.event.id;
+    // In step, all three occurrences: nothing owed.
+    let n = await settle(id);
+    await beat2985(D2985A, S2985A, sync(copies(rec2985(id))));
+    assert.equal(writes2985(D2985A).length, n);
+    assert.equal(rec2985(id).outlook[S2985A].state, "written");
+    // A moved occurrence read back under its ORIGINAL start, where it moved to: in step.
+    const k2 = iso2968(T2968 + 864e5);
+    const moved = await turma2968("PATCH", `${id}:${k2}`, { version: 1, scope: "occurrence",
+      start: iso2968(T2968 + 864e5 + 7.2e6), end: iso2968(T2968 + 864e5 + 10.8e6) });
+    assert.equal(moved.status, 200, JSON.stringify(moved.body));
+    n = await settle(id);
+    await beat2985(D2985A, S2985A, sync(copies(rec2985(id))));
+    assert.equal(writes2985(D2985A).length, n);
+    // One occurrence deleted in Outlook: the SERIES is re-written in place (its
+    // outlookId kept), never re-created beside the copy that is still there.
+    await beat2985(D2985A, S2985A, sync(copies(rec2985(id)).filter((c) => !c.id.endsWith(k2))));
+    let w = writes2985(D2985A).at(-1);
+    assert.deepEqual([writes2985(D2985A).length, w.op, w.outlookId], [n + 1, "upsert", "EID-1"]);
+    assert.ok(!rec2985(id).outlook[S2985A].recreatedAt);
+    // One occurrence renamed in Outlook.
+    n = await settle(id);
+    await beat2985(D2985A, S2985A, sync(copies(rec2985(id), { [iso2968(T2968)]: { subject: "Renamed" } })));
+    assert.equal(writes2985(D2985A).length, n + 1);
+    // An occurrence the record does not have (a pattern Outlook read differently).
+    n = await settle(id);
+    const extra = copies(rec2985(id));
+    extra.push({ ...extra[0], id: `GID-S:${iso2968(T2968 + 1.8e6)}`, start: iso2968(T2968 + 1.8e6) });
+    await beat2985(D2985A, S2985A, sync(extra));
+    assert.equal(writes2985(D2985A).length, n + 1);
+    // No stamped copy in the row (a one-week row of a weekly series looks the
+    // same as a deleted series): re-written in place, never "re-created" (QA).
+    n = await settle(id);
+    await beat2985(D2985A, S2985A, sync([]));
+    w = writes2985(D2985A).at(-1);
+    assert.deepEqual([writes2985(D2985A).length, w.outlookId], [n + 1, "EID-1"]);
+    assert.ok(!rec2985(id).outlook[S2985A].recreatedAt);
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2986: a series check expects what was sent, and never judges an occurrence across the window edge", async () => {
+  cleanup2985(D2985A);
+  const recur = require("../recurrence.js");
+  try {
+    await beat2985(D2985A, S2985A);
+    // Daily, 3h long; the row starts 1h into the first occurrence and ends 1h into the third.
+    const id = (await turma2968("POST", null, ev2968([S2985A], { subject: "Clinic", location: "Room 2",
+      end: iso2968(T2968 + 1.08e7), sensitivity: "private", recurrence: { freq: "daily", interval: 1, count: 4 } })))
+      .body.event.id;
+    // The owner makes the second occurrence public, sending only its sensitivity:
+    // the series is written withheld, so that occurrence reads "Private event" too.
+    const k2 = iso2968(T2968 + 864e5);
+    assert.equal((await turma2968("PATCH", `${id}:${k2}`, { version: 1, scope: "occurrence",
+      sensitivity: "normal" })).status, 200);
+    const from = T2968 + 3.6e6;
+    const until = T2968 + 2 * 864e5 + 3.6e6;
+    const rec = rec2985(id);
+    // The reader's row: every occurrence OVERLAPPING [from, until), as Outlook holds them.
+    const events = recur.occurrences({ startMs: rec.startMs, endMs: rec.endMs, timeZone: rec.timeZone,
+      rule: rec.recurrence }, from - 1.08e7, until, 10).map((o) => copy2985(rec, {
+      id: `GID-P:${o.key}`, seriesId: "GID-P", recurring: true, start: iso2968(o.startMs), end: iso2968(o.endMs),
+      subject: "Private event", location: "", sensitivity: o.key === k2 ? "normal" : "private" }));
+    assert.equal(events.length, 3, "the row holds the straddling first and third occurrences too");
+    hub.__resetCalendarWriteMemo();
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, rec.version)] });
+    await later2985();
+    const n = writes2985(D2985A).length;
+    for (let i = 0; i < 2; i++) {
+      hub.__resetCalendarWriteMemo();
+      await beat2985(D2985A, S2985A, { calendarSync: [{ windowFrom: from, windowUntil: until,
+        syncedAt: Date.now(), events }] });
+    }
+    assert.equal(writes2985(D2985A).length, n, "in step: no repair loop");
+    assert.equal(rec2985(id).outlook[S2985A].state, "written");
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
 test("XERK-2985: tenant isolation — writes, results and stamps never cross tenants", async () => {
   const T = tenants2533();
   let F;

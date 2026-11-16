@@ -45670,6 +45670,7 @@ class SessionManager:
         read-back dedup hides it, and a deleted copy leaves its week)."""
         cli = session_cli_module()
         weeks = set()
+        series = False
         while True:
             with self._cal_lock:
                 keys = list(self._cal_writes)[:cli.CALENDAR_WRITE_BATCH_MAX]
@@ -45692,6 +45693,10 @@ class SessionManager:
                 log(f"calendar: {len(batch)} write(s) failed: {type(e).__name__}: {e}")
             self._cal_write_push([self._cal_write_row(c, r) for c, r in zip(batch, got)])
             for r in got:
+                # A series' occurrences reach past any one week (XERK-2986):
+                # it owes the whole scheduled window.
+                if r.get("ok") and r.get("series") is True:
+                    series = True
                 if r.get("ok") and isinstance(r.get("startMs"), int):
                     m = r["startMs"]
                     weeks.add((m - CALENDAR_MONDAY_MS) // CALENDAR_WEEK_MS * CALENDAR_WEEK_MS
@@ -45702,7 +45707,7 @@ class SessionManager:
         with self._cal_lock:
             if self._cal_want is not None:
                 lo, hi = min(lo, self._cal_want[0]), max(hi, self._cal_want[1])
-            if hi - lo > CALENDAR_SPAN_MAX_MS:
+            if series or hi - lo > CALENDAR_SPAN_MAX_MS:
                 # Writes spread wider than one sync may ask: the scheduled window.
                 lo, hi = calendar_default_window(int(time.time() * 1000) if now_ms is None else now_ms)
             self._cal_want = (lo, hi)

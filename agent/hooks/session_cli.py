@@ -103,7 +103,12 @@ _SENSITIVITY = {0: "normal", 1: "personal", 2: "private", 3: "confidential"}
 # The Turma writer (XERK-2984): commands per PowerShell run, and its timeout
 # (an Outlook security prompt blocks a write as it blocks a read).
 CALENDAR_WRITE_BATCH_MAX = 20
-CALENDAR_WRITE_TIMEOUT_SEC = 120
+# A recurring copy is one Save plus a GetOccurrence/Save per exception (≤100).
+CALENDAR_WRITE_TIMEOUT_SEC = 300
+CALENDAR_WRITE_EXCEPTIONS_MAX = 100          # the hub's CALENDAR_TURMA_EXCEPTIONS_MAX
+# Occurrence edits one PowerShell run takes: each is a GetOccurrence + Save, and a
+# run that times out fails (and re-sends) every command in it.
+CALENDAR_WRITE_EDITS_PER_RUN = 200
 CALENDAR_WRITE_ERROR_MAX = 300
 CALENDAR_OUTLOOK_ID_MAX = 300
 # Invitees one sent copy carries (XERK-2989): the hub's attendee cap.
@@ -111,6 +116,14 @@ CALENDAR_WRITE_ATTENDEES_MAX = 100
 _TURMA_ID = re.compile(r"turma:[0-9a-f]{16}")
 _BUSY_CODE = {v: k for k, v in _BUSY.items()}
 _SENSITIVITY_CODE = {v: k for k, v in _SENSITIVITY.items()}
+# A recurring Turma event (XERK-2969 rule) as an Outlook RecurrencePattern
+# (XERK-2986). OlRecurrenceType: daily 0, weekly 1, monthly 2, monthNth 3.
+# OlDaysOfWeek bits: Sunday 1 ... Saturday 64. Instance 5 = "last".
+_RULE_DAYS = ("SU", "MO", "TU", "WE", "TH", "FR", "SA")
+_RULE_KEYS = ("freq", "interval", "byDay", "byMonthDay", "byWeekday", "until", "count")
+_RULE_DATE = re.compile(r"(\d{4})-(\d{2})-(\d{2})")
+_OCCURRENCE_KEY = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+OUTLOOK_INTERVAL_MAX = 99        # Outlook's own bound on every pattern's Interval
 _CANCELED_STATUS = (5, 7)        # olMeetingCanceled, olMeetingReceivedAndCanceled
 # Control, bidi, line/paragraph-separator and invisible format characters:
 # each becomes a space, so a hidden one cannot reorder or split the printed text.
@@ -297,6 +310,18 @@ function FindCopy($c) {
   $null
 }
 function Utc($ms) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$ms).UtcDateTime }
+function IsoZ($utc) { $utc.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", $inv) }
+function Has($o, $k) { $null -ne $o.PSObject.Properties[$k] }
+# The text/enum fields a command carries: a series all of them, an occurrence
+# edit only the ones it overrides.
+function SetFields($it, $e) {
+  if (Has $e 'subject') { $it.Subject = [string]$e.subject }
+  if (Has $e 'location') { $it.Location = [string]$e.location }
+  if (Has $e 'body') { $it.Body = [string]$e.body }
+  if (Has $e 'busy') { $it.BusyStatus = [int]$e.busy }
+  if (Has $e 'sensitivity') { $it.Sensitivity = [int]$e.sensitivity }
+  if (Has $e 'categories') { $it.Categories = (@($e.categories) -join $sep) }
+}
 # Invitations (XERK-2989). `TurmaSent` = the sentKey last sent to the attendees.
 function SentStamp($it) {
   $v = ''
@@ -351,6 +376,10 @@ __ATTACH__
         # a cancellation and a plain appointment replaces the sent copy.
         if ($it -and (SentStamp $it) -and -not $e.send) { CancelCopy $it; $it = $null }
         if (-not $it) { $it = $ol.CreateItem(1) }
+        # A copy is rewritten whole: clearing drops an old pattern and every
+        # old exception, so a re-sent upsert converges on exactly the record
+        # (and a series made single again loses its pattern).
+        elseif ([bool]$it.IsRecurring) { $it.ClearRecurrencePattern() }
         # A copy whose invitations never went out keeps no recipients when not sending.
         if (-not $e.send -and -not (SentStamp $it) -and [int]$it.MeetingStatus -ne 0) {
           for ($i = $it.Recipients.Count; $i -ge 1; $i--) { $it.Recipients.Remove($i) }
@@ -366,12 +395,7 @@ __ATTACH__
         # names two instants, and a wall time cannot say which.
         $it.StartUTC = Utc $e.startMs
         $it.EndUTC = Utc $e.endMs
-        $it.Subject = [string]$e.subject
-        $it.Location = [string]$e.location
-        $it.Body = [string]$e.body
-        $it.BusyStatus = [int]$e.busy
-        $it.Sensitivity = [int]$e.sensitivity
-        $it.Categories = (@($e.categories) -join $sep)
+        SetFields $it $e
         # A reminder (XERK-2988): Outlook on this host fires it; null = none.
         if ($null -ne $e.reminder) {
           $it.ReminderSet = $true
@@ -406,13 +430,85 @@ __ATTACH__
           if ($e.allowForward) { try { $it.PropertyAccessor.SetProperty($dnf, $false) } catch {} }
           else { $it.PropertyAccessor.SetProperty($dnf, $true) }
         }
+        $rec = $e.recurrence
+        if ($rec) {
+          # The anchor's WALL start and length in the event's zone: Outlook's
+          # pattern, like turma/recurrence.js, keeps the wall time across DST.
+          $z = [TimeZoneInfo]::FindSystemTimeZoneById([string]$e.zone)
+          $ws = [TimeZoneInfo]::ConvertTimeFromUtc((Utc $e.startMs), $z)
+          $we = [TimeZoneInfo]::ConvertTimeFromUtc((Utc $e.endMs), $z)
+          $pat = $it.GetRecurrencePattern()
+          $pat.RecurrenceType = [int]$rec.type
+          if ([int]$rec.type -eq 1 -or [int]$rec.type -eq 3) {
+            $mask = [int]$rec.mask
+            if (-not $mask) { $mask = 1 -shl [int]$ws.DayOfWeek }
+            $pat.DayOfWeekMask = $mask
+          }
+          if ([int]$rec.type -eq 2) {
+            $dom = [int]$rec.dayOfMonth
+            if (-not $dom) { $dom = $ws.Day }
+            $pat.DayOfMonth = $dom
+          }
+          if ([int]$rec.type -eq 3) { $pat.Instance = [int]$rec.instance }
+          $pat.Interval = [int]$rec.interval
+          $pat.PatternStartDate = $ws.Date
+          $pat.StartTime = $ws
+          $pat.Duration = [int][Math]::Round(($we - $ws).TotalMinutes)
+          if ([int]$rec.count -gt 0) { $pat.Occurrences = [int]$rec.count }
+          elseif ($rec.until) {
+            $u = @($rec.until)
+            $pat.PatternEndDate = New-Object DateTime ([int]$u[0]), ([int]$u[1]), ([int]$u[2])
+          } else { $pat.NoEndDate = $true }
+        }
         $it.Save()
+        if ($rec) {
+          # Each edit opens its occurrence by the ORIGINAL start, so a moved one
+          # keeps the id the reader (and the hub) name it by.
+          $r.series = $true
+          $pat = $it.GetRecurrencePattern()
+          $bad = 0
+          $first = ''
+          $all = @($e.exceptions)
+          foreach ($x in $all) {
+            try {
+              $at = Utc $x.atMs
+              if ([bool]$e.allDay) { $at = ([TimeZoneInfo]::ConvertTimeFromUtc($at, $z)).Date }
+              else { $at = $at.ToLocalTime() }
+              $o = $null
+              try { $o = $pat.GetOccurrence($at) } catch {}
+              if (-not $o) { throw ('Outlook has no occurrence at ' + (IsoZ (Utc $x.atMs))) }
+              if ($x.deleted) { $o.Delete() }
+              else {
+                if (Has $x 'allDay') { $o.AllDayEvent = [bool]$x.allDay }
+                if (Has $x 'startMs') { $o.StartUTC = Utc $x.startMs; $o.EndUTC = Utc $x.endMs }
+                SetFields $o $x
+                # An exception is its own item: stamp it too, so it reads back
+                # as the series' copy whether or not Outlook copied the master's.
+                try {
+                  $q = $o.UserProperties.Find('TurmaId')
+                  if (-not $q) { $q = $o.UserProperties.Add('TurmaId', 1, $true) }
+                  $q.Value = [string]$c.turmaId
+                } catch {}
+                $o.Save()
+              }
+            } catch {
+              $bad++
+              if (-not $first) { $first = $_.Exception.Message }
+            }
+          }
+          if ($bad) {
+            throw ([string]$bad + ' of ' + [string]$all.Count + ' occurrence edits failed: ' + $first)
+          }
+        }
         $r.outlookId = [string]$it.EntryID
         $r.startMs = Ms $it.StartUTC
         try { $r.lastModified = Local $it.LastModificationTime } catch {}
         # Send only what the attendees have not had: a re-sent or repair upsert of
         # unchanged fields saves and sends nothing.
         if ($e.send -and (SentStamp $it) -cne [string]$e.sentKey) {
+          # A series' occurrences were saved after its master: send from a fresh
+          # read of the master, never the copy held from before them.
+          if ($r.series) { $it = $ol.Session.GetItemFromID($r.outlookId) }
           # A failed send puts the previous stamp back: an earlier invitation still went
           # out, so a later delete must still cancel it (QA). It differs from sentKey, so
           # the retry sends.
@@ -1020,6 +1116,13 @@ def normalize_calendar_windows(doc, count) -> list:
                 unreadable += 1
             else:
                 events.append(ev)
+        # An edited occurrence (an exception) may not carry the master's TurmaId
+        # property (XERK-2986): it is one series, so the stamp any of its items
+        # in the window carries is the whole series'.
+        stamps = {ev["seriesId"]: ev["turmaId"] for ev in events if ev["seriesId"] and ev["turmaId"]}
+        for ev in events:
+            if ev["seriesId"] and not ev["turmaId"]:
+                ev["turmaId"] = stamps.get(ev["seriesId"], "")
         out.append({"complete": w.get("complete") is True, "unreadable": unreadable,
                     "events": events})
     return out
@@ -1189,11 +1292,6 @@ def prepare_calendar_write(cmd) -> dict:
     ev = cmd.get("event")
     if not isinstance(ev, dict):
         raise Refused("an upsert needs its event")
-    # Recurring copies are XERK-2986's: writing only the first instance would
-    # be a wrong copy the drift check could never repair.
-    if ev.get("recurrence") is not None:
-        raise Refused("this agent writes single events only; a recurring event "
-                      "needs a newer agent")
     start, end = _event_ms(ev, "start"), _event_ms(ev, "end")
     if start is None or end is None or end < start:
         raise Refused("the event's start/end are not instants with an end after the start")
@@ -1201,25 +1299,20 @@ def prepare_calendar_write(cmd) -> dict:
     zone = windows_zone(zone_name or "UTC")
     if zone is None:
         raise Refused(f"the time zone {_text(zone_name, 64)!r} has no Windows zone")
-    sens, busy = ev.get("sensitivity"), ev.get("busy")
+    sens = ev.get("sensitivity")
     sens = sens if isinstance(sens, str) and sens in _SENSITIVITY_CODE else "normal"
-    busy = busy if isinstance(busy, str) and busy in _BUSY_CODE else "busy"
-    subject, location = _text(ev.get("subject")), _text(ev.get("location"))
-    body = _body(ev.get("body"))
-    url = _text(ev.get("joinUrl"), 500)
-    if url.startswith("https://"):
-        body = f"{body}\nJoin: {url}" if body else f"Join: {url}"
-    cats = ev.get("categories") if isinstance(ev.get("categories"), list) else []
-    cats = [c for c in (_text(c, 100) for c in cats[:CALENDAR_CATEGORIES_MAX]) if c]
-    # The hub withholds a private event's text before it sends it; withheld here
-    # too, since the mailbox is any user of the org, not the event's owner.
-    if sens in ("private", "confidential"):
-        subject, location, body = "Private event", "", ""
-    out["event"] = {
-        "subject": subject, "location": location, "body": body,
-        "startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
-        "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats,
-        "reminder": _reminder_minutes(ev.get("reminderMinutes"))}
+    fields = _write_fields(ev, sens, whole=True)
+    fields.update({"startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
+                   "reminder": _reminder_minutes(ev.get("reminderMinutes"))})
+    rule = ev.get("recurrence")
+    if rule is not None:
+        fields["recurrence"] = outlook_recurrence(rule)
+        # An occurrence's body merges the series' body as WRITTEN: a private
+        # series' text never reaches an occurrence made public, even when the
+        # hub sent it unwithheld.
+        base = {"body": "", "joinUrl": ""} if sens in ("private", "confidential") else ev
+        fields["exceptions"] = _write_exceptions(ev.get("exceptions"), sens, base)
+    out["event"] = fields
     # Invitations (XERK-2989): only the copy the hub names as the sender, never a
     # private one. Every other copy is a plain appointment with no recipients.
     send = ev.get("sendInvites") is True and sens not in ("private", "confidential")
@@ -1259,11 +1352,185 @@ def _reminder_minutes(v):
     return v if type(v) is int and v in CALENDAR_REMINDER_MINUTES else None
 
 
+def _write_fields(ev, series_sens, whole, series=None) -> dict:
+    """The AppointmentItem text/enum fields of a record (`whole`: every field,
+    defaulted) or of an occurrence override (only the fields it carries). A
+    private/confidential one (its own sensitivity, else the series') is written
+    withheld: the hub withholds it first, and the mailbox is any user of the
+    org, not the event's owner."""
+    out = {}
+    has = (lambda k: True) if whole else (lambda k: k in ev)
+    sens = ev.get("sensitivity")
+    if has("sensitivity"):
+        sens = sens if isinstance(sens, str) and sens in _SENSITIVITY_CODE else "normal"
+        out["sensitivity"] = _SENSITIVITY_CODE[sens]
+    else:
+        sens = series_sens
+    if has("busy"):
+        busy = ev.get("busy")
+        out["busy"] = _BUSY_CODE[busy if isinstance(busy, str) and busy in _BUSY_CODE else "busy"]
+    if has("subject"):
+        out["subject"] = _text(ev.get("subject"))
+    if has("location"):
+        out["location"] = _text(ev.get("location"))
+    if has("body") or has("joinUrl"):
+        # An occurrence's body is written whole: an override of one of the two
+        # keeps the series' other (the hub's occurrence view merges them too).
+        both = {**{k: (series or {}).get(k) for k in ("body", "joinUrl")}, **ev}
+        body = _body(both.get("body"))
+        url = _text(both.get("joinUrl"), 500)
+        if url.startswith("https://"):
+            body = f"{body}\nJoin: {url}" if body else f"Join: {url}"
+        out["body"] = body
+    if has("categories"):
+        cats = ev.get("categories") if isinstance(ev.get("categories"), list) else []
+        out["categories"] = [c for c in (_text(c, 100) for c in cats[:CALENDAR_CATEGORIES_MAX]) if c]
+    if sens in ("private", "confidential"):
+        out.update(subject="Private event", location="", body="")
+    return out
+
+
+def _rule_date(v):
+    """A rule's `until` "YYYY-MM-DD" -> [y, m, d] (a real date), else None."""
+    m = _RULE_DATE.fullmatch(v) if isinstance(v, str) else None
+    if not m:
+        return None
+    try:
+        datetime.date(*map(int, m.groups()))
+    except ValueError:
+        return None
+    return [int(g) for g in m.groups()]
+
+
+def _rule_int(v, lo, hi):
+    return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def outlook_recurrence(rule) -> dict:
+    """A stored Turma rule (turma/recurrence.js `sanitizeRule`) -> the plain
+    RecurrencePattern values the writer script sets. `mask`/`dayOfMonth` 0 =
+    the anchor's own (the script reads it off the anchor's wall start in the
+    event's zone), as an absent byDay/byMonthDay is in the rule. Raises Refused,
+    in words, for a rule Outlook cannot say exactly — never an approximation,
+    since the hub dedups the read-back by occurrence start.
+
+    - daily + byDay is a FILTER on every-N-days: every day (N=1) is a weekly
+      mask; every 7k days only ever lands on the anchor's weekday, so weekly
+      every k weeks; any other N has no Outlook pattern.
+    - yearly is monthly every 12N months (the same month-end clamp, and no
+      olRecursYearly Interval units to get wrong).
+    - "A day past a month's end is its last day" is Outlook's own monthly rule
+      (its "fewer than 31 days ... last day of the month" note), so the 31st
+      maps to DayOfMonth 31 unchanged.
+    - Every N > 1 weeks groups days into weeks. Turma's weeks start Sunday;
+      Outlook's start on the mailbox's first day of week (Monday in much of the
+      world), which no pattern property sets. Sunday with any other day then
+      lands in different weeks, so that combination is refused.
+    """
+    if not isinstance(rule, dict) or any(k not in _RULE_KEYS for k in rule):
+        raise Refused("the recurrence is not a Turma rule")
+    freq = rule.get("freq")
+    if freq not in ("daily", "weekly", "monthly", "yearly"):
+        raise Refused("the recurrence has no known freq")
+    n = rule.get("interval", 1)
+    if not _rule_int(n, 1, 99):
+        raise Refused("the recurrence interval must be 1..99")
+    by_day = rule.get("byDay")
+    if by_day is not None and (not isinstance(by_day, list) or not by_day or
+                               any(d not in _RULE_DAYS for d in by_day) or len(set(by_day)) != len(by_day)):
+        raise Refused("the recurrence's days are not SU..SA")
+    mask = sum(1 << _RULE_DAYS.index(d) for d in by_day or ())
+    out = {"interval": n, "mask": 0, "dayOfMonth": 0, "instance": 0, "count": 0, "until": None}
+    if freq == "daily":
+        if by_day is None:
+            out["type"] = 0
+        elif n == 1:
+            out.update(type=1, mask=mask)
+        elif n % 7 == 0:
+            # Only the anchor's weekday can recur; the hub refuses a rule whose
+            # days never meet it, so the anchor's day (mask 0) is the whole set.
+            out.update(type=1, interval=n // 7)
+        else:
+            raise Refused(f"Outlook cannot repeat every {n} days on chosen weekdays")
+    elif freq == "weekly":
+        if by_day is not None and n > 1 and "SU" in by_day and len(by_day) > 1:
+            raise Refused("Outlook groups every-N-weeks days by its own first day of the week, "
+                          "so Sunday with other days cannot be written exactly")
+        out.update(type=1, mask=mask)
+    else:
+        months = n if freq == "monthly" else 12 * n
+        if months > OUTLOOK_INTERVAL_MAX:
+            raise Refused(f"Outlook repeats at most every {OUTLOOK_INTERVAL_MAX} months "
+                          f"(every {OUTLOOK_INTERVAL_MAX // 12} years)")
+        out["interval"] = months
+        if by_day is not None:
+            raise Refused("byDay is for a daily or weekly rule")
+        wd, dom = rule.get("byWeekday"), rule.get("byMonthDay")
+        if wd is not None and dom is not None:
+            raise Refused("the recurrence takes byMonthDay or byWeekday, not both")
+        if wd is not None:
+            if (not isinstance(wd, dict) or set(wd) - {"n", "day"} or wd.get("day") not in _RULE_DAYS
+                    or not (_rule_int(wd.get("n"), 1, 4) or wd.get("n") == -1)):
+                raise Refused("the recurrence's byWeekday is not {n: 1..4 | -1, day}")
+            out.update(type=3, mask=1 << _RULE_DAYS.index(wd["day"]),
+                       instance=5 if wd["n"] == -1 else wd["n"])
+        else:
+            if dom is not None and not _rule_int(dom, 1, 31):
+                raise Refused("the recurrence's byMonthDay must be 1..31")
+            out.update(type=2, dayOfMonth=dom or 0)
+    if "until" in rule and "count" in rule:
+        raise Refused("the recurrence takes until or count, not both")
+    if "count" in rule:
+        if not _rule_int(rule["count"], 1, 999):
+            raise Refused("the recurrence count must be 1..999")
+        out["count"] = rule["count"]
+    if "until" in rule:
+        out["until"] = _rule_date(rule["until"])
+        if out["until"] is None:
+            raise Refused("the recurrence's until is not a date")
+    return out
+
+
+def _write_exceptions(raw, series_sens, series=None) -> list:
+    """The record's `exceptions` ({<original start UTC ISO>: {deleted:true} |
+    override}) -> `[{atMs, deleted} | {atMs, ...fields}]`, oldest first. The
+    script opens each by its ORIGINAL start (GetOccurrence), so the reader's
+    `<id>:<original start>` read-back keeps the hub's key even when it moved."""
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        raise Refused("the recurrence's exceptions are not a map")
+    if len(raw) > CALENDAR_WRITE_EXCEPTIONS_MAX:
+        raise Refused(f"at most {CALENDAR_WRITE_EXCEPTIONS_MAX} occurrence edits a series")
+    out = []
+    for key in sorted(raw):
+        ex = raw[key]
+        at = _event_ms({"start": key}, "start") if _OCCURRENCE_KEY.fullmatch(key) else None
+        if at is None or not isinstance(ex, dict):
+            raise Refused(f"the occurrence edit {_text(key, 40)!r} is not readable")
+        if ex.get("deleted") is True:
+            out.append({"atMs": at, "deleted": True})
+            continue
+        row = {"atMs": at, **_write_fields(ex, series_sens, whole=False, series=series)}
+        if "start" in ex or "end" in ex:
+            s, e = _event_ms(ex, "start"), _event_ms(ex, "end")
+            if s is None or e is None or e < s:
+                raise Refused(f"the occurrence edit {key} has no start/end instants")
+            row.update(startMs=s, endMs=e)
+        if "allDay" in ex:
+            row["allDay"] = ex.get("allDay") is True
+        out.append(row)
+    return out
+
+
 def _write_result(r) -> dict:
-    """One script result -> `{ok, outlookId?, lastModified?, startMs?, error?}`."""
+    """One script result -> `{ok, outlookId?, lastModified?, startMs?, series?, error?}`
+    (`series`: a recurring copy, whose occurrences span far more than one week)."""
     if not isinstance(r, dict):
         return {"ok": False, "error": "Outlook gave no answer for this event"}
     out = {"ok": r.get("ok") is True}
+    if r.get("series") is True:
+        out["series"] = True
     start = _int(r.get("startMs"))
     if start is not None and 0 < start < CALENDAR_MS_MAX:
         out["startMs"] = start
@@ -1300,6 +1567,33 @@ def write_calendar_events(cmds, powershell=None, timeout=None) -> list:
         except Exception as e:      # one unreadable command never fails the batch
             results[i] = {"ok": False, "refused": True,
                           "error": f"the command could not be read ({type(e).__name__})"}
+    runs, edits = [], 0
+    for item in ready:
+        n = len(item[1].get("event", {}).get("exceptions") or ())
+        if not runs or edits + n > CALENDAR_WRITE_EDITS_PER_RUN:
+            runs.append([])
+            edits = 0
+        runs[-1].append(item)
+        edits += n
+    # A run that fails costs ITS commands only: an earlier run's are already in
+    # Outlook and answered (even rows it answered ok:false). Only when no run got
+    # an answer is Outlook unreachable.
+    failed, answered = None, False
+    for run in runs:
+        try:
+            _write_run(run, results, powershell, timeout)
+            answered = True
+        except Refused as e:
+            failed = failed or e
+            for i, _ in run:
+                results[i] = {"ok": False, "error": str(e)[:CALENDAR_WRITE_ERROR_MAX]}
+    if failed is not None and not answered:
+        raise failed
+    return results
+
+
+def _write_run(ready, results, powershell, timeout):
+    """One PowerShell run of prepared commands; fills `results` in place."""
     if ready:
         payload = json.dumps({"cmds": [p for _, p in ready]}, ensure_ascii=False)
         doc = _run_outlook_ps(_CALENDAR_WRITE_PS, timeout or CALENDAR_WRITE_TIMEOUT_SEC,
@@ -1314,7 +1608,6 @@ def write_calendar_events(cmds, powershell=None, timeout=None) -> list:
             raise Refused("Outlook's answer to the write was not in the expected shape")
         for (i, _), r in zip(ready, got):
             results[i] = _write_result(r)
-    return results
 
 
 def _calendar(args) -> int:

@@ -57728,6 +57728,18 @@ class TestCalendarWrite(ManagerMixin, unittest.TestCase):
         run.assert_called_once_with(*ha.calendar_default_window(self.MON), force=True,
                                     now_ms=self.MON)
 
+    def test_xerk2986_a_written_series_owes_the_default_window(self):
+        p = mock.patch.object(self.cli, "write_calendar_events", side_effect=lambda cmds, **kw: [
+            {"ok": True, "series": True, "outlookId": "E1", "startMs": self.MON + 9 * 3600000}
+            for _ in cmds])
+        p.start()
+        self.addCleanup(p.stop)
+        self.sm._stage_calendar_write(self.cmd())
+        with mock.patch.object(self.sm, "_run_calendar_sync") as run:
+            self.sm._calendar_pass(now_ms=self.MON)
+        run.assert_called_once_with(*ha.calendar_default_window(self.MON), force=True,
+                                    now_ms=self.MON)
+
     def test_xerk2984_outbox_overflow_drops_the_oldest(self):
         rows = [{"turmaId": self.TID, "version": i} for i in range(ha.CALENDAR_WRITE_OUTBOX_MAX + 2)]
         self.sm._cal_write_push(rows)

@@ -7684,14 +7684,18 @@ function calOutlookCheckSync(key, from, until, events, syncedAt, now) {
       let missing = false;
       let drift = false;
       if (copies.length) {
-        // A series' occurrences are compared by XERK-2986; a single copy here.
-        drift = !rec.recurrence && copies.some((c) => calOutlookDrifted(rec, org, e, c));
+        drift = rec.recurrence ? calOutlookSeriesDrifted(rec, org, copies, from, until)
+          : copies.some((c) => calOutlookDrifted(rec, org, e, c));
       } else if (!rec.recurrence) {
         missing = rec.startMs >= from && rec.startMs < until;
       } else {
+        // A series with no stamped copy in this row: a sync row is often one week,
+        // and the series lives on outside it. Re-written in place (the agent finds
+        // it by its outlookId or stamp, and creates it only if it is gone), never
+        // reported as re-created.
         eachTurmaOccurrence(rec, from, until, (o) => {
           const s = turmaOccurrenceRecord(rec, o, rec.exceptions[o.key]).startMs;
-          if (s >= from && s < until) { missing = true; return false; }
+          if (s >= from && s < until) { drift = true; return false; }
           return true;
         });
       }
@@ -7751,6 +7755,33 @@ function calTurmaResponses(rec) {
 // What a served Turma attendee may say it answered: the reader's words, less "organizer"
 // and "unknown" (no answer an invitee gave).
 const CAL_TURMA_RESPONSES = new Set(["none", "tentative", "accepted", "declined", "notResponded"]);
+// A series' copy (XERK-2986) is its occurrences, each read back as
+// `<GlobalAppointmentID>:<original start>`. Of those this window owns (a start in
+// [from, until), where the occurrence starts now), one missing, one extra or one
+// whose fields moved is drift: the whole series is re-written (the agent clears and
+// rewrites it), never re-created. Each is compared to what the agent was SENT
+// (calWriteEvent: a withheld series keeps "Private event" on an occurrence made
+// public), else that copy reads as drifted forever. lastModified is not compared:
+// the writer saves the series, then each occurrence edit after it.
+const CAL_OCCURRENCE_KEY_TAIL = /:(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$/;
+function calOutlookSeriesDrifted(rec, org, copies, from, until) {
+  const got = new Map();
+  for (const c of copies) {
+    const m = CAL_OCCURRENCE_KEY_TAIL.exec(c.id);
+    if (m && c.startMs >= from && c.startMs < until) got.set(m[1], c);
+  }
+  const sent = { ...rec, ...calWriteEvent(rec, org) };
+  let drift = false;
+  eachTurmaOccurrence(rec, from, until, (o) => {
+    const occ = turmaOccurrenceRecord(sent, o, sent.exceptions[o.key]);
+    if (occ.startMs < from || occ.startMs >= until) return true;
+    const c = got.get(o.key);
+    got.delete(o.key);
+    drift = !c || calOutlookDrifted(occ, org, {}, c);
+    return !drift;
+  });
+  return drift || got.size > 0;
+}
 // The per-org write state a client is served (only for the served orgs; never the host or outlookId).
 function calOutlookWire(outlook, served) {
   const out = {};
