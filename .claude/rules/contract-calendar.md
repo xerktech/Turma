@@ -302,8 +302,11 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 
 ## Turma-created events (hub, epic XERK-2967; store + routes XERK-2968)
 
-Events made IN Turma, owned by the hub, never written to Outlook. Every child of the epic
+Events made IN Turma, owned by the hub. Every child of the epic
 (recurrence XERK-2969, matching + brief XERK-2970, web XERK-2971, Android XERK-2972) builds here.
+- **Written to each org's Outlook by one host of that org** (epic XERK-2982): writer pick,
+  `writeCalendarEvent`, `calendarWriteResults`, the `outlook` record field, read-back dedup and the
+  field mapping → `contract-calendar-outlook-write.md`.
 - **Store**: `/data/calendar-turma-events.json` (`CALENDAR_TURMA_EVENTS_FILE`),
   `registerExternalStore`, tenant id ("" = untenanted) → eventId → record. Keyed by TENANT, not
   host or org: one event may belong to several orgs of one tenant.
