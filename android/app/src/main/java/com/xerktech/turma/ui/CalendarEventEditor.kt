@@ -58,6 +58,7 @@ import com.xerktech.turma.core.CAL_SHOW_AS
 import com.xerktech.turma.core.RepeatForm
 import com.xerktech.turma.core.calAnchorNth
 import com.xerktech.turma.core.calDayLong
+import com.xerktech.turma.core.calInvitesNote
 import com.xerktech.turma.core.calDayShort
 import com.xerktech.turma.core.calRepeatDay
 import com.xerktech.turma.core.calRepeatDaysShown
@@ -167,6 +168,17 @@ internal fun CalendarEventEditor(
                 label = { Text("Optional attendees") },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
             )
+            // XERK-2989: the event's, never one occurrence's.
+            CheckRow("Send invitations from Outlook", d.invites, { set(d.copy(invites = it)) },
+                Modifier.testTag("cal-ed-invites"), enabled = !d.oneOccurrence)
+            if (d.invites) {
+                CheckRow("Request responses", d.reqResp, { set(d.copy(reqResp = it)) },
+                    Modifier.testTag("cal-ed-reqresp"), enabled = !d.oneOccurrence)
+                CheckRow("Allow forwarding", d.allowFwd, { set(d.copy(allowFwd = it)) },
+                    Modifier.testTag("cal-ed-allowfwd"), enabled = !d.oneOccurrence)
+                Text(calInvitesNote(d), Modifier.testTag("cal-ed-invites-note"), style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             HorizontalDivider()
             CheckRow("All day", d.allDay, { set(d.copy(allDay = it)) }, Modifier.testTag("cal-ed-allday"))
             WhenRow("Starts", d.startDate, d.startTime, d.allDay, locale, "start", { picker = it })

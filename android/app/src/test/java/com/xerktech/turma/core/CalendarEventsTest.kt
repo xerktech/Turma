@@ -75,6 +75,30 @@ class CalendarEventsTest {
         assertEquals(setOf("reminderMinutes", "version", "scope"), sc.keys)
     }
 
+    @Test fun `XERK-2989 invitations ride the payload, read back, and the panel tallies the answers`() {
+        val d = draft("a.atlassian.net")
+        assertEquals(listOf(false, true, true), listOf(d.invites, d.reqResp, d.allowFwd))
+        val p = calDraftPayload(d.copy(invites = true, allowFwd = false))
+        assertEquals(listOf("true", "true", "false"),
+            listOf("sendInvites", "responseRequested", "allowForward").map { p[it]!!.jsonPrimitive.content })
+        val (ev) = decode("""[{"source":"turma","host":"","id":"turma:0123456789abcdef","orgs":["a.atlassian.net"],
+            "org":"a.atlassian.net","subject":"P","start":"2026-11-16T09:00:00-05:00","end":"2026-11-16T09:30:00-05:00",
+            "startMs":1,"endMs":2,"timeZone":"America/New_York","sendInvites":true,"responseRequested":false,
+            "attendees":[{"name":"Ann","email":"ann@x.com","role":"required","response":"accepted"},
+            {"name":"Bo","email":"bo@x.com","role":"optional","response":"declined"}]}]""")
+        val back = calDraftOf(ev, java.time.ZoneId.of("America/New_York"))
+        assertEquals(listOf(true, false, true), listOf(back.invites, back.reqResp, back.allowFwd))
+        assertEquals("Sent from A's Outlook · no responses requested · 1 accepted, 1 declined",
+            calInvitesText(ev) { "A" })
+        assertEquals("", calInvitesText(ev.copy(sendInvites = false)) { "A" })
+        assertEquals("", calInvitesText(ev.copy(recurring = true)) { "A" })
+        // An older hub sends none of the three: the defaults.
+        val (old) = decode("""[{"source":"turma","id":"turma:0123456789abcdef","subject":"P","start":"2026-11-16T09:00:00-05:00",
+            "end":"2026-11-16T09:30:00-05:00","startMs":1,"endMs":2}]""")
+        assertEquals(listOf(false, true, true), listOf(old.sendInvites, old.responseRequested, old.allowForward))
+        assertTrue(calInvitesNote(d.copy(private = true)).startsWith("A private event sends no invitations"))
+    }
+
     @Test fun `an offline event sends no join link, and all-day ends at the midnight after its last day`() {
         val p = calDraftPayload(draft("o").copy(allDay = true, endDate = day.plusDays(1), joinUrl = "https://x.example"))
         assertEquals("", p["joinUrl"]!!.jsonPrimitive.content)

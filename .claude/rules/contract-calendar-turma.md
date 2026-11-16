@@ -40,14 +40,16 @@ Events made IN Turma, owned by the hub. Every child of the epic
   a `turma:` id the caller's tenants do not hold (malformed included) is a 404.
 - **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
   order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
-  timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
-  sensitivity, reminderMinutes, recurrence, exceptions, createdBy, createdAt, updatedAt, version, outlook}`.
+  timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, sendInvites,
+  responseRequested, allowForward, busy, categories, sensitivity, reminderMinutes, recurrence, exceptions,
+  createdBy, createdAt, updatedAt, version, outlook}` (the three invitation flags: XERK-2989).
   - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
     `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
   - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.
   - `timeZone` an IANA zone the hub's Intl knows (≤64, else "UTC"): the wall clock the creator
     meant, which a recurrence needs; `start`/`end` alone fix the instant.
-  - Attendee `role` is `required|optional` only (the creator is the organizer); no `response`.
+  - Attendee `role` is `required|optional` only (the creator is the organizer); no stored
+    `response` (served from the sending copy, XERK-2989).
   - `busy` free|tentative|busy|outOfOffice|workingElsewhere (default busy).
   - `reminderMinutes` (XERK-2988): null (none, the default and an older record's) or one of
     `CAL_TURMA_REMINDERS` (0, 5, 15, 30, 60, 120, 720, 1440, 10080); anything else is a 400.

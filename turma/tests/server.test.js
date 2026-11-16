@@ -35270,6 +35270,76 @@ test("XERK-2985: the Daily Brief lists a Turma event once, never its Outlook cop
   }
 });
 
+// ---- XERK-2989: invitations from the first org's copy, and the responses served back ----------
+test("XERK-2989: only the first org's copy sends invitations; its responses are served on the event", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    const people = [{ name: "Ann", email: "Ann@x.com", role: "required" }, { name: "Bo", email: "bo@x.com", role: "optional" }];
+    const c = await turma2968("POST", null, ev2968([S2985A, S2985B], { attendees: people, sendInvites: true, allowForward: false }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const id = c.body.event.id;
+    assert.deepEqual([c.body.event.sendInvites, c.body.event.responseRequested, c.body.event.allowForward], [true, true, false]);
+    const [wa] = writes2985(D2985A), [wb] = writes2985(D2985B);
+    assert.deepEqual([wa.event.sendInvites, wa.event.responseRequested, wa.event.allowForward], [true, true, false]);
+    assert.equal(wa.event.attendees.length, 2);
+    assert.equal(wb.event.sendInvites, false, "every other org's copy is a plain appointment");
+    // Defaults: off, responses requested, forwarding allowed; an older record coerces to them.
+    const plain = (await turma2968("POST", null, ev2968([S2985A]))).body.event;
+    assert.deepEqual([plain.sendInvites, plain.responseRequested, plain.allowForward], [false, true, true]);
+    const { sendInvites, responseRequested, allowForward, ...old } = rec2985(id);
+    const back = hub.sanitizeTurmaEvent(old, "");
+    assert.deepEqual([back.sendInvites, back.responseRequested, back.allowForward], [false, true, true]);
+    assert.equal(JSON.stringify(hub.sanitizeTurmaEvent(rec2985(id), "")), JSON.stringify(rec2985(id)), "a fixed point");
+    assert.equal((await turma2968("POST", null, ev2968([S2985A], { sendInvites: "yes" }))).status, 400);
+    // The sending copy's synced read-back carries each invitee's answer; it is served on the event.
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    await later2985();
+    const n0 = writes2985(D2985A).length;
+    const copy = copy2985(rec2985(id), { lastModified: "2026-11-15T11:00:00Z", status: 1, attendees: [
+      { name: "Me", email: "me@x.com", role: "organizer", response: "organizer" },
+      { name: "Ann", email: "ann@x.com", role: "required", response: "accepted" },
+      { name: "Bo", email: "bo@x.com", role: "optional", response: "declined" }] });
+    await beat2985(D2985A, S2985A, sync2985([copy]));
+    assert.equal(writes2985(D2985A).length, n0, "a response moving lastModified is no drift on the sending copy");
+    const [e] = (await served2968()).filter((x) => x.id === id);
+    assert.deepEqual(e.attendees.map((x) => [x.email, x.response]), [["ann@x.com", "accepted"], ["bo@x.com", "declined"]]);
+    // Outlook's "none" is "no answer yet" only when an answer was asked for (QA).
+    await beat2985(D2985A, S2985A, sync2985([{ ...copy, attendees: [{ name: "Ann", email: "ann@x.com", role: "required", response: "none" }] }]));
+    assert.equal((await served2968()).find((x) => x.id === id).attendees[0].response, "notResponded");
+    const off = await turma2968("PATCH", id, { version: 1, responseRequested: false });
+    assert.equal(off.status, 200, JSON.stringify(off.body));
+    assert.equal(off.body.event.attendees[0].response, "none");
+    // A private event sends nothing (its attendees are withheld) and serves no answers.
+    const priv = await turma2968("PATCH", id, { version: 2, sensitivity: "private" });
+    assert.equal(priv.status, 200, JSON.stringify(priv.body));
+    assert.equal(writes2985(D2985A).at(-1).event.sendInvites, false);
+    assert.equal(hub.calTurmaResponses(rec2985(id)), null, "no answers read for a copy that sends none");
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-2989: an occurrence takes no invitation option of its own", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const c = await turma2968("POST", null, ev2968([S2985A], { recurrence: { freq: "daily", interval: 1, count: 3 } }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const occ = `${c.body.event.id}:${iso2968(T2968 + 864e5)}`;
+    const bad = await turma2968("PATCH", occ, { version: 1, scope: "occurrence", sendInvites: true });
+    assert.equal(bad.status, 400);
+    assert.match(bad.body.error, /occurrence takes no sendInvites/);
+    const same = await turma2968("PATCH", occ, { version: 1, scope: "occurrence", sendInvites: false, subject: "x" });
+    assert.equal(same.status, 200, JSON.stringify(same.body));
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
 test("XERK-2985: copies the hub writes never count against a tenant's Turma event cap", () => {
   const rec = { id: "turma:0123456789abcdef", outlook: { a: { host: "h", outlookId: "x".repeat(300) } } };
   assert.equal(hub.calTurmaBytes(rec), Buffer.byteLength(JSON.stringify({ id: rec.id })));

@@ -133,6 +133,10 @@ data class TurmaEventDraft(
     // The stored sensitivity, so un-ticking Private on a confidential event keeps it.
     val sensitivity: String = "normal",
     val orgs: Set<String> = emptySet(),
+    // XERK-2989: send invitations from the first org's Outlook, and its two options.
+    val invites: Boolean = false,
+    val reqResp: Boolean = true,
+    val allowFwd: Boolean = true,
     // XERK-2973: how it repeats, and for an occurrence of a series which events the
     // edit is for ("occurrence" | "following" | "series"; "" = a plain event / a new one).
     val repeat: RepeatForm = RepeatForm(),
@@ -220,6 +224,7 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
         categories = ev.categories.joinToString(", "),
         private = ev.sensitivity == "private", sensitivity = ev.sensitivity.ifEmpty { "normal" },
         orgs = calOrgsOf(ev).toSet(),
+        invites = ev.sendInvites, reqResp = ev.responseRequested, allowFwd = ev.allowForward,
         repeat = calRepeatOf(calRuleOf(ev.recurrence)),
     )
 }
@@ -278,6 +283,29 @@ fun calScopedPayload(base: TurmaEventDraft, draft: TurmaEventDraft, orgsOrder: L
         now["scope"]?.let { put("scope", it) }
     }
 }
+
+/**
+ * A Turma event's invitations line (XERK-2989, the web's invitesText): which org's
+ * Outlook sends them, the options, a tally of the answers the hub read back; "" = none sent.
+ */
+fun calInvitesText(ev: CalendarEvent, orgLabel: (String) -> String): String {
+    // A series is not written to Outlook yet (XERK-2986), so it sends nothing either.
+    if (!ev.sendInvites || ev.private || ev.recurring) return ""
+    val orgs = calOrgsOf(ev)
+    val bits = mutableListOf(if (orgs.isNotEmpty()) "Sent from ${orgLabel(orgs[0])}'s Outlook" else "Sent from Outlook")
+    if (!ev.responseRequested) bits += "no responses requested"
+    if (!ev.allowForward) bits += "forwarding off"
+    val n = ev.attendees.groupingBy { it.response }.eachCount()
+    val tally = listOf("accepted", "tentative", "declined", "notResponded").filter { (n[it] ?: 0) > 0 }
+        .map { "${n[it]} ${calAttendeeResponse(it).lowercase()}" }
+    if (tally.isNotEmpty()) bits += tally.joinToString(", ")
+    return bits.joinToString(" · ")
+}
+
+/** The editor's note under Invitations (the web's invitesRowHtml). */
+fun calInvitesNote(d: TurmaEventDraft): String =
+    if (d.private) "A private event sends no invitations: its details are withheld from Outlook."
+    else "Sent once, from the Outlook host of the event's first org; updates and a delete reach the attendees too."
 
 /**
  * The day a served occurrence's rule is read from: its ORIGINAL start (a moved
@@ -484,6 +512,9 @@ fun calDraftPayload(d: TurmaEventDraft, orgsOrder: List<String> = emptyList()): 
         put("busy", d.busy)
         put("categories", JsonArray(calCategories(d.categories).map { JsonPrimitive(it) }))
         put("sensitivity", if (d.private) "private" else d.sensitivity.takeIf { it != "private" } ?: "normal")
+        put("sendInvites", d.invites)
+        put("responseRequested", d.reqResp)
+        put("allowForward", d.allowFwd)
         put("reminderMinutes", if (d.reminder.isNotEmpty() && CAL_REMINDERS.any { it.first == d.reminder })
             JsonPrimitive(d.reminder.toInt()) else JsonNull)
         // One occurrence takes no rule (the hub refuses it): the series' stands (XERK-2973).
