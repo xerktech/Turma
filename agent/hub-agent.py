@@ -11132,6 +11132,27 @@ def _tool_input_summary(inp):
     return str(inp)
 
 
+def _read_regular_file_bounded(path, cap):
+    """Up to cap+1 bytes of a REGULAR file, else None. Opened O_NONBLOCK and
+    checked by fstat, so a FIFO (or device) named like a media file the
+    session hands SendUserFile can't block the reader — a plain open() of a
+    FIFO hangs the beat / history worker with no exception to catch."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, left = [], cap + 1
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _send_user_file_detail(inp):
     """Read the image/SVG/HTML files a SendUserFile call delivered and return a
     list of preview entries for its tool_use block (XERK-221), or None:
@@ -11163,9 +11184,8 @@ def _send_user_file_detail(inp):
         entry = {"name": name, "kind": "file"}
         if mime or vmime or render_html:
             try:
-                with open(path, "rb") as fh:
-                    data = fh.read(cap + 1)
-                if len(data) <= cap:
+                data = _read_regular_file_bounded(path, cap)
+                if data is not None and len(data) <= cap:
                     if mime or vmime:
                         entry = {"name": name, "kind": "image" if mime else "video",
                                  "src": "data:%s;base64,%s" % (mime or vmime, base64.b64encode(data).decode("ascii"))}

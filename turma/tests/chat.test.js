@@ -1383,7 +1383,7 @@ test("render: a SendUserFile video plays inline; a non-data src is a chip", () =
     { name: "evil.mp4", kind: "video", src: "https://ex.com/x.mp4" },
     { name: "bad.mp4", kind: "video", src: "javascript:alert(1)" },
   ])));
-  assert.match(html, /<video class="md-video" controls playsinline preload="metadata" src="data:video\/mp4;base64,AAAA"/);
+  assert.match(html, /<video class="md-video" controls playsinline preload="metadata" data-vkey="clip\.mp4:[^"]*" data-name="clip\.mp4" src="data:video\/mp4;base64,AAAA"/);
   assert.match(html, /📎 evil\.mp4/);
   assert.match(html, /📎 bad\.mp4/);
   assert.doesNotMatch(html, /javascript:alert|ex\.com/);

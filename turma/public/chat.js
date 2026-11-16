@@ -1819,6 +1819,47 @@
   // it can't break out of the attribute. A non-renderable/oversize file (kind
   // "file") shows as a name chip. The src scheme is re-checked here (defence in
   // depth) so only data:image/* and http(s) ever reach an <img>.
+  // A video's identity across repaints: cheap (never hashes megabytes of
+  // base64) yet distinct per clip — name, length and the payload's tail.
+  function videoKey(f) {
+    return String(f.name || "") + ":" + f.src.length + ":" + f.src.slice(-48);
+  }
+  // A full body repaint rebuilds every node, which restarted a playing clip on
+  // each new transcript line. Carry the existing <video> elements over by key;
+  // moving a media element within one task keeps it playing.
+  function carryVideos(scroll, write) {
+    const old = new Map();
+    if (scroll.querySelectorAll) {
+      for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
+        const k = v.getAttribute("data-vkey");
+        if (!old.has(k)) old.set(k, v);
+      }
+    }
+    write();
+    if (!old.size) return;
+    for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
+      const prev = old.get(v.getAttribute("data-vkey"));
+      if (prev && prev !== v) { v.replaceWith(prev); old.delete(v.getAttribute("data-vkey")); }
+    }
+  }
+  // A clip the browser can't decode (.mov or Theora .ogv in Chrome) shows the
+  // same name chip as any other file instead of a dead black player. Media
+  // `error` doesn't bubble, so listen in the capture phase.
+  if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("error", (ev) => {
+      const v = ev.target;
+      if (!v || v.tagName !== "VIDEO" || !v.classList || !v.classList.contains("md-video")) return;
+      const chip = document.createElement("div");
+      chip.className = "tool-file file";
+      const span = document.createElement("span");
+      span.className = "tool-file-name";
+      span.textContent = "📎 " + (v.getAttribute("data-name") || "video") + " (this browser can't play it)";
+      chip.appendChild(span);
+      const fig = v.closest && v.closest("figure.tool-file");
+      (fig || v).replaceWith(chip);
+    }, true);
+  }
+
   function renderToolFiles(files, caption) {
     let out = '<div class="tool-files">';
     for (const f of files) {
@@ -1832,8 +1873,8 @@
       } else if (f.kind === "video" && typeof f.src === "string" && /^data:video\//i.test(f.src)) {
         // A delivered clip plays inline. Only a data:video/* URI the agent built
         // reaches src= (no remote fetch); preload=metadata keeps a long chat cheap.
-        out += '<figure class="tool-file"><video class="md-video" controls playsinline preload="metadata" src="' +
-          esc(f.src) + '" title="' + name + '"></video>' +
+        out += '<figure class="tool-file"><video class="md-video" controls playsinline preload="metadata" data-vkey="' +
+          esc(videoKey(f)) + '" data-name="' + name + '" src="' + esc(f.src) + '" title="' + name + '"></video>' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else if (f.kind === "html" && typeof f.html === "string") {
         out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +
@@ -2416,8 +2457,10 @@
     // `display: contents` on both wrappers keeps them out of layout entirely, so
     // the bubbles stay direct flex children of the scroll and every align-self
     // (user right, agent left) still resolves against it.
-    scroll.innerHTML = '<div id="chatBody" style="display:contents">' + bodyHtml + "</div>" +
-      '<div id="chatLiveRegion" style="display:contents">' + liveHtml + "</div>";
+    carryVideos(scroll, () => {
+      scroll.innerHTML = '<div id="chatBody" style="display:contents">' + bodyHtml + "</div>" +
+        '<div id="chatLiveRegion" style="display:contents">' + liveHtml + "</div>";
+    });
     lastBodyHtml = bodyHtml;
     lastLiveHtml = liveHtml;
     // Stay pinned to the bottom while following along; otherwise hold the

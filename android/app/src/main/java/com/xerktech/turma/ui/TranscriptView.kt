@@ -870,8 +870,11 @@ private fun VideoPreview(f: SendFile) {
             } catch (e: java.io.IOException) { null }
         }
     }
+    // A clip the device can't decode (Theora .ogv on most) is a chip, never the
+    // platform's modal "Can't play this video." dialog over a black box.
+    var failed by remember(f.src) { mutableStateOf(false) }
     val playable = file
-    if (playable == null) { FileChip(f.name, f.shed); return }
+    if (playable == null || failed) { FileChip(f.name, f.shed); return }
     Column {
         AndroidView(
             factory = { c ->
@@ -881,6 +884,8 @@ private fun VideoPreview(f: SendFile) {
                     setMediaController(controller)
                     // Show the first frame instead of a black box until Play.
                     setOnPreparedListener { it.isLooping = false; seekTo(1) }
+                    // Returning true suppresses VideoView's own error dialog.
+                    setOnErrorListener { _, _, _ -> failed = true; true }
                 }
             },
             update = { v ->

@@ -566,6 +566,60 @@ function toolInputSummary(inp) {
   return String(inp);
 }
 
+// Up to cap+1 bytes of a REGULAR file, else null. O_NONBLOCK + fstat, so a
+// FIFO named like a media file can't block this event loop (which also bridges
+// every terminal on the host). Mirror of hub-agent.py _read_regular_file_bounded.
+function readRegularFileBounded(p, cap) {
+  const fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0));
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) return null;
+    // Size the buffer to the file (a grown file still stops at cap+1).
+    const buf = Buffer.alloc(Math.min(cap, st.size) + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const r = fs.readSync(fd, buf, n, buf.length - n, null);
+      if (!r) break;
+      n += r;
+    }
+    return buf.subarray(0, n);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// A tail frame must fit the hub's control-channel frame ceiling (16 MiB at a
+// 512 MiB container): over it the hub DROPS the channel, the re-arm re-sends the
+// same frame, and the host's terminals and live tails flap until the viewer
+// leaves. A few SendUserFile videos (4 MiB each) reach that, so past this budget
+// the OLDEST entries in the frame lose their file payloads (the `shed` chip the
+// archive uses). `sent` still records the full weight, so the shed copy is not
+// re-sent every poll; /history (its own byte budget) serves the full one.
+const LIVE_FRAME_BUDGET_BYTES = Number(process.env.SESSION_LIVE_FRAME_BUDGET_BYTES) || 8 * 1024 * 1024;
+function shedFrameToBudget(entries, budget) {
+  const sizes = entries.map((e) => JSON.stringify(e).length);
+  let total = sizes.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < entries.length && total > budget; i++) {
+    const e = entries[i];
+    if (!Array.isArray(e.blocks)) continue;
+    let touched = false;
+    const blocks = e.blocks.map((b) => {
+      if (!b || !Array.isArray(b.files)) return b;
+      const files = b.files.map((f) => {
+        if (!f || (typeof f.src !== "string" && typeof f.html !== "string")) return f;
+        touched = true;
+        return { name: f.name, kind: "file", shed: true };
+      });
+      return { ...b, files };
+    });
+    if (!touched) continue;
+    entries[i] = { ...e, blocks };
+    const size = JSON.stringify(entries[i]).length;
+    total -= sizes[i] - size;
+    sizes[i] = size;
+  }
+}
+
 // Read the image/SVG/HTML files a SendUserFile call delivered and return preview
 // entries for its tool_use block (XERK-221), or null. Mirror of hub-agent.py
 // _send_user_file_detail(): image -> {name, kind:"image", src:data URI};
@@ -587,13 +641,11 @@ function sendUserFileDetail(inp) {
     let entry = { name, kind: "file" };
     if (mime || vmime || renderHtml) {
       try {
-        if (fs.statSync(p).size <= cap) { // bound the read (mirrors Python's read(cap+1))
-          const data = fs.readFileSync(p);
-          if (data.length <= cap) {
-            entry = (mime || vmime)
-              ? { name, kind: mime ? "image" : "video", src: "data:" + (mime || vmime) + ";base64," + data.toString("base64") }
-              : { name, kind: "html", html: data.toString("utf8") };
-          }
+        const data = readRegularFileBounded(p, cap);
+        if (data && data.length <= cap) {
+          entry = (mime || vmime)
+            ? { name, kind: mime ? "image" : "video", src: "data:" + (mime || vmime) + ";base64," + data.toString("base64") }
+            : { name, kind: "html", html: data.toString("utf8") };
         }
       } catch { /* unreadable / gone → name chip */ }
     }
@@ -2612,6 +2664,7 @@ function pollWatcher(sessionId) {
         if (w.sent.get(e.id) === weight) continue;
         entries.push(e);
       }
+      shedFrameToBudget(entries, LIVE_FRAME_BUDGET_BYTES);
       const queuedJson = JSON.stringify(tail.queued);
       const queuedChanged = queuedJson !== w.lastQueued;
       // Commit ONLY once the frame has actually gone out. Two ways to get this
@@ -3202,7 +3255,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { shedFrameToBudget, mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

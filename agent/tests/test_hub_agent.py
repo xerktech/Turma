@@ -4846,6 +4846,24 @@ class TestEntryBlocks(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_send_user_file_fifo_named_like_media_is_a_chip_not_a_hang(self):
+        # A FIFO at a SendUserFile path must not block the reader (a plain open()
+        # of a FIFO hangs the beat / history worker forever).
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs here")
+        d = tempfile.mkdtemp()
+        try:
+            fifo = os.path.join(d, "x.mp4")
+            os.mkfifo(fifo)
+            block = ha._entry_blocks({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t1", "name": "SendUserFile",
+                 "input": {"files": [fifo, os.path.join(d, "y.png")]}},
+            ]}}, ha.BLOCK_CAPS)[0]
+            self.assertEqual(block["files"], [{"name": "x.mp4", "kind": "file"},
+                                              {"name": "y.png", "kind": "file"}])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_description_arg_rides_as_desc(self):
         block = ha._entry_blocks({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {

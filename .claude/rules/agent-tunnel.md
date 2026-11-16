@@ -35,6 +35,11 @@ Python side in `.claude/rules/agent.md`.
     committed on the same rule. A test sink returning exactly `false` drives that path.
   - A lost frame is not only a missing entry: when a later copy of that id IS sent, every id-keyed
     grow-only consumer appends it at the END, so the transcript reads out of order too.
+- **A frame is held under `LIVE_FRAME_BUDGET_BYTES` (8 MiB) by shedding file payloads, oldest
+  entry first** (`shedFrameToBudget`): over the hub's ws frame ceiling (16 MiB at 512 MiB) the hub
+  drops the control channel, the re-arm re-sends the same frame, and the host's terminals flap until
+  the viewer leaves — three 4 MiB SendUserFile videos did it. `sent` keeps the FULL weight so the shed
+  copy is not re-sent each poll; `/history` serves the full one. Test: `a frame over budget sheds`.
 - **A RE-ARM resets the delta state and polls immediately** (`startWatch`'s existing-watcher path).
   A re-arm means somebody is looking who has seen nothing on this channel — a control-channel flap
   re-sends every watch, and a SECOND viewer re-sends that one — and the deltas they missed went down

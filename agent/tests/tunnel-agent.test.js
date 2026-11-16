@@ -160,6 +160,47 @@ test("entryBlocks: SendUserFile embeds a video under its own cap, chips past it"
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("entryBlocks: a FIFO named like a video is a chip, never a blocking read", () => {
+  if (process.platform === "win32") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "suf-"));
+  const fifo = path.join(dir, "x.mp4");
+  require("child_process").execFileSync("mkfifo", [fifo]);
+  const [b] = entryBlocks(
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "SendUserFile",
+      input: { files: [fifo] } }] } }, BLOCK_CAPS);
+  assert.deepEqual(b.files, [{ name: "x.mp4", kind: "file" }]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("SendUserFile video MIME map and cap match hub-agent.py", () => {
+  const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
+  const js = fs.readFileSync(path.join(__dirname, "..", "tunnel-agent.js"), "utf8");
+  const pairs = (src, re) => {
+    const body = src.match(re)[1];
+    return [...body.matchAll(/"(\.[a-z0-9]+)":\s*"([^"]+)"/g)].map((m) => m[1] + "=" + m[2]).sort();
+  };
+  assert.deepEqual(pairs(py, /SEND_FILE_VIDEO_MIME = \{([^}]*)\}/), pairs(js, /const SEND_FILE_VIDEO_MIME = \{([^}]*)\}/));
+  assert.match(py, /_env_int\("SESSION_SEND_FILE_VIDEO_MAX_BYTES", 4 << 20\)/);
+  assert.match(js, /SESSION_SEND_FILE_VIDEO_MAX_BYTES\) \|\| 4 \* 1024 \* 1024/);
+});
+
+test("live tail: a frame over budget sheds the OLDEST entries' file payloads first", () => {
+  const { shedFrameToBudget } = require("../tunnel-agent.js");
+  const big = "data:video/mp4;base64," + "A".repeat(1000);
+  const mk = (id) => ({ id, role: "assistant", blocks: [{ t: "tool_use", name: "SendUserFile",
+    files: [{ name: id + ".mp4", kind: "video", src: big }] }] });
+  const entries = [mk("a"), mk("b"), mk("c")];
+  const one = JSON.stringify(entries[0]).length;
+  shedFrameToBudget(entries, one * 2 + 400);
+  assert.deepEqual(entries[0].blocks[0].files, [{ name: "a.mp4", kind: "file", shed: true }]);
+  assert.equal(entries[1].blocks[0].files[0].src, big);
+  assert.equal(entries[2].blocks[0].files[0].src, big);
+  // Under budget: untouched.
+  const keep = [mk("d")];
+  shedFrameToBudget(keep, 1 << 20);
+  assert.equal(keep[0].blocks[0].files[0].src, big);
+});
+
 test("entryBlocks: over-cap text/result get truncated:true and are clipped", () => {
   const big = "x".repeat(BLOCK_CAPS.text + 500);
   const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS);
