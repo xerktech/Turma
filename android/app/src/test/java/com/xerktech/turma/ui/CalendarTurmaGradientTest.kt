@@ -4,6 +4,7 @@ import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.hasContentDescription
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.unit.dp
 import com.xerktech.turma.harness.HubHarness
@@ -56,6 +57,13 @@ class CalendarTurmaGradientTest {
           "subject": "Joint planning", "startMs": ${t(9)}, "endMs": ${t(11)}, "timeZone": "${zone.id}",
           "busy": "busy", "myResponse": "notResponded", "editable": true, "version": 1, "meeting": false }"""
 
+    // Canceled, its Outlook copy failed: dimmed like the web, the "!" on a white pill.
+    private val canceled = """
+        { "source": "turma", "host": "", "id": "turma:fedcba9876543210", "orgs": ["$a"], "org": "$a",
+          "subject": "Dropped sync", "startMs": ${t(15)}, "endMs": ${t(17)}, "timeZone": "${zone.id}",
+          "busy": "busy", "canceled": true, "editable": true, "version": 1, "meeting": false,
+          "outlook": { "$a": { "state": "failed", "error": "Outlook is not open", "at": 1 } } }"""
+
     private val outlook = """
         { "host": "h1", "org": "$a", "matchOrg": "$a", "id": "E1", "source": "outlook", "subject": "Outlook standup",
           "startMs": ${t(12)}, "endMs": ${t(14)}, "busy": "busy", "myResponse": "accepted" }"""
@@ -67,7 +75,7 @@ class CalendarTurmaGradientTest {
             okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(
                 """{ "from": ${url.queryParameter("from")}, "until": ${url.queryParameter("until")},
                   "hosts": [ { "host": "h1", "device": "h1", "online": true, "syncedAt": 1, "ranges": [[0, 9000000000000000]] } ],
-                  "events": [ $turma, $outlook ] }""",
+                  "events": [ $turma, $canceled, $outlook ] }""",
             )
         }
         hub.json("/api/holidays", "[]")
@@ -115,10 +123,27 @@ class CalendarTurmaGradientTest {
         }
         assertTrue("blue end ${hex(top)} → purple end ${hex(bottom)}", r(bottom) > r(top) + 20 && g(bottom) < g(top) - 20)
 
+        // The title is drawn white on it: somewhere in the title line a near-white glyph pixel.
+        val white = (0 until 40).any { dx -> (0 until 10).any { dy ->
+            val c = pixel(inner + dx * 2 * px, box.top + (3 + dy) * px); r(c) > 225 && g(c) > 225 && bl(c) > 225 } }
+        assertTrue("white title text", white)
+
         // Two orgs: the bar's top half is one org's colour and its bottom half the other's.
         val barTop = pixel(bar, box.top + box.height * 0.25f)
         val barBottom = pixel(bar, box.top + box.height * 0.75f)
         assertNotEquals("stacked org bar", hex(barTop), hex(barBottom))
+
+        // A canceled Turma event is dimmed (alpha 0.6): its blue end washes toward the page.
+        compose.onNode(event("Dropped sync")).performScrollTo()
+        val cb = compose.onNode(event("Dropped sync")).fetchSemanticsNode().boundsInRoot
+        val dim = pixel(cb.left + 8 * px, cb.bottom - 3 * px)
+        val full = pixel(box.left + 8 * px, box.bottom - 3 * px)
+        assertTrue("dimmed ${hex(dim)} vs ${hex(full)}", r(dim) > r(full) + 40 && g(dim) > g(full) + 30)
+
+        // Its failed mark sits on a white pill, not red straight on the gradient.
+        val olk = compose.onNodeWithTag("cal-olk-failed", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        val pill = pixel(olk.left + 1.5f * px, (olk.top + olk.bottom) / 2)
+        assertTrue("pill ${hex(pill)}", r(pill) > 225 && g(pill) > 225 && bl(pill) > 225)
 
         // An Outlook event keeps its light org tint.
         compose.onNode(event("Outlook standup")).performScrollTo()

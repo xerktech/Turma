@@ -99,7 +99,12 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.ui.graphics.LinearGradientShader
+import androidx.compose.ui.graphics.Shader
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -1027,7 +1032,8 @@ private fun EventBlock(
     }
     Row(
         modifier.alpha(if (st.past || (turma && st.canceled)) 0.6f else 1f).clip(shape).then(fill)
-            .then(if (open) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, shape) else Modifier)
+            // The accent ring vanished into the gradient's blue end (QA): a Turma block is ringed in ink.
+            .then(if (open) Modifier.border(2.dp, if (turma) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary, shape) else Modifier)
             .clickable(onClick = onClick)
             .testTag("cal-ev")
             .clearAndSetSemantics { contentDescription = aria; role = Role.Button },
@@ -1065,12 +1071,18 @@ private fun EventBlock(
                             fontWeight = FontWeight.SemiBold, color = subtle,
                         )
                     }
-                    // A Turma event's Outlook copy failed or is being written (XERK-2987).
+                    // A Turma event's Outlook copy failed or is being written (XERK-2987): web `.cal-olk`,
+                    // a white pill with a fixed dark glyph in both themes — a theme colour alone fell
+                    // to ~1.3:1 on the gradient (QA). White clears 3:1 on every stop.
                     when (val m = com.xerktech.turma.core.calOutlookMark(ev)) {
                         "failed", "pending" -> Text(
-                            if (m == "failed") "!" else "…", Modifier.padding(start = 2.dp).testTag("cal-olk-$m"),
-                            fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                            color = if (m == "failed") TurmaColors.criticalText() else subtle,
+                            if (m == "failed") "!" else "…",
+                            Modifier.padding(start = 3.dp).testTag("cal-olk-$m")
+                                .background(Color.White, RoundedCornerShape(7.dp))
+                                .defaultMinSize(minWidth = 14.dp).padding(horizontal = 3.dp),
+                            fontSize = 11.sp, fontWeight = FontWeight.ExtraBold, lineHeight = 14.sp,
+                            textAlign = TextAlign.Center,
+                            color = if (m == "failed") OLK_FAILED else OLK_PENDING,
                         )
                     }
                     CalBadgeView(badge)
@@ -1084,10 +1096,23 @@ private fun EventBlock(
     }
 }
 
-// The Turma icon's lit "T" (favicon.svg / ic_launcher_foreground): web `--turma-grad`, 135deg.
-private val TURMA_EVENT_GRADIENT = Brush.linearGradient(
-    0f to Color(0xFF4A95F0), 0.55f to Color(0xFF6271DF), 1f to Color(0xFF7A4DCF),
-)
+// The Turma icon's lit "T" (favicon.svg / ic_launcher_foreground): web `--turma-grad`.
+// CSS `135deg`: the bands stay at 45° whatever the block's shape, the line running through the
+// centre and just reaching both corners — not Compose's corner-to-corner default, which shades a
+// tall block vertically and a wide one horizontally (QA).
+private val TURMA_EVENT_GRADIENT = object : ShaderBrush() {
+    override fun createShader(size: Size): Shader {
+        val half = (size.width + size.height) / 4f   // half the CSS gradient line, per axis (÷√2 twice)
+        val c = Offset(size.width / 2f, size.height / 2f)
+        return LinearGradientShader(
+            from = c - Offset(half, half), to = c + Offset(half, half),
+            colors = listOf(Color(0xFF4A95F0), Color(0xFF6271DF), Color(0xFF7A4DCF)),
+            colorStops = listOf(0f, 0.55f, 1f),
+        )
+    }
+}
+private val OLK_FAILED = Color(0xFFB3261E)
+private val OLK_PENDING = Color(0xFF3D3C3A)
 private val TURMA_EVENT_SUBTLE = Color.White.copy(alpha = 0.88f)
 
 @Composable
