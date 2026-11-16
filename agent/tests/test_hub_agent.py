@@ -57248,6 +57248,12 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()                           # its tick is not patched
         with mock.patch.object(ha.threading, "Thread") as thread:
             sm._calendar_tick()
+            thread.assert_called_once()                    # a fresh manager reads at once
+            thread.reset_mock()
+            sm._cal_worker = None
+            sm._cal_wake.clear()
+            sm._cal_next_at = time.monotonic() + 600
+            sm._calendar_tick()
             thread.assert_not_called()                     # not due, nothing owed
             sm._cal_want = (self.MON, self.MON + self.WEEK)
             sm._calendar_tick()
@@ -57458,8 +57464,18 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(["error" in r for r in self.rows()], [False])
         self.assertIsNone(self.sm._cal_last_error)
 
+    def test_xerk2984_a_fresh_manager_reads_at_once_and_reports_write(self):
+        # A restart too quick for the hub to queue a reconnect sync must not leave
+        # the host unable to take Turma events until the 15-minute schedule.
+        self.assertFalse(self.sm.build_payload(0)["calendar"]["write"])
+        self.sm._calendar_pass(now_ms=self.MON)
+        self.assertTrue(self.reads)
+        self.assertTrue(self.sm.build_payload(0)["calendar"]["write"])
+        self.assertGreater(self.sm._cal_next_at, time.monotonic())
+
     def test_the_pass_runs_a_hub_window_first_else_only_when_due(self):
         with mock.patch.object(self.sm, "_run_calendar_sync") as run:
+            self.sm._cal_next_at = time.monotonic() + 600
             self.sm._calendar_pass()
             run.assert_not_called()                         # not due yet
             self.sm._cal_want = (self.MON, self.MON + self.WEEK)
@@ -57628,6 +57644,7 @@ class TestCalendarWrite(ManagerMixin, unittest.TestCase):
 
     def test_xerk2984_outlook_down_fails_every_row_and_clears_write(self):
         self.sm._cal_outlook_ok = True
+        self.sm._cal_next_at = time.monotonic() + 600     # no scheduled read in this pass
         self.fail = "classic Outlook is not open: open it and retry"
         self.sm._stage_calendar_write(self.cmd())
         self.sm._calendar_pass(now_ms=self.MON)

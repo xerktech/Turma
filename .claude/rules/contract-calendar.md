@@ -63,6 +63,10 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 - **Off the beat**: `_calendar_worker_loop` runs the reads; the beat's `_calendar_tick` is a time
   compare that wakes it every `CALENDAR_SYNC_EVERY_SEC` (`TURMA_CALENDAR_SYNC_MIN`, 15) or on a
   `syncCalendar` (`_stage_calendar_sync` only stores the window; a newer one replaces it).
+- **The first scheduled read is due at manager start** (XERK-2984): `calendar.write` stays false
+  until Outlook answers, and a restart quicker than `OFFLINE_AFTER_MS` gets no reconnect
+  `syncCalendar`, so waiting out the schedule left every Outlook host refusing Turma events for 15
+  minutes after each update.
 - **The reader is the session CLI's** (`session_cli_module().read_calendar_windows`), loaded by path:
   one Outlook reader, one PowerShell script, on WSL and native Windows alike.
 - **Week chunks, each a COMPLETE window**: `calendar_weeks` cuts at UTC Mondays, read

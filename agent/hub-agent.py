@@ -29467,7 +29467,11 @@ class SessionManager:
         self._cal_wake = threading.Event()
         self._cal_worker = None
         self._cal_want = None
-        self._cal_next_at = time.monotonic() + CALENDAR_SYNC_EVERY_SEC
+        # The first scheduled read is due at once (XERK-2984): `calendar.write`
+        # stays false until Outlook has answered, and a restart quick enough that
+        # the hub queues no reconnect sync would otherwise leave the host unable
+        # to take Turma events for a whole CALENDAR_SYNC_EVERY_SEC.
+        self._cal_next_at = time.monotonic()
         self._cal_hashes = {}
         self._cal_last_error = None
         self._cal_last_error_range = None   # (from, until) the last Outlook error covered
