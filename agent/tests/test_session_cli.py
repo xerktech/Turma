@@ -308,6 +308,10 @@ _FAKE_SYNC_OUTLOOK = r"""
     $o | Add-Member ScriptMethod GetOrganizer { $script:orgEntry }
     $o
   }
+  # XERK-2984: the Turma writer's stamp, as a UserProperties collection.
+  function UP($v) { $u = [pscustomobject]@{ v = $v }
+    $u | Add-Member ScriptMethod Find { param($n) if ($n -eq 'TurmaId') { [pscustomobject]@{ Value = $this.v } } }
+    $u }
   $exPa = [pscustomobject]@{}
   $exPa | Add-Member ScriptMethod GetProperty { param($t)
     if ($t -like '*/82280040') { [datetime]'2026-11-17T14:00:00' } else { throw 'no prop' } }
@@ -324,10 +328,10 @@ _FAKE_SYNC_OUTLOOK = r"""
       PropertyAccessor = $exPa; Body = 'moved' })),
     (Appt (@{ Subject = 'Review'; GlobalAppointmentID = 'G-REVIEW'; RecurrenceState = 0
       IsRecurring = $false; StartUTC = [datetime]'2026-11-18T16:00:00'; EndUTC = [datetime]'2026-11-18T17:00:00'
-      MeetingStatus = 5; Body = '' })),
+      MeetingStatus = 5; Body = ''; UserProperties = (UP 'turma:0123456789abcdef') })),
     (Appt (@{ Subject = 'Doctor'; GlobalAppointmentID = 'G-DOC'; RecurrenceState = 0
       IsRecurring = $false; StartUTC = [datetime]'2026-11-19T10:00:00'; EndUTC = [datetime]'2026-11-19T11:00:00'
-      Sensitivity = 2; Body = 'private notes' })),
+      Sensitivity = 2; Body = 'private notes'; UserProperties = (UP 'turma:NOT-OURS') })),
     (Appt (@{ Subject = 'No id'; RecurrenceState = 0; IsRecurring = $false
       StartUTC = [datetime]'2026-11-20T10:00:00'; EndUTC = [datetime]'2026-11-20T11:00:00'; Body = '' })))
   $script:items = [pscustomobject]@{ IncludeRecurrences = $false }
@@ -741,6 +745,9 @@ class CalendarSyncReaderTest(unittest.TestCase):
         self.assertRegex(st["lastModified"], ISO)
         self.assertEqual((st["sensitivity"], dr["sensitivity"]), ("normal", "private"))
         self.assertRegex(mv["start"], ISO)
+        # XERK-2984: the stamp, kept only in its own shape.
+        self.assertEqual((rv["turmaId"], dr["turmaId"], st["turmaId"]),
+                         ("turma:0123456789abcdef", "", ""))
 
     def test_several_windows_in_one_run_and_the_cap_marks_incomplete(self):
         wins = [(self.MON, self.MON + self.WEEK), (self.MON + self.WEEK, self.MON + 2 * self.WEEK)]
@@ -785,6 +792,8 @@ class CalendarSyncReaderTest(unittest.TestCase):
         self.assertEqual(sorted(e["id"] for e in w["events"]),
                          ["G-DOC", "G-REVIEW", "G-STANDUP:2026-11-16T14:00:00Z",
                           "G-STANDUP:2026-11-17T14:00:00Z"])
+        self.assertEqual({e["id"]: e["turmaId"] for e in w["events"]}["G-REVIEW"],
+                         "turma:0123456789abcdef")
         # The session view of the same reply drops the sync's fields and the body.
         printed = cli.normalize_calendar(doc)["events"][0]
         self.assertNotIn("body", printed)
@@ -805,6 +814,270 @@ class CalendarSyncReaderTest(unittest.TestCase):
         self.assertEqual(ev["sensitivity"], "private")     # unreadable errs private
         self.assertEqual(ev["organizerEmail"], "ana@x.example")
         self.assertFalse(ev["isOnlineMeeting"])
+
+
+# XERK-2984: a fake Outlook for the Turma writer — a store of appointments by
+# EntryID (one the user made, never stamped), GetItemFromID, a DASL Find on the
+# stamp, CreateItem, TimeZones (one Outlook lacks), and Save/Delete/Send that log
+# what they did to stderr. Send throws: the writer must never call it.
+_FAKE_WRITE_OUTLOOK = r"""
+  $script:store = [ordered]@{}
+  $script:n = 0
+  $script:cal = [pscustomobject]@{ EntryID = 'CAL'; Items = $null }
+  $script:bin = [pscustomobject]@{ EntryID = 'BIN' }
+  function NewItem($id) {
+    $it = [pscustomobject]@{ EntryID = $id; Subject = ''; Location = ''; Body = ''; BusyStatus = 2
+      Sensitivity = 0; Categories = ''; AllDayEvent = $false; ReminderSet = $true
+      StartTimeZone = $null; EndTimeZone = $null; StartInStartTimeZone = $null; EndInEndTimeZone = $null
+      StartUTC = [datetime]'2026-11-18T12:00:00'; EndUTC = [datetime]'2026-11-18T13:00:00'
+      LastModificationTime = [datetime]'2026-11-16T09:30:00'; props = @{}; Parent = $script:cal }
+    $up = [pscustomobject]@{ owner = $it }
+    $up | Add-Member ScriptMethod Find { param($k) $this.owner.props[$k] }
+    $up | Add-Member ScriptMethod Add { param($k, $t, $f)
+      [Console]::Error.WriteLine("ADDPROP $k type=$t folder=$f")
+      $p = [pscustomobject]@{ Value = '' }; $this.owner.props[$k] = $p; $p }
+    $it | Add-Member NoteProperty UserProperties $up
+    $it | Add-Member ScriptMethod Save {
+      if (-not $this.EntryID) { $script:n++; $this.EntryID = "E$($script:n)" }
+      $script:store[$this.EntryID] = $this
+      $z = [TimeZoneInfo]::FindSystemTimeZoneById($this.StartTimeZone.ID)
+      $this.StartInStartTimeZone = [TimeZoneInfo]::ConvertTimeFromUtc($this.StartUTC, $z)
+      $st = ''; if ($this.props['TurmaId']) { $st = $this.props['TurmaId'].Value }
+      [Console]::Error.WriteLine('SAVE ' + (ConvertTo-Json -Compress -InputObject @{
+        id = $this.EntryID; stamp = $st; subject = $this.Subject; location = $this.Location
+        body = $this.Body; busy = $this.BusyStatus; sens = $this.Sensitivity; cats = $this.Categories
+        allDay = $this.AllDayEvent; reminder = $this.ReminderSet; tz = $this.StartTimeZone.ID
+        wall = $this.StartInStartTimeZone.ToString('s')
+        startUtc = $this.StartUTC.ToString('s'); endUtc = $this.EndUTC.ToString('s') })) }
+    $it | Add-Member ScriptMethod Delete {
+      [Console]::Error.WriteLine("DELETE $($this.EntryID)"); $script:store.Remove($this.EntryID) }
+    $it | Add-Member ScriptMethod Send { [Console]::Error.WriteLine("SEND $($this.EntryID)"); throw 'SENT' }
+    $it
+  }
+  $mine = NewItem 'U1'; $mine.Subject = 'My own lunch'; $script:store['U1'] = $mine
+  # A stamp in the wrong case (PowerShell's -eq would match it), and a real
+  # copy the user deleted to Deleted Items: neither is the copy.
+  $odd = NewItem 'T9'; $odd.props['TurmaId'] = [pscustomobject]@{ Value = 'TURMA:DDDDDDDDDDDDDDDD' }
+  $script:store['T9'] = $odd
+  $gone = NewItem 'B7'; $gone.Parent = $script:bin
+  $gone.props['TurmaId'] = [pscustomobject]@{ Value = 'turma:9999999999999999' }; $script:store['B7'] = $gone
+  $items = [pscustomobject]@{}
+  $items | Add-Member ScriptMethod Find { param($f)
+    [Console]::Error.WriteLine("FIND $f")
+    if ($f -match "TurmaId"" = '([^']*)'$") {
+      foreach ($it in $script:store.Values) {
+        if ($it.Parent -eq $script:cal -and $it.props['TurmaId'] -and
+            $it.props['TurmaId'].Value -eq $Matches[1]) { return $it } } }
+    $null }
+  $tzs = [pscustomobject]@{}
+  $tzs | Add-Member ScriptMethod Item { param($id)
+    if ($id -eq 'Russia Time Zone 11') { throw 'no such zone' }
+    [pscustomobject]@{ ID = $id } }
+  $ol = [pscustomobject]@{ Session = [pscustomobject]@{}; TimeZones = $tzs }
+  $ol.Session | Add-Member ScriptMethod GetItemFromID { param($id)
+    if ($script:store.Contains($id)) { $script:store[$id] } else { throw 'The operation failed.' } }
+  $script:cal.Items = $items
+  $ol.Session | Add-Member ScriptMethod GetDefaultFolder { param($n) $script:cal }
+  $ol.Session | Add-Member ScriptMethod CompareEntryIDs { param($a, $b) $a -ceq $b }
+  $script:items = $items
+  $ol | Add-Member ScriptMethod CreateItem { param($t) [Console]::Error.WriteLine("CREATE $t"); NewItem '' }"""
+
+WRITE_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calendar_write_fixture.json")
+
+
+class CalendarWriteTest(unittest.TestCase):
+    """XERK-2984: the Turma writer — commands typed and capped before the
+    script, find-before-create on the stamp (so a replay never duplicates), a
+    foreign EntryID never edited, Save without Send, an absent copy's delete ok."""
+
+    MON = 1794787200000          # 2026-11-16T00:00Z, a Monday
+    A, B, C, D, K = ("turma:" + c * 16 for c in "abcde")
+
+    def up(self, tid, **ev):
+        e = {"subject": "Plan", "start": "2026-11-16T09:00:00-05:00",
+             "end": "2026-11-16T10:00:00-05:00", "timeZone": "America/New_York"}
+        e.update(ev)
+        return {"op": "upsert", "turmaId": tid, "outlookId": "", "event": e}
+
+    def run_write(self, cmds):
+        """The real script under pwsh against _FAKE_WRITE_OUTLOOK: (results, stderr lines)."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        seen = {}
+        real = cli.subprocess.run
+
+        def run(*a, **kw):
+            seen["proc"] = real(*a, **kw)
+            return seen["proc"]
+        with mock.patch.object(cli, "_CALENDAR_WRITE_PS",
+                               cli._CALENDAR_WRITE_PS.replace(_COM_LINES, _FAKE_WRITE_OUTLOOK)), \
+                mock.patch.object(cli.subprocess, "run", side_effect=run):
+            got = cli.write_calendar_events(cmds, powershell=pwsh)
+        err = seen["proc"].stderr.decode("utf-8", "replace").splitlines()
+        return got, err, seen["proc"].stdout.decode("utf-8-sig").strip().splitlines()[-1]
+
+    def test_the_real_script_upserts_finds_its_copy_and_deletes(self):
+        cmds = [
+            self.up(self.A, body="Agenda", joinUrl="https://teams.microsoft.com/l/x",
+                    categories=["Team", "Plan"], busy="tentative", location="Room 1"),
+            self.up(self.A, subject="Plan v2"),                  # a replay: finds it by stamp
+            dict(self.up(self.B), outlookId="U1"),               # a foreign EntryID
+            self.up(self.C, sensitivity="private", body="secret", location="home"),
+            self.up(self.K, timeZone="Asia/Kamchatka"),          # a zone this Outlook lacks
+            {"op": "delete", "turmaId": self.A, "outlookId": "E1"},
+            {"op": "delete", "turmaId": self.D, "outlookId": ""},  # never existed: ok
+            self.up("turma:" + "f" * 16, timeZone="Mars/Base"),    # refused before the script
+        ]
+        got, err, last = self.run_write(cmds)
+        saves = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual([r["ok"] for r in got], [True, True, True, True, False, True, True, False])
+        self.assertEqual([r.get("outlookId") for r in got[:4]], ["E1", "E1", "E2", "E3"])
+        self.assertEqual(sum(l.startswith("CREATE 1") for l in err), 3)   # A, B, C — not the replay
+        first, replay, b, c = saves
+        self.assertEqual(first["stamp"], self.A)
+        self.assertEqual(first["body"], "Agenda\nJoin: https://teams.microsoft.com/l/x")
+        self.assertEqual((first["busy"], first["sens"], first["reminder"], first["allDay"]),
+                         (1, 0, False, False))
+        self.assertEqual((first["tz"], first["wall"]), ("Eastern Standard Time", "2026-11-16T09:00:00"))
+        self.assertEqual((first["startUtc"], first["endUtc"]), ("2026-11-16T14:00:00", "2026-11-16T15:00:00"))
+        self.assertIn("Team", first["cats"])
+        self.assertIn("Plan", first["cats"])
+        self.assertEqual((replay["id"], replay["subject"]), ("E1", "Plan v2"))
+        # The user's own appointment, named by a stale EntryID, is left alone.
+        self.assertEqual(b["id"], "E2")
+        self.assertNotIn("SAVE", " ".join(l for l in err if '"id":"U1"' in l))
+        self.assertEqual((c["subject"], c["body"], c["location"], c["sens"]), ("Private event", "", "", 2))
+        self.assertIn("no time zone", got[4]["error"])
+        self.assertIn("DELETE E1", err)
+        self.assertEqual(sum(l.startswith("DELETE") for l in err), 1)   # never T9 (TURMA:DDDD…)
+        self.assertFalse([l for l in err if l.startswith("SEND")])
+        self.assertEqual(got[5]["startMs"], self.MON + 14 * 3600000)
+        self.assertNotIn("startMs", got[6])
+        self.assertIn("no Windows zone", got[7]["error"])
+        self.assertRegex(got[0]["lastModified"], ISO)
+        # Every stamp lookup is the DASL filter on the user property.
+        self.assertTrue(any(l.startswith("FIND @SQL=\"http://schemas.microsoft.com/mapi/string/"
+                                         "{00020329-0000-0000-C000-000000000046}/TurmaId\" = '"
+                                         + self.A + "'") for l in err))
+
+    def test_an_all_day_event_keeps_its_midnights(self):
+        got, err, _ = self.run_write([self.up(self.A, allDay=True, start="2026-11-16T00:00:00-05:00",
+                                              end="2026-11-18T00:00:00-05:00")])
+        (save,) = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertTrue(save["allDay"])
+        self.assertEqual((save["wall"], save["endUtc"]), ("2026-11-16T00:00:00", "2026-11-18T05:00:00"))
+
+    def test_the_fall_back_hour_round_trips_as_instants(self):
+        """The repeated 02:30 of Berlin's fall-back night: the FIRST one (+02:00)
+        is a different instant from the second; a wall time cannot tell them apart."""
+        got, err, _ = self.run_write([
+            self.up(self.A, start="2026-10-25T02:30:00+02:00", end="2026-10-25T03:30:00+02:00",
+                    timeZone="Europe/Berlin"),
+            self.up(self.B, start="2026-10-25T02:30:00+01:00", end="2026-10-25T03:30:00+01:00",
+                    timeZone="Europe/Berlin")])
+        first, second = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual((first["startUtc"], first["endUtc"]), ("2026-10-25T00:30:00", "2026-10-25T01:30:00"))
+        self.assertEqual((second["startUtc"], second["endUtc"]), ("2026-10-25T01:30:00", "2026-10-25T02:30:00"))
+        self.assertEqual(first["tz"], "W. Europe Standard Time")
+
+    def test_a_copy_in_deleted_items_is_not_edited_a_new_one_is_made(self):
+        got, err, _ = self.run_write([dict(self.up("turma:" + "9" * 16), outlookId="B7")])
+        (save,) = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertNotEqual(save["id"], "B7")
+        self.assertEqual(got[0]["outlookId"], save["id"])
+
+    def test_one_unreadable_command_never_fails_the_batch(self):
+        with mock.patch.object(cli, "_run_outlook_ps",
+                               return_value={"ok": True, "results": [{"ok": True, "outlookId": "E1"}]}) as run:
+            got = cli.write_calendar_events([self.up(self.A, subject="bad \ud800 text"),
+                                             self.up(self.C)])
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(got[0]["ok"])
+        self.assertTrue(got[0]["refused"])
+        self.assertEqual(got[1], {"ok": True, "outlookId": "E1"})
+        p = cli.prepare_calendar_write(self.up(self.B, busy={"x": 1}, sensitivity=["y"]))
+        self.assertEqual((p["event"]["busy"], p["event"]["sensitivity"]), (2, 0))
+
+    def test_the_recorded_fixture(self):
+        """A reply recorded from the real script (test above), read without pwsh."""
+        with open(WRITE_FIXTURE, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        ps = os.path.join(tempfile.mkdtemp(prefix="cal-write-"), "powershell.exe")
+        self.addCleanup(shutil.rmtree, os.path.dirname(ps), ignore_errors=True)
+        with open(ps, "w") as fh:
+            fh.write('#!/bin/sh\ncat > "$(dirname "$0")/stdin"\necho "$6" > "$(dirname "$0")/enc"\n'
+                     f"echo '{json.dumps(doc)}'\n")
+        os.chmod(ps, 0o755)
+        cmds = [self.up(self.A), self.up(self.A, subject="x"), dict(self.up(self.B), outlookId="U1"),
+                self.up(self.C, sensitivity="private"), self.up(self.K, timeZone="Asia/Kamchatka"),
+                {"op": "delete", "turmaId": self.A, "outlookId": "E1"},
+                {"op": "delete", "turmaId": self.D, "outlookId": ""}]
+        got = cli.write_calendar_events(cmds, powershell=ps)
+        self.assertEqual([r["ok"] for r in got], [True, True, True, True, False, True, True])
+        self.assertEqual(got[2]["outlookId"], "E2")
+        # Only ASCII base64 reaches stdin, and no event text reaches the script.
+        d = os.path.dirname(ps)
+        with open(os.path.join(d, "stdin"), "rb") as fh:
+            sent = json.loads(base64.b64decode(fh.read()))
+        self.assertEqual([c["turmaId"] for c in sent["cmds"]], [c["turmaId"] for c in cmds])
+        with open(os.path.join(d, "enc")) as fh:
+            script = base64.b64decode(fh.read().strip()).decode("utf-16-le")
+        self.assertNotIn("Plan", script)
+        self.assertNotIn("__", script)
+
+    def test_a_whole_run_failure_is_refused_and_a_short_answer_too(self):
+        with mock.patch.object(cli, "_run_outlook_ps",
+                               return_value={"ok": False, "error": "classic Outlook is not open"}):
+            with self.assertRaisesRegex(cli.Refused, "not open"):
+                cli.write_calendar_events([self.up(self.A)])
+        with mock.patch.object(cli, "_run_outlook_ps", return_value={"ok": True, "results": []}):
+            with self.assertRaisesRegex(cli.Refused, "expected shape"):
+                cli.write_calendar_events([self.up(self.A)])
+        with mock.patch.object(cli, "_run_outlook_ps") as run:      # nothing writable: no run
+            got = cli.write_calendar_events([{"op": "upsert", "turmaId": "x"}])
+        run.assert_not_called()
+        self.assertFalse(got[0]["ok"])
+        self.assertTrue(got[0]["refused"])           # Outlook was never asked
+        with mock.patch.object(cli, "_run_outlook_ps") as run:
+            got = cli.write_calendar_events([self.up(self.A, recurrence={"freq": "daily"}),
+                                             self.up(self.B, timeZone="Mars/Base")])
+        run.assert_not_called()
+        self.assertEqual([(r["ok"], r.get("refused")) for r in got], [(False, True)] * 2)
+        with self.assertRaises(cli.Refused):
+            cli.write_calendar_events([self.up(self.A)] * (cli.CALENDAR_WRITE_BATCH_MAX + 1))
+
+    def test_prepare_types_caps_and_refuses_in_words(self):
+        p = cli.prepare_calendar_write(self.up(self.A, subject="a\x00b" + "y" * 400,
+                                               categories=["  x ", 5] + ["c"] * 40,
+                                               busy="nope", joinUrl="http://insecure"))
+        e = p["event"]
+        self.assertEqual(len(e["subject"]), cli.CALENDAR_TEXT_MAX)
+        self.assertTrue(e["subject"].startswith("a b"))
+        self.assertEqual((e["busy"], e["sensitivity"]), (2, 0))       # defaults: busy, normal
+        self.assertEqual(e["body"], "")                                # only an https link rides
+        self.assertEqual(e["categories"], ["x"] + ["c"] * 18)
+        self.assertEqual((e["startMs"], e["endMs"]), (self.MON + 14 * 3600000, self.MON + 15 * 3600000))
+        self.assertEqual(cli.prepare_calendar_write(self.up(self.A, start="2026-11-16T14:00:00Z",
+                                                            end="2026-11-16T15:00:00Z", timeZone=None)
+                                                    )["event"]["zone"], "UTC")
+        self.assertEqual(cli.prepare_calendar_write(self.up(self.A, timeZone="Asia/Kolkata"))["event"]["zone"],
+                         "India Standard Time")
+        # Bare GMT is UTC+0 all year, never London's GMT Standard Time.
+        self.assertEqual((cli.windows_zone("GMT"), cli.windows_zone("Europe/London")),
+                         ("UTC", "GMT Standard Time"))
+        self.assertEqual(cli.prepare_calendar_write({"op": "delete", "turmaId": self.A,
+                                                     "outlookId": "x\x00y"}),
+                         {"op": "delete", "turmaId": self.A, "outlookId": ""})
+        for bad, why in [({"op": "upsert", "turmaId": "turma:ABC"}, "Turma event id"),
+                         ({"op": "move", "turmaId": self.A}, "upsert or delete"),
+                         ({"op": "upsert", "turmaId": self.A}, "needs its event"),
+                         (self.up(self.A, start="2026-11-16T09:00:00"), "instants"),
+                         (self.up(self.A, end="2026-11-16T08:00:00-05:00"), "instants"),
+                         (self.up(self.A, recurrence={"freq": "daily"}), "single events"),
+                         (self.up(self.A, timeZone="Mars/Base"), "no Windows zone")]:
+            with self.assertRaisesRegex(cli.Refused, why, msg=bad):
+                cli.prepare_calendar_write(bad)
 
 
 class WslConfReaderTest(unittest.TestCase):

@@ -33635,6 +33635,33 @@ test("XERK-2978: an untenanted private series whose creator user is gone is the 
   }
 });
 
+test("XERK-2993: before the users store hydrates, an absent creator is not orphaned", async () => {
+  const D = "cal2993";
+  const bg = { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] };
+  const legacy = { kind: "legacy", userId: null, tenantId: null, roles: [] };
+  try {
+    await beat1574(D, S2968A);
+    const c = hub.createTurmaEvent(legacy, ev2968([S2968A]));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const rec = hub.getCalendarTurmaEvents()[""][c.body.event.id];
+    rec.createdBy = "user:not-loaded-yet";
+    rec.sensitivity = "private";
+    // An HA replica serving before its tenancy store landed: withheld, not editable.
+    hub.__setTenancyHydrated(false);
+    const v = hub.calendarView(bg, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === rec.id);
+    assert.deepEqual([v.subject, v.editable], ["Private event", false]);
+    assert.equal(hub.deleteTurmaEvent(bg, rec.id).status, 409);
+    // Once hydrated, a creator still absent is gone: the operators own it (XERK-2978).
+    hub.__setTenancyHydrated(true);
+    const w = hub.calendarView(bg, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === rec.id);
+    assert.deepEqual([w.subject, w.editable], ["Planning", true]);
+    assert.equal(hub.deleteTurmaEvent(bg, rec.id).status, 200);
+  } finally {
+    hub.__setTenancyHydrated(true);
+    cleanup2968(D);
+  }
+});
+
 test("XERK-2968: each tenant sees and edits only its own Turma events; private ones are the creator's", async () => {
   const T = tenants2533();
   let F;

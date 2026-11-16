@@ -20,6 +20,8 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
     as structure, under `ATTENTION_HINT_LOCKDOWN` (`_run_lockdown_oneshot`), cwd `REGISTRY_DIR`.
   - **The prompt rides STDIN, never argv** (`stdin_text`): Linux caps one argv string at 128 KiB,
     under a long meeting. Its opening is in `INTERNAL_TOOL_PROMPT_SIGS`.
+  - Stdin is encoded with `errors="replace"` and a Popen `ValueError` is a launch failure
+    (XERK-2953): a lone surrogate raised past the `OSError` guard and leaked the `.in` file.
   - Past `MEETING_INPUT_MAX` the LAST segments are dropped and `truncated` says so.
 - **`parse_meeting_items` rejects, never repairs** (`meeting_items_problems`; the eval scores
   with the same function, so tightening one re-runs `bench/meeting-items/run_eval.py`):
