@@ -220,12 +220,16 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - Its holder's mailbox is the ORGANIZER the attendees see, not necessarily the event's creator.
   - `orgs[0]` changing (org dropped, 24h grace) cancels from the old copy (its tombstone delete)
     and sends afresh from the new one: attendees get a cancellation and a new invitation.
+  - A RE-HOMED sending copy re-invites from the new holder's mailbox, and the old copy is cancelled
+    only if its host returns (open: XERK-3010).
 - **A private/confidential event sends nothing**: its attendees are withheld from every copy.
 - Agent (`_CALENDAR_WRITE_PS`): the sending copy is `MeetingStatus` olMeeting with its recipients
   synced (the mailbox owner's own recipient kept); `Send()` runs only when `sentKey` (a hash of every
   sent field, `prepare_calendar_write`) differs from the copy's `TurmaSent` property, so a re-sent,
-  re-delivered or repair upsert never mails the attendees again. A failed `Send()` clears the stamp
-  and fails the row in Outlook's words (retried like any failed write).
+  re-delivered or repair upsert never mails the attendees again. A failed `Send()` RESTORES the
+  previous stamp (never clears it: an earlier invitation still went out, so a later delete must still
+  cancel it) and fails the row in Outlook's words (retried like any failed write).
+  - The mailbox owner is the organizer: never added as its own recipient, even when listed.
   - A sent copy's delete, or an upsert no longer sending, is a CANCELLATION (`MeetingStatus` 5,
     `Send()`) then `Delete()`; the no-longer-sending upsert then writes a fresh plain copy.
   - Forwarding: `PidNameMeetingDoNotForward` (MS-OXOCAL 2.2.1.51, PS_PUBLIC_STRINGS `DoNotForward`)
@@ -236,7 +240,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   them on the Turma event's `attendees[].response` from the SENDING copy's synced read-back (its
   holder's stored event stamped with the record's id; `calTurmaResponses`). `none` reads
   `notResponded` when responses were requested; `organizer`/`unknown` never ride. Single events only.
-  Clients show them per attendee and tally them on an "Invitations" row.
+  Clients show them per attendee and tally them on an "Invitations" row (not for a series, which
+  is not written to Outlook until XERK-2986).
 - **Teams link: the pasted `joinUrl` stays.** The Teams Meeting add-in exposes no COM/object-model
   API; creating a Teams meeting means pressing its ribbon button in a displayed Inspector — UI
   automation on the user's desktop, which the off-beat writer must never do. Revisit only if

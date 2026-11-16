@@ -869,7 +869,7 @@ _FAKE_WRITE_OUTLOOK = r"""
     $it | Add-Member ScriptMethod Delete {
       [Console]::Error.WriteLine("DELETE $($this.EntryID)"); $script:store.Remove($this.EntryID) }
     $it | Add-Member ScriptMethod Send {
-      if ($script:failSend) { throw 'The send failed.' }
+      if ($script:failSend -or ($this.Subject -eq 'Boom' -and $this.MeetingStatus -eq 1)) { throw 'The send failed.' }
       [Console]::Error.WriteLine("SEND $($this.EntryID) status=$($this.MeetingStatus) to=" +
         (@($this.Recipients.list | ForEach-Object { $_.Address }) -join ',')) }
     $it
@@ -1044,6 +1044,21 @@ class CalendarWriteTest(unittest.TestCase):
         self.assertIn("did not send the invitations", got[0]["error"])
         self.assertIn("The send failed.", got[0]["error"])
         self.assertEqual(json.loads([l for l in err if l.startswith("SAVE ")][-1][5:])["sent"], "")
+
+    def test_xerk2989_qa_a_failed_update_keeps_the_sent_stamp_so_a_delete_still_cancels(self):
+        inv = dict(sendInvites=True, attendees=self.PEOPLE)
+        got, err, _ = self.run_write([self.up(self.A, **inv), self.up(self.A, subject="Boom", **inv),
+                                      {"op": "delete", "turmaId": self.A, "outlookId": ""}])
+        self.assertEqual([r["ok"] for r in got], [True, False, True])
+        self.assertIn("SEND E1 status=5 to=ann@example.com,bo@example.com", err)   # still cancelled
+        self.assertIn("DELETE E1", err)
+
+    def test_xerk2989_qa_the_mailbox_owner_is_never_its_own_recipient(self):
+        inv = dict(sendInvites=True, attendees=self.PEOPLE + [{"email": "me@example.com"}])
+        got, err, _ = self.run_write([self.up(self.A, **inv), self.up(self.A, **inv), self.up(self.A, subject="v2", **inv)])
+        self.assertTrue(all(r["ok"] for r in got))
+        for save in [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]:
+            self.assertEqual(save["to"], ["ann@example.com:1", "bo@example.com:2"])
 
     def test_xerk2989_prepare_types_the_invitation(self):
         p = cli.prepare_calendar_write(self.up(self.A, sendInvites=True, attendees=[

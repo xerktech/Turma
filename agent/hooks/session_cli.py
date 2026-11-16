@@ -379,13 +379,14 @@ __ATTACH__
           for ($i = $it.Recipients.Count; $i -ge 1; $i--) {
             $rc = $it.Recipients.Item($i)
             $ad = Addr $rc
-            if ($me -and $ad -eq $me) { continue }
+            # The mailbox owner is the organizer, never an invitee of its own meeting.
+            if ($me -and $ad -eq $me) { $want.Remove($ad); continue }
             if ($ad -and $want.ContainsKey($ad)) { $rc.Type = [int]$want[$ad].type; $want.Remove($ad) }
             else { $it.Recipients.Remove($i) }
           }
           foreach ($a in @($e.attendees)) {
             $k = ([string]$a.email).ToLower()
-            if (-not $want.ContainsKey($k)) { continue }
+            if (-not $want.ContainsKey($k) -or ($me -and $k -eq $me)) { continue }
             $want.Remove($k)
             $rc = $it.Recipients.Add([string]$a.email)
             $rc.Type = [int]$a.type
@@ -403,11 +404,15 @@ __ATTACH__
         # Send only what the attendees have not had: a re-sent or repair upsert of
         # unchanged fields saves and sends nothing.
         if ($e.send -and (SentStamp $it) -cne [string]$e.sentKey) {
+          # A failed send puts the previous stamp back: an earlier invitation still went
+          # out, so a later delete must still cancel it (QA). It differs from sentKey, so
+          # the retry sends.
+          $was = SentStamp $it
           SetSent $it $e.sentKey
           $it.Save()
           try { $it.Send() } catch {
             $m = $_.Exception.Message
-            try { SetSent $it ''; $it.Save() } catch {}
+            try { SetSent $it $was; $it.Save() } catch {}
             throw ('Outlook saved the event but did not send the invitations: ' + $m)
           }
           try { $r.lastModified = Local ($ol.Session.GetItemFromID($r.outlookId)).LastModificationTime } catch {}

@@ -35274,10 +35274,17 @@ test("XERK-2989: only the first org's copy sends invitations; its responses are 
     assert.equal(writes2985(D2985A).length, n0, "a response moving lastModified is no drift on the sending copy");
     const [e] = (await served2968()).filter((x) => x.id === id);
     assert.deepEqual(e.attendees.map((x) => [x.email, x.response]), [["ann@x.com", "accepted"], ["bo@x.com", "declined"]]);
+    // Outlook's "none" is "no answer yet" only when an answer was asked for (QA).
+    await beat2985(D2985A, S2985A, sync2985([{ ...copy, attendees: [{ name: "Ann", email: "ann@x.com", role: "required", response: "none" }] }]));
+    assert.equal((await served2968()).find((x) => x.id === id).attendees[0].response, "notResponded");
+    const off = await turma2968("PATCH", id, { version: 1, responseRequested: false });
+    assert.equal(off.status, 200, JSON.stringify(off.body));
+    assert.equal(off.body.event.attendees[0].response, "none");
     // A private event sends nothing (its attendees are withheld) and serves no answers.
-    const priv = await turma2968("PATCH", id, { version: 1, sensitivity: "private" });
+    const priv = await turma2968("PATCH", id, { version: 2, sensitivity: "private" });
     assert.equal(priv.status, 200, JSON.stringify(priv.body));
     assert.equal(writes2985(D2985A).at(-1).event.sendInvites, false);
+    assert.equal(hub.calTurmaResponses(rec2985(id)), null, "no answers read for a copy that sends none");
   } finally {
     cleanup2985(D2985A, D2985B);
     forget2533(D2985A, D2985B);

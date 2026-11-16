@@ -31948,7 +31948,7 @@ if (process.env.TURMA_TEST) {
     getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
     CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calOutlookTickAt = 0; },
-    sanitizeTurmaEvent, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
+    sanitizeTurmaEvent, calTurmaResponses, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
