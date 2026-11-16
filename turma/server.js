@@ -7553,7 +7553,19 @@ function calOutlookReconcile(t, rec, now, memo) {
   for (const org of rec.orgs) {
     let e = rec.outlook[org];
     if (!e) e = rec.outlook[org] = { host: "", outlookId: "", version: 0, state: "pending", at: now };
-    if (e.host && !calWriteHolderOk(e.host, t, org, now)) {
+    const holderOk = !!e.host && calWriteHolderOk(e.host, t, org, now);
+    // A sending copy is never re-homed (XERK-3010): the new holder would invite every
+    // attendee again from its own mailbox, and the old invitation is cancelled only if
+    // its host ever returns. It stays with its host, failed, saying why.
+    if (e.host && !holderOk && calTurmaSends(rec, org) && calCopyMaySend(e, rec.id)) {
+      if (e.version !== rec.version) e.version = rec.version;
+      const error = calHeldError(e.host);
+      if (e.state !== "failed" || e.error !== error) Object.assign(e, { state: "failed", error, at: now });
+      continue;
+    }
+    // Its host is back: retry at once, not on the hourly failure retry.
+    if (holderOk && e.state === "failed" && calIsHeldError(e.error)) e.at = 0;
+    if (e.host && !holderOk) {
       calTombstoneAdd(e.host, rec.id, org, e.outlookId, now);
       Object.assign(e, { host: "", outlookId: "", state: "pending", at: now });
       delete e.error;
@@ -7587,6 +7599,20 @@ function calOutlookReconcile(t, rec, now, memo) {
   rec.outlook = calOutlookSanitize(rec.outlook, rec.orgs, t);
   return JSON.stringify(rec.outlook) !== before;
 }
+// Whether `e`'s copy may already have mailed its attendees: a copy exists (an id, or an
+// ok row), or an upsert reached its host this process. Only a copy that provably sent
+// nothing may move to another host.
+function calCopyMaySend(e, turmaId) {
+  if (e.outlookId || e.state === "written") return true;
+  const s = calWriteSent.get(`${e.host}\u0000${turmaId}`);
+  return !!s && s.op === "upsert";
+}
+const CAL_HELD_PREFIX = "Kept on ";
+function calHeldError(host) {
+  return `${CAL_HELD_PREFIX}${baseOfKey(host)}: its invitations went out from that mailbox, so ` +
+    "moving it would invite every attendee again. Bring that host back, or turn invitations off.";
+}
+const calIsHeldError = (s) => typeof s === "string" && s.startsWith(CAL_HELD_PREFIX);
 // After a record write (`before` -> `after`, either null): every copy whose org the
 // record no longer names becomes a tombstone, then the rest are reconciled.
 function calOutlookAfterWrite(t, before, after, now = Date.now()) {
@@ -32025,7 +32051,7 @@ if (process.env.TURMA_TEST) {
     // XERK-2968: Turma-created events.
     getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
-    CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
+    CALENDAR_WRITE_REPAIR_MIN_MS, calCopyMaySend, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
     sanitizeTurmaEvent, calTurmaResponses, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,

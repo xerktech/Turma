@@ -47,6 +47,16 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
     left that edit out of Outlook for up to an hour.
     Tests: server.test.js "XERK-2990: a holder whose Outlook fails a run keeps its copy".
   - Org loss is judged on `decidedOrgOf` held for the same 2h (a brief drift re-homes nothing).
+- **A SENDING copy is never re-homed** (XERK-3010, operator decision): it stays with its host,
+  `failed`, error "Kept on <device>: …" (`calHeldError`), no tombstone, nothing to another host.
+  - Why: the new holder's first upsert invites every attendee again from ANOTHER mailbox, and the
+    old copy's cancellation runs only if its host ever returns — two meetings, two organizers.
+  - "Sending" = `calTurmaSends` for that org AND the copy may already have mailed
+    (`calCopyMaySend`: an `outlookId`, a `written` state, or an upsert sent this process). A copy
+    that provably sent nothing still moves.
+  - Its host back: the owed write goes at once (`at` reset), not on the hourly failure retry.
+  - Ways out for the operator: bring the host back, or turn invitations off (the copy then moves
+    and the old one is cancelled whenever its host returns).
 
 ## Tombstones: deleting a copy a record no longer names
 
@@ -291,8 +301,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - Its holder's mailbox is the ORGANIZER the attendees see, not necessarily the event's creator.
   - `orgs[0]` changing (org dropped, 24h grace) cancels from the old copy (its tombstone delete)
     and sends afresh from the new one: attendees get a cancellation and a new invitation.
-  - A RE-HOMED sending copy re-invites from the new holder's mailbox, and the old copy is cancelled
-    only if its host returns (open: XERK-3010).
+  - A sending copy is never re-homed (XERK-3010, "Re-homing" above): it stays with its host,
+    failed, until that host returns or invitations are turned off.
 - **A private/confidential event sends nothing**: its attendees are withheld from every copy.
 - Agent (`_CALENDAR_WRITE_PS`): the sending copy is `MeetingStatus` olMeeting with its recipients
   synced (the mailbox owner's own recipient kept); `Send()` runs only when `sentKey` (a hash of every
