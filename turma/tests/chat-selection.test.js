@@ -668,14 +668,14 @@ test("content growing with no load event re-pins a reader parked at the bottom (
   globalThis.ResizeObserver = class { constructor(f) { cb = f; } observe(n) { watched.add(n); } };
   globalThis.MutationObserver = class { constructor(f) { onChildren = f; } observe() {} };
   const st = staticScroll("trScroll2993");
-  const first = { id: "m1" };
-  st.children = [first];
+  const first = [{ id: "m1" }, { id: "m2" }, { id: "m3" }];
+  st.children = first;
   window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t2993" });
-  assert.ok(watched.has(first), "a message is observed");
-  const later = { id: "m2" };
-  st.children = [later];
+  assert.ok(first.every((c) => watched.has(c)), "every message is observed");
+  const later = [{ id: "m4" }, { id: "m5" }];
+  st.children = later;
   onChildren();
-  assert.ok(watched.has(later), "a repaint's message is observed");
+  assert.ok(later.every((c) => watched.has(c)), "every message a repaint adds is observed");
   st.scrollHeight = 3100; // the font swapped in: every line got taller
   cb();
   assert.equal(st.scrollTop, 3100);

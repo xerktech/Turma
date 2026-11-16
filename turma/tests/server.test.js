@@ -34558,6 +34558,13 @@ test("XERK-2953: a 'following' edit moving the occurrence to another date moves 
       assert.equal(r.status, 400, `${scope}: ${JSON.stringify(r.body)}`);
       assert.match(r.body.error, /in the new time zone .*change the repeat days too, or keep the time zone/, scope);
     }
+    // A real move that also changes the zone is a move: the old wording.
+    for (const [id, scope] of [[z.id, "series"], [`${z.id}:2027-07-31T01:00:00Z`, "following"]]) {
+      const r = await turma2968("PATCH", id, { version: 1, scope, timeZone: "Asia/Tokyo",
+        start: "2027-07-31T02:00:00Z", end: "2027-07-31T03:00:00Z" });
+      assert.equal(r.status, 400, `${scope}: ${JSON.stringify(r.body)}`);
+      assert.match(r.body.error, /^moving this occurrence/, scope);
+    }
     assert.equal(hub.getCalendarTurmaEvents()[""][z.id].version, 1);
     // ...within the week it re-anchors, every 2 weeks too.
     const w2 = await mk("2027-07-05T09:00:00Z", { freq: "weekly", interval: 2, byDay: ["MO", "WE"] });
