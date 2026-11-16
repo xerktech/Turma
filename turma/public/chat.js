@@ -1825,16 +1825,23 @@
     return String(f.name || "") + ":" + f.src.length + ":" + f.src.slice(-48);
   }
   // A full body repaint rebuilds every node, which restarted a playing clip on
-  // each new transcript line. Carry the existing <video> elements over by key;
-  // moving a media element within one task keeps it playing.
+  // each new transcript line. Carry the existing <video> elements over; moving a
+  // media element within one task keeps it playing. A node is matched by the
+  // CARD it sits in (data-dkey = the tool call's id, data-uuid = the transcript
+  // entry's) plus its clip key, then by order within that card — never by clip
+  // alone: history can fold an OLDER
+  // copy of the same clip in ABOVE (or turn a shed chip there into a video),
+  // and an order-only match moved the playing node into that older message.
+  function videoSlot(v) {
+    const card = v.closest ? v.closest("[data-dkey]") : null;
+    return (card ? card.getAttribute("data-dkey") + "\u0000" + (card.getAttribute("data-uuid") || "") : "") +
+      "\u0000" + v.getAttribute("data-vkey");
+  }
   function carryVideos(scroll, write) {
-    // Key -> the old nodes IN DOCUMENT ORDER: one clip sent twice shares a key,
-    // and the Nth new copy takes the Nth old one (entries only append, so the
-    // order holds), never the first copy for every slot.
     const old = new Map();
     if (scroll.querySelectorAll) {
       for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
-        const k = v.getAttribute("data-vkey");
+        const k = videoSlot(v);
         if (!old.has(k)) old.set(k, []);
         old.get(k).push(v);
       }
@@ -1842,7 +1849,7 @@
     write();
     if (!old.size) return;
     for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
-      const list = old.get(v.getAttribute("data-vkey"));
+      const list = old.get(videoSlot(v));
       const prev = list && list.shift();
       if (prev && prev !== v) v.replaceWith(prev);
     }
@@ -4221,7 +4228,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
+      carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, backgroundBarVerb, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,
