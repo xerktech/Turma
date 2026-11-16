@@ -268,8 +268,25 @@ fun calLayoutDay(segs: List<CalSeg>): List<CalSeg> {
     return out
 }
 
-/** The timed events of [day] as laid-out segments. */
-fun calDaySegments(events: List<CalendarEvent>, day: LocalDate, zone: ZoneId): List<CalSeg> {
+/**
+ * The minutes a short event lays out as at a row height of [slotDp] (XERK-3026): at least
+ * [CAL_MIN_LAYOUT_MIN], and enough that a block drawn at its floor [floorDp] ends no lower than
+ * its layout does. Laid out shorter, the grown block covered the top of an event starting 20-30
+ * minutes later in the same column. The floor alone, not floor + the 2dp gap a block leaves: a
+ * floored block may touch the next one, and asking for the gap too split events 30 minutes apart
+ * into half-width columns on a short pane, where main never overlapped them (QA).
+ */
+fun calMinLayoutMin(slotDp: Float, floorDp: Float): Double =
+    if (slotDp <= 0f) CAL_MIN_LAYOUT_MIN.toDouble()
+    else maxOf(CAL_MIN_LAYOUT_MIN.toDouble(), floorDp.toDouble() / slotDp * 30.0)
+
+/** The timed events of [day] as laid-out segments; a short one lays out as [minLayoutMin]. */
+fun calDaySegments(
+    events: List<CalendarEvent>,
+    day: LocalDate,
+    zone: ZoneId,
+    minLayoutMin: Double = CAL_MIN_LAYOUT_MIN.toDouble(),
+): List<CalSeg> {
     val segs = events.filter { calDrawable(it) && !calInBand(it) && calOnDay(it, day, zone) }.map { ev ->
         val top = calWallMinutes(ev.s(), day, zone)
         var end = if (ev.e() > ev.s()) calWallMinutes(ev.e(), day, zone) else top
@@ -281,7 +298,7 @@ fun calDaySegments(events: List<CalendarEvent>, day: LocalDate, zone: ZoneId): L
         if (ev.e() > from && ev.e() < calDayStartMs(day.plusDays(1), zone) && back > 0 &&
             calOffsetSec(ev.e() - back * 1000L, zone) != calOffsetSec(ev.e(), zone)
         ) end = minOf(1440.0, end + back / 60.0)
-        CalSeg(ev, top, end, minOf(1440.0, maxOf(end, top + CAL_MIN_LAYOUT_MIN)))
+        CalSeg(ev, top, end, minOf(1440.0, maxOf(end, top + minLayoutMin)))
     }
     return calLayoutDay(segs)
 }

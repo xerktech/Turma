@@ -332,7 +332,8 @@
   .cal-ev .m { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
   /* A timed block is a size container, so its time line shows only when the block as DRAWN is
      tall enough: a tall pane stretches the rows, and a 30-minute block then has room. */
-  .cal-ev:not(.allday) { container-type: size; padding-top: 0; padding-bottom: 0; }
+  /* A small phone's 10 hours give a 15-minute meeting less than its title line: never shorter (XERK-3024). */
+  .cal-ev:not(.allday) { container-type: size; padding-top: 0; padding-bottom: 0; min-height: calc(1.25em + 2px); }
   .cal-evb { display: flex; flex-direction: column; gap: 1px; min-width: 0; height: 100%; box-sizing: border-box; padding: 2px 0; }
   @container (height < 34px) {
     .cal-evb { justify-content: center; padding: 0; }
@@ -367,13 +368,14 @@
     --critical-text: color-mix(in srgb, var(--cal-critical-text) 50%, var(--ink));
     --warning-text: color-mix(in srgb, var(--cal-warning-text) 50%, var(--ink));
     box-shadow: -12px 0 32px rgba(0, 0, 0, 0.25); }
-  /* A Turma-made event's panel (XERK-3023) wears the same blue → purple gradient as its grid
-     block (.cal-ev.turma), white text, in both themes. The 4.5:1 rule above cannot hold here:
-     pure white on the lightest stop is ~3.0:1, so every panel text token is WHITE (never a
-     translucent white, which fell under 3:1), chips get a dark backing, and focus goes white
-     (the outline AND the fields' --focus-ring halo), so each clears 3:1, the block's own bar.
-     Contrast decision: XERK-3025. Fields and buttons keep their own surfaces and --ink. */
-  .cal-detail.turma { background: linear-gradient(135deg, #4a95f0 0%, #6271df 55%, #7a4dcf 100%);
+  /* A Turma-made event's panel (XERK-3023) wears its grid block's blue → purple (.cal-ev.turma)
+     with every stop darkened 25% (XERK-3025): on the block's exact stops white is only ~3.0:1,
+     so the panel's small text could not meet the 4.5:1 rule above; on these it is >=5.07:1.
+     Every panel text token is WHITE (never a translucent white), chips get a dark backing, and
+     focus goes white (the outline AND the fields' --focus-ring halo). Fields keep their own
+     surface and --ink; a plain button has NO surface (transparent, --ink text), so it goes white
+     with a 0.7-white border (>=3.3:1 on the gradient) — leaving --ink there was ~2.5:1 in light. */
+  .cal-detail.turma { background: linear-gradient(135deg, #3870b4 0%, #4a55a7 55%, #5c3a9b 100%);
     color: #fff; border-left-color: transparent;
     --ink-2: #fff; --muted: #fff; --accent-text: #fff;
     --good-text: #e6ffec; --critical-text: #fff0ee; --warning-text: #fff6d6;
@@ -381,6 +383,15 @@
   .cal-detail.turma a { text-decoration: underline; }
   .cal-detail.turma .mt-people span, .cal-detail.turma .cal-cat { background: rgba(0, 0, 0, 0.22); }
   .cal-detail.turma :focus-visible { outline-color: #fff; }
+  .cal-detail.turma button:not(.primary):not(.linkish) { color: #fff; border-color: rgba(255, 255, 255, 0.7); }
+  .cal-detail.turma button:not(.primary):not(.linkish):hover:not(:disabled) { border-color: #fff; }
+  /* A panel field shows focus by a SOLID ring (XERK-3023 follow-up): app.css's 30% accent halo
+     read ~1.45:1 on the org tint. On the gradient the ring is white with a dark inner line, so a
+     white field's edge still reads against its own white halo. */
+  .cal-detail input:focus, .cal-detail select:focus, .cal-detail textarea:focus {
+    box-shadow: 0 0 0 2px var(--accent); }
+  .cal-detail.turma input:focus, .cal-detail.turma select:focus, .cal-detail.turma textarea:focus {
+    box-shadow: 0 0 0 1px rgba(11, 11, 11, 0.75), 0 0 0 3px #fff; }
   .cal-detail-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
   .cal-detail h2 { flex: 1 1 auto; font-family: var(--font-display); font-size: 18px; margin: 0; overflow-wrap: anywhere; }
   .cal-dstate { font-size: 12px; color: var(--muted); text-transform: capitalize; margin-bottom: 6px; }

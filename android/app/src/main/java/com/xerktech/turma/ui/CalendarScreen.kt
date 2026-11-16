@@ -122,6 +122,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -146,6 +147,7 @@ import com.xerktech.turma.core.calCollect
 import com.xerktech.turma.core.calDay
 import com.xerktech.turma.core.calDayKey
 import com.xerktech.turma.core.calDaySegments
+import com.xerktech.turma.core.calMinLayoutMin
 import com.xerktech.turma.core.calEventOrg
 import com.xerktech.turma.core.calInBand
 import com.xerktech.turma.core.calLinkCandidates
@@ -210,6 +212,14 @@ import kotlinx.serialization.json.put
  */
 
 private val SHORT_DP = 34.dp          // shorter than this, a block shows its title alone
+private val SHORT_LINE = 12.sp        // a short block's one title line (XERK-3024)
+// A timed block is never drawn shorter than this, nor than its title line plus a 1dp margin each side
+// (blockFloor); the day's layout reads that floor (calMinLayoutMin) so a grown block never covers the
+// next event (XERK-3026). Change the floor only here and in blockFloor.
+private val BLOCK_MIN_DP = 10.dp
+
+/** The floor a timed block is drawn and laid out at: its title line whole, in sp so a large font is too. */
+private fun Density.blockFloor(): Dp = maxOf(BLOCK_MIN_DP, SHORT_LINE.toDp() + 2.dp)
 
 /** The neutral colour of an unassigned event (the web's `--muted`). */
 @Composable
@@ -926,10 +936,14 @@ private fun WeekGrid(
                                 .shown(d, "cal-col-${calDayKey(d)}"),
                         ) {
                             val w = maxWidth
-                            for (seg in calDaySegments(range.events, d, zone)) {
+                            val floor = with(density) { blockFloor() }
+                            val minMin = calMinLayoutMin(slot.value, floor.value)
+                            for (seg in calDaySegments(range.events, d, zone, minMin)) {
                                 val ev = seg.ev
                                 val badge = calBadge(ev, fleet.meetingProposals)
-                                val h = slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp
+                                // A 640dp phone's 10 hours give a 15-minute meeting less than its title
+                                // line: the block grows to hold it (XERK-3024), laid out at that height.
+                                val h = maxOf(slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp, floor)
                                 EventBlock(
                                     segModifier(seg, w, h, slot), ev, now, calOrgsOf(ev).map(colorOf), badge, short = h < SHORT_DP,
                                     open = ev.key == detailKey,
@@ -993,7 +1007,7 @@ private fun segModifier(seg: CalSeg, colWidth: Dp, height: Dp, slot: Dp): Modifi
     val left = colWidth * (seg.col.toFloat() / seg.cols)
     val width = colWidth * (seg.span.toFloat() / seg.cols)
     return Modifier.offset(x = left + 1.dp, y = slot * (seg.top / 30).toFloat())
-        .width((width - 4.dp).coerceAtLeast(8.dp)).height(height.coerceAtLeast(10.dp))
+        .width((width - 4.dp).coerceAtLeast(8.dp)).height(height.coerceAtLeast(BLOCK_MIN_DP))
 }
 
 /**
@@ -1059,7 +1073,7 @@ private fun EventBlock(
                     Text(
                         calTitle(ev), Modifier.weight(1f, fill = false), fontSize = if (short) 11.sp else 12.sp, fontWeight = FontWeight.SemiBold,
                         maxLines = if (short) 1 else 2, overflow = TextOverflow.Ellipsis,
-                        lineHeight = if (short) 12.sp else 14.sp,
+                        lineHeight = if (short) SHORT_LINE else 14.sp,
                         textDecoration = if (st.canceled) TextDecoration.LineThrough else null,
                     )
                     Spacer(Modifier.weight(0.001f))

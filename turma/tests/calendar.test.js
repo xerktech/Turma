@@ -1020,6 +1020,8 @@ test("XERK-2943: brief.html keeps the CSS that sizes short blocks and clears the
   const css = require("fs").readFileSync(require("path").join(__dirname, "..", "public", "brief.html"), "utf8");
   assert.match(css, /\.wrap\.tri-wrap \{ --tri-wrap: 1280px; max-width: var\(--tri-wrap\);/);
   assert.match(css, /\.cal-ev:not\(\.allday\) \{ container-type: size;/);
+  // XERK-3024: a 15-minute block on a small phone still holds its whole title line.
+  assert.match(css, /\.cal-ev:not\(\.allday\) \{[^}]*min-height: calc\(1\.25em \+ 2px\);/);
   assert.match(css, /@container \(height < 34px\) \{[^}]*\.cal-evb \{[^}]*\}\s*\.cal-evb \.m \{ display: none; \}/);
   assert.match(css, /\.cal:has\(> \.cal-detail:not\(\[hidden\]\)\) > \.cal-main \{\s*margin-right: max\(0px, 447px - max\(0px, \(100vw - var\(--tri-wrap\)\) \/ 2\)\);/);
 });
@@ -1086,7 +1088,18 @@ test("XERK-3023: a Turma event's panel wears its block's gradient; an Outlook on
   const css = fs.readFileSync(require("node:path").join(__dirname, "..", "public", "brief.html"), "utf8");
   const grad = (sel) => (new RegExp(`${sel}\\s*\\{[^}]*?(linear-gradient\\([^;]*\\))`).exec(css) || [])[1];
   assert.ok(grad("\\.cal-ev\\.turma"), "the block has a gradient");
-  assert.equal(grad("\\.cal-detail\\.turma"), grad("\\.cal-ev\\.turma"), "the panel's gradient is the block's");
+  // XERK-3025: the panel's stops are the block's, each channel x0.75, so white clears 4.5:1.
+  const stops = (g) => [...g.matchAll(/#([0-9a-f]{6})\s+(\d+%)/gi)].map((m) => [m[1], m[2]]);
+  const rgb = (h) => [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  const lum = (h) => { const [r, g, b] = rgb(h).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+  const block = stops(grad("\\.cal-ev\\.turma")), panel = stops(grad("\\.cal-detail\\.turma"));
+  assert.equal(panel.length, block.length, "the panel has the block's stops");
+  panel.forEach(([hex, pos], i) => {
+    assert.equal(pos, block[i][1], "same stop positions as the block");
+    assert.deepEqual(rgb(hex), rgb(block[i][0]).map((v) => Math.round(v * 0.75)), `stop ${i} is the block's darkened 25%`);
+    assert.ok(1.05 / (lum(hex) + 0.05) >= 4.5, `white on panel stop #${hex} clears 4.5:1`);
+  });
   const rule = /\.cal-detail\.turma\s*\{([^}]*)\}/.exec(css)[1];
   assert.match(rule, /(^|[\s;])color:\s*#fff/, "the panel's text is white on the gradient");
   for (const tok of ["--muted", "--ink-2", "--accent-text"]) {
@@ -1094,6 +1107,13 @@ test("XERK-3023: a Turma event's panel wears its block's gradient; an Outlook on
   }
   assert.match(css, /\.cal-detail\.turma :focus-visible\s*\{\s*outline-color:\s*#fff/, "the focus ring shows on the gradient");
   assert.match(rule, /--focus-ring:\s*#fff/, "a field's focus halo shows on the gradient too");
+  // XERK-3025 QA: a plain button is transparent with --ink text, ~2.5:1 on the gradient in light.
+  assert.match(css, /\.cal-detail\.turma button:not\(\.primary\):not\(\.linkish\)\s*\{\s*color:\s*#fff;\s*border-color:\s*rgba\(255,\s*255,\s*255,\s*0\.7\)/,
+    "the panel's plain buttons are white, with a border that shows on the gradient");
+  assert.match(css, /\.cal-detail select:focus[^{]*\{\s*box-shadow:\s*0 0 0 2px var\(--accent\)/,
+    "a panel field's focus is a solid accent ring on the org tint, not the faint 30% halo");
+  assert.match(css, /\.cal-detail\.turma select:focus[^{]*\{\s*box-shadow:\s*0 0 0 1px rgba\(11, 11, 11, 0\.75\), 0 0 0 3px #fff/,
+    "on the gradient a white field keeps a dark edge inside its white ring");
 });
 
 test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {
