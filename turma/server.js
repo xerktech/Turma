@@ -3149,6 +3149,16 @@ function registerExternalStore({ name, file, coerce, read, install, afterLoad, o
   STORE_PERSISTENT[key] = mode ? { file, debounceMs, mode } : { file, debounceMs };
   externalizedStores.push({ key, name, coerce, read, install, afterLoad, onLoaded });
   return function persist() {
+    // XERK-2995: under HA the mirror is empty until the boot load returns the
+    // shared value (each replica's /data is an emptyDir), and this writes the WHOLE
+    // mirror — so a write in that window would replace the shared store with
+    // almost nothing. Skip it: the boot load (or its seed, when the key is absent)
+    // then decides. The request gate keeps routes out of this window; this guard
+    // covers in-process callers (a sweep, a login stamp).
+    if (HA_ON && externalStoresLoading.has(key)) {
+      console.error(`store ${name}: write skipped — the shared value is not loaded yet`);
+      return Promise.resolve();
+    }
     // `liveStore` is the module-load backend (file/in-memory off, Valkey on). On
     // the file backend it writes this store's /data file (via STORE_PERSISTENT);
     // fire-and-forget — the mirror + SSE already reflect the change, a store blip
@@ -3163,6 +3173,17 @@ function registerExternalStore({ name, file, coerce, read, install, afterLoad, o
 // no-op; a genuine change installs it and drops the agents cache. It does NOT
 // broadcast SSE — the originating setter's broadcast is fanned to every replica's
 // clients by XERK-762, so re-broadcasting here would double-deliver.
+// XERK-2995: the store keys wireExternalStores has not loaded yet. While any is
+// pending under HA the replica answers /readyz 503, refuses every request it
+// would serve itself, and skips the stores' whole-value writes (persist above).
+const externalStoresLoading = new Set();
+let storeLoadRetryMs = 2000;
+// "Loading shared state" — the gate the request handler, /readyz and the leader's
+// sweeps read. HA off: never (the file backend primed every mirror at module init).
+function externalStoresPending() {
+  return HA_ON && externalStoresLoading.size > 0;
+}
+
 function applyExternalStoreValue(desc, rawValue) {
   const next = desc.coerce(rawValue);
   if (sameValue(next, desc.read())) return false;
@@ -3181,20 +3202,27 @@ function applyExternalStoreValue(desc, rawValue) {
 // module-load `liveStore`, and production passes that same binding here.
 function wireExternalStores(store) {
   for (const desc of externalizedStores) {
+    externalStoresLoading.add(desc.key);
     store.watch(desc.key, (ev) => {
       try {
         applyExternalStoreValue(desc, ev && ev.value);
+        // A watched value IS the shared value: the mirror now holds it.
+        if (ev && ev.value != null) externalStoresLoading.delete(desc.key);
       } catch (e) {
         console.error(`store ${desc.name}: watch apply failed: ${e && e.message}`);
       }
     });
   }
   // Load off the ready backend (file: immediate; shared: once both sockets are up).
-  // Best-effort — a store that is down at boot leaves the file/seed-primed mirror
-  // in place and re-syncs when a later set or watch lands; never fatal.
-  Promise.resolve(store.ready?.()).then(() => {
-    for (const desc of externalizedStores) {
-      Promise.resolve(store.get(desc.key)).then((raw) => {
+  // Never fatal, but RETRIED until it lands (XERK-2995): until a store is loaded
+  // the replica is unready and writes none of it, so a store that is down at boot
+  // keeps this replica out of service rather than letting it clobber shared state.
+  const load = (desc) => {
+    Promise.resolve(store.ready?.()).then(() => store.get(desc.key)).then((raw) => {
+        // A watch value that landed while this GET was in flight is the same or
+        // NEWER than its reply: installing the reply would roll the mirror back, and
+        // the next whole-mirror write would delete the other replica's change (QA).
+        if (!externalStoresLoading.has(desc.key)) return;
         if (raw == null) {
           // Nothing stored yet — publish our file/seed-primed mirror up, if it
           // carries data (migrates existing single-process state into the store).
@@ -3211,11 +3239,28 @@ function wireExternalStores(store) {
           desc.afterLoad?.();
         }
         // The backend's value is now this replica's (stored or seeded up), on
-        // either branch — `afterLoad` runs on the stored one only.
+        // either branch — `afterLoad` runs on the stored one only (XERK-2993).
         desc.onLoaded?.();
-      }).catch((e) => console.error(`store ${desc.name}: load failed: ${e && e.message}`));
-    }
-  }).catch(() => {});
+        externalStoresLoading.delete(desc.key);
+      }).catch((e) => {
+        // A value that does not parse, or a key of another Valkey type (WRONGTYPE),
+        // will never read: retrying would hold every replica unready forever with no
+        // route left to repair it (QA). It is unreadable either way, so keep the
+        // mirror and let the next write (a SET) replace it — the pre-XERK-2995
+        // behaviour, for these cases only. Every other error (connection, LOADING,
+        // READONLY…) may clear, so it retries. `onLoaded` is NOT run: this replica
+        // never read the backend's value, so whatever waits on a real load (the
+        // tenancy-hydrated gate, XERK-2993) keeps failing safe.
+        if (e instanceof SyntaxError || /^WRONGTYPE\b/.test((e && e.message) || "")) {
+          console.error(`store ${desc.name}: ERROR the stored value is unreadable; serving without it — the next write replaces it: ${e.message}`);
+          externalStoresLoading.delete(desc.key);
+          return;
+        }
+        console.error(`store ${desc.name}: load failed, retrying: ${e && e.message}`);
+        setTimeout(() => { if (externalStoresLoading.has(desc.key)) load(desc); }, storeLoadRetryMs).unref?.();
+      });
+  };
+  for (const desc of externalizedStores) load(desc);
 }
 
 // ---- mobile push device registry -------------------------------------------
@@ -24429,6 +24474,9 @@ function decisionsTick(now = Date.now()) {
 function masterOrchestrationTick() {
   if (!isLeader()) return;
   if (Date.now() - BOOT_AT < BOOT_GRACE_MS) return;
+  // XERK-2995: the sweeps decide on the stores (a brief's "already fired" row, the
+  // epic runs, the opt-ins); with them unread they would act on nothing or twice.
+  if (externalStoresPending()) return;
   // Move the pre-tenancy deployment into its owner's tenant (XERK-2554): run or
   // resume it, then sweep the migrated hosts' leftovers for a settle window.
   tenantMigrationTick();
@@ -26059,6 +26107,12 @@ const server = http.createServer(async (req, res) => {
     // removes a branch a single-process hub never took.
     if (url.pathname === "/readyz") {
       if (hubDraining) return json(res, 503, { ready: false, draining: true });
+      // XERK-2995: not until every externalized store has been read — before
+      // that the mirrors are empty and a write would clobber the shared value.
+      if (externalStoresPending()) {
+        return json(res, 503, { ready: false,
+          loading: externalizedStores.filter((d) => externalStoresLoading.has(d.key)).map((d) => d.name) });
+      }
       // Still Ready — the leader must keep serving everything else — but a gated
       // archive ingest is on the probe body, so a hung hydrate is visible there.
       if (archive.isHydrating()) {
@@ -26075,6 +26129,17 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/metrics" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
       return res.end(metricsText());
+    }
+
+    // XERK-2995: a replica that has not read the shared stores serves nothing
+    // itself (a forwarded request already went to the leader above). Its mirrors
+    // are empty, so a write would replace the shared store with nearly nothing (an
+    // admin user create deleted every user) and a read would answer wrong (no local
+    // users reads as an open hub). /readyz keeps the LB away; this covers a
+    // request that reaches the replica anyway.
+    if (externalStoresPending()) {
+      res.setHeader("Retry-After", "2");
+      return json(res, 503, { error: "the hub is still loading its shared state; retry shortly" });
     }
 
     // Branded static assets (stylesheet, UI fonts, icon/favicon set, manifest):
@@ -31167,6 +31232,11 @@ server.on("upgrade", async (req, socket, head) => {
     try { socket.destroy(); } catch {}
     return;
   }
+  // XERK-2995: no socket is served here before the shared stores are read.
+  if (externalStoresPending()) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\n\r\n");
+    return socket.destroy();
+  }
   const url = new URL(req.url, "http://x");
   const parts = url.pathname.split("/").filter(Boolean);
 
@@ -31784,6 +31854,8 @@ if (process.env.TURMA_TEST) {
     // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
     // drive the per-host write-through and hydration, and pin the non-HA path off.
     __setLiveStore(store, on) { liveStore = store; HA_ON = !!on; },
+    __setStoreLoadRetryMs(ms) { storeLoadRetryMs = ms; },
+    externalStoresPending: () => externalStoresPending(),
     __setDailyBriefDefault(s) { dailyBriefDefault = s; },
     __getHaOn() { return HA_ON; },
     __setTenancyHydrated(v) { tenancyHydrated = !!v; },
@@ -32040,6 +32112,8 @@ if (process.env.TURMA_TEST) {
     oidcPrincipal,
     tenancyState: () => tenancyState,
     __setTenancy(v) { tenancyState = tenancy.coerceTenancy(v); },
+    // XERK-2995: the real setter (mirror + persist), as a sweep or login calls it.
+    setTenancy: (v) => setTenancy(tenancy.coerceTenancy(v)),
     // Host ⇄ tenant binding (XERK-2533).
     tenantOfKey,
     // XERK-2551: org keys belong to tenants.
@@ -32718,7 +32792,9 @@ if (process.env.TURMA_TEST) {
     // then ABSTAINS (drops + backdates the lease) so a healthy-store replica promotes.
     // Same signal the forwarder's storeHealthy uses; the lease itself lives in the k8s
     // API, not the store, so it stays writable to hand over.
-    canLead: () => !liveStore.health || liveStore.health === "ready",
+    // XERK-2995: nor may one that has not read the shared stores — it would serve
+    // nothing but 503s while every follower forwards to it.
+    canLead: () => (!liveStore.health || liveStore.health === "ready") && !externalStoresPending(),
     onChange: (leader) => {
       if (leader) {
         console.log("leader: this replica is now the leader — running the singleton sweeps");
