@@ -1365,7 +1365,10 @@ test("XERK-2989: invitations — the form round-trips them, the editor offers th
   assert.equal(cal.invitesText(ev), "Sent from acme's Outlook · forwarding off · 1 accepted, 1 declined, 1 not responded");
   assert.equal(cal.invitesText(tev()), "", "no row when it sends none");
   assert.equal(cal.invitesText(tev({ sendInvites: true, private: true })), "");
-  assert.equal(cal.invitesText(tev({ sendInvites: true, recurring: true })), "", "a series is not written to Outlook yet");
+  // XERK-3012: a series sends invitations too, and shows its sending copy's answers.
+  assert.equal(cal.invitesText({ ...ev, recurring: true, seriesId: "turma:ab" }),
+    "Sent from acme's Outlook · forwarding off · 1 accepted, 1 declined, 1 not responded");
+  assert.equal(cal.invitesText(tev({ recurring: true })), "", "a series that sends none shows none");
   assert.match(cal.detailHtml(ev), /Invitations/);
 });
 

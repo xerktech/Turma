@@ -7730,9 +7730,11 @@ const calTurmaSends = (rec, org) => rec.sendInvites === true && org === rec.orgs
 // The attendee responses Outlook tracked on the sending copy (XERK-2989): its holder's
 // synced copy (stamped with the record's id) -> lowercased email -> response. Null when
 // nothing is known yet. Indexed per stored event list, rebuilt when a sync replaces it.
+// A series (XERK-3012) reads its first stamped occurrence: Outlook keeps one recipient
+// list, with its answers, on the series' meeting.
 const calStampIndex = new WeakMap();
 function calTurmaResponses(rec) {
-  if (rec.recurrence || !calTurmaSends(rec, rec.orgs[0])) return null;
+  if (!calTurmaSends(rec, rec.orgs[0])) return null;
   const e = rec.outlook && Object.hasOwn(rec.outlook, rec.orgs[0]) ? rec.outlook[rec.orgs[0]] : null;
   const h = e && e.host && Object.hasOwn(calendarEvents, e.host) ? calendarEvents[e.host] : null;
   if (!h || !Array.isArray(h.events)) return null;

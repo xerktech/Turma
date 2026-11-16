@@ -301,9 +301,10 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - **Responses**: the reader already reports each recipient's `response`; `GET /api/calendar` serves
   them on the Turma event's `attendees[].response` from the SENDING copy's synced read-back (its
   holder's stored event stamped with the record's id; `calTurmaResponses`). `none` reads
-  `notResponded` when responses were requested; `organizer`/`unknown` never ride. Single events only.
-  Clients show them per attendee and tally them on an "Invitations" row (not for a series, which
-  is not written to Outlook until XERK-2986).
+  `notResponded` when responses were requested; `organizer`/`unknown` never ride.
+  A series reads its first stamped occurrence's copy (Outlook keeps one recipient list per series),
+  and every served occurrence carries those answers (XERK-3012).
+  Clients show them per attendee and tally them on an "Invitations" row, a series' too.
 - **Teams link: the pasted `joinUrl` stays.** The Teams Meeting add-in exposes no COM/object-model
   API; creating a Teams meeting means pressing its ribbon button in a displayed Inspector — UI
   automation on the user's desktop, which the off-beat writer must never do. Revisit only if

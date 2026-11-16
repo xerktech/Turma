@@ -35430,6 +35430,39 @@ test("XERK-2989: only the first org's copy sends invitations; its responses are 
   }
 });
 
+test("XERK-3012: an invited series serves its sending copy's responses on every occurrence", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const people = [{ name: "Ann", email: "ann@x.com", role: "required" }, { name: "Bo", email: "bo@x.com", role: "optional" }];
+    const c = await turma2968("POST", null, ev2968([S2985A], { attendees: people, sendInvites: true,
+      recurrence: { freq: "daily", interval: 1, count: 2 } }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const id = c.body.event.id;
+    assert.equal(writes2985(D2985A).at(-1).event.sendInvites, true);
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    await later2985();
+    // The reader stamps each occurrence with the series' id; Outlook keeps one recipient list.
+    const answers = [{ name: "Me", email: "me@x.com", role: "organizer", response: "organizer" },
+      { name: "Ann", email: "ann@x.com", role: "required", response: "accepted" },
+      { name: "Bo", email: "bo@x.com", role: "optional", response: "none" }];
+    const k0 = iso2968(T2968), k1 = iso2968(T2968 + 864e5);
+    await beat2985(D2985A, S2985A, sync2985([
+      copy2985(rec2985(id), { id: `GID-S:${k0}`, seriesId: "GID-S", recurring: true, attendees: answers }),
+      copy2985(rec2985(id), { id: `GID-S:${k1}`, seriesId: "GID-S", recurring: true, start: k1,
+        end: iso2968(T2968 + 864e5 + 3.6e6), attendees: answers })]));
+    const occ = (await served2968()).filter((e) => e.seriesId === id);
+    assert.ok(occ.length >= 1, "an occurrence is served");
+    for (const e of occ) {
+      assert.equal(e.sendInvites, true);
+      assert.deepEqual(e.attendees.map((a) => [a.email, a.response]), [["ann@x.com", "accepted"], ["bo@x.com", "notResponded"]]);
+    }
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
 test("XERK-2989: an occurrence takes no invitation option of its own", async () => {
   cleanup2985(D2985A);
   try {
