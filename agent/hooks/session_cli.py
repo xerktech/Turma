@@ -392,6 +392,10 @@ __ATTACH__
             $rc.Type = [int]$a.type
           }
           [void]$it.Recipients.ResolveAll()
+          # Only the mailbox owner was listed: nobody to invite, so a plain copy (QA).
+          if ($it.Recipients.Count -eq 0) { $it.MeetingStatus = 0; $e.send = $false }
+        }
+        if ($e.send) {
           $it.ResponseRequested = [bool]$e.responseRequested
           # PidNameMeetingDoNotForward (MS-OXOCAL 2.2.1.51): TRUE = attendees cannot forward.
           if ($e.allowForward) { try { $it.PropertyAccessor.SetProperty($dnf, $false) } catch {} }

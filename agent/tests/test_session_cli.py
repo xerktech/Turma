@@ -1060,6 +1060,13 @@ class CalendarWriteTest(unittest.TestCase):
         for save in [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]:
             self.assertEqual(save["to"], ["ann@example.com:1", "bo@example.com:2"])
 
+    def test_xerk2989_qa_only_the_owner_listed_sends_nothing(self):
+        got, err, _ = self.run_write([self.up(self.A, sendInvites=True, attendees=[{"email": "me@example.com"}])])
+        self.assertTrue(got[0]["ok"])
+        self.assertFalse(self.sends(err))
+        (save,) = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual((save["status"], save["to"], save["sent"]), (0, [], ""))
+
     def test_xerk2989_prepare_types_the_invitation(self):
         p = cli.prepare_calendar_write(self.up(self.A, sendInvites=True, attendees=[
             {"email": "ann@example.com", "role": "optional"}, {"email": "ANN@example.com"},
