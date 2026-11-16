@@ -146,6 +146,7 @@ import com.xerktech.turma.core.calCollect
 import com.xerktech.turma.core.calDay
 import com.xerktech.turma.core.calDayKey
 import com.xerktech.turma.core.calDaySegments
+import com.xerktech.turma.core.calMinLayoutMin
 import com.xerktech.turma.core.calEventOrg
 import com.xerktech.turma.core.calInBand
 import com.xerktech.turma.core.calLinkCandidates
@@ -210,6 +211,9 @@ import kotlinx.serialization.json.put
  */
 
 private val SHORT_DP = 34.dp          // shorter than this, a block shows its title alone
+// A timed block is never drawn shorter than this; the day's layout reads it (calMinLayoutMin) so a
+// grown block never covers the next event (XERK-3026). Change it only here.
+private val BLOCK_MIN_DP = 10.dp
 
 /** The neutral colour of an unassigned event (the web's `--muted`). */
 @Composable
@@ -926,7 +930,8 @@ private fun WeekGrid(
                                 .shown(d, "cal-col-${calDayKey(d)}"),
                         ) {
                             val w = maxWidth
-                            for (seg in calDaySegments(range.events, d, zone)) {
+                            val minMin = calMinLayoutMin(slot.value, BLOCK_MIN_DP.value)
+                            for (seg in calDaySegments(range.events, d, zone, minMin)) {
                                 val ev = seg.ev
                                 val badge = calBadge(ev, fleet.meetingProposals)
                                 val h = slot * ((seg.bottom - seg.top) / 30).toFloat() - 2.dp
@@ -993,7 +998,7 @@ private fun segModifier(seg: CalSeg, colWidth: Dp, height: Dp, slot: Dp): Modifi
     val left = colWidth * (seg.col.toFloat() / seg.cols)
     val width = colWidth * (seg.span.toFloat() / seg.cols)
     return Modifier.offset(x = left + 1.dp, y = slot * (seg.top / 30).toFloat())
-        .width((width - 4.dp).coerceAtLeast(8.dp)).height(height.coerceAtLeast(10.dp))
+        .width((width - 4.dp).coerceAtLeast(8.dp)).height(height.coerceAtLeast(BLOCK_MIN_DP))
 }
 
 /**
