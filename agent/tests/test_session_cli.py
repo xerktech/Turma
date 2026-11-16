@@ -866,9 +866,54 @@ _FAKE_WRITE_OUTLOOK = r"""
         startUtc = $this.StartUTC.ToString('s'); endUtc = $this.EndUTC.ToString('s')
         status = $this.MeetingStatus; sent = $sent; resp = $this.ResponseRequested
         dnf = $this.mapi.Values | Select-Object -First 1
-        to = @($this.Recipients.list | ForEach-Object { "$($_.Address):$($_.Type)" }) })) }
+        to = @($this.Recipients.list | ForEach-Object { "$($_.Address):$($_.Type)" }) }))
+      if ($this.pat) {
+        $q = $this.pat; $ped = ''; if ($q.PatternEndDate) { $ped = $q.PatternEndDate.ToString('yyyy-MM-dd') }
+        [Console]::Error.WriteLine('PATTERN ' + (ConvertTo-Json -Compress -InputObject @{
+          id = $this.EntryID; type = $q.RecurrenceType; mask = $q.DayOfWeekMask; dom = $q.DayOfMonth
+          instance = $q.Instance; interval = $q.Interval; start = $q.PatternStartDate.ToString('yyyy-MM-dd')
+          time = $q.StartTime.ToString('HH:mm:ss'); duration = $q.Duration; count = $q.Occurrences
+          end = $ped; noEnd = $q.NoEndDate })) } }
     $it | Add-Member ScriptMethod Delete {
       [Console]::Error.WriteLine("DELETE $($this.EntryID)"); $script:store.Remove($this.EntryID) }
+    # XERK-2986: a RecurrencePattern that logs what the writer set (PATTERN on
+    # the item's Save), and GetOccurrence handing back an occurrence that logs
+    # its own Save/Delete — Python expands the logged pattern by Outlook's rules.
+    $it | Add-Member NoteProperty IsRecurring $false
+    $it | Add-Member NoteProperty pat $null
+    $it | Add-Member ScriptMethod ClearRecurrencePattern {
+      [Console]::Error.WriteLine("CLEAR $($this.EntryID)"); $this.pat = $null; $this.IsRecurring = $false }
+    $it | Add-Member ScriptMethod GetRecurrencePattern {
+      if (-not $this.pat) {
+        $pt = [pscustomobject]@{ RecurrenceType = 0; DayOfWeekMask = 0; DayOfMonth = 0; Instance = 0
+          Interval = 1; PatternStartDate = $null; StartTime = $null; Duration = 0; Occurrences = 0
+          PatternEndDate = $null; NoEndDate = $false; owner = $this }
+        $pt | Add-Member ScriptMethod GetOccurrence { param($at)
+          if ($at.Kind -eq 'Local') { $key = $at.ToUniversalTime().ToString('s') + 'Z' }
+          else { $key = 'D' + $at.ToString('yyyy-MM-dd') }
+          if ($key -eq '2031-01-01T00:00:00Z') { throw 'no such occurrence' }
+          [Console]::Error.WriteLine("GETOCC $key")
+          $o = [pscustomobject]@{ key = $key; StartUTC = $null; EndUTC = $null; AllDayEvent = $null
+            Subject = $null; Location = $null; Body = $null; BusyStatus = $null; Sensitivity = $null
+            Categories = $null }
+          $o | Add-Member ScriptMethod Delete { [Console]::Error.WriteLine("OCCDELETE $($this.key)") }
+          $oup = [pscustomobject]@{ owner = $o }
+          $oup | Add-Member ScriptMethod Find { param($k) $null }
+          $oup | Add-Member ScriptMethod Add { param($k, $t, $f)
+            $q = [pscustomobject]@{ Value = ''; k = $this.owner.key }
+            $q | Add-Member ScriptMethod ToString { "x" } -Force
+            $this.owner | Add-Member NoteProperty stamp $q -Force; $q }
+          $o | Add-Member NoteProperty UserProperties $oup
+          $o | Add-Member ScriptMethod Save {
+            $s = ''; if ($this.StartUTC) { $s = $this.StartUTC.ToString('s') }
+            $e = ''; if ($this.EndUTC) { $e = $this.EndUTC.ToString('s') }
+            [Console]::Error.WriteLine('OCCSAVE ' + (ConvertTo-Json -Compress -InputObject @{
+              key = $this.key; subject = $this.Subject; location = $this.Location; body = $this.Body
+              stamp = $(if ($this.stamp) { $this.stamp.Value } else { '' })
+              busy = $this.BusyStatus; sens = $this.Sensitivity; startUtc = $s; endUtc = $e })) }
+          $o }
+        $this.pat = $pt; $this.IsRecurring = $true }
+      $this.pat }
     $it | Add-Member ScriptMethod Send {
       if ($script:failSend -or ($this.Subject -eq 'Boom' -and $this.MeetingStatus -eq 1)) { throw 'The send failed.' }
       [Console]::Error.WriteLine("SEND $($this.EntryID) status=$($this.MeetingStatus) to=" +
@@ -1187,7 +1232,8 @@ class CalendarWriteTest(unittest.TestCase):
         self.assertFalse(got[0]["ok"])
         self.assertTrue(got[0]["refused"])           # Outlook was never asked
         with mock.patch.object(cli, "_run_outlook_ps") as run:
-            got = cli.write_calendar_events([self.up(self.A, recurrence={"freq": "daily"}),
+            got = cli.write_calendar_events([self.up(self.A, recurrence={"freq": "daily", "interval": 3,
+                                                                         "byDay": ["MO"]}),
                                              self.up(self.B, timeZone="Mars/Base")])
         run.assert_not_called()
         self.assertEqual([(r["ok"], r.get("refused")) for r in got], [(False, True)] * 2)
@@ -1221,10 +1267,382 @@ class CalendarWriteTest(unittest.TestCase):
                          ({"op": "upsert", "turmaId": self.A}, "needs its event"),
                          (self.up(self.A, start="2026-11-16T09:00:00"), "instants"),
                          (self.up(self.A, end="2026-11-16T08:00:00-05:00"), "instants"),
-                         (self.up(self.A, recurrence={"freq": "daily"}), "single events"),
+                         (self.up(self.A, recurrence={"freq": "daily", "interval": 3, "byDay": ["MO"]}),
+                          "every 3 days"),
                          (self.up(self.A, timeZone="Mars/Base"), "no Windows zone")]:
             with self.assertRaisesRegex(cli.Refused, why, msg=bad):
                 cli.prepare_calendar_write(bad)
+
+
+RECURRENCE_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "turma",
+                             "recurrence.js")
+_NODE_EXPAND = """
+const r = require(process.argv[1]);
+const jobs = JSON.parse(require("fs").readFileSync(0, "utf8"));
+process.stdout.write(JSON.stringify(jobs.map((j) =>
+  r.occurrences(j.series, j.lo, j.hi, 2000).map((o) => o.key))));
+"""
+
+
+def _outlook_dates(p, last):
+    """Outlook's own expansion of a logged RecurrencePattern (local dates), up
+    to `last`: daily every N; weekly = the mask's days in every Nth week
+    counted from the start's week (weeks start Sunday, the default first day);
+    monthly = DayOfMonth, past the month's end its last day (Outlook's "fewer
+    than 31 days" rule); monthNth = the Instance-th weekday, 5 = the last.
+    Occurrences / PatternEndDate end it; nothing before PatternStartDate."""
+    import calendar
+    import datetime as dt
+    start = dt.date.fromisoformat(p["start"])
+    end = dt.date.fromisoformat(p["end"]) if p["end"] else None
+    t, iv, out = p["type"], p["interval"], []
+
+    def month(k):
+        m = start.month - 1 + k * iv
+        y, mo = start.year + m // 12, m % 12 + 1
+        return y, mo, calendar.monthrange(y, mo)[1]
+
+    for k in range(5000):
+        if t == 0:
+            days = [start + dt.timedelta(days=k * iv)]
+        elif t == 1:
+            ws = start - dt.timedelta(days=(start.weekday() + 1) % 7) + dt.timedelta(weeks=k * iv)
+            days = [ws + dt.timedelta(days=i) for i in range(7) if p["mask"] >> i & 1]
+        elif t == 2:
+            y, mo, n = month(k)
+            days = [dt.date(y, mo, min(p["dom"], n))]
+        else:
+            y, mo, n = month(k)
+            want = p["mask"].bit_length() - 1
+            first = dt.date(y, mo, 1)
+            hit = first + dt.timedelta(days=(want - (first.weekday() + 1) % 7) % 7)
+            if p["instance"] == 5:
+                while hit + dt.timedelta(weeks=1) <= dt.date(y, mo, n):
+                    hit += dt.timedelta(weeks=1)
+            else:
+                hit += dt.timedelta(weeks=p["instance"] - 1)
+            days = [hit]
+        for d in days:
+            if d < start:
+                continue
+            if (end and d > end) or d > last or (p["count"] and len(out) >= p["count"]):
+                return out
+            out.append(d)
+    return out
+
+
+class CalendarRecurrenceWriteTest(unittest.TestCase):
+    """XERK-2986: a recurring Turma event is ONE Outlook series. The pin the
+    ticket asks for: the real writer script runs under pwsh against the fake
+    Outlook, the pattern it SET is expanded by Outlook's rules, its occurrence
+    edits applied, and that read-back must name exactly the occurrence ids
+    (original starts, UTC) and starts turma/recurrence.js expands — or the
+    hub's read-back dedup breaks."""
+
+    TID = "turma:" + "a" * 16
+
+    @staticmethod
+    def utc(local, zone):
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        t = dt.datetime.fromisoformat(local).replace(tzinfo=ZoneInfo(zone))
+        return int(t.timestamp() * 1000)
+
+    @staticmethod
+    def key(ms):
+        import datetime as dt
+        return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def cmd(self, i, start, zone, rule, minutes=60, exceptions=None, all_day=False):
+        s = self.utc(start, zone)
+        ev = {"subject": f"S{i}", "start": self.key(s), "end": self.key(s + minutes * 60000),
+              "timeZone": zone, "allDay": all_day, "recurrence": rule,
+              "exceptions": exceptions or {}}
+        return {"op": "upsert", "turmaId": f"turma:{i:016x}", "outlookId": "", "event": ev}
+
+    CASES = [
+        # Weekly across the US fall-back (a 9:00 stays 9:00), with a deleted
+        # and a moved occurrence.
+        ("2026-10-26T09:00", "America/New_York", {"freq": "weekly", "interval": 1,
+                                                   "byDay": ["MO", "WE", "FR"], "count": 12}),
+        # The 31st: Feb 28, Apr 30 ... (a day past a month's end is its last).
+        ("2027-01-31T10:00", "Europe/Berlin", {"freq": "monthly", "interval": 1, "until": "2027-12-31"}),
+        ("2026-11-27T18:30", "America/Chicago", {"freq": "monthly", "interval": 1,
+                                               "byWeekday": {"n": -1, "day": "FR"}}),
+        ("2028-02-29T08:00", "UTC", {"freq": "yearly", "interval": 1, "count": 5}),
+        ("2026-11-16T07:15", "Australia/Sydney", {"freq": "daily", "interval": 1,
+                                                  "byDay": ["MO", "TU", "WE", "TH", "FR"], "count": 40}),
+        ("2026-11-16T12:00", "Europe/London", {"freq": "daily", "interval": 14,
+                                               "byDay": ["MO", "TU"], "count": 10}),
+        ("2026-11-17T16:00", "America/Los_Angeles", {"freq": "weekly", "interval": 2,
+                                                     "byDay": ["TU", "TH"], "until": "2027-06-30"}),
+        ("2026-11-10T11:00", "Europe/Berlin", {"freq": "monthly", "interval": 2,
+                                               "byWeekday": {"n": 2, "day": "TU"}, "count": 9}),
+        ("2026-03-15T09:30", "America/New_York", {"freq": "yearly", "interval": 2, "count": 4}),
+        ("2026-11-16T09:00", "Asia/Tokyo", {"freq": "daily", "interval": 3, "until": "2027-04-01"}),
+        ("2026-11-03T09:00", "America/New_York", {"freq": "weekly", "interval": 1}),
+        ("2026-11-12T23:30", "Pacific/Auckland", {"freq": "monthly", "interval": 1, "byMonthDay": 30,
+                                                  "count": 14}),
+    ]
+
+    def run_write(self, cmds):
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        seen = {}
+        real = cli.subprocess.run
+
+        def run(*a, **kw):
+            seen["proc"] = real(*a, **kw)
+            return seen["proc"]
+        with mock.patch.object(cli, "_CALENDAR_WRITE_PS",
+                               cli._CALENDAR_WRITE_PS.replace(_COM_LINES, _FAKE_WRITE_OUTLOOK)), \
+                mock.patch.object(cli.subprocess, "run", side_effect=run):
+            got = cli.write_calendar_events(cmds, powershell=pwsh)
+        return got, seen["proc"].stderr.decode("utf-8", "replace").splitlines()
+
+    def node_keys(self, jobs):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not installed")
+        out = subprocess.run([node, "-e", _NODE_EXPAND, os.path.abspath(RECURRENCE_JS)],
+                             input=json.dumps(jobs).encode(), capture_output=True, check=True)
+        return json.loads(out.stdout)
+
+    def test_the_read_back_names_what_recurrence_js_expands(self):
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        cmds = [self.cmd(i, *c) for i, c in enumerate(self.CASES)]
+        # Occurrence edits on the first series: a delete and a move.
+        moved_from = self.utc("2026-11-06T09:00", "America/New_York")
+        moved_to = moved_from + 3600000
+        cmds[0]["event"]["exceptions"] = {
+            self.key(self.utc("2026-10-28T09:00", "America/New_York")): {"deleted": True},
+            self.key(moved_from): {"start": self.key(moved_to), "end": self.key(moved_to + 3600000),
+                                   "subject": "Moved"}}
+        got, err = self.run_write(cmds)
+        self.assertEqual([r["ok"] for r in got], [True] * len(cmds), got)
+        self.assertTrue(all(r.get("series") for r in got))
+        patterns = [json.loads(l[8:]) for l in err if l.startswith("PATTERN ")]
+        self.assertEqual(len(patterns), len(cmds))
+        horizon = 3 * 365 * 86400000
+        jobs = []
+        for c in cmds:
+            e = c["event"]
+            s = cli._event_ms(e, "start")
+            jobs.append({"series": {"startMs": s, "endMs": cli._event_ms(e, "end"),
+                                    "timeZone": e["timeZone"], "rule": e["recurrence"]},
+                         "lo": s, "hi": s + horizon})
+        want = self.node_keys(jobs)
+        for c, p, w, j in zip(cmds, patterns, want, jobs):
+            zone = ZoneInfo(c["event"]["timeZone"])
+            hm = dt.time.fromisoformat(p["time"])
+            last = (dt.datetime.fromtimestamp(j["hi"] / 1000, dt.timezone.utc)
+                    .astimezone(zone).date())
+            keys = []
+            for d in _outlook_dates(p, last):
+                ms = int(dt.datetime.combine(d, hm, zone).timestamp() * 1000)
+                if ms < j["hi"]:
+                    keys.append(self.key(ms))
+            self.assertEqual(keys, w, (c["event"]["recurrence"], p))
+            self.assertEqual(p["duration"], 60)
+        # The edits opened the occurrences by their ORIGINAL starts (both are
+        # occurrences of the series), deleted one and moved the other.
+        opened = [l.split()[1] for l in err if l.startswith("GETOCC ")]
+        self.assertEqual(opened, sorted(cmds[0]["event"]["exceptions"]))
+        self.assertTrue(set(opened) <= set(want[0]))
+        self.assertIn(f"OCCDELETE {self.key(self.utc('2026-10-28T09:00', 'America/New_York'))}", err)
+        (occ,) = [json.loads(l[8:]) for l in err if l.startswith("OCCSAVE ")]
+        self.assertEqual((occ["key"], occ["subject"], occ["startUtc"] + "Z"),
+                         (self.key(moved_from), "Moved", self.key(moved_to)))
+        self.assertIsNone(occ["location"])       # only the overridden fields are set
+
+    def test_a_rewrite_clears_the_old_series_first(self):
+        c = self.cmd(1, *self.CASES[0])
+        got, err = self.run_write([c, dict(c, outlookId="E1")])
+        self.assertEqual([r.get("outlookId") for r in got], ["E1", "E1"])
+        self.assertEqual(sum(l.startswith("CLEAR E1") for l in err), 1)
+        self.assertEqual(sum(l.startswith("CREATE") for l in err), 1)
+
+    def test_a_missing_occurrence_fails_the_row_in_words(self):
+        c = self.cmd(1, "2026-11-03T09:00", "UTC", {"freq": "weekly", "interval": 1})
+        c["event"]["exceptions"] = {"2031-01-01T00:00:00Z": {"deleted": True}}
+        got, _ = self.run_write([c])
+        self.assertFalse(got[0]["ok"])
+        self.assertIn("1 of 1 occurrence edits failed: Outlook has no occurrence at "
+                      "2031-01-01T00:00:00Z", got[0]["error"])
+
+    def test_a_private_occurrence_edit_is_written_withheld(self):
+        c = self.cmd(1, "2026-11-03T09:00", "UTC", {"freq": "weekly", "interval": 1})
+        c["event"]["exceptions"] = {"2026-11-10T09:00:00Z": {"sensitivity": "private",
+                                                             "subject": "Secret", "location": "Home"}}
+        got, err = self.run_write([c])
+        self.assertTrue(got[0]["ok"], got)
+        (occ,) = [json.loads(l[8:]) for l in err if l.startswith("OCCSAVE ")]
+        self.assertEqual((occ["subject"], occ["location"], occ["body"], occ["sens"]),
+                         ("Private event", "", "", 2))
+
+    def test_an_edited_occurrence_is_stamped_and_keeps_the_series_body(self):
+        """QA: an override of the join link alone wrote "Join: …" over the
+        series' agenda; and an exception is stamped itself, in case Outlook does
+        not copy the master's TurmaId to it."""
+        c = self.cmd(1, "2026-11-03T09:00", "UTC", {"freq": "weekly", "interval": 1})
+        c["event"].update(body="Agenda", joinUrl="https://zoom.us/j/1")
+        c["event"]["exceptions"] = {"2026-11-10T09:00:00Z": {"joinUrl": "https://zoom.us/j/9"},
+                                    "2026-11-17T09:00:00Z": {"body": "New agenda"}}
+        got, err = self.run_write([c])
+        self.assertTrue(got[0]["ok"], got)
+        occ = [json.loads(l[8:]) for l in err if l.startswith("OCCSAVE ")]
+        self.assertEqual([(o["body"], o["stamp"]) for o in occ],
+                         [("Agenda\nJoin: https://zoom.us/j/9", c["turmaId"]),
+                          ("New agenda\nJoin: https://zoom.us/j/1", c["turmaId"])])
+
+    def test_a_series_stamp_reaches_its_unstamped_exceptions_on_read(self):
+        base = {"globalId": "G-S", "recurrenceState": 3, "recurring": True, "subject": "x", "attendees": []}
+        doc = {"ok": True, "windows": [{"events": [
+            dict(base, originalStart="2026-11-10T09:00:00Z", turmaId=""),
+            dict(base, recurrenceState=2, originalStart="2026-11-17T09:00:00Z", turmaId=self.TID),
+            dict(base, globalId="G-OTHER", originalStart="2026-11-10T10:00:00Z", turmaId="")]}]}
+        (w,) = cli.normalize_calendar_windows(doc, 1)
+        self.assertEqual([e["turmaId"] for e in w["events"]], [self.TID, self.TID, ""])
+
+    def test_many_occurrence_edits_split_into_several_runs(self):
+        cmds = []
+        for i in range(3):
+            c = self.cmd(i, "2026-11-03T09:00", "UTC", {"freq": "daily", "interval": 1})
+            c["event"]["exceptions"] = {f"2027-0{1 + j // 28}-{1 + j % 28:02d}T09:00:00Z": {"deleted": True}
+                                        for j in range(90)}
+            cmds.append(c)
+        runs = []
+        with mock.patch.object(cli, "_run_outlook_ps", side_effect=lambda script, t, ps, stdin: (
+                runs.append(len(json.loads(base64.b64decode(stdin))["cmds"])) or
+                {"ok": True, "results": [{"ok": True, "series": True}] * runs[-1]})):
+            got = cli.write_calendar_events(cmds)
+        self.assertEqual(runs, [2, 1])
+        self.assertEqual([r["ok"] for r in got], [True] * 3)
+        # A later run failing costs only its own commands (QA); all failing raises.
+        calls = []
+
+        def second_fails(script, t, ps, stdin):
+            calls.append(1)
+            if len(calls) == 2:
+                return {"ok": False, "error": "Outlook did not answer"}
+            n = len(json.loads(base64.b64decode(stdin))["cmds"])
+            return {"ok": True, "results": [{"ok": True, "series": True}] * n}
+        with mock.patch.object(cli, "_run_outlook_ps", side_effect=second_fails):
+            got = cli.write_calendar_events(cmds)
+        self.assertEqual([r["ok"] for r in got], [True, True, False])
+        self.assertIn("did not answer", got[2]["error"])
+        # A run that ANSWERED, even with failed rows, means Outlook is there.
+        calls.clear()
+
+        def first_answers_no(script, t, ps, stdin):
+            calls.append(1)
+            if len(calls) == 2:
+                return {"ok": False, "error": "Outlook did not answer"}
+            n = len(json.loads(base64.b64decode(stdin))["cmds"])
+            return {"ok": True, "results": [{"ok": False, "error": "1 of 1 occurrence edits failed"}] * n}
+        with mock.patch.object(cli, "_run_outlook_ps", side_effect=first_answers_no):
+            got = cli.write_calendar_events(cmds)
+        self.assertEqual([r["error"][:6] for r in got], ["1 of 1", "1 of 1", "Outloo"])
+        with mock.patch.object(cli, "_run_outlook_ps",
+                               return_value={"ok": False, "error": "Outlook is not open"}):
+            with self.assertRaisesRegex(cli.Refused, "not open"):
+                cli.write_calendar_events(cmds)
+
+    def test_a_private_series_text_never_reaches_a_public_occurrence(self):
+        """QA: unwithheld by the hub, a private series' body must still not be
+        merged into an occurrence made public."""
+        c = self.cmd(1, "2026-11-03T09:00", "UTC", {"freq": "weekly", "interval": 1})
+        c["event"].update(sensitivity="private", body="SECRET", joinUrl="https://zoom.us/j/1")
+        c["event"]["exceptions"] = {"2026-11-10T09:00:00Z": {"sensitivity": "normal",
+                                                             "joinUrl": "https://zoom.us/j/9"}}
+        (ex,) = cli.prepare_calendar_write(c)["event"]["exceptions"]
+        self.assertEqual(ex["body"], "Join: https://zoom.us/j/9")
+
+    def test_a_series_that_invites_sends_once_per_change(self):
+        """The seam with XERK-2989: a sending series sends on create, not on a
+        repair rewrite of the same record, again on a rule or exception change,
+        and never while an occurrence edit fails."""
+        def send(i, **ev):
+            c = self.cmd(1, "2026-11-03T09:00", "UTC", {"freq": "weekly", "interval": 1})
+            c["event"].update(sendInvites=True, attendees=[{"email": "ann@x.example", "role": "required"}])
+            c["event"].update(ev)
+            return c
+        moved = {"2026-11-10T09:00:00Z": {"subject": "Moved"}}
+        steps = [send(0), dict(send(0), outlookId="E1"),
+                 dict(send(0, recurrence={"freq": "weekly", "interval": 1, "count": 5}), outlookId="E1"),
+                 dict(send(0, recurrence={"freq": "weekly", "interval": 1, "count": 5}, exceptions=moved),
+                      outlookId="E1"),
+                 dict(send(0, recurrence={"freq": "weekly", "interval": 1, "count": 5},
+                           exceptions={"2031-01-01T00:00:00Z": {"deleted": True}}), outlookId="E1")]
+        # One fake Outlook lives for one run, so each prefix of the steps is a run.
+        total = []
+        for k in range(1, len(steps) + 1):
+            got, err = self.run_write(steps[:k])
+            total.append(sum(l.startswith("SEND ") for l in err))
+        self.assertEqual([t - p for t, p in zip(total, [0] + total)], [1, 0, 1, 1, 0])
+        self.assertEqual([r["ok"] for r in got], [True, True, True, True, False])
+
+    def test_an_all_day_occurrence_is_opened_by_its_date(self):
+        c = self.cmd(1, "2026-11-16T00:00", "Europe/Berlin", {"freq": "daily", "interval": 1},
+                     minutes=1440, all_day=True)
+        c["event"]["exceptions"] = {self.key(self.utc("2026-11-18T00:00", "Europe/Berlin")):
+                                    {"deleted": True}}
+        got, err = self.run_write([c])
+        self.assertTrue(got[0]["ok"], got)
+        self.assertIn("OCCDELETE D2026-11-18", err)
+        (p,) = [json.loads(l[8:]) for l in err if l.startswith("PATTERN ")]
+        self.assertEqual((p["start"], p["time"], p["duration"]), ("2026-11-16", "00:00:00", 1440))
+
+    def test_the_mapping_and_its_refusals(self):
+        m = cli.outlook_recurrence
+        self.assertEqual(m({"freq": "yearly", "interval": 3, "byWeekday": {"n": -1, "day": "MO"}}),
+                         {"type": 3, "interval": 36, "mask": 2, "dayOfMonth": 0, "instance": 5,
+                          "count": 0, "until": None})
+        self.assertEqual(m({"freq": "monthly", "interval": 1, "byMonthDay": 31, "until": "2027-02-28"}),
+                         {"type": 2, "interval": 1, "mask": 0, "dayOfMonth": 31, "instance": 0,
+                          "count": 0, "until": [2027, 2, 28]})
+        self.assertEqual(m({"freq": "daily", "interval": 1, "byDay": ["SU", "SA"]})["mask"], 65)
+        self.assertEqual((m({"freq": "daily", "interval": 21, "byDay": ["MO"]})["type"],
+                          m({"freq": "daily", "interval": 21, "byDay": ["MO"]})["interval"]), (1, 3))
+        # Sunday with another day every N > 1 weeks is fine every week.
+        self.assertEqual(m({"freq": "weekly", "interval": 1, "byDay": ["SU", "MO"]})["mask"], 3)
+        for bad, why in [({"freq": "daily", "interval": 3, "byDay": ["MO"]}, "every 3 days"),
+                         ({"freq": "weekly", "interval": 2, "byDay": ["SU", "MO"]}, "first day"),
+                         ({"freq": "yearly", "interval": 9}, "at most every 99 months"),
+                         ({"freq": "hourly"}, "freq"),
+                         ({"freq": "daily", "x": 1}, "not a Turma rule"),
+                         ({"freq": "monthly", "byDay": ["MO"]}, "daily or weekly"),
+                         ({"freq": "monthly", "byWeekday": {"n": 5, "day": "MO"}}, "byWeekday"),
+                         ({"freq": "daily", "count": 1000}, "1..999"),
+                         ({"freq": "daily", "until": "2027-02-30"}, "not a date"),
+                         ({"freq": "daily", "count": 2, "until": "2027-01-01"}, "not both"),
+                         ({"freq": "weekly", "byDay": ["MO", "MO"]}, "SU..SA"),
+                         ("daily", "not a Turma rule")]:
+            with self.assertRaisesRegex(cli.Refused, why, msg=bad):
+                m(bad)
+
+    def test_exceptions_are_typed_capped_and_refused_in_words(self):
+        up = self.cmd(1, "2026-11-03T09:00", "UTC", {"freq": "weekly", "interval": 1})
+        up["event"]["exceptions"] = {"2026-11-17T09:00:00Z": {"busy": "free", "joinUrl": "https://x.example/j",
+                                                              "start": "2026-11-17T10:00:00Z",
+                                                              "end": "2026-11-17T11:00:00Z"},
+                                     "2026-11-10T09:00:00Z": {"deleted": True}}
+        ex = cli.prepare_calendar_write(up)["event"]["exceptions"]
+        self.assertEqual(ex, [{"atMs": 1794301200000, "deleted": True},
+                              {"atMs": 1794906000000, "busy": 0, "body": "Join: https://x.example/j",
+                               "startMs": 1794909600000, "endMs": 1794913200000}])
+        for raw, why in [({"2026-11-10": {"deleted": True}}, "not readable"),
+                         ({"2026-11-10T09:00:00Z": "x"}, "not readable"),
+                         ({"2026-11-10T09:00:00Z": {"start": "2026-11-10T10:00:00Z"}}, "start/end"),
+                         ([], "not a map"),
+                         ({f"2026-11-10T09:00:{i % 60:02d}Z" if i < 60 else
+                           f"2026-11-11T09:00:{i % 60:02d}Z": {"deleted": True} for i in range(101)},
+                          "at most 100")]:
+            up["event"]["exceptions"] = raw
+            with self.assertRaisesRegex(cli.Refused, why, msg=raw):
+                cli.prepare_calendar_write(up)
 
 
 class WslConfReaderTest(unittest.TestCase):
