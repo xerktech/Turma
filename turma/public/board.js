@@ -2814,7 +2814,7 @@
   // where meta = {loading|error|projects,labels}, types = {loading|error|types}.
   // The New-ticket form's attachments row (XERK-2935): one chip per picked
   // file, uploaded to the hub as soon as it is picked, plus the picker button.
-  function createFilesHtml(files, note) {
+  function createFilesHtml(files, note, busy) {
     const list = files || [];
     const chips = list.map((f, i) => {
       const state = f.status === "uploading" ? " · uploading…"
@@ -2824,7 +2824,8 @@
           <button type="button" class="cf-file-x" data-cf-file-remove="${i}"
             aria-label="Remove ${esc(f.name)}">✕</button></span>`;
     }).join("");
-    const full = list.length >= CREATE_FILES_MAX;
+    // Disabled mid-create too: the create already took its upload list.
+    const full = list.length >= CREATE_FILES_MAX || !!busy;
     return `<div class="cf-field"><span>Attachments</span>
         <div class="cf-files">${chips}
           <button type="button" class="cf-btn cf-attach" data-cf-attach="1"${full ? " disabled" : ""}>📎 Attach files</button>
@@ -2916,7 +2917,7 @@
           <input type="text" data-cf-labels="1" list="cf-label-suggestions"
             placeholder="comma-separated ${esc(labelWord)}s" value="${esc(v.labels || "")}">
           <datalist id="cf-label-suggestions">${suggestions}</datalist></label>
-        ${createFilesHtml(files, s.filesNote)}
+        ${createFilesHtml(files, s.filesNote, s.busy)}
       </div>
       ${s.error ? `<div class="cf-note cf-err">Couldn't create — ${esc(s.error)}</div>` : ""}
       ${s.confirmDiscard
