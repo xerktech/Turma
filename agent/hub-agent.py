@@ -45503,6 +45503,15 @@ class SessionManager:
                 return
             if want is None:
                 self._cal_next_at = time.monotonic() + CALENDAR_SYNC_EVERY_SEC
+            else:
+                # A hub window covering the scheduled one (the reconnect sync)
+                # IS that read: without this a restart read Outlook twice. The
+                # hub sends it unrounded (now - 8w, now + 26w) while the default
+                # rounds out to Mondays, so a week of slack each side; the edge
+                # days it misses wait for the next scheduled read.
+                d = calendar_default_window(int(time.time() * 1000) if now_ms is None else now_ms)
+                if want[0] <= d[0] + CALENDAR_WEEK_MS and want[1] >= d[1] - CALENDAR_WEEK_MS:
+                    self._cal_next_at = time.monotonic() + CALENDAR_SYNC_EVERY_SEC
         try:
             if want is not None:
                 self._run_calendar_sync(*want, force=True, now_ms=now_ms)

@@ -57473,6 +57473,26 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         self.assertTrue(self.sm.build_payload(0)["calendar"]["write"])
         self.assertGreater(self.sm._cal_next_at, time.monotonic())
 
+    def test_xerk2984_a_reconnect_sync_counts_as_the_scheduled_read(self):
+        # The hub's reconnect window (server.js: now - 8w, now + 26w, unrounded)
+        # counts as the scheduled read: one read, not two. Mid-week, mid-day now.
+        now = self.MON + 3 * 86400000 + 5 * 3600000 + 123
+        hub = (now - 8 * self.WEEK, now + 26 * self.WEEK)
+        with mock.patch.object(self.sm, "_run_calendar_sync") as run:
+            for lag in (0, 60000):                            # the agent's clock a little later
+                self.sm._cal_next_at = 0
+                self.sm._cal_want = hub
+                self.sm._calendar_pass(now_ms=now + lag)
+                self.assertEqual(run.call_count, 1)
+                self.assertGreater(self.sm._cal_next_at, time.monotonic())
+                run.reset_mock()
+            self.sm._cal_next_at = 0                          # a narrow window does not
+            self.sm._cal_want = (self.MON, self.MON + self.WEEK)
+            self.sm._calendar_pass(now_ms=self.MON)
+            self.assertLessEqual(self.sm._cal_next_at, time.monotonic())
+            self.sm._calendar_pass(now_ms=self.MON)
+            self.assertEqual(run.call_count, 2)
+
     def test_the_pass_runs_a_hub_window_first_else_only_when_due(self):
         with mock.patch.object(self.sm, "_run_calendar_sync") as run:
             self.sm._cal_next_at = time.monotonic() + 600
