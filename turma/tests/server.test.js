@@ -35087,11 +35087,27 @@ test("XERK-2990: a holder whose Outlook fails a run keeps its copy for the re-ho
     // Outlook answers again: the owed write goes to the same holder.
     await beat2985(holder, S2985A);
     assert.equal(writes2985(holder).filter((x) => x.turmaId === id && x.version === 2).length, 1);
-    // Down past the grace: the holder gives the copy up (the clock jump leaves no
-    // online candidate, so it is owed and unassigned) and its old copy is a tombstone.
+    // A write that failed while Outlook was closed retries as soon as it is back,
+    // not after the hourly retry.
+    await beat2985(holder, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 2, op: "upsert",
+      ok: false, error: "classic Outlook is not open" }] });
+    assert.equal(rec2985(id).outlook[S2985A].state, "failed");
     await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
-    hub.calendarOutlookTick(Date.now() + hub.CALENDAR_WRITE_REHOME_MS + 1000, true);
-    assert.notEqual(rec2985(id).outlook[S2985A].host, holder);
+    const before = writes2985(holder).filter((x) => x.turmaId === id).length;
+    await beat2985(holder, S2985A);
+    assert.equal(writes2985(holder).filter((x) => x.turmaId === id).length, before + 1, "re-sent on Outlook's return");
+    assert.equal(rec2985(id).outlook[S2985A].state, "pending");
+    // Down past the grace, both hosts still beating: only the grace can move the copy.
+    await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
+    const t0 = Date.now();
+    hub.calendarOutlookTick(t0, true);   // first seen not writing
+    const later = t0 + hub.CALENDAR_WRITE_REHOME_MS + 1000;
+    hub.calendarOutlookTick(t0 + hub.CALENDAR_WRITE_REHOME_MS - 60e3, true);
+    assert.equal(rec2985(id).outlook[S2985A].host, holder, "kept inside the grace");
+    agents[holder].lastSeen = later;
+    agents[other].lastSeen = later;
+    hub.calendarOutlookTick(later, true);
+    assert.equal(rec2985(id).outlook[S2985A].host, other);
     assert.ok(hub.getCalendarOutlookTombstones()[holder].some((x) => x.turmaId === id));
   } finally {
     cleanup2985(D2985A, D2985A2);

@@ -6430,7 +6430,9 @@ function calendarOnBeat(key, prev, next, rows, now = Date.now(), writeRows = nul
   try {
     ingestCalendarWriteResults(key, writeRows, now);
     const wasWriter = prev && calWriteCapable(prev) && prev.lastSeen && now - prev.lastSeen <= OFFLINE_AFTER_MS;
+    if (calWriteCapable(next)) calWriteDownAt.delete(key);
     if (calWriteCapable(next) && !wasWriter) {
+      calOutlookRetryHost(key);
       calOutlookReconcileTenant(tenantOfKey(key), now);
       calOutlookFlushHost(key, now);
     }
@@ -7380,6 +7382,18 @@ function calWriteHolderDownOk(key, a, now) {
   if (!(a.calendar && a.calendar.available === true && a.calendar.write === false)) return false;
   if (!calWriteDownAt.has(key)) calMemoSet(calWriteDownAt, key, now);
   return now - calWriteDownAt.get(key) < CALENDAR_WRITE_REHOME_MS;
+}
+// A holder that starts writing again (Outlook back, or reconnected) retries what failed
+// while it was not (XERK-2990): a write sent just before its Outlook closed fails, and
+// the hourly retry would otherwise leave that edit out of Outlook for up to an hour.
+function calOutlookRetryHost(key) {
+  for (const e of Object.values(calendarTurmaEvents[tenantOfKey(key)] || {})) {
+    for (const x of Object.values((e && e.outlook) || {})) {
+      if (x && x.host === key && x.state === "failed") x.at = 0;
+    }
+  }
+  const prefix = `${key}\u0000`;
+  for (const [k, v] of calWriteSent) if (k.startsWith(prefix) && v && v.failed) calWriteSent.delete(k);
 }
 function calWriteHolderOk(key, t, org, now) {
   const a = agents[key];

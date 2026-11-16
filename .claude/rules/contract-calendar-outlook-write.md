@@ -42,6 +42,9 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - `write: false` (Outlook failed its last run: closed, restarting, a read timing out on a prompt)
     is kept distinct from absent by `normalizeCalendarCapability`. Re-homing on it at once moved a
     SENDING copy on one Outlook restart, cancelling and re-inviting every attendee (XERK-2990).
+  - When the holder reports `write: true` again, its `failed` copies retry at once
+    (`calOutlookRetryHost`): a write sent just before Outlook closed fails, and the hourly retry
+    left that edit out of Outlook for up to an hour.
     Tests: server.test.js "XERK-2990: a holder whose Outlook fails a run keeps its copy".
   - Org loss is judged on `decidedOrgOf` held for the same 2h (a brief drift re-homes nothing).
 
