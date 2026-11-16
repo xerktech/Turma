@@ -1740,7 +1740,8 @@ data class ThinkingBlock(val text: String = "", val truncated: Boolean = false) 
 /**
  * One file a SendUserFile call delivered, embedded on its tool_use block by the
  * agent for inline preview (XERK-221). [kind] is "image" (render [src] — a
- * data:/http(s) URI — as an <img>), "html" (render [html] in a sandboxed
+ * data:/http(s) URI — as an <img>), "video" (play [src], a base64 data:video URI),
+ * "html" (render [html] in a sandboxed
  * WebView), or "file" (a name-only chip: oversize/missing/non-renderable).
  */
 @Serializable

@@ -1810,7 +1810,7 @@
   }
   function actionKey(a, gk, idx) { return a.id ? ("act:" + a.id) : ("act:" + gk + ":" + idx); }
 
-  // SendUserFile inline previews (XERK-221): the image/SVG/HTML files a session
+  // SendUserFile inline previews (XERK-221): the image/SVG/video/HTML files a session
   // delivered, embedded on the block by the agent. An image renders through the
   // same <img> path as prose images (a data:image/svg+xml SVG in secure static
   // mode); an HTML page renders in a FULLY sandboxed iframe — `sandbox` with no
@@ -1819,6 +1819,59 @@
   // it can't break out of the attribute. A non-renderable/oversize file (kind
   // "file") shows as a name chip. The src scheme is re-checked here (defence in
   // depth) so only data:image/* and http(s) ever reach an <img>.
+  // A video's identity across repaints: cheap (never hashes megabytes of
+  // base64) yet distinct per clip — name, length and the payload's tail.
+  function videoKey(f) {
+    return String(f.name || "") + ":" + f.src.length + ":" + f.src.slice(-48);
+  }
+  // A full body repaint rebuilds every node, which restarted a playing clip on
+  // each new transcript line. Carry the existing <video> elements over; moving a
+  // media element within one task keeps it playing. A node is matched by the
+  // CARD it sits in (data-dkey = the tool call's id, data-uuid = the transcript
+  // entry's) plus its clip key, then by order within that card — never by clip
+  // alone: history can fold an OLDER
+  // copy of the same clip in ABOVE (or turn a shed chip there into a video),
+  // and an order-only match moved the playing node into that older message.
+  function videoSlot(v) {
+    const card = v.closest ? v.closest("[data-dkey]") : null;
+    return (card ? card.getAttribute("data-dkey") + "\u0000" + (card.getAttribute("data-uuid") || "") : "") +
+      "\u0000" + v.getAttribute("data-vkey");
+  }
+  function carryVideos(scroll, write) {
+    const old = new Map();
+    if (scroll.querySelectorAll) {
+      for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
+        const k = videoSlot(v);
+        if (!old.has(k)) old.set(k, []);
+        old.get(k).push(v);
+      }
+    }
+    write();
+    if (!old.size) return;
+    for (const v of scroll.querySelectorAll("video.md-video[data-vkey]")) {
+      const list = old.get(videoSlot(v));
+      const prev = list && list.shift();
+      if (prev && prev !== v) v.replaceWith(prev);
+    }
+  }
+  // A clip the browser can't decode (.mov or Theora .ogv in Chrome) shows the
+  // same name chip as any other file instead of a dead black player. Media
+  // `error` doesn't bubble, so listen in the capture phase.
+  if (typeof document !== "undefined" && document.addEventListener) {
+    document.addEventListener("error", (ev) => {
+      const v = ev.target;
+      if (!v || v.tagName !== "VIDEO" || !v.classList || !v.classList.contains("md-video")) return;
+      const chip = document.createElement("div");
+      chip.className = "tool-file file";
+      const span = document.createElement("span");
+      span.className = "tool-file-name";
+      span.textContent = "📎 " + (v.getAttribute("data-name") || "video") + " (this browser can't play it)";
+      chip.appendChild(span);
+      const fig = v.closest && v.closest("figure.tool-file");
+      (fig || v).replaceWith(chip);
+    }, true);
+  }
+
   function renderToolFiles(files, caption) {
     let out = '<div class="tool-files">';
     for (const f of files) {
@@ -1828,6 +1881,12 @@
         const svg = /^data:image\/svg\+xml/i.test(f.src);
         out += '<figure class="tool-file"><img class="md-img' + (svg ? " md-svg" : "") +
           '" src="' + esc(f.src) + '" alt="' + name + '"' + svgSizeAttrs(f.src) + ' loading="lazy">' +
+          '<figcaption>' + name + "</figcaption></figure>";
+      } else if (f.kind === "video" && typeof f.src === "string" && /^data:video\//i.test(f.src)) {
+        // A delivered clip plays inline. Only a data:video/* URI the agent built
+        // reaches src= (no remote fetch); preload=metadata keeps a long chat cheap.
+        out += '<figure class="tool-file"><video class="md-video" controls playsinline preload="metadata" data-vkey="' +
+          esc(videoKey(f)) + '" data-name="' + name + '" src="' + esc(f.src) + '" title="' + name + '"></video>' +
           '<figcaption>' + name + "</figcaption></figure>";
       } else if (f.kind === "html" && typeof f.html === "string") {
         out += '<figure class="tool-file"><iframe class="md-embed" sandbox referrerpolicy="no-referrer"' +
@@ -2410,8 +2469,10 @@
     // `display: contents` on both wrappers keeps them out of layout entirely, so
     // the bubbles stay direct flex children of the scroll and every align-self
     // (user right, agent left) still resolves against it.
-    scroll.innerHTML = '<div id="chatBody" style="display:contents">' + bodyHtml + "</div>" +
-      '<div id="chatLiveRegion" style="display:contents">' + liveHtml + "</div>";
+    carryVideos(scroll, () => {
+      scroll.innerHTML = '<div id="chatBody" style="display:contents">' + bodyHtml + "</div>" +
+        '<div id="chatLiveRegion" style="display:contents">' + liveHtml + "</div>";
+    });
     lastBodyHtml = bodyHtml;
     lastLiveHtml = liveHtml;
     // Stay pinned to the bottom while following along; otherwise hold the
@@ -4167,7 +4228,7 @@
   // in the browser (no `module`); the browser path uses window.TurmaChat above.
   if (typeof module !== "undefined" && module.exports) {
     module.exports = {
-      mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
+      carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
       agentsHtml, hasBackgroundAgents, backgroundBarVerb, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,

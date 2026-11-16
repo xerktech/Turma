@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
+const { carryVideos, mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -1375,6 +1375,58 @@ test("render: a preview DROPPED to fit says so; one that never rendered does not
   ])));
   assert.match(plainHtml, /📎 notes\.bin/);
   assert.doesNotMatch(plainHtml, /preview dropped/);
+});
+
+test("render: a SendUserFile video plays inline; a non-data src is a chip", () => {
+  const html = withVerbosity("normal", () => itemsToHtml(suItems([
+    { name: "clip.mp4", kind: "video", src: "data:video/mp4;base64,AAAA" },
+    { name: "evil.mp4", kind: "video", src: "https://ex.com/x.mp4" },
+    { name: "bad.mp4", kind: "video", src: "javascript:alert(1)" },
+  ])));
+  assert.match(html, /<video class="md-video" controls playsinline preload="metadata" data-vkey="clip\.mp4:[^"]*" data-name="clip\.mp4" src="data:video\/mp4;base64,AAAA"/);
+  assert.match(html, /📎 evil\.mp4/);
+  assert.match(html, /📎 bad\.mp4/);
+  assert.doesNotMatch(html, /javascript:alert|ex\.com/);
+});
+
+// carryVideos over a minimal DOM: each "video" knows its card (data-dkey) and
+// clip key; write() swaps in a fresh list, and replaceWith records the carry.
+function fakeVideoDom() {
+  const scroll = { vids: [] };
+  const mk = (dkey, vkey, tag) => {
+    const v = { tag, getAttribute: (a) => (a === "data-vkey" ? vkey : null),
+      closest: () => ({ getAttribute: (a) => (a === "data-dkey" ? dkey.split("#")[0] : dkey.split("#")[1] || "") }),
+      replaceWith(o) { const i = scroll.vids.indexOf(v); scroll.vids[i] = o; } };
+    return v;
+  };
+  scroll.querySelectorAll = () => scroll.vids.slice();
+  return { scroll, mk };
+}
+
+test("carryVideos: a playing clip stays the same node across a repaint, per card", () => {
+  const { scroll, mk } = fakeVideoDom();
+  const playing = mk("act:t2", "clip:9:x", "old-t2");
+  const other = mk("act:t1", "clip:9:x", "old-t1");
+  scroll.vids = [other, playing];
+  carryVideos(scroll, () => { scroll.vids = [mk("act:t1", "clip:9:x", "new-t1"), mk("act:t2", "clip:9:x", "new-t2")]; });
+  assert.deepEqual(scroll.vids.map((v) => v.tag), ["old-t1", "old-t2"]);
+});
+
+test("carryVideos: two cards sharing a tool id are told apart by their entry uuid", () => {
+  const { scroll, mk } = fakeVideoDom();
+  const playing = mk("act:t5#e2", "clip:9:x", "playing");
+  scroll.vids = [playing];
+  carryVideos(scroll, () => { scroll.vids = [mk("act:t5#e1", "clip:9:x", "older"), mk("act:t5#e2", "clip:9:x", "fresh")]; });
+  assert.deepEqual(scroll.vids.map((v) => v.tag), ["older", "playing"]);
+});
+
+test("carryVideos: an OLDER copy folded in above never takes the playing node", () => {
+  const { scroll, mk } = fakeVideoDom();
+  const playing = mk("act:t2", "clip:9:x", "playing");
+  scroll.vids = [playing];
+  // History adds an older message holding the SAME clip above it.
+  carryVideos(scroll, () => { scroll.vids = [mk("act:t0", "clip:9:x", "older"), mk("act:t2", "clip:9:x", "fresh")]; });
+  assert.deepEqual(scroll.vids.map((v) => v.tag), ["older", "playing"]);
 });
 
 test("render: a non-renderable / missing SendUserFile file is a name chip, not an image", () => {

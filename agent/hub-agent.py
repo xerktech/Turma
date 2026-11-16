@@ -1095,6 +1095,14 @@ SEND_FILE_IMG_MIME = {
     ".avif": "image/avif", ".bmp": "image/bmp", ".ico": "image/x-icon",
 }
 SEND_FILE_HTML_EXT = {".html", ".htm"}
+# Videos embed too, under their OWN larger cap: a short clip is megabytes, never
+# 512 KiB. 4 MiB raw is ~5.4 MiB base64, under HISTORY_MAX_BYTES (6 MiB), so a
+# delivered clip still rides one `history` reply instead of being shed from it.
+SEND_FILE_VIDEO_MAX_BYTES = _env_int("SESSION_SEND_FILE_VIDEO_MAX_BYTES", 4 << 20)
+SEND_FILE_VIDEO_MIME = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".ogv": "video/ogg",
+}
 # Terminal color/cursor codes sometimes make it into pasted transcript text;
 # strip them so a client only ever sees plain text.
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -11124,10 +11132,33 @@ def _tool_input_summary(inp):
     return str(inp)
 
 
+def _read_regular_file_bounded(path, cap):
+    """Up to cap+1 bytes of a REGULAR file, else None. Opened O_NONBLOCK and
+    checked by fstat, so a FIFO (or device) named like a media file the
+    session hands SendUserFile can't block the reader — a plain open() of a
+    FIFO hangs the beat / history worker with no exception to catch."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, left = [], cap + 1
+        while left > 0:
+            b = os.read(fd, min(left, 1 << 20))
+            if not b:
+                break
+            chunks.append(b)
+            left -= len(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _send_user_file_detail(inp):
     """Read the image/SVG/HTML files a SendUserFile call delivered and return a
     list of preview entries for its tool_use block (XERK-221), or None:
       image -> {"name", "kind":"image", "src": "data:<mime>;base64,<b64>"}
+      video -> {"name", "kind":"video", "src": "data:video/<x>;base64,<b64>"}
+                                         (up to SEND_FILE_VIDEO_MAX_BYTES)
       html  -> {"name", "kind":"html",  "html": "<markup>"}   (display:"render" only)
       else  -> {"name", "kind":"file"}   (attach-mode HTML, oversize, unreadable, or
                                           a non-renderable type — a bare name chip)
@@ -11147,16 +11178,17 @@ def _send_user_file_detail(inp):
         name = os.path.basename(path)
         ext = os.path.splitext(path)[1].lower()
         mime = SEND_FILE_IMG_MIME.get(ext)
+        vmime = SEND_FILE_VIDEO_MIME.get(ext)
         render_html = ext in SEND_FILE_HTML_EXT and display != "attach"
+        cap = SEND_FILE_VIDEO_MAX_BYTES if vmime else SEND_FILE_MAX_BYTES
         entry = {"name": name, "kind": "file"}
-        if mime or render_html:
+        if mime or vmime or render_html:
             try:
-                with open(path, "rb") as fh:
-                    data = fh.read(SEND_FILE_MAX_BYTES + 1)
-                if len(data) <= SEND_FILE_MAX_BYTES:
-                    if mime:
-                        entry = {"name": name, "kind": "image",
-                                 "src": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii"))}
+                data = _read_regular_file_bounded(path, cap)
+                if data is not None and len(data) <= cap:
+                    if mime or vmime:
+                        entry = {"name": name, "kind": "image" if mime else "video",
+                                 "src": "data:%s;base64,%s" % (mime or vmime, base64.b64encode(data).decode("ascii"))}
                     else:
                         entry = {"name": name, "kind": "html", "html": data.decode("utf-8", "replace")}
             except OSError:

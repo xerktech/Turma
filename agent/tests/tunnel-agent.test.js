@@ -145,6 +145,62 @@ test("entryBlocks: SendUserFile embeds image/SVG/HTML files, degrades the rest (
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+test("entryBlocks: SendUserFile embeds a video under its own cap, chips past it", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "suf-"));
+  const body = Buffer.alloc(600 * 1024); // over the 512 KiB IMAGE cap
+  fs.writeFileSync(path.join(dir, "clip.mp4"), body);
+  fs.writeFileSync(path.join(dir, "big.webm"), Buffer.alloc(4 * 1024 * 1024 + 1));
+  const [b] = entryBlocks(
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "SendUserFile",
+      input: { files: [path.join(dir, "clip.mp4"), path.join(dir, "big.webm")] } }] } }, BLOCK_CAPS);
+  assert.deepEqual(b.files, [
+    { name: "clip.mp4", kind: "video", src: "data:video/mp4;base64," + body.toString("base64") },
+    { name: "big.webm", kind: "file" },
+  ]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("entryBlocks: a FIFO named like a video is a chip, never a blocking read", () => {
+  if (process.platform === "win32") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "suf-"));
+  const fifo = path.join(dir, "x.mp4");
+  require("child_process").execFileSync("mkfifo", [fifo]);
+  const [b] = entryBlocks(
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t1", name: "SendUserFile",
+      input: { files: [fifo] } }] } }, BLOCK_CAPS);
+  assert.deepEqual(b.files, [{ name: "x.mp4", kind: "file" }]);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("SendUserFile video MIME map and cap match hub-agent.py", () => {
+  const py = fs.readFileSync(path.join(__dirname, "..", "hub-agent.py"), "utf8");
+  const js = fs.readFileSync(path.join(__dirname, "..", "tunnel-agent.js"), "utf8");
+  const pairs = (src, re) => {
+    const body = src.match(re)[1];
+    return [...body.matchAll(/"(\.[a-z0-9]+)":\s*"([^"]+)"/g)].map((m) => m[1] + "=" + m[2]).sort();
+  };
+  assert.deepEqual(pairs(py, /SEND_FILE_VIDEO_MIME = \{([^}]*)\}/), pairs(js, /const SEND_FILE_VIDEO_MIME = \{([^}]*)\}/));
+  assert.match(py, /_env_int\("SESSION_SEND_FILE_VIDEO_MAX_BYTES", 4 << 20\)/);
+  assert.match(js, /SESSION_SEND_FILE_VIDEO_MAX_BYTES\) \|\| 4 \* 1024 \* 1024/);
+});
+
+test("live tail: a frame over budget sheds the OLDEST entries' file payloads first", () => {
+  const { shedFrameToBudget } = require("../tunnel-agent.js");
+  const big = "data:video/mp4;base64," + "A".repeat(1000);
+  const mk = (id) => ({ id, role: "assistant", blocks: [{ t: "tool_use", name: "SendUserFile",
+    files: [{ name: id + ".mp4", kind: "video", src: big }] }] });
+  const entries = [mk("a"), mk("b"), mk("c")];
+  const one = JSON.stringify(entries[0]).length;
+  shedFrameToBudget(entries, one * 2 + 400);
+  assert.deepEqual(entries[0].blocks[0].files, [{ name: "a.mp4", kind: "file", shed: true }]);
+  assert.equal(entries[1].blocks[0].files[0].src, big);
+  assert.equal(entries[2].blocks[0].files[0].src, big);
+  // Under budget: untouched.
+  const keep = [mk("d")];
+  shedFrameToBudget(keep, 1 << 20);
+  assert.equal(keep[0].blocks[0].files[0].src, big);
+});
+
 test("entryBlocks: over-cap text/result get truncated:true and are clipped", () => {
   const big = "x".repeat(BLOCK_CAPS.text + 500);
   const [tb] = entryBlocks({ type: "assistant", message: { content: big } }, BLOCK_CAPS);
@@ -2196,6 +2252,40 @@ test("control channel: a hub that never app-pings is left alone (no reconnect lo
   } finally {
     child.kill();
     hub.srv.close();
+  }
+});
+
+// The budget must be WIRED into pollWatcher (a test of the helper alone stayed
+// green with the call deleted), and measured in bytes: CJK HTML is ~3x its
+// character count, and the hub's ws ceiling counts bytes.
+test("watch -> frame: the live tail sheds to its BYTE budget (multibyte HTML)", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wire-"));
+  const work = path.join(dir, "wt");
+  fs.mkdirSync(work, { recursive: true });
+  const proj = path.join(PROJECTS_ROOT, mod.projectSlug(work));
+  fs.mkdirSync(proj, { recursive: true });
+  const tid = "21111111-2222-3333-4444-555555555555";
+  const html = path.join(dir, "page.html");
+  fs.writeFileSync(html, "漢".repeat(3000)); // 3000 chars, 9000 bytes
+  const send = (id) => JSON.stringify({ type: "assistant", uuid: id, message: { content: [
+    { type: "tool_use", id: "t" + id, name: "SendUserFile", input: { files: [html], display: "render" } }] } });
+  fs.writeFileSync(path.join(proj, `${tid}.jsonl`), [send("a1"), send("a2")].join("\n") + "\n");
+  const frames = [];
+  mod.__setControlSink((o) => { frames.push(o); return true; });
+  mod.__setFrameBudget(12000); // one entry's BYTES fit, two don't; by chars both would
+  try {
+    mod.startWatch("sess-budget", work, tid);
+    const tail = frames.find((f) => f.tail === "sess-budget");
+    assert.ok(tail, "a tail frame was emitted");
+    const files = tail.entries.map((e) => e.blocks[0].files[0]);
+    assert.deepEqual(files[0], { name: "page.html", kind: "file", shed: true });
+    assert.equal(files[1].kind, "html");
+  } finally {
+    mod.stopWatch("sess-budget");
+    mod.__setControlSink(null);
+    mod.__setFrameBudget(8 * 1024 * 1024);
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

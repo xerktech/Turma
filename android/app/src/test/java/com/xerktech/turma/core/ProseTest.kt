@@ -699,6 +699,15 @@ class ProseTest {
             assertTrue(src, !isPreviewImageSrc(src))
     }
 
+    @Test fun `a SendUserFile video plays only from a base64 data video URI`() {
+        val (bytes, ext) = previewVideoData("data:video/mp4;base64,AAECAw==")!!
+        assertEquals(listOf<Byte>(0, 1, 2, 3), bytes.toList())
+        assertEquals("mp4", ext)
+        assertEquals("webm", previewVideoData("DATA:VIDEO/WEBM;base64,AA==")!!.second)
+        for (src in listOf("https://x.y/a.mp4", "data:video/mp4,raw", "data:video/mp4;base64,", "data:video/mp4;base64,@@", "javascript:x"))
+            assertTrue(src, previewVideoData(src) == null)
+    }
+
     // Expose parseInline for the linkify/inline-code cases (it's file-private).
     private fun parseInlineOnly(text: String): List<Span> = paras(text).single().spans
 }
