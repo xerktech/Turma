@@ -1925,3 +1925,43 @@ test("XERK-2992: the feed section mints a link shown once, per org, escaped, and
     globalThis.location = { href: "" };
   }
 });
+
+test("XERK-2987: each org's Outlook copy on the panel, escaped; the block marks failed/pending; an older hub reads as before", () => {
+  // An older hub serves no `outlook`: no state, the old wording, no mark.
+  assert.equal(cal.outlookStates(tev()), null);
+  assert.equal(cal.outlookMark(tev()), "");
+  assert.match(cal.detailHtml(tev(), NOW), /Made in Turma — not on Outlook/);
+  assert.ok(!/>Outlook<\/span>/.test(cal.detailHtml(tev(), NOW)));
+  // An Outlook event never reads an `outlook` field as its own state.
+  assert.equal(cal.outlookStates({ source: "outlook", org: "acme", outlook: { acme: { state: "failed" } } }), null);
+  const ev = tev({ outlook: {
+    acme: { state: "failed", error: "<b>Outlook</b> is not open", at: 1 },
+    globex: { state: "pending", noHost: true, at: 1 },
+  } });
+  assert.deepEqual(cal.outlookStates(ev).map((x) => [x.org, x.state, x.text]),
+    [["acme", "failed", "Failed: <b>Outlook</b> is not open"], ["globex", "nohost", "No Outlook host for this org"]]);
+  const h = cal.detailHtml(ev, NOW);
+  assert.match(h, /Calendar<\/span><span class="v">Made in Turma<\/span>/);
+  assert.match(h, /<span class="cal-olk-row failed">acme: Failed: &lt;b&gt;Outlook&lt;\/b&gt; is not open<\/span>/);
+  assert.match(h, /<span class="cal-olk-row nohost">globex: No Outlook host for this org<\/span>/);
+  assert.ok(!h.includes("<b>Outlook"), "Outlook's words are escaped");
+  assert.ok(!/data-olk-retry|Retry/.test(h), "no retry route exists: the next edit retries");
+  assert.equal(cal.outlookMark(ev), "failed");
+  // Written and writing; one org drops the org prefix; a re-created copy says so.
+  const one = tev({ orgs: ["acme"], outlook: { acme: { state: "written", recreatedAt: 5, at: 5 } } });
+  assert.match(cal.detailHtml(one, NOW), /<span class="cal-olk-row written">In Outlook \(re-created after it was deleted there\)<\/span>/);
+  assert.equal(cal.outlookMark(one), "");
+  const writing = tev({ outlook: { acme: { state: "written", at: 1 }, globex: { state: "pending", at: 1 } } });
+  assert.equal(cal.outlookMark(writing), "pending");
+  assert.match(cal.detailHtml(writing, NOW), /globex: Writing…/);
+  // No host alone never marks the block (it may wait forever).
+  assert.equal(cal.outlookMark(tev({ outlook: { acme: { state: "pending", noHost: true }, globex: { state: "written" } } })), "");
+});
+
+test("XERK-2987: the block wears the mark and says it aloud", () => withOrgs(async () => {
+  replies = { "/api/calendar": () => ({ hosts: [], events: [tev({ outlook: { acme: { state: "failed", error: "x" }, globex: { state: "written" } } })] }) };
+  cal.refetch();
+  const html = await show(at(2027, 5, 4));
+  assert.match(html, /<span class="cal-olk failed" aria-hidden="true"[^>]*>!<\/span>/);
+  assert.match(html, /aria-label="Joint planning,[^"]*Turma event, an Outlook copy failed/);
+}));

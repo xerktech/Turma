@@ -50,6 +50,9 @@ Python side in `.claude/rules/agent.md`.
   state the chat's `/history` repair was gated OUT of. The hub turns it into `{type:"watch",
   armed:false, reason}` for the viewer (`turma-sessions.md`).
 - Tests: the `live tail:` cases in `tunnel-agent.test.js`.
+- **The tail also merges the bridge mod's `unsaved.json`** (`mergeUnsaved`, XERK-2959): rows
+  Claude Code holds back from the transcript while an AskUserQuestion waits. Rules:
+  `agent-bridge-mod.md` ("Rows Claude Code has not written yet").
 
 ### Control-channel liveness
 

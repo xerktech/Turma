@@ -34,6 +34,15 @@ import type { Register, EngineInterface } from 'claude-code'
 //    agent writes beside its requests (`status.json`), and a wake through the
 //    session CLI (TURMA_SESSION_CLI), which validates it.
 //
+// 5. It mirrors the current turn's conversation rows to `unsaved.json` beside
+//    the agent's requests (XERK-2959). Claude Code holds a response's rows
+//    back from the transcript file until every tool call in that response has
+//    finished, so while an AskUserQuestion waits on the operator its text, the
+//    SendUserFile beside it and that file's result are on screen but in no
+//    file. The engine hands each row to `session.append` as it keeps it, under
+//    the uuid the transcript later files it by, so the chat merges this file's
+//    rows by uuid until the transcript catches up.
+//
 // It draws nothing: a band or status entry would change the pane the agent's
 // parsers read. Writes are chained so they land in event order, and never
 // awaited by a hook, so a slow disk cannot hold a turn.
@@ -51,6 +60,8 @@ type Writer = {
   lastRename: number
   submitting: boolean
   lastSubmit: number
+  // This turn's rows as unsaved.json carries them, each already serialized.
+  rows: string[]
 }
 
 const NAME_MAX = 200
@@ -62,6 +73,49 @@ const POLL_MS = 2000
 // The longest machine message the mod submits: Turma's are a few hundred
 // characters; this bounds what a session-writable file can put in a turn.
 const SUBMIT_MAX = 20000
+// unsaved.json's bounds: a row past ROW_MAX (a large image a tool read back) is
+// left out, and the oldest rows go first past ROWS_MAX or UNSAVED_MAX bytes.
+// The agent's readers refuse a file past 4 MiB (UNSAVED_MAX_BYTES).
+const ROW_MAX = 256 * 1024
+const ROWS_MAX = 60
+const UNSAVED_MAX = 1024 * 1024
+const UNSAVED_DOORS = new Set(['prompt', 'response', 'tool-result', 'tool-message'])
+
+// Write this turn's rows (whole file, on the write chain, never awaited by a
+// hook). `claudeSessionId` binds them: a `/clear` or a nested claude says
+// nothing about the pinned conversation.
+function publishRows($: EngineInterface, w: Writer) {
+  const rows = w.rows.slice()
+  w.chain = w.chain
+    .then(async () => {
+      const dir = await $.env.get('TURMA_MOD_REQUESTS')
+      if (!dir) return
+      const claudeSessionId = await $.session.id()
+      const body = `{"v":1,"claudeSessionId":${JSON.stringify(claudeSessionId)},"rows":[${rows.join(',')}]}`
+      await $.fs.write(`${dir}/unsaved.json`, body)
+    })
+    .catch(() => undefined)
+}
+
+// Keep one row the engine just stored. Main loop only: a subagent's rows live
+// in its own transcript.
+function keepRow($: EngineInterface, w: Writer, e: any, at: number) {
+  if (e.agentId !== undefined || !UNSAVED_DOORS.has(e.door)) return
+  const m = e.message
+  if (!m || (m.type !== 'user' && m.type !== 'assistant') || !Array.isArray(m.content)) return
+  if (typeof e.uuid !== 'string' || !e.uuid) return
+  const row = JSON.stringify({
+    type: m.type,
+    uuid: e.uuid,
+    timestamp: new Date(at).toISOString(),
+    message: { role: m.role || m.type, content: m.content },
+  })
+  if (row.length > ROW_MAX) return
+  w.rows.push(row)
+  let size = w.rows.reduce((n, r) => n + r.length + 1, 0)
+  while (w.rows.length > ROWS_MAX || size > UNSAVED_MAX - 200) size -= w.rows.shift()!.length + 1
+  publishRows($, w)
+}
 
 function publish($: EngineInterface, w: Writer, turn: Turn, turnId: string | null) {
   const seq = ++w.seq
@@ -462,12 +516,14 @@ async function turmaText($: EngineInterface, args: string): Promise<string> {
 export const register: Register = on => {
   const w: Writer = {
     chain: Promise.resolve(), seq: 0, turn: 'idle', stopped: false, renaming: false, lastRename: 0,
-    submitting: false, lastSubmit: 0,
+    submitting: false, lastSubmit: 0, rows: [],
   }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     publish($, w, 'idle', null)
+    w.rows = []
+    publishRows($, w)
     $.clock.every(POLL_MS, () => void pollRename($, w).catch(() => { w.renaming = false }))
     $.clock.every(POLL_MS, () => void pollSubmit($, w).catch(() => { w.submitting = false }))
     void $.command
@@ -488,6 +544,26 @@ export const register: Register = on => {
     if (e.agentId === undefined) {
       w.stopped = false
       publish($, w, 'running', e.turnId)
+      // A new turn: the last one's rows are in the transcript by now. Written
+      // at once: a tail window the new turn's attachments fill holds no message
+      // to judge the old rows against, and they would show again.
+      w.rows = []
+      publishRows($, w)
+    }
+    return result
+  })
+
+  // Present from 2.1.304 (BRIDGE_MOD_MIN_CLAUDE) on, verified on 2.1.304 and
+  // 2.1.325. The engine checks event names when it compiles this module, so an
+  // unknown one fails the whole mod: a try/catch here could not guard it.
+  on('session.append', async ($, e, next) => {
+    const at = Date.now()
+    const result = await next(e)
+    // `result` is the row as stored; a refused plugin note has no message.
+    try {
+      keepRow($, w, { ...e, message: (result as any)?.message || e.message }, at)
+    } catch {
+      // never fail the engine's append over the mirror
     }
     return result
   })

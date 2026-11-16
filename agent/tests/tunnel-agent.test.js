@@ -3582,3 +3582,68 @@ test("scanAgentEntry: a launch parked by an earlier interim expires on its clock
   assert.equal(liveAgentsReport(st, exp - 1).length, 1);
   assert.deepEqual(liveAgentsReport(st, exp), []);
 });
+
+// XERK-2959: while an AskUserQuestion waits, Claude Code has not written that
+// response's rows (its text, a SendUserFile beside it and the file's result);
+// the bridge mod mirrors them to unsaved.json and the live tail shows them.
+test("XERK-2959: the live tail shows the bridge mod's unsaved rows until the transcript files them", () => {
+  const { mergeUnsaved, unsavedPath } = require("../tunnel-agent.js");
+  const wt = "/wt/xerk2959";
+  const dir = writeTranscript(wt, "conv-9.jsonl", [
+    { uuid: "p1", type: "user", timestamp: "2026-11-16T02:37:09.000Z", message: { content: "show me" } },
+    { uuid: "a1", type: "assistant", timestamp: "2026-11-16T02:37:12.000Z",
+      message: { content: [{ type: "text", text: "Working on it" }] } },
+  ]);
+  const reqDir = fs.mkdtempSync(path.join(os.tmpdir(), "unsaved-"));
+  const file = path.join(reqDir, "unsaved.json");
+  const rows = [
+    // Filed already (in the tail): never twice.
+    { type: "assistant", uuid: "a1", timestamp: "2026-11-16T02:37:12.000Z",
+      message: { role: "assistant", content: [{ type: "text", text: "Working on it" }] } },
+    { type: "assistant", uuid: "a2", timestamp: "2026-11-16T02:37:46.700Z",
+      message: { role: "assistant", content: [{ type: "text", text: "Here is the screenshot" }] } },
+    { type: "assistant", uuid: "a3", timestamp: "2026-11-16T02:37:46.729Z",
+      message: { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "AskUserQuestion",
+        input: { questions: [{ question: "Looks right?", options: [{ label: "Yes" }, { label: "No" }] }] } }] } },
+  ];
+  fs.writeFileSync(file, JSON.stringify({ v: 1, claudeSessionId: "conv-9", rows }));
+  const cache = {};
+  let tail = transcriptTail(wt, cache, "conv-9", null, file).entries;
+  assert.deepEqual(tail.map((e) => e.id), ["p1", "a1", "a2", "a3"]);
+  assert.equal(tail[2].text, "Here is the screenshot");
+  assert.equal(tail[3].blocks[0].name, "AskUserQuestion");
+  // Another conversation's file (a /clear) adds nothing.
+  fs.writeFileSync(file, JSON.stringify({ v: 1, claudeSessionId: "other", rows }));
+  assert.deepEqual(transcriptTail(wt, cache, "conv-9", null, file).entries.map((e) => e.id), ["p1", "a1"]);
+  // The transcript files them: each row once, in transcript order.
+  fs.writeFileSync(file, JSON.stringify({ v: 1, claudeSessionId: "conv-9", rows }));
+  fs.appendFileSync(path.join(dir, "conv-9.jsonl"), JSON.stringify(rows[1]) + "\n" + JSON.stringify(rows[2]) + "\n");
+  tail = transcriptTail(wt, cache, "conv-9", null, file).entries;
+  assert.deepEqual(tail.map((e) => e.id), ["p1", "a1", "a2", "a3"]);
+  // A row older than the tail's newest message was filed and has scrolled out
+  // of the window: it must not come back at the end.
+  const older = { type: "assistant", uuid: "gone", timestamp: "2026-11-16T02:00:00.000Z",
+    message: { role: "assistant", content: [{ type: "text", text: "old" }] } };
+  assert.deepEqual(mergeUnsaved([{ uuid: "x", type: "user", timestamp: "2026-11-16T02:37:09.000Z" }],
+    { v: 1, claudeSessionId: "c", rows: [older] }, "c"), []);
+  // Malformed docs and rows add nothing; a planted link is never followed.
+  assert.deepEqual(mergeUnsaved([], { v: 2, claudeSessionId: "c", rows: [rows[1]] }, "c"), []);
+  assert.deepEqual(mergeUnsaved([], { v: 1, claudeSessionId: "c", rows: [{ type: "assistant", uuid: "z" }, null, 7] }, "c"), []);
+  const link = path.join(reqDir, "link.json");
+  fs.symlinkSync(file, link);
+  assert.deepEqual(transcriptTail(wt, null, "conv-9", null, link).entries.map((e) => e.id), ["p1", "a1", "a2", "a3"]);
+  fs.writeFileSync(path.join(dir, "conv-9.jsonl"), fs.readFileSync(path.join(dir, "conv-9.jsonl"), "utf8").split("\n").slice(0, 2).join("\n") + "\n");
+  assert.deepEqual(transcriptTail(wt, null, "conv-9", null, link).entries.map((e) => e.id), ["p1", "a1"]);
+  // A FIFO planted at the name is refused at once, never blocking the loop.
+  if (process.platform !== "win32") {
+    const { readUnsaved } = require("../tunnel-agent.js");
+    const fifo = path.join(reqDir, "fifo.json");
+    require("child_process").execFileSync("mkfifo", [fifo]);
+    const t0 = Date.now();
+    assert.equal(readUnsaved(fifo), null);
+    assert.ok(Date.now() - t0 < 1000);
+  }
+  // Only a plain session id names a file.
+  assert.equal(unsavedPath("../etc"), null);
+  assert.match(unsavedPath("abc-1"), /mod-requests[\\/]abc-1[\\/]unsaved\.json$/);
+});

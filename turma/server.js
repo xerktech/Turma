@@ -7694,6 +7694,8 @@ function calOutlookWire(outlook, served) {
     const e = outlook && Object.hasOwn(outlook, org) ? outlook[org] : null;
     if (!e) continue;
     const w = { state: e.state };
+    // No online writer of that org holds the copy (XERK-2987): clients say so instead of "Writing…".
+    if (!e.host && e.state !== "written") w.noHost = true;
     if (e.error) w.error = e.error;
     if (e.recreatedAt) w.recreatedAt = e.recreatedAt;
     w.at = e.at;

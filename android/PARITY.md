@@ -249,6 +249,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   - An event of several orgs is ONE block with a "+N" mark, its detail naming every org; the hub's
     `?org=` filter matches any of them. Edit / Delete only on a Turma event served `editable:true`
     with a `version` (absent = an older hub, read-only); Outlook events are unchanged.
+  - Each org's Outlook copy (XERK-2987): the detail names it per org ("In Outlook" / "Writing…" /
+    "Failed: <Outlook's words>" / "No Outlook host for this org"), and the block wears "!" (failed)
+    or "…" (writing). No Retry on either client (the hub has no retry route; the next edit retries).
+    An older hub's event (no `outlook`) keeps "Made in Turma — not on Outlook".
   - A 409 (changed since opened) shows the hub's words and reloads the editor from the event it
     carries. Both clients send the same body (`core/CalendarEvents.kt` `calDraftPayload` ↔ the
     web editor's save).

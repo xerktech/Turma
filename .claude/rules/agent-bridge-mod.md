@@ -106,6 +106,33 @@ every Claude launch loads with `--plugin-dir`. Roadmap for what else rides it: X
   resend). The mod's text cap is `SUBMIT_MAX` (20000), matching `MOD_SUBMIT_MAX`.
 - The chat shows it as a Turma message, frame stripped (`_plugin_message`, `agent-entry-blocks.md`).
 
+## Rows Claude Code has not written yet (XERK-2959)
+
+- **Claude Code files a response's rows only once every tool call in it has finished**
+  (measured, 2.1.325). While `ask.py` blocks an AskUserQuestion, that response's text, a
+  SendUserFile beside it and the file's result are on screen and in NO transcript, so the
+  chat showed none of it until the answer.
+- The mod mirrors the current main-loop turn's `user`/`assistant` rows from `session.append`
+  (fires as the engine keeps a row, under the uuid the transcript later files it by) to
+  `unsaved.json` in `TURMA_MOD_REQUESTS`: `{v:1, claudeSessionId, rows:[transcript-shaped]}`.
+  Reset each main `turn.start`; a row past 256 KiB is left out, the oldest go past 60 / 1 MiB.
+- Readers: `transcriptTail` (`tunnel-agent.js`, the live tail) and `transcript_tail` /
+  `_history_entries` (`hub-agent.py`), via `mergeUnsaved` ↔ `_merge_unsaved` (a parity pair).
+  A row rides only for the pinned conversation, with a uuid not already read, and no OLDER
+  than the newest message read — else a filed row the 128 KB window dropped would come back
+  at the end. Display only: never folded into the live-agent or PR scans.
+- Read as a session-written file (`O_NOFOLLOW|O_NONBLOCK`, regular, ≤4 MiB); a launch clears
+  it with the request dir.
+- **`session.append` exists from `BRIDGE_MOD_MIN_CLAUDE` (2.1.304) on** (QA-verified there and
+  on 2.1.325). The engine checks event names when it COMPILES the module: an unknown one fails
+  the WHOLE mod (turn state, rename, submit). Never raise the event set without a floor bump;
+  a try/catch around `on()` guards nothing.
+- **`turn.start` writes the emptied file at once**: right after a prompt, 2.1.325's attachment
+  and request-shape rows can fill the 128 KB tail window, leaving no message to judge the old
+  turn's rows against, and they showed again.
+- Tests: the `XERK-2959` cases in `bridge-mod.test.js`, `tunnel-agent.test.js`,
+  `TestUnsavedRows` (`test_hub_agent.py`).
+
 ## `/turma` commands (XERK-2131 task 3)
 
 - The mod registers `/turma` (`immediate`, so it answers mid-turn): `peers` (the roster at
