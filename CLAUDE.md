@@ -111,6 +111,8 @@ Each spans components; the rule lives in the named file, which loads when any si
 - **The Calendar**: the `calendarSync` outbox, `syncCalendar` command, event whitelist and
   `GET /api/calendar` (XERK-2891); holiday catalogs + per-org days off (XERK-2892) →
   `contract-calendar.md`.
+- **Turma-created and recurring events** (XERK-2967, XERK-2969): store, routes, scopes, expansion
+  → `contract-calendar-turma.md`.
 - **"Working" is `paneBusy` OR live background WORK** (XERK-245, XERK-1570) → `session-working.md`.
 
 ## Conventions

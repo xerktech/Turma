@@ -489,3 +489,18 @@ test("XERK-1598: a refusal of a SMALL unread body keeps the connection", async (
   assert.doesNotMatch(got, /\r\nconnection: close\r\n/i, "a small refused body does not close");
   assert.match(got, /HTTP\/1\.1 200 /, "the same socket served the next request");
 });
+
+test("XERK-2953: a budget 503 reports what is actually held, the big lane included", async () => {
+  for (let i = 0; i < 80 && hub.bodyInflightHeld(); i++) await sleep(25);
+  const holder = await holdBigLane();
+  try {
+    const r = await postWhileWriting(7 << 20);
+    assert.match(r.got, /^HTTP\/1\.1 503 /);
+    const body = JSON.parse(r.got.match(/\{"error"[^}]*\}/)[0]);
+    // Only the big lane is held: the shared budget alone read 0.
+    assert.ok(body.held > hub.BODY_INFLIGHT_TOTAL_MAX, `held ${body.held} while another body holds the big lane`);
+    assert.equal(body.limit, hub.BODY_INFLIGHT_TOTAL_MAX);
+  } finally {
+    holder.destroy();
+  }
+});

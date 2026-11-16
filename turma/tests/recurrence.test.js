@@ -168,3 +168,37 @@ test("XERK-2969: the cached zone offset equals Intl's at every minute around eac
   }
   assert.ok(checked > 5000);
 });
+
+test("XERK-2953: reanchorDays moves an explicit day with a moved anchor, so it is an occurrence of its own rule", () => {
+  // 2027-07-31 is a Saturday, 2027-07-30 a Friday.
+  assert.deepEqual(r.reanchorDays({ freq: "monthly", interval: 1, byMonthDay: 31 }, "2027-07-31", "2027-07-30"),
+    { freq: "monthly", interval: 1, byMonthDay: 30 });
+  // byDay shifts by the weekday delta, across the week's end too (Sat -> Sun is +1).
+  assert.deepEqual(r.reanchorDays({ freq: "weekly", interval: 1, byDay: ["MO", "WE"] }, "2027-07-26", "2027-07-27").byDay, ["TU", "TH"]);
+  assert.deepEqual(r.reanchorDays({ freq: "weekly", interval: 1, byDay: ["FR", "SA"] }, "2027-07-31", "2027-08-01").byDay, ["SU", "SA"]);
+  assert.deepEqual(r.reanchorDays({ freq: "daily", interval: 1, byDay: ["MO", "TU", "WE", "TH", "FR"] }, "2027-07-30", "2027-07-23").byDay,
+    ["MO", "TU", "WE", "TH", "FR"], "a whole-week move keeps the days");
+  // byWeekday: the new date's weekday and nth; a 5th is the last; "last" stays last when it still is.
+  assert.deepEqual(r.reanchorDays({ freq: "monthly", interval: 1, byWeekday: { n: 2, day: "TU" } }, "2027-07-13", "2027-07-14").byWeekday,
+    { n: 2, day: "WE" });
+  assert.deepEqual(r.reanchorDays({ freq: "monthly", interval: 1, byWeekday: { n: 4, day: "TU" } }, "2027-07-27", "2027-07-29").byWeekday,
+    { n: -1, day: "TH" });
+  assert.deepEqual(r.reanchorDays({ freq: "monthly", interval: 1, byWeekday: { n: -1, day: "TU" } }, "2027-07-27", "2027-07-26").byWeekday,
+    { n: -1, day: "MO" });
+  assert.deepEqual(r.reanchorDays({ freq: "monthly", interval: 1, byWeekday: { n: -1, day: "TU" } }, "2027-07-27", "2027-07-20").byWeekday,
+    { n: 3, day: "TU" });
+  // Implicit days and same-date edits are left alone.
+  assert.equal(r.reanchorDays({ freq: "monthly", interval: 1 }, "2027-07-31", "2027-07-30").byMonthDay, undefined);
+  const same = { freq: "monthly", interval: 1, byMonthDay: 31 };
+  assert.equal(r.reanchorDays(same, "2027-07-31", "2027-07-31"), same);
+  // Every re-anchored rule names its new anchor as an occurrence.
+  for (const [rule, from, to] of [[{ freq: "monthly", interval: 1, byMonthDay: 31 }, "2027-07-31", "2027-07-30"],
+    [{ freq: "weekly", interval: 2, byDay: ["MO", "WE"] }, "2027-07-26", "2027-07-24"],
+    [{ freq: "yearly", interval: 1, byWeekday: { n: -1, day: "FR" } }, "2027-07-30", "2027-07-28"]]) {
+    const re = r.sanitizeRule(r.reanchorDays(rule, from, to));
+    const s = series(`${to}T09:00:00Z`, `${to}T10:00:00Z`, re, "UTC");
+    assert.equal(keys(s, s.startMs, Infinity, 1)[0], `${to}T09:00:00Z`, JSON.stringify(re));
+  }
+  assert.equal(r.sameDays(r.sanitizeRule({ freq: "weekly", byDay: ["WE", "MO"] }), r.sanitizeRule({ freq: "weekly", byDay: ["MO", "WE"] })), true);
+  assert.equal(r.sameDays({ freq: "monthly", interval: 1 }, { freq: "monthly", interval: 1, byMonthDay: 3 }), false);
+});

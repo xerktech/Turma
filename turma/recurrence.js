@@ -1,7 +1,7 @@
 "use strict";
 // Recurring Turma events (XERK-2969): the rule whitelist and its expansion.
 // Pure: no server state, no dependency (zone math is Intl). Contract:
-// .claude/rules/contract-calendar.md ("Recurring Turma events").
+// .claude/rules/contract-calendar-turma.md ("Recurring Turma events").
 //
 // A series is its record's first instance (the ANCHOR: start, end, timeZone)
 // plus a rule. Occurrences keep the anchor's WALL-CLOCK start and length in the
@@ -248,10 +248,39 @@ function occurrenceAt(series, key) {
   const [o] = occurrences(series, ms, ms + 1, 1);
   return o && o.key === key ? o : null;
 }
+// Whether stored rules `a` and `b` name the same EXPLICIT days (byDay, byMonthDay,
+// byWeekday; absent = the anchor's). Both through sanitizeRule, so byDay order agrees.
+const DAY_FIELDS = ["byDay", "byMonthDay", "byWeekday"];
+const sameDays = (a, b) => !!a && !!b && DAY_FIELDS.every((k) => JSON.stringify(a[k]) === JSON.stringify(b[k]));
+// `rule` with its EXPLICIT day moved along with an anchor moved from local date `from`
+// to `to` (YYYY-MM-DD), so the moved first instance is an occurrence of its own rule:
+// - byDay shifts every day by the move's weekday delta (the pattern moves, as re-timing
+//   a series moves it): MO,WE moved Monday -> Tuesday is TU,TH.
+// - byMonthDay takes the new date's day of month.
+// - byWeekday takes the new date's weekday and its nth (5th = last; a "last" rule stays
+//   last when the new date is its month's last such weekday).
+// An implicit day already reads off the anchor; a same-date move changes nothing.
+function reanchorDays(rule, from, to) {
+  const a = dateDay(from), b = dateDay(to);
+  if (!isObj(rule) || !Number.isFinite(a) || !Number.isFinite(b) || a === b) return rule;
+  const out = { ...rule };
+  if (Array.isArray(rule.byDay)) {
+    const shift = (((b - a) % 7) + 7) % 7;
+    out.byDay = DAYS.filter((_, i) => rule.byDay.includes(DAYS[(i - shift + 7) % 7]));
+  }
+  const dom = Number(to.slice(8));
+  if (has(rule, "byMonthDay")) out.byMonthDay = dom;
+  if (isObj(rule.byWeekday)) {
+    const len = new Date(Date.UTC(Number(to.slice(0, 4)), Number(to.slice(5, 7)), 0)).getUTCDate();
+    const n = Math.ceil(dom / 7);
+    out.byWeekday = { n: n > 4 || (rule.byWeekday.n === -1 && dom + 7 > len) ? -1 : n, day: DAYS[(((b + 4) % 7) + 7) % 7] };
+  }
+  return out;
+}
 // The local date `days` after `ms`'s in `tz`, as YYYY-MM-DD.
 const localDate = (ms, tz, days = 0) => dayDate(Math.floor(wallOf(ms, tz) / DAY_MS) + days);
 
 module.exports = {
   FREQS, DAYS, INTERVAL_MAX, COUNT_MAX, PERIODS_MAX, DURATION_MAX_MS, KEY_RE,
-  ruleError, sanitizeRule, eachOccurrence, occurrences, occurrenceAt, localDate, wallOf, instantOf,
+  ruleError, sanitizeRule, eachOccurrence, occurrences, occurrenceAt, localDate, wallOf, instantOf, sameDays, reanchorDays,
 };

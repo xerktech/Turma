@@ -33376,7 +33376,8 @@ test("XERK-2968: a Turma event round-trips create, edit and delete, and is serve
     assert.match(e.id, /^turma:[0-9a-f]{16}$/);
     assert.deepEqual([e.source, e.org, e.orgs, e.version, e.editable, e.recurrence], ["turma", S2968A, [S2968A, S2968B], 1, true, null]);
     assert.deepEqual(e.attendees, [{ name: "Bo", email: "bo@x.com", role: "optional" }]);
-    assert.equal(e.createdBy, "breakglass");
+    assert.equal(hub.getCalendarTurmaEvents()[""][e.id].createdBy, "breakglass");
+    assert.ok(!("createdBy" in e), "the creator is stored, never served (XERK-2953)");
     // Served once, though it is in two orgs.
     assert.deepEqual((await served2968()).map((x) => x.id), [e.id]);
     // The stored record is a coerce fixed point.
@@ -34389,6 +34390,255 @@ test("XERK-2969: an occurrence made private by its owner is the owner's alone to
     const asOther = hub.calendarView(other, T2968 - 864e5, T2968 + 5 * W2969, null).events.find((e) => e.id === pub);
     assert.deepEqual([asOther.subject, asOther.editable], ["Open lunch", false]);
     assert.equal(hub.patchTurmaEvent(other, pub, { version: 2, subject: "x" }).status, 409);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+// ---- XERK-2953: low-severity calendar findings (rollup) -------------------------
+test("XERK-2953: a 'following' split or delete whose earlier occurrences are all deleted deletes the old series", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const at = (id, k) => `${id}:${key2969(k)}`;
+    const s = (await turma2968("POST", null, weekly2969())).body.event;
+    assert.equal((await turma2968("DELETE", at(s.id, 0))).status, 200);
+    assert.equal((await turma2968("DELETE", at(s.id, 1))).status, 200);
+    const sp = await turma2968("PATCH", at(s.id, 2), { version: 3, scope: "following", subject: "v2" });
+    assert.equal(sp.status, 200, JSON.stringify(sp.body));
+    const n = sp.body.event.id;
+    assert.equal(sp.body.previous, undefined, "no previous series is left");
+    assert.deepEqual(Object.keys(hub.getCalendarTurmaEvents()[""]), [n], "the old series no longer counts toward the caps");
+    assert.deepEqual((await occ2969()).map((e) => [e.seriesId, e.originalStart, e.subject]),
+      [2, 3, 4].map((k) => [n, key2969(k), "v2"]));
+    // One undeleted occurrence before the split keeps the old series.
+    assert.equal((await turma2968("DELETE", at(n, 3))).status, 200);
+    const kept = await turma2968("PATCH", at(n, 4), { version: 2, scope: "following", subject: "v3" });
+    assert.equal(kept.status, 200, JSON.stringify(kept.body));
+    assert.equal(kept.body.previous.id, n);
+    assert.ok(Object.hasOwn(hub.getCalendarTurmaEvents()[""], n));
+    // DELETE following likewise removes a series it would leave serving nothing.
+    const u = (await turma2968("POST", null, weekly2969())).body.event;
+    assert.equal((await turma2968("DELETE", at(u.id, 0))).status, 200);
+    const d = await request("DELETE", `/api/calendar/events/${encodeURIComponent(at(u.id, 1))}?scope=following`, { headers: userHeaders });
+    assert.deepEqual([d.status, d.body], [200, { ok: true }]);
+    assert.ok(!Object.hasOwn(hub.getCalendarTurmaEvents()[""], u.id));
+    // A tenant AT its event cap may still split such a series: the old one no longer counts.
+    for (const id of Object.keys(hub.getCalendarTurmaEvents()[""])) delete hub.getCalendarTurmaEvents()[""][id];
+    const full = (await turma2968("POST", null, weekly2969())).body.event;
+    const b = hub.getCalendarTurmaEvents()[""];
+    for (let i = 1; i < hub.CALENDAR_TURMA_EVENTS_MAX; i++) {
+      const id = `turma:${i.toString(16).padStart(16, "0")}`;
+      b[id] = hub.sanitizeTurmaEvent({ ...ev2968([S2968A]), id, createdBy: "breakglass", createdAt: 1, updatedAt: 1, version: 1 }, "");
+    }
+    assert.equal((await turma2968("POST", null, ev2968([S2968A]))).status, 409, "the tenant is at its cap");
+    assert.equal((await turma2968("DELETE", at(full.id, 0))).status, 200);
+    const atCap = await turma2968("PATCH", at(full.id, 1), { version: 2, scope: "following", subject: "v2" });
+    assert.equal(atCap.status, 200, JSON.stringify(atCap.body));
+    assert.equal(Object.keys(b).length, hub.CALENDAR_TURMA_EVENTS_MAX);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2953: deleting a dead series' old half still respects an occurrence its owner made private", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const other = { kind: "legacy", roles: [] };
+    const at = (id, k) => `${id}:${key2969(k)}`;
+    const s = (await turma2968("POST", null, weekly2969({ recurrence: { freq: "weekly", count: 6 } }))).body.event;
+    assert.equal((await turma2968("PATCH", at(s.id, 3), { version: 1, sensitivity: "private" })).status, 200);
+    assert.equal((await turma2968("DELETE", at(s.id, 0))).status, 200);
+    assert.equal((await turma2968("DELETE", at(s.id, 1))).status, 200);
+    // Deleting "this and following" from 2 would now delete the whole series, private 3 included.
+    const r = hub.deleteTurmaEvent(other, at(s.id, 2), "following");
+    assert.equal(r.status, 409);
+    assert.match(r.body.error, /made private/);
+    assert.ok(Object.hasOwn(hub.getCalendarTurmaEvents()[""], s.id));
+    // A split carries it, unchanged, onto the new series: allowed, and the old one goes.
+    const sp = hub.patchTurmaEvent(other, at(s.id, 2), { version: 4, scope: "following", subject: "Later" });
+    assert.equal(sp.status, 200, JSON.stringify(sp.body));
+    assert.ok(!Object.hasOwn(hub.getCalendarTurmaEvents()[""], s.id));
+    assert.equal(hub.getCalendarTurmaEvents()[""][sp.body.event.id].exceptions[key2969(3)].sensitivity, "private");
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2953: a 'following' edit moving the occurrence to another date moves an explicit day with it", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const range = async (id, from, until) => (await calGet2891(Date.parse(from), Date.parse(until))).body.events
+      .filter((e) => e.seriesId === id).map((e) => e.start);
+    const mk = async (start, rule) => (await turma2968("POST", null, ev2968([S2968A], { timeZone: "UTC", start,
+      end: start.replace("T09", "T10"), recurrence: rule }))).body.event;
+    // "The 31st", Jul 31 moved to Jul 30: the new series is the 30th, its first instance its own occurrence.
+    for (const sent of [{}, { recurrence: { freq: "monthly", interval: 1, byMonthDay: 31 } }]) {
+      const m = await mk("2027-01-31T09:00:00Z", { freq: "monthly", byMonthDay: 31 });
+      const mv = await turma2968("PATCH", `${m.id}:2027-07-31T09:00:00Z`, { version: 1, scope: "following",
+        start: "2027-07-30T09:00:00Z", end: "2027-07-30T10:00:00Z", ...sent });
+      assert.equal(mv.status, 200, JSON.stringify(mv.body));
+      assert.deepEqual(mv.body.event.recurrence, { freq: "monthly", interval: 1, byMonthDay: 30 });
+      assert.deepEqual(await range(mv.body.event.id, "2027-07-01T00:00:00Z", "2027-10-01T00:00:00Z"),
+        ["2027-07-30T09:00:00Z", "2027-08-30T09:00:00Z", "2027-09-30T09:00:00Z"]);
+    }
+    // Weekly MO,WE: a Monday moved to Tuesday moves the pattern to TU,TH.
+    const w = await mk("2027-07-05T09:00:00Z", { freq: "weekly", byDay: ["MO", "WE"] });
+    const wm = await turma2968("PATCH", `${w.id}:2027-07-19T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-07-20T09:00:00Z", end: "2027-07-20T10:00:00Z" });
+    assert.equal(wm.status, 200, JSON.stringify(wm.body));
+    assert.deepEqual(wm.body.event.recurrence.byDay, ["TU", "TH"]);
+    assert.deepEqual(await range(wm.body.event.id, "2027-07-19T00:00:00Z", "2027-08-01T00:00:00Z"),
+      ["2027-07-20T09:00:00Z", "2027-07-22T09:00:00Z", "2027-07-27T09:00:00Z", "2027-07-29T09:00:00Z"]);
+    // The 2nd Tuesday moved to the Wednesday after: the 2nd Wednesday.
+    const nth = await mk("2027-07-13T09:00:00Z", { freq: "monthly", byWeekday: { n: 2, day: "TU" } });
+    const nm = await turma2968("PATCH", `${nth.id}:2027-08-10T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-08-11T09:00:00Z", end: "2027-08-11T10:00:00Z" });
+    assert.equal(nm.status, 200, JSON.stringify(nm.body));
+    assert.deepEqual(nm.body.event.recurrence.byWeekday, { n: 2, day: "WE" });
+    // A day the client CHANGED is the one it asked for.
+    const c = await mk("2027-01-31T09:00:00Z", { freq: "monthly", byMonthDay: 31 });
+    const cm = await turma2968("PATCH", `${c.id}:2027-07-31T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-07-30T09:00:00Z", end: "2027-07-30T10:00:00Z", recurrence: { freq: "monthly", interval: 1, byMonthDay: 15 } });
+    assert.equal(cm.status, 200, JSON.stringify(cm.body));
+    assert.equal(cm.body.event.recurrence.byMonthDay, 15);
+    // Same date, another time: the explicit day stays.
+    const t = await mk("2027-01-31T09:00:00Z", { freq: "monthly", byMonthDay: 31 });
+    const tm = await turma2968("PATCH", `${t.id}:2027-07-31T09:00:00Z`, { version: 1, scope: "following",
+      start: "2027-07-31T11:00:00Z", end: "2027-07-31T12:00:00Z" });
+    assert.equal(tm.body.event.recurrence.byMonthDay, 31);
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2953: Turma expansion STOPS at CALENDAR_SERVE_MAX, never expands everything and slices", async () => {
+  cleanup2968(D2968A);
+  const rec = require("../recurrence.js");
+  const orig = rec.eachOccurrence;
+  let yielded = 0;
+  try {
+    await beat1574(D2968A, S2968A);
+    const b = Object.create(null);
+    for (let i = 0; i < 60; i++) {
+      const id = `turma:${i.toString(16).padStart(16, "0")}`;
+      b[id] = hub.sanitizeTurmaEvent({ ...weekly2969({ recurrence: { freq: "daily" } }), id, createdBy: "breakglass",
+        createdAt: 1, updatedAt: 1, version: 1 }, "");
+    }
+    hub.getCalendarTurmaEvents()[""] = b;
+    rec.eachOccurrence = (s, lo, hi, max, each) => orig(s, lo, hi, max, (o) => { yielded++; return each(o); });
+    const r = await calGet2891(T2968, T2968 + 100 * 864e5);
+    assert.equal(r.body.truncated, true);
+    // 60 daily series x 100 days = 6000 occurrences in range; the walk stops at the cap
+    // (each series may also yield the one look-back occurrence before the range).
+    assert.ok(yielded <= hub.CALENDAR_SERVE_MAX + 60, `${yielded} occurrences expanded for a ${hub.CALENDAR_SERVE_MAX} cap`);
+  } finally {
+    rec.eachOccurrence = orig;
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2953: a moved Turma event whose capture link is kept re-broadcasts the meetings frame", async () => {
+  const A = "lkS2953.atlassian.net";
+  cleanup2896(A, ["lkS2953"]);
+  cleanup2968();
+  const { res } = await sseConnect(userHeaders);
+  try {
+    await beat1574("lkS2953", A);
+    const c = await turma2968("POST", null, turmaEv2970([A], T2896, 60));
+    const id = c.body.event.id;
+    await postMeeting2508(A, capture2896("s1", T2896, 55));
+    assert.equal(row2896(A, "s1").calendarEventId, id);
+    const events = collectSse(res);
+    const shows = (pred) => events.some((e) => e.event === "meetingProposals" &&
+      (JSON.parse(e.data)[A] || []).some((m) => m.meetingId === "s1" && m.calendarEvent && pred(m.calendarEvent)));
+    // Moved 3 hours on: the auto link holds (the capture is what happened), served `moved`.
+    const mv = await turma2968("PATCH", id, { version: 1, start: iso2968(T2896 + 3 * 3.6e6), end: iso2968(T2896 + 4 * 3.6e6) });
+    assert.equal(mv.status, 200, JSON.stringify(mv.body));
+    assert.equal(row2896(A, "s1").calendarEventId, id, "the link is kept");
+    await waitFor(() => shows((ev) => ev.moved === true && ev.startMs === T2896 + 3 * 3.6e6));
+    // Renamed, no move: the served subject changes, so a frame goes out too.
+    assert.equal((await turma2968("PATCH", id, { version: 2, subject: "Renamed review" })).status, 200);
+    await waitFor(() => shows((ev) => ev.subject === "Renamed review"));
+  } finally {
+    res.destroy();
+    cleanup2968();
+    cleanup2896(A, ["lkS2953"]);
+  }
+});
+
+test("XERK-2953: a series in several orgs is walked once per span, so another org's capture is not cut", () => {
+  cleanup2968();
+  try {
+    const now = Math.floor(Date.now() / 3.6e6) * 3.6e6;
+    const n = Math.ceil(hub.CALENDAR_CANDIDATE_WORK_MAX / 3);
+    const b = Object.create(null);
+    for (let i = 0; i < n; i++) {
+      const id = `turma:${i.toString(16).padStart(16, "0")}`;
+      b[id] = hub.sanitizeTurmaEvent({ ...turmaEv2970([S2968A, S2968B], now - 30 * 864e5, 30,
+        { timeZone: "UTC", recurrence: { freq: "daily" } }), id, createdBy: "breakglass", createdAt: 1, updatedAt: 1, version: 1 }, "");
+    }
+    hub.getCalendarTurmaEvents()[""] = b;
+    const capA = { site: S2968A, startedAt: now - 864e5, endedAt: now - 864e5 + 18e5 };
+    const capB = { ...capA, site: S2968B, startedAt: capA.startedAt + 60e3 };
+    const ix = hub.calendarCandidateIndex("", [capA, capB]);
+    assert.ok(!ix.cut, "one walk per series covers both orgs' coinciding windows");
+    for (const org of [S2968A, S2968B]) {
+      assert.equal(ix.list.filter((c) => c.org === org).length, n, `${org}: every series' occurrence`);
+    }
+  } finally {
+    cleanup2968();
+  }
+});
+
+test("XERK-2953: the calendar range ends by the year 9999, so every served occurrence id resolves", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const s = await turma2968("POST", null, ev2968([S2968A], { timeZone: "UTC", start: "9999-12-30T09:00:00Z",
+      end: "9999-12-30T10:00:00Z", recurrence: { freq: "daily" } }));
+    assert.equal(s.status, 200, JSON.stringify(s.body));
+    const end = hub.CALENDAR_SERVE_UNTIL_MAX;
+    const ok = await calGet2891(end - 5 * 864e5, end);
+    assert.equal(ok.status, 200);
+    const occ = ok.body.events.filter((e) => e.seriesId === s.body.event.id);
+    assert.deepEqual(occ.map((e) => e.originalStart), ["9999-12-30T09:00:00Z", "9999-12-31T09:00:00Z"]);
+    assert.equal((await turma2968("PATCH", occ[1].id, { version: 1, subject: "Last" })).status, 200);
+    // Past it (year 10000 keys, or past Date's range where zone math throws): a 400 in words.
+    for (const [from, until] of [[end - 864e5, end + 864e5], [8.7e15, 8.7e15 + 864e5]]) {
+      const r = await calGet2891(from, until);
+      assert.equal(r.status, 400, `${from}..${until}`);
+      assert.match(r.body.error, /year 9999/);
+    }
+  } finally {
+    cleanup2968(D2968A);
+    forget2533(D2968A);
+  }
+});
+
+test("XERK-2953: a served Turma event never carries its creator's id, private or not", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const legacy = { kind: "legacy", userId: null, tenantId: null, roles: [] };
+    const c = hub.createTurmaEvent(legacy, ev2968([S2968A]));
+    assert.equal(c.status, 200);
+    const rec = hub.getCalendarTurmaEvents()[""][c.body.event.id];
+    rec.createdBy = "user:0123456789abcdef0123456789abcdef";
+    rec.sensitivity = "private";
+    assert.ok(!("createdBy" in c.body.event));
+    // `legacy` is not its owner (a gone creator's untenanted event is an admin's, XERK-2978).
+    const served = hub.calendarView(legacy, T2968 - 864e5, T2968 + 864e5, null).events.find((e) => e.id === rec.id);
+    assert.equal(served.private, true);
+    assert.ok(!("createdBy" in served), "a withheld event does not name its creator");
+    assert.ok(!JSON.stringify(served).includes("0123456789abcdef0123456789abcdef"));
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);

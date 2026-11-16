@@ -267,7 +267,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 
 ## Turma-made events (XERK-2971)
 
-- Wire: `contract-calendar.md` "Turma-created events". The web half is all in `calendar.js`.
+- Wire: `contract-calendar-turma.md` "Turma-created events". The web half is all in `calendar.js`.
 - **Create**: "+ New event" in the bar, or a click/drag on an empty grid slot (30-min rows,
   `slotMinAt`); a TOUCH that moved >10px is a swipe, never a create. The header's org pick
   (∩ pickable orgs) pre-fills the orgs; a lone org is picked for you.
@@ -321,7 +321,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     A "following" until may not end before the split (`splitDay`).
   - A rule sent for "following" is the SERIES' rule as changed; the hub re-anchors it at the split
     (implicit month day pinned; a count series' count is the whole run's, and the editor says
-    "in the whole series", `wholeCount`) — `contract-calendar.md`.
+    "in the whole series", `wholeCount`) — `contract-calendar-turma.md`.
   - "This event" disables the orgs and zone (with a note) and sends no `recurrence`: the hub refuses
     an occurrence's own rule, orgs or zone.
 - **Every repeating event wears `RECUR_SVG`** (Outlook's circling arrows) beside its title and in
