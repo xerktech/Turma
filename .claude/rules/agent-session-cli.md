@@ -347,5 +347,16 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   `seriesId`, `lastModified`, plain-text `body`, `categories`, `sensitivity`, `organizerEmail`.
   An item with no id is unreadable; an unreadable sensitivity is `private`, never `normal`.
 - The session subcommand still never prints a body or the sync fields (`normalize_calendar`).
+- The sync's full shape also carries `turmaId` (XERK-2984): the `TurmaId` user property the
+  Turma writer stamps, kept only as `turma:<16 hex>`, else "".
+- **The Turma writer** (`write_calendar_events`, `_CALENDAR_WRITE_PS`) shares the attach block
+  (`_OUTLOOK_ATTACH_PS`) and `_run_outlook_ps` with the reader; its rules are in
+  `contract-calendar-outlook-write.md` ("Agent: the write"). It has no subcommand: the hub drives it.
+- The `pwsh` cases skip without pwsh (CI's ubuntu-latest has it). Off CI, the
+  `mcr.microsoft.com/powershell` image lacks `tzdata`: install it, or every writer case fails in
+  `FindSystemTimeZoneById`. The stub-`powershell.exe` cases need an exec-capable `TMPDIR`.
+- pwsh 7's `ConvertFrom-Json` turns ISO-date-looking strings into dates; production's 5.1 does not.
+  So a pwsh pass is no proof of how 5.1 reads the writer's JSON. `$home` is PowerShell's read-only
+  `$HOME`: never use it as a script variable.
 - Tests: `CalendarTest` in `test_session_cli.py` (drives the real script under `pwsh` against a
   fake Outlook object model); `test_calendar_is_taught_only_on_wsl_with_a_safe_path`.

@@ -57059,7 +57059,8 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
     # ---- the command and the capability --------------------------------------
 
     def test_capability_and_handle_commands_stage_without_reading(self):
-        self.assertEqual(self.sm.build_payload(1, light=True)["calendar"], {"available": True})
+        self.assertEqual(self.sm.build_payload(1, light=True)["calendar"],
+                         {"available": True, "write": False})
         self.sm.handle_commands([{"type": "syncCalendar", "from": self.MON,
                                   "until": self.MON + self.WEEK, "cmdId": "c1"}])
         self.assertEqual(self.sm._cal_want, (self.MON, self.MON + self.WEEK))
@@ -57071,7 +57072,8 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
                 mock.patch.object(ha, "log") as log:
             sm = self.make_manager()
         self.assertTrue(any("no Outlook here" in str(c) for c in log.call_args_list))
-        self.assertEqual(sm.build_payload(1, light=True)["calendar"], {"available": False})
+        self.assertEqual(sm.build_payload(1, light=True)["calendar"],
+                         {"available": False, "write": False})
         with mock.patch.object(ha.threading, "Thread") as thread:
             sm._calendar_tick(force_wake=True)
             thread.assert_not_called()
@@ -57354,6 +57356,187 @@ class TestCalendarSync(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.sm.calendar_results, rows[3:])
         self.assertEqual(self.sm._cal_hashes, {})
         self.assertEqual(len(self.sm._cal_sizes), ha.CALENDAR_OUTBOX_MAX)
+
+
+class TestCalendarWrite(ManagerMixin, unittest.TestCase):
+    """XERK-2984: the agent half of contract-calendar-outlook-write.md — a
+    `writeCalendarEvent` staged on the beat, written off it on the calendar
+    worker, answered on the `calendarWriteResults` outbox, a sync of the week
+    it touched owed after, and `calendar.write` only while Outlook answers."""
+
+    WEEK = ha.CALENDAR_WEEK_MS
+    MON = 1794787200000          # 2026-11-16T00:00Z, a Monday
+    TID = "turma:0123456789abcdef"
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(ha, "calendar_host_kind", lambda: "wsl")
+        p.start()
+        self.addCleanup(p.stop)
+        self.sm = self.make_manager()
+        self.cli = ha.session_cli_module()
+        self.writes = []
+        self.outlook = {}            # turmaId -> {"outlookId", "startMs"}: a fake Outlook
+        self.fail = None
+        self.n = 0
+
+        def write(cmds, **kw):
+            self.writes.append([dict(c) for c in cmds])
+            if self.fail:
+                raise self.cli.Refused(self.fail)
+            out = []
+            for c in cmds:
+                have = self.outlook.get(c["turmaId"])
+                if c["op"] == "delete":
+                    self.outlook.pop(c["turmaId"], None)
+                    out.append(dict({"ok": True}, **({"startMs": have["startMs"]} if have else {})))
+                    continue
+                if have is None:              # find-before-create: only a miss makes one
+                    self.n += 1
+                    have = self.outlook[c["turmaId"]] = {"outlookId": f"E{self.n}"}
+                have["startMs"] = c["event"]["startMs"]
+                out.append({"ok": True, "outlookId": have["outlookId"],
+                            "lastModified": "2026-11-16T09:00:00-05:00", "startMs": have["startMs"]})
+            return out
+        p = mock.patch.object(self.cli, "write_calendar_events", side_effect=write)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(self.cli, "read_calendar_windows",
+                              side_effect=lambda w, **kw: [{"complete": True, "unreadable": 0,
+                                                            "events": []} for _ in w])
+        self.reads = p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(self.sm, "_calendar_tick")      # never a real thread
+        self.tick = p.start()
+        self.addCleanup(p.stop)
+
+    def cmd(self, op="upsert", version=1, **over):
+        c = {"type": "writeCalendarEvent", "op": op, "turmaId": self.TID, "org": "acme.atlassian.net",
+             "version": version, "outlookId": "",
+             "event": {"subject": "Plan", "startMs": self.MON + 9 * 3600000,
+                       "endMs": self.MON + 10 * 3600000, "timeZone": "UTC"}}
+        if op == "delete":
+            c.pop("event")
+        c.update(over)
+        return c
+
+    def test_xerk2984_handle_commands_stages_without_writing(self):
+        self.sm.handle_commands([dict(self.cmd(), cmdId="c1")])
+        self.assertEqual(list(self.sm._cal_writes), [self.TID])
+        self.tick.assert_called_with(force_wake=True)
+        self.assertEqual(self.writes, [])
+
+    def test_xerk2984_a_command_round_trips_to_the_outbox_and_owes_its_week(self):
+        self.sm._stage_calendar_write(self.cmd())
+        self.sm._calendar_pass(now_ms=self.MON)
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(payload["calendarWriteResults"], [
+            {"turmaId": self.TID, "org": "acme.atlassian.net", "version": 1, "op": "upsert",
+             "ok": True, "outlookId": "E1", "lastModified": "2026-11-16T09:00:00-05:00"}])
+        # The written week is synced in the same pass, forced, so the hub sees
+        # the stamped copy at once.
+        self.assertEqual(self.reads.call_args_list[0].args[0], [(self.MON, self.MON + self.WEEK)])
+        self.assertIsNone(self.sm._cal_want)
+        self.assertEqual(payload["calendar"], {"available": True, "write": True})
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual(self.sm.calendar_write_results, [])
+
+    def test_xerk2984_a_replayed_upsert_never_makes_a_second_copy(self):
+        for v in (1, 1, 2):
+            self.sm._stage_calendar_write(self.cmd(version=v))
+            self.sm._calendar_pass(now_ms=self.MON)
+        self.assertEqual(len(self.outlook), 1)
+        self.assertEqual([r["outlookId"] for r in self.sm.calendar_write_results], ["E1"] * 3)
+        self.assertEqual([r["version"] for r in self.sm.calendar_write_results], [1, 1, 2])
+
+    def test_xerk2984_a_newer_command_replaces_one_not_yet_run(self):
+        self.sm._stage_calendar_write(self.cmd(version=1))
+        self.sm._stage_calendar_write(self.cmd(op="delete", version=2))
+        self.sm._calendar_pass(now_ms=self.MON)
+        self.assertEqual([[c["op"] for c in b] for b in self.writes], [["delete"]])
+        (row,) = self.sm.calendar_write_results
+        self.assertEqual((row["op"], row["version"], row["ok"]), ("delete", 2, True))
+        self.assertNotIn("outlookId", row)
+
+    def test_xerk2984_batches_respect_the_per_run_cap(self):
+        n = self.cli.CALENDAR_WRITE_BATCH_MAX + 3
+        for i in range(n):
+            self.sm._stage_calendar_write(self.cmd(turmaId=f"turma:{i:016x}"))
+        self.sm._calendar_pass(now_ms=self.MON)
+        self.assertEqual([len(b) for b in self.writes], [self.cli.CALENDAR_WRITE_BATCH_MAX, 3])
+        self.assertEqual(len(self.sm.calendar_write_results), n)
+
+    def test_xerk2984_outlook_down_fails_every_row_and_clears_write(self):
+        self.sm._cal_outlook_ok = True
+        self.fail = "classic Outlook is not open: open it and retry"
+        self.sm._stage_calendar_write(self.cmd())
+        self.sm._calendar_pass(now_ms=self.MON)
+        (row,) = self.sm.calendar_write_results
+        self.assertEqual((row["ok"], row["error"]), (False, self.fail))
+        self.assertEqual(self.sm.build_payload(1, light=True)["calendar"]["write"], False)
+        self.assertEqual(self.reads.call_count, 0)        # nothing written, nothing to sync
+
+    def test_xerk2984_a_batch_refused_before_outlook_says_nothing_about_outlook(self):
+        """QA: a batch the CLI refused whole (a recurring event) never started
+        PowerShell, so it must not turn `calendar.write` back on."""
+        self.sm._cal_outlook_ok = False
+        p = mock.patch.object(self.cli, "write_calendar_events", side_effect=lambda cmds, **kw: [
+            {"ok": False, "refused": True, "error": "single events only"} for _ in cmds])
+        p.start()
+        self.addCleanup(p.stop)
+        self.sm._stage_calendar_write(self.cmd())
+        self.sm._run_calendar_writes(now_ms=self.MON)
+        self.assertFalse(self.sm.build_payload(1, light=True)["calendar"]["write"])
+        (row,) = self.sm.calendar_write_results
+        self.assertNotIn("refused", row)
+
+    def test_xerk2984_a_failed_read_clears_write_and_a_good_one_sets_it(self):
+        self.assertFalse(self.sm.build_payload(1, light=True)["calendar"]["write"])
+        self.sm._run_calendar_sync(self.MON, self.MON + self.WEEK, force=True, now_ms=self.MON)
+        self.assertTrue(self.sm.build_payload(1, light=True)["calendar"]["write"])
+        self.reads.side_effect = self.cli.Refused("Outlook did not answer in 120s")
+        self.sm._run_calendar_sync(self.MON, self.MON + self.WEEK, force=True, now_ms=self.MON)
+        self.assertFalse(self.sm.build_payload(1, light=True)["calendar"]["write"])
+
+    def test_xerk2984_unusable_commands_are_answered_or_logged(self):
+        with mock.patch.object(ha, "log") as log:
+            self.sm._stage_calendar_write(self.cmd(turmaId="G-OUTLOOK"))
+        self.assertTrue(any("no Turma event id" in str(c) for c in log.call_args_list))
+        self.sm._stage_calendar_write(self.cmd(op="move"))
+        (row,) = self.sm.calendar_write_results
+        self.assertFalse(row["ok"])
+        self.assertIn("unknown op", row["error"])
+        self.assertEqual(self.sm._cal_writes, {})
+        with mock.patch.object(ha, "calendar_host_kind", lambda: None):
+            sm = self.make_manager()
+        sm._stage_calendar_write(self.cmd())
+        (row,) = sm.calendar_write_results
+        self.assertIn("no Outlook here", row["error"])
+
+    def test_xerk2984_a_delete_owes_the_week_the_copy_was_in(self):
+        self.outlook[self.TID] = {"outlookId": "E9", "startMs": self.MON + 2 * self.WEEK + 5}
+        self.sm._stage_calendar_write(self.cmd(op="delete"))
+        self.sm._calendar_pass(now_ms=self.MON)
+        self.assertEqual(self.reads.call_args_list[0].args[0],
+                         [(self.MON + 2 * self.WEEK, self.MON + 3 * self.WEEK)])
+
+    def test_xerk2984_writes_spread_past_one_sync_owe_the_default_window(self):
+        self.sm._stage_calendar_write(self.cmd(turmaId="turma:" + "a" * 16))
+        far = self.cmd(turmaId="turma:" + "b" * 16)
+        far["event"] = dict(far["event"], startMs=self.MON + 60 * self.WEEK,
+                            endMs=self.MON + 60 * self.WEEK + 1)
+        self.sm._stage_calendar_write(far)
+        with mock.patch.object(self.sm, "_run_calendar_sync") as run:
+            self.sm._calendar_pass(now_ms=self.MON)
+        run.assert_called_once_with(*ha.calendar_default_window(self.MON), force=True,
+                                    now_ms=self.MON)
+
+    def test_xerk2984_outbox_overflow_drops_the_oldest(self):
+        rows = [{"turmaId": self.TID, "version": i} for i in range(ha.CALENDAR_WRITE_OUTBOX_MAX + 2)]
+        self.sm._cal_write_push(rows)
+        self.assertEqual(self.sm.calendar_write_results, rows[2:])
+        self.assertEqual(len(self.sm.build_payload(1, light=True)["calendarWriteResults"]),
+                         ha.CALENDAR_WRITE_ROWS_MAX)
 
 
 class TestDailyBriefWorker(ManagerMixin, unittest.TestCase):

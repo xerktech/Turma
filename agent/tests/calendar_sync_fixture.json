@@ -30,7 +30,8 @@
      "status": 1,
      "start": "2026-11-16T09:00:00-05:00",
      "allDay": false,
-     "originalStart": "2026-11-16T14:00:00Z"
+     "originalStart": "2026-11-16T14:00:00Z",
+     "turmaId": ""
     },
     {
      "sensitivity": 0,
@@ -52,7 +53,8 @@
      "status": 1,
      "start": "2026-11-17T10:00:00-05:00",
      "allDay": false,
-     "originalStart": "2026-11-17T14:00:00Z"
+     "originalStart": "2026-11-17T14:00:00Z",
+     "turmaId": ""
     },
     {
      "sensitivity": 0,
@@ -74,7 +76,8 @@
      "status": 5,
      "start": "2026-11-18T11:00:00-05:00",
      "allDay": false,
-     "originalStart": ""
+     "originalStart": "",
+     "turmaId": "turma:0123456789abcdef"
     },
     {
      "sensitivity": 2,
@@ -96,7 +99,8 @@
      "status": 1,
      "start": "2026-11-19T05:00:00-05:00",
      "allDay": false,
-     "originalStart": ""
+     "originalStart": "",
+     "turmaId": "turma:NOT-OURS"
     },
     {
      "sensitivity": 0,
@@ -118,7 +122,8 @@
      "status": 1,
      "start": "2026-11-20T05:00:00-05:00",
      "allDay": false,
-     "originalStart": ""
+     "originalStart": "",
+     "turmaId": ""
     }
    ]
   }

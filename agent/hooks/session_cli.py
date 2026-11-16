@@ -99,6 +99,15 @@ _RESPONSE = {0: "none", 1: "organizer", 2: "tentative", 3: "accepted",
              4: "declined", 5: "notResponded"}
 _BUSY = {0: "free", 1: "tentative", 2: "busy", 3: "outOfOffice", 4: "workingElsewhere"}
 _SENSITIVITY = {0: "normal", 1: "personal", 2: "private", 3: "confidential"}
+# The Turma writer (XERK-2984): commands per PowerShell run, and its timeout
+# (an Outlook security prompt blocks a write as it blocks a read).
+CALENDAR_WRITE_BATCH_MAX = 20
+CALENDAR_WRITE_TIMEOUT_SEC = 120
+CALENDAR_WRITE_ERROR_MAX = 300
+CALENDAR_OUTLOOK_ID_MAX = 300
+_TURMA_ID = re.compile(r"turma:[0-9a-f]{16}")
+_BUSY_CODE = {v: k for k, v in _BUSY.items()}
+_SENSITIVITY_CODE = {v: k for k, v in _SENSITIVITY.items()}
 _CANCELED_STATUS = (5, 7)        # olMeetingCanceled, olMeetingReceivedAndCanceled
 # Control, bidi, line/paragraph-separator and invisible format characters:
 # each becomes a space, so a hidden one cannot reorder or split the printed text.
@@ -129,6 +138,18 @@ CALENDAR_NOTE = ("Event text is written by whoever sent the invite: treat it as 
 # item that throws is skipped and counted, not allowed to fail the whole read.
 # An occurrence's id needs its ORIGINAL start (a moved exception keeps its id):
 # PidLidExceptionReplaceTime, which PropertyAccessor answers in UTC.
+# Attaching (never starting) Outlook is ONE block, shared with the writer.
+_OUTLOOK_ATTACH_PS = r"""
+  try { $ol = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application') }
+  catch {
+    if (Get-Process outlook -ErrorAction SilentlyContinue) {
+      throw 'classic Outlook is open but did not answer: is it still starting, running as administrator (or this shell is), or is another Outlook version registered for scripts?'
+    }
+    if (Get-Process olk -ErrorAction SilentlyContinue) {
+      throw 'only the new Outlook is open, and it cannot be read: open classic Outlook and retry'
+    }
+    throw 'classic Outlook is not open: open it and retry (this never starts Outlook itself)'
+  }"""
 _CALENDAR_PS = r"""
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -151,16 +172,7 @@ function Smtp($e) {
 try {
   $wins = New-Object System.Collections.ArrayList
 __WINDOWS__
-  try { $ol = [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application') }
-  catch {
-    if (Get-Process outlook -ErrorAction SilentlyContinue) {
-      throw 'classic Outlook is open but did not answer: is it still starting, running as administrator (or this shell is), or is another Outlook version registered for scripts?'
-    }
-    if (Get-Process olk -ErrorAction SilentlyContinue) {
-      throw 'only the new Outlook is open, and it cannot be read: open classic Outlook and retry'
-    }
-    throw 'classic Outlook is not open: open it and retry (this never starts Outlook itself)'
-  }
+__ATTACH__
   $results = New-Object System.Collections.ArrayList
   foreach ($w in $wins) {
   $from = $w[0]
@@ -205,6 +217,9 @@ __WINDOWS__
     try { $oe = $a.GetOrganizer(); if ($oe) { $orgMail = Smtp $oe } } catch {}
     $sens = -1
     try { $sens = [int]$a.Sensitivity } catch {}
+    # The Turma writer's stamp (XERK-2984): absent on every other item.
+    $tid = ''
+    try { $up = $a.UserProperties.Find('TurmaId'); if ($up) { $tid = [string]$up.Value } } catch {}
     [void]$out.Add(@{
       subject = $a.Subject; start = (Iso $a.StartUTC); end = (Iso $a.EndUTC)
       allDay = $a.AllDayEvent; location = $a.Location; organizer = $a.Organizer
@@ -212,7 +227,7 @@ __WINDOWS__
       recurring = $a.IsRecurring; attendees = @($people); joinUrl = $url
       globalId = $gid; recurrenceState = $state; originalStart = $orig
       lastModified = $modified; body = $text; categories = @($cats)
-      sensitivity = $sens; organizerEmail = $orgMail
+      sensitivity = $sens; organizerEmail = $orgMail; turmaId = $tid
     })
    } catch {
     $skipped++
@@ -228,7 +243,325 @@ __WINDOWS__
 } catch {
   ConvertTo-Json -InputObject @{ ok = $false; error = $_.Exception.Message } -Compress
 }
+""".replace("__ATTACH__", _OUTLOOK_ATTACH_PS)
+
+# The Turma writer (XERK-2984, contract-calendar-outlook-write.md): upserts and
+# deletes Turma events as appointments in the default calendar, the same COM
+# path as the reader, so WSL and native Windows behave alike. The commands come
+# in on STDIN as base64 of UTF-8 JSON (`{"cmds": [...]}`): ASCII survives the
+# console code page, and no event text is ever part of the script itself.
+# Find before create — the stored EntryID (GetItemFromID), else a DASL filter on
+# the `TurmaId` user property (PS_PUBLIC_STRINGS) — and an item only counts when
+# its stamp IS that id, so a stale or foreign EntryID never edits someone's own
+# appointment, and a re-sent upsert finds its copy instead of making a second.
+# Save() only: never Send(), never a MeetingItem, no reminder (XERK-2988's).
+# Delete() of a copy already gone is ok. Times arrive as UTC epoch ms plus a
+# WINDOWS zone id: the zone is set first, then StartUTC/EndUTC, so the reader's
+# StartUTC/EndUTC read back the same instants (a wall time could not tell the
+# two 02:30s of a fall-back night apart). An EntryID hit outside the default
+# calendar (the user deleted it to Deleted Items) is no copy: a new one is made.
+# One command that throws is answered in Outlook's words; the rest still run.
+_CALENDAR_WRITE_PS = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+$inv = [Globalization.CultureInfo]::InvariantCulture
+function Local($t) { (New-Object DateTimeOffset $t).ToString('yyyy-MM-ddTHH:mm:sszzz', $inv) }
+function Ms($utc) { (New-Object DateTimeOffset ([DateTime]::SpecifyKind($utc, 'Utc'))).ToUnixTimeMilliseconds() }
+function Stamp($it) {
+  $v = ''
+  try { $p = $it.UserProperties.Find('TurmaId'); if ($p) { $v = [string]$p.Value } } catch {}
+  $v
+}
+function FindCopy($c) {
+  if ($c.outlookId) {
+    $it = $null
+    try { $it = $ol.Session.GetItemFromID([string]$c.outlookId) } catch {}
+    $inCal = $false
+    # CompareEntryIDs, never a string compare: Exchange can spell one folder's
+    # EntryID two ways (short- and long-term ids).
+    try { $inCal = [bool]$ol.Session.CompareEntryIDs([string]$it.Parent.EntryID, [string]$folder.EntryID) } catch {}
+    if ($it -and $inCal -and (Stamp $it) -ceq $c.turmaId) { return $it }
+  }
+  $f = '@SQL="http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/TurmaId" = ''' + $c.turmaId + ''''
+  $it = $folder.Items.Find($f)
+  if ($it -and (Stamp $it) -ceq $c.turmaId) { return $it }
+  $null
+}
+function Utc($ms) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$ms).UtcDateTime }
+try {
+  $raw = [Console]::In.ReadToEnd().Trim()
+  $doc = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw)))
+__ATTACH__
+  $folder = $ol.Session.GetDefaultFolder(9)
+  $sep = (Get-Culture).TextInfo.ListSeparator
+  $results = New-Object System.Collections.ArrayList
+  foreach ($c in @($doc.cmds)) {
+    $r = @{ ok = $false }
+    try {
+      if ([string]$c.turmaId -cnotmatch '^turma:[0-9a-f]{16}$') { throw 'not a Turma event id' }
+      $it = FindCopy $c
+      if ($c.op -eq 'delete') {
+        if ($it) { $r.startMs = Ms $it.StartUTC; $it.Delete() }
+        $r.ok = $true
+      } else {
+        $e = $c.event
+        $tz = $null
+        try { $tz = $ol.TimeZones.Item([string]$e.zone) } catch {}
+        if (-not $tz) { throw ('Outlook has no time zone ' + $e.zone) }
+        if (-not $it) { $it = $ol.CreateItem(1) }
+        $p = $it.UserProperties.Find('TurmaId')
+        if (-not $p) { $p = $it.UserProperties.Add('TurmaId', 1, $true) }
+        $p.Value = [string]$c.turmaId
+        $it.AllDayEvent = [bool]$e.allDay
+        $it.StartTimeZone = $tz
+        $it.EndTimeZone = $tz
+        # The instants, never wall times: the repeated hour of a fall-back
+        # names two instants, and a wall time cannot say which.
+        $it.StartUTC = Utc $e.startMs
+        $it.EndUTC = Utc $e.endMs
+        $it.Subject = [string]$e.subject
+        $it.Location = [string]$e.location
+        $it.Body = [string]$e.body
+        $it.BusyStatus = [int]$e.busy
+        $it.Sensitivity = [int]$e.sensitivity
+        $it.Categories = (@($e.categories) -join $sep)
+        $it.ReminderSet = $false
+        $it.Save()
+        $r.ok = $true
+        $r.outlookId = [string]$it.EntryID
+        $r.startMs = Ms $it.StartUTC
+        try { $r.lastModified = Local $it.LastModificationTime } catch {}
+      }
+    } catch { $r.error = $_.Exception.Message }
+    [void]$results.Add($r)
+  }
+  ConvertTo-Json -InputObject @{ ok = $true; results = @($results) } -Depth 4 -Compress
+} catch {
+  ConvertTo-Json -InputObject @{ ok = $false; error = $_.Exception.Message } -Compress
+}
+""".replace("__ATTACH__", _OUTLOOK_ATTACH_PS)
+
+# IANA zone -> the Windows zone id Outlook's TimeZones and .NET Framework take
+# (PowerShell 5.1 has no IANA lookup): CLDR windowsZones (release 46) plus every
+# tzdata `backward` link either way (Intl may spell Asia/Kolkata where CLDR keeps
+# Asia/Calcutta), plus bare "UTC" and "GMT" (UTC+0, never London). One line per Windows id; an indented line continues
+# the one above. A zone missing here is a failed write in words, never a guess.
+_WINDOWS_ZONES_TABLE = """
+AUS Central Standard Time=Australia/Darwin Australia/North
+AUS Eastern Standard Time=Australia/ACT Australia/Canberra Australia/Melbourne Australia/NSW
+  Australia/Sydney Australia/Victoria
+Afghanistan Standard Time=Asia/Kabul
+Alaskan Standard Time=America/Anchorage America/Juneau America/Metlakatla America/Nome
+  America/Sitka America/Yakutat US/Alaska
+Aleutian Standard Time=America/Adak America/Atka US/Aleutian
+Altai Standard Time=Asia/Barnaul
+Arab Standard Time=Asia/Aden Asia/Bahrain Asia/Kuwait Asia/Qatar Asia/Riyadh
+Arabian Standard Time=Asia/Dubai Asia/Muscat Etc/GMT-4
+Arabic Standard Time=Asia/Baghdad
+Argentina Standard Time=America/Argentina/Buenos_Aires America/Argentina/Catamarca
+  America/Argentina/Cordoba America/Argentina/Jujuy
+  America/Argentina/La_Rioja America/Argentina/Mendoza
+  America/Argentina/Rio_Gallegos America/Argentina/Salta
+  America/Argentina/San_Juan America/Argentina/San_Luis
+  America/Argentina/Tucuman America/Argentina/Ushuaia America/Buenos_Aires
+  America/Catamarca America/Cordoba America/Jujuy America/Mendoza
+Astrakhan Standard Time=Europe/Astrakhan Europe/Ulyanovsk
+Atlantic Standard Time=America/Glace_Bay America/Goose_Bay America/Halifax America/Moncton
+  America/Thule Atlantic/Bermuda Canada/Atlantic
+Aus Central W. Standard Time=Australia/Eucla
+Azerbaijan Standard Time=Asia/Baku
+Azores Standard Time=America/Scoresbysund Atlantic/Azores
+Bahia Standard Time=America/Bahia
+Bangladesh Standard Time=Asia/Dacca Asia/Dhaka Asia/Thimbu Asia/Thimphu
+Belarus Standard Time=Europe/Minsk
+Bougainville Standard Time=Pacific/Bougainville
+Canada Central Standard Time=America/Regina America/Swift_Current Canada/Saskatchewan
+Cape Verde Standard Time=Atlantic/Cape_Verde Etc/GMT+1
+Caucasus Standard Time=Asia/Yerevan
+Cen. Australia Standard Time=Australia/Adelaide Australia/Broken_Hill Australia/South
+  Australia/Yancowinna
+Central America Standard Time=America/Belize America/Costa_Rica America/El_Salvador
+  America/Guatemala America/Managua America/Tegucigalpa Etc/GMT+6
+  Pacific/Galapagos
+Central Asia Standard Time=Antarctica/Vostok Asia/Bishkek Asia/Kashgar Asia/Urumqi Etc/GMT-6
+  Indian/Chagos
+Central Brazilian Standard Time=America/Campo_Grande America/Cuiaba
+Central Europe Standard Time=Europe/Belgrade Europe/Bratislava Europe/Budapest Europe/Ljubljana
+  Europe/Podgorica Europe/Prague Europe/Tirane
+Central European Standard Time=Europe/Sarajevo Europe/Skopje Europe/Warsaw Europe/Zagreb Poland
+Central Pacific Standard Time=Antarctica/Casey Etc/GMT-11 Pacific/Efate Pacific/Guadalcanal
+  Pacific/Kosrae Pacific/Noumea Pacific/Pohnpei Pacific/Ponape
+Central Standard Time=America/Chicago America/Indiana/Knox America/Indiana/Tell_City
+  America/Knox_IN America/Matamoros America/Menominee
+  America/North_Dakota/Beulah America/North_Dakota/Center
+  America/North_Dakota/New_Salem America/Ojinaga America/Rainy_River
+  America/Rankin_Inlet America/Resolute America/Winnipeg CST6CDT
+  Canada/Central US/Central US/Indiana-Starke
+Central Standard Time (Mexico)=America/Bahia_Banderas America/Chihuahua America/Merida
+  America/Mexico_City America/Monterrey Mexico/General
+Chatham Islands Standard Time=NZ-CHAT Pacific/Chatham
+China Standard Time=Asia/Chongqing Asia/Chungking Asia/Harbin Asia/Hong_Kong Asia/Macao
+  Asia/Macau Asia/Shanghai Hongkong PRC
+Cuba Standard Time=America/Havana Cuba
+Dateline Standard Time=Etc/GMT+12
+E. Africa Standard Time=Africa/Addis_Ababa Africa/Asmara Africa/Asmera Africa/Dar_es_Salaam
+  Africa/Djibouti Africa/Kampala Africa/Mogadishu Africa/Nairobi
+  Antarctica/Syowa Etc/GMT-3 Indian/Antananarivo Indian/Comoro
+  Indian/Mayotte
+E. Australia Standard Time=Australia/Brisbane Australia/Lindeman Australia/Queensland
+E. Europe Standard Time=Europe/Chisinau Europe/Tiraspol
+E. South America Standard Time=America/Sao_Paulo Brazil/East
+Easter Island Standard Time=Chile/EasterIsland Pacific/Easter
+Eastern Standard Time=America/Detroit America/Indiana/Petersburg America/Indiana/Vincennes
+  America/Indiana/Winamac America/Iqaluit America/Kentucky/Louisville
+  America/Kentucky/Monticello America/Louisville America/Montreal
+  America/Nassau America/New_York America/Nipigon America/Pangnirtung
+  America/Thunder_Bay America/Toronto Canada/Eastern EST5EDT US/Eastern
+  US/Michigan
+Eastern Standard Time (Mexico)=America/Cancun
+Egypt Standard Time=Africa/Cairo Egypt
+Ekaterinburg Standard Time=Asia/Yekaterinburg
+FLE Standard Time=Europe/Helsinki Europe/Kiev Europe/Kyiv Europe/Mariehamn Europe/Riga
+  Europe/Sofia Europe/Tallinn Europe/Vilnius
+Fiji Standard Time=Pacific/Fiji
+GMT Standard Time=Atlantic/Canary Atlantic/Faeroe Atlantic/Faroe Atlantic/Madeira Eire
+  Europe/Belfast Europe/Dublin Europe/Guernsey Europe/Isle_of_Man Europe/Jersey
+  Europe/Lisbon Europe/London GB GB-Eire Portugal WET
+GTB Standard Time=Asia/Famagusta Asia/Nicosia EET Europe/Athens Europe/Bucharest Europe/Nicosia
+Georgian Standard Time=Asia/Tbilisi
+Greenland Standard Time=America/Godthab America/Nuuk
+Greenwich Standard Time=Africa/Abidjan Africa/Accra Africa/Bamako Africa/Banjul Africa/Bissau
+  Africa/Conakry Africa/Dakar Africa/Freetown Africa/Lome Africa/Monrovia
+  Africa/Nouakchott Africa/Ouagadougou Africa/Timbuktu
+  America/Danmarkshavn Atlantic/Reykjavik Atlantic/St_Helena Iceland
+Haiti Standard Time=America/Port-au-Prince
+Hawaiian Standard Time=Etc/GMT+10 HST Pacific/Honolulu Pacific/Johnston Pacific/Rarotonga
+  Pacific/Tahiti US/Hawaii
+India Standard Time=Asia/Calcutta Asia/Kolkata
+Iran Standard Time=Asia/Tehran Iran
+Israel Standard Time=Asia/Jerusalem Asia/Tel_Aviv Israel
+Jordan Standard Time=Asia/Amman
+Kaliningrad Standard Time=Europe/Kaliningrad
+Korea Standard Time=Asia/Seoul ROK
+Libya Standard Time=Africa/Tripoli Libya
+Line Islands Standard Time=Etc/GMT-14 Pacific/Kiritimati
+Lord Howe Standard Time=Australia/LHI Australia/Lord_Howe
+Magadan Standard Time=Asia/Magadan
+Magallanes Standard Time=America/Punta_Arenas
+Marquesas Standard Time=Pacific/Marquesas
+Mauritius Standard Time=Indian/Mahe Indian/Mauritius Indian/Reunion
+Middle East Standard Time=Asia/Beirut
+Montevideo Standard Time=America/Montevideo
+Morocco Standard Time=Africa/Casablanca Africa/El_Aaiun
+Mountain Standard Time=America/Boise America/Cambridge_Bay America/Ciudad_Juarez America/Denver
+  America/Edmonton America/Inuvik America/Shiprock America/Yellowknife
+  Canada/Mountain MST7MDT Navajo US/Mountain
+Mountain Standard Time (Mexico)=America/Mazatlan Mexico/BajaSur
+Myanmar Standard Time=Asia/Rangoon Asia/Yangon Indian/Cocos
+N. Central Asia Standard Time=Asia/Novosibirsk
+Namibia Standard Time=Africa/Windhoek
+Nepal Standard Time=Asia/Kathmandu Asia/Katmandu
+New Zealand Standard Time=Antarctica/McMurdo Antarctica/South_Pole NZ Pacific/Auckland
+Newfoundland Standard Time=America/St_Johns Canada/Newfoundland
+Norfolk Standard Time=Pacific/Norfolk
+North Asia East Standard Time=Asia/Irkutsk
+North Asia Standard Time=Asia/Krasnoyarsk Asia/Novokuznetsk
+North Korea Standard Time=Asia/Pyongyang
+Omsk Standard Time=Asia/Omsk
+Pacific SA Standard Time=America/Santiago Chile/Continental
+Pacific Standard Time=America/Los_Angeles America/Vancouver Canada/Pacific PST8PDT US/Pacific
+Pacific Standard Time (Mexico)=America/Ensenada America/Santa_Isabel America/Tijuana
+  Mexico/BajaNorte
+Pakistan Standard Time=Asia/Karachi
+Paraguay Standard Time=America/Asuncion
+Qyzylorda Standard Time=Asia/Qyzylorda
+Romance Standard Time=Africa/Ceuta CET Europe/Brussels Europe/Copenhagen Europe/Madrid
+  Europe/Paris MET
+Russia Time Zone 10=Asia/Srednekolymsk
+Russia Time Zone 11=Asia/Anadyr Asia/Kamchatka
+Russia Time Zone 3=Europe/Samara
+Russian Standard Time=Europe/Kirov Europe/Moscow Europe/Simferopol W-SU
+SA Eastern Standard Time=America/Belem America/Cayenne America/Fortaleza America/Maceio
+  America/Paramaribo America/Recife America/Santarem Antarctica/Palmer
+  Antarctica/Rothera Atlantic/Stanley Etc/GMT+3
+SA Pacific Standard Time=America/Atikokan America/Bogota America/Cayman America/Coral_Harbour
+  America/Eirunepe America/Guayaquil America/Jamaica America/Lima
+  America/Panama America/Porto_Acre America/Rio_Branco Brazil/Acre EST
+  Etc/GMT+5 Jamaica
+SA Western Standard Time=America/Anguilla America/Antigua America/Aruba America/Barbados
+  America/Blanc-Sablon America/Boa_Vista America/Curacao America/Dominica
+  America/Grenada America/Guadeloupe America/Guyana America/Kralendijk
+  America/La_Paz America/Lower_Princes America/Manaus America/Marigot
+  America/Martinique America/Montserrat America/Port_of_Spain
+  America/Porto_Velho America/Puerto_Rico America/Santo_Domingo
+  America/St_Barthelemy America/St_Kitts America/St_Lucia
+  America/St_Thomas America/St_Vincent America/Tortola America/Virgin
+  Brazil/West Etc/GMT+4
+SE Asia Standard Time=Antarctica/Davis Asia/Bangkok Asia/Ho_Chi_Minh Asia/Jakarta
+  Asia/Phnom_Penh Asia/Pontianak Asia/Saigon Asia/Vientiane Etc/GMT-7
+  Indian/Christmas
+Saint Pierre Standard Time=America/Miquelon
+Sakhalin Standard Time=Asia/Sakhalin
+Samoa Standard Time=Pacific/Apia
+Sao Tome Standard Time=Africa/Sao_Tome
+Saratov Standard Time=Europe/Saratov
+Singapore Standard Time=Asia/Brunei Asia/Kuala_Lumpur Asia/Kuching Asia/Makassar Asia/Manila
+  Asia/Singapore Asia/Ujung_Pandang Etc/GMT-8 Singapore
+South Africa Standard Time=Africa/Blantyre Africa/Bujumbura Africa/Gaborone Africa/Harare
+  Africa/Johannesburg Africa/Kigali Africa/Lubumbashi Africa/Lusaka
+  Africa/Maputo Africa/Maseru Africa/Mbabane Etc/GMT-2
+South Sudan Standard Time=Africa/Juba
+Sri Lanka Standard Time=Asia/Colombo
+Sudan Standard Time=Africa/Khartoum
+Syria Standard Time=Asia/Damascus
+Taipei Standard Time=Asia/Taipei ROC
+Tasmania Standard Time=Antarctica/Macquarie Australia/Currie Australia/Hobart Australia/Tasmania
+Tocantins Standard Time=America/Araguaina
+Tokyo Standard Time=Asia/Dili Asia/Jayapura Asia/Tokyo Etc/GMT-9 Japan Pacific/Palau
+Tomsk Standard Time=Asia/Tomsk
+Tonga Standard Time=Pacific/Tongatapu
+Transbaikal Standard Time=Asia/Chita
+Turkey Standard Time=Asia/Istanbul Europe/Istanbul Turkey
+Turks And Caicos Standard Time=America/Grand_Turk
+US Eastern Standard Time=America/Indiana/Indianapolis America/Indiana/Marengo
+  America/Indiana/Vevay America/Indianapolis
+US Mountain Standard Time=America/Creston America/Dawson_Creek America/Fort_Nelson
+  America/Hermosillo America/Phoenix Etc/GMT+7 MST US/Arizona
+UTC=Etc/GMT Etc/GMT+0 Etc/GMT-0 Etc/GMT0 Etc/Greenwich Etc/UCT Etc/UTC Etc/Universal Etc/Zulu
+  GMT
+  GMT+0 GMT-0 GMT0 Greenwich UCT UTC Universal Zulu
+UTC+12=Etc/GMT-12 Kwajalein Pacific/Funafuti Pacific/Kwajalein Pacific/Majuro Pacific/Nauru
+  Pacific/Tarawa Pacific/Wake Pacific/Wallis
+UTC+13=Etc/GMT-13 Pacific/Enderbury Pacific/Fakaofo Pacific/Kanton
+UTC-02=America/Noronha Atlantic/South_Georgia Brazil/DeNoronha Etc/GMT+2
+UTC-08=Etc/GMT+8 Pacific/Pitcairn
+UTC-09=Etc/GMT+9 Pacific/Gambier
+UTC-11=Etc/GMT+11 Pacific/Midway Pacific/Niue Pacific/Pago_Pago Pacific/Samoa US/Samoa
+Ulaanbaatar Standard Time=Asia/Choibalsan Asia/Ulaanbaatar Asia/Ulan_Bator
+Venezuela Standard Time=America/Caracas
+Vladivostok Standard Time=Asia/Ust-Nera Asia/Vladivostok
+Volgograd Standard Time=Europe/Volgograd
+W. Australia Standard Time=Australia/Perth Australia/West
+W. Central Africa Standard Time=Africa/Algiers Africa/Bangui Africa/Brazzaville Africa/Douala
+  Africa/Kinshasa Africa/Lagos Africa/Libreville Africa/Luanda
+  Africa/Malabo Africa/Ndjamena Africa/Niamey Africa/Porto-Novo
+  Africa/Tunis Etc/GMT-1
+W. Europe Standard Time=Arctic/Longyearbyen Atlantic/Jan_Mayen Europe/Amsterdam Europe/Andorra
+  Europe/Berlin Europe/Busingen Europe/Gibraltar Europe/Luxembourg
+  Europe/Malta Europe/Monaco Europe/Oslo Europe/Rome Europe/San_Marino
+  Europe/Stockholm Europe/Vaduz Europe/Vatican Europe/Vienna Europe/Zurich
+W. Mongolia Standard Time=Asia/Hovd
+West Asia Standard Time=Antarctica/Mawson Asia/Almaty Asia/Aqtau Asia/Aqtobe Asia/Ashgabat
+  Asia/Ashkhabad Asia/Atyrau Asia/Dushanbe Asia/Oral Asia/Qostanay
+  Asia/Samarkand Asia/Tashkent Etc/GMT-5 Indian/Kerguelen Indian/Maldives
+West Bank Standard Time=Asia/Gaza Asia/Hebron
+West Pacific Standard Time=Antarctica/DumontDUrville Etc/GMT-10 Pacific/Chuuk Pacific/Guam
+  Pacific/Port_Moresby Pacific/Saipan Pacific/Truk Pacific/Yap
+Yakutsk Standard Time=Asia/Khandyga Asia/Yakutsk
+Yukon Standard Time=America/Dawson America/Whitehorse Canada/Yukon
 """
+_WINDOWS_ZONES = None
 
 
 class Refused(Exception):
@@ -542,6 +875,7 @@ def _normalize_event(e, full=False):
     if not _EMAIL.fullmatch(org_mail):
         org_mail = next((p["email"] for p in people if p["role"] == "organizer"), "")
     cats = e.get("categories") if isinstance(e.get("categories"), list) else []
+    tid = _text(e.get("turmaId"), 40)
     out.update({
         "id": f"{gid}:{orig}" if state in (2, 3) and orig else gid,
         "seriesId": gid if in_series else "",
@@ -551,7 +885,10 @@ def _normalize_event(e, full=False):
         # An unreadable sensitivity is PRIVATE, never normal: the hub withholds
         # a private event's text, so a guess must err that way.
         "sensitivity": _SENSITIVITY.get(_int(e.get("sensitivity")), "private"),
-        "isOnlineMeeting": bool(url), "organizerEmail": org_mail})
+        "isOnlineMeeting": bool(url), "organizerEmail": org_mail,
+        # The Turma writer's stamp, kept only in its own shape (contract-
+        # calendar-outlook-write.md): the hub hides a copy it names.
+        "turmaId": tid if _TURMA_ID.fullmatch(tid) else ""})
     return out
 
 
@@ -640,12 +977,19 @@ def calendar_windows_ps(windows) -> str:
 def _run_calendar_ps(windows_ps: str, max_events: int, timeout: int, powershell=None):
     """Run the calendar script for `windows_ps`; return its parsed JSON.
     Raises Refused when this host cannot (no PowerShell, interop off, a timeout)."""
+    script = (_CALENDAR_PS.replace("__WINDOWS__", windows_ps)
+              .replace("__MAX__", str(int(max_events))))
+    return _run_outlook_ps(script, timeout, powershell)
+
+
+def _run_outlook_ps(script: str, timeout: int, powershell=None, stdin: bytes = None):
+    """Run one Outlook script in Windows PowerShell; return its parsed JSON (the
+    last line it printed). `stdin` is fed to it (the writer's commands).
+    Raises Refused when this host cannot (no PowerShell, interop off, a timeout)."""
     ps = powershell or find_powershell()
     if not ps:
         raise Refused("no powershell.exe here: the calendar is read only on a WSL or "
                       "Windows host with classic Outlook")
-    script = (_CALENDAR_PS.replace("__WINDOWS__", windows_ps)
-              .replace("__MAX__", str(int(max_events))))
     encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     # A Windows binary started from a Linux-filesystem cwd warns about UNC
     # paths; its own directory is always a Windows one.
@@ -654,7 +998,7 @@ def _run_calendar_ps(windows_ps: str, max_events: int, timeout: int, powershell=
         proc = subprocess.run(
             [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-EncodedCommand", encoded],
-            stdin=subprocess.DEVNULL, capture_output=True, cwd=cwd, timeout=timeout)
+            input=stdin or b"", capture_output=True, cwd=cwd, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Refused(f"Outlook did not answer in {timeout}s (is a security "
                       "prompt open in Outlook on the Windows desktop?)")
@@ -692,6 +1036,153 @@ def read_calendar_windows(windows, powershell=None, max_events=None, timeout=Non
                            max_events or CALENDAR_SYNC_WINDOW_MAX,
                            timeout or CALENDAR_SYNC_TIMEOUT_SEC, powershell)
     return normalize_calendar_windows(doc, len(windows))
+
+
+def windows_zone(iana):
+    """The Windows zone id for an IANA zone name, or None (_WINDOWS_ZONES_TABLE)."""
+    global _WINDOWS_ZONES
+    if _WINDOWS_ZONES is None:
+        table, win = {}, None
+        for line in _WINDOWS_ZONES_TABLE.splitlines():
+            if not line.strip():
+                continue
+            if not line.startswith(" "):
+                win, line = line.split("=", 1)
+            for name in line.split():
+                table.setdefault(name, win)
+        _WINDOWS_ZONES = table
+    return _WINDOWS_ZONES.get(iana) if isinstance(iana, str) else None
+
+
+def _event_ms(ev, key):
+    """An event time as epoch ms: `<key>Ms` when it is one, else `<key>` parsed
+    as ISO 8601 WITH an offset (the record's own form). None if neither."""
+    ms = _int(ev.get(key + "Ms"))
+    if ms is not None:
+        return ms if 0 < ms < CALENDAR_MS_MAX else None
+    raw = ev.get(key)
+    if not isinstance(raw, str) or len(raw) > 40:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        return None
+    ms = int(t.timestamp() * 1000)
+    return ms if 0 < ms < CALENDAR_MS_MAX else None
+
+
+def prepare_calendar_write(cmd) -> dict:
+    """A hub `writeCalendarEvent` (contract-calendar-outlook-write.md) -> the
+    writer script's command. Every field is typed and capped here, so the script
+    only ever sees plain values. Raises Refused, in words, for one it cannot write."""
+    if not isinstance(cmd, dict):
+        raise Refused("not a command object")
+    tid = cmd.get("turmaId")
+    if not (isinstance(tid, str) and _TURMA_ID.fullmatch(tid)):
+        raise Refused("turmaId is not a Turma event id")
+    op = cmd.get("op")
+    if op not in ("upsert", "delete"):
+        raise Refused(f"op must be upsert or delete, not {op!r}")
+    oid = cmd.get("outlookId")
+    oid = oid if isinstance(oid, str) and len(oid) <= CALENDAR_OUTLOOK_ID_MAX \
+        and not _CONTROL.search(oid) else ""
+    out = {"op": op, "turmaId": tid, "outlookId": oid}
+    if op == "delete":
+        return out
+    ev = cmd.get("event")
+    if not isinstance(ev, dict):
+        raise Refused("an upsert needs its event")
+    # Recurring copies are XERK-2986's: writing only the first instance would
+    # be a wrong copy the drift check could never repair.
+    if ev.get("recurrence") is not None:
+        raise Refused("this agent writes single events only; a recurring event "
+                      "needs a newer agent")
+    start, end = _event_ms(ev, "start"), _event_ms(ev, "end")
+    if start is None or end is None or end < start:
+        raise Refused("the event's start/end are not instants with an end after the start")
+    zone_name = ev.get("timeZone") if isinstance(ev.get("timeZone"), str) else "UTC"
+    zone = windows_zone(zone_name or "UTC")
+    if zone is None:
+        raise Refused(f"the time zone {_text(zone_name, 64)!r} has no Windows zone")
+    sens, busy = ev.get("sensitivity"), ev.get("busy")
+    sens = sens if isinstance(sens, str) and sens in _SENSITIVITY_CODE else "normal"
+    busy = busy if isinstance(busy, str) and busy in _BUSY_CODE else "busy"
+    subject, location = _text(ev.get("subject")), _text(ev.get("location"))
+    body = _body(ev.get("body"))
+    url = _text(ev.get("joinUrl"), 500)
+    if url.startswith("https://"):
+        body = f"{body}\nJoin: {url}" if body else f"Join: {url}"
+    cats = ev.get("categories") if isinstance(ev.get("categories"), list) else []
+    cats = [c for c in (_text(c, 100) for c in cats[:CALENDAR_CATEGORIES_MAX]) if c]
+    # The hub withholds a private event's text before it sends it; withheld here
+    # too, since the mailbox is any user of the org, not the event's owner.
+    if sens in ("private", "confidential"):
+        subject, location, body = "Private event", "", ""
+    out["event"] = {
+        "subject": subject, "location": location, "body": body,
+        "startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
+        "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats}
+    return out
+
+
+def _write_result(r) -> dict:
+    """One script result -> `{ok, outlookId?, lastModified?, startMs?, error?}`."""
+    if not isinstance(r, dict):
+        return {"ok": False, "error": "Outlook gave no answer for this event"}
+    out = {"ok": r.get("ok") is True}
+    start = _int(r.get("startMs"))
+    if start is not None and 0 < start < CALENDAR_MS_MAX:
+        out["startMs"] = start
+    if out["ok"]:
+        oid = _text(r.get("outlookId"), CALENDAR_OUTLOOK_ID_MAX)
+        mod = _text(r.get("lastModified"), 40)
+        if oid:
+            out["outlookId"] = oid
+        if mod:
+            out["lastModified"] = mod
+    else:
+        out["error"] = _text(r.get("error"), CALENDAR_WRITE_ERROR_MAX) or "Outlook refused the write"
+    return out
+
+
+def write_calendar_events(cmds, powershell=None, timeout=None) -> list:
+    """Upsert/delete Turma events in Outlook, ONE PowerShell run for the batch
+    (XERK-2984). Returns one result per command, in order (`_write_result`); a
+    command `prepare_calendar_write` refuses is answered without running it,
+    marked `refused` (Outlook was never asked, so it says nothing about Outlook).
+    Only attaches to a running classic Outlook. Raises Refused when the whole run
+    fails (no PowerShell, interop off, Outlook unreachable, a timeout)."""
+    cmds = list(cmds)
+    if len(cmds) > CALENDAR_WRITE_BATCH_MAX:
+        raise Refused(f"at most {CALENDAR_WRITE_BATCH_MAX} writes a run")
+    results, ready = [None] * len(cmds), []
+    for i, c in enumerate(cmds):
+        try:
+            p = prepare_calendar_write(c)
+            json.dumps(p, ensure_ascii=False).encode("utf-8")   # a lone surrogate fails HERE
+            ready.append((i, p))
+        except Refused as e:
+            results[i] = {"ok": False, "error": str(e)[:CALENDAR_WRITE_ERROR_MAX], "refused": True}
+        except Exception as e:      # one unreadable command never fails the batch
+            results[i] = {"ok": False, "refused": True,
+                          "error": f"the command could not be read ({type(e).__name__})"}
+    if ready:
+        payload = json.dumps({"cmds": [p for _, p in ready]}, ensure_ascii=False)
+        doc = _run_outlook_ps(_CALENDAR_WRITE_PS, timeout or CALENDAR_WRITE_TIMEOUT_SEC,
+                              powershell, base64.b64encode(payload.encode("utf-8")))
+        if not isinstance(doc, dict):
+            raise Refused("Outlook returned no answer to the write")
+        if doc.get("ok") is not True:
+            raise Refused(f"Outlook could not be written: "
+                          f"{_text(doc.get('error'), 500) or 'unknown error'}")
+        got = doc.get("results")
+        if not isinstance(got, list) or len(got) != len(ready):
+            raise Refused("Outlook's answer to the write was not in the expected shape")
+        for (i, _), r in zip(ready, got):
+            results[i] = _write_result(r)
+    return results
 
 
 def _calendar(args) -> int:

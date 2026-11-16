@@ -5555,6 +5555,14 @@ CALENDAR_WEEKS_PER_READ = 4
 # window is re-sent next run (their hashes are forgotten).
 CALENDAR_OUTBOX_MAX = 40
 CALENDAR_ERROR_MAX = 300
+# Turma events written to Outlook (XERK-2984, contract-calendar-outlook-write.md):
+# result rows a beat (the hub's CALENDAR_WRITE_ROWS_MAX), undelivered rows kept
+# (past it the oldest drop; the hub's result timeout re-sends their writes), and
+# writes waiting for the worker (one per turmaId; past it the oldest drop too).
+CALENDAR_WRITE_ROWS_MAX = 50
+CALENDAR_WRITE_OUTBOX_MAX = 200
+CALENDAR_WRITE_QUEUE_MAX = 200
+TURMA_EVENT_ID_RE = re.compile(r"turma:[0-9a-f]{16}")
 
 _SESSION_CLI_MODULE = None
 
@@ -29356,6 +29364,14 @@ class SessionManager:
         self._cal_said_off = False
         self.calendar_results = []
         self._cal_sizes = {}             # id(row) -> its JSON bytes, sized off the beat
+        # Turma events written to Outlook (XERK-2984): `_cal_writes` is turmaId ->
+        # the owed `writeCalendarEvent` (a newer one replaces it), run by the SAME
+        # worker; `calendar_write_results` is the `calendarWriteResults` outbox,
+        # cleared BY IDENTITY once a beat carried it. `_cal_outlook_ok` is whether
+        # Outlook last answered (None = not asked yet): `calendar.write` needs True.
+        self._cal_writes = {}
+        self.calendar_write_results = []
+        self._cal_outlook_ok = None
         self.calendar_kind = calendar_host_kind()
         if self.calendar_kind is None:
             log("calendar: no Outlook here (not a WSL or Windows host); calendar sync is off")
@@ -45334,7 +45350,8 @@ class SessionManager:
             return
         try:
             with self._cal_lock:
-                due = force_wake or self._cal_want is not None or time.monotonic() >= self._cal_next_at
+                due = (force_wake or self._cal_want is not None or bool(self._cal_writes)
+                       or time.monotonic() >= self._cal_next_at)
                 if not due:
                     return
                 worker = self._cal_worker
@@ -45356,8 +45373,13 @@ class SessionManager:
             self._calendar_pass()
 
     def _calendar_pass(self, now_ms=None):
-        """OFF THE BEAT: run the owed hub window (forced: every week sent), else
-        the scheduled one (only changed weeks). Never raises."""
+        """OFF THE BEAT: run the owed Outlook writes, then the owed hub window
+        (forced: every week sent), else the scheduled one (only changed weeks).
+        Never raises."""
+        try:
+            self._run_calendar_writes(now_ms)
+        except Exception as e:
+            log(f"calendar writes failed: {type(e).__name__}: {e}")
         with self._cal_lock:
             want, self._cal_want = self._cal_want, None
             if want is None and time.monotonic() < self._cal_next_at:
@@ -45390,9 +45412,11 @@ class SessionManager:
             try:
                 got = cli.read_calendar_windows(group)
             except cli.Refused as e:
+                self._cal_outlook_ok = False
                 error = (str(e) or "Outlook could not be read")[:CALENDAR_ERROR_MAX]
                 error_from = group[0][0]
                 break
+            self._cal_outlook_ok = True
             for (f, u), w in zip(group, got):
                 # An item Outlook threw on (or one with no id) is ABSENT from the
                 # week, so sent it would be deleted on the hub: not complete either.
@@ -45463,6 +45487,113 @@ class SessionManager:
         # Error rows LAST: a good row clears the hub's lastError, so an earlier
         # week's error would be wiped by a later week's good row of this pass.
         self._cal_push([r for r in rows if "error" not in r] + [r for r in rows if "error" in r])
+
+    # ---- Turma events written to Outlook (XERK-2984) ---------------------------
+
+    def _stage_calendar_write(self, cmd):
+        """ON THE BEAT (handle_commands): take a `writeCalendarEvent` — check it
+        names a Turma event, then hand it to the calendar worker; no I/O. A newer
+        command for the same turmaId replaces one not yet run (the hub keeps one
+        undelivered per (host, turmaId) the same way). One this host cannot run
+        (no Outlook here, an unknown op) is answered failed at once."""
+        tid = cmd.get("turmaId") if isinstance(cmd, dict) else None
+        if not (isinstance(tid, str) and TURMA_EVENT_ID_RE.fullmatch(tid)):
+            log("calendar: writeCalendarEvent refused (no Turma event id)")
+            return
+        error = None
+        if self.calendar_kind is None:
+            error = "no Outlook here: this host is not a WSL or Windows host"
+        elif cmd.get("op") not in ("upsert", "delete"):
+            error = f"unknown op {str(cmd.get('op'))[:40]!r}: upsert or delete"
+        if error:
+            self._cal_write_push([self._cal_write_row(cmd, {"ok": False, "error": error})])
+            return
+        with self._cal_lock:
+            self._cal_writes.pop(tid, None)
+            self._cal_writes[tid] = cmd
+            over = len(self._cal_writes) - CALENDAR_WRITE_QUEUE_MAX
+            for k in list(self._cal_writes)[:max(0, over)]:
+                del self._cal_writes[k]
+        if over > 0:
+            log(f"calendar: write queue past {CALENDAR_WRITE_QUEUE_MAX}; dropped {over} oldest")
+        self._calendar_tick(force_wake=True)
+
+    @staticmethod
+    def _cal_write_row(cmd, res):
+        """A `calendarWriteResults` row (the contract's shape) for one command."""
+        org, version = cmd.get("org"), cmd.get("version")
+        row = {"turmaId": cmd["turmaId"],
+               "org": org[:200] if isinstance(org, str) else "",
+               "version": version if isinstance(version, int) and not isinstance(version, bool)
+               and version >= 0 else 0,
+               "op": cmd.get("op") if cmd.get("op") in ("upsert", "delete") else "upsert",
+               "ok": res.get("ok") is True}
+        if row["ok"]:
+            if row["op"] == "upsert":
+                for k in ("outlookId", "lastModified"):
+                    if res.get(k):
+                        row[k] = res[k]
+        else:
+            row["error"] = (res.get("error") or "Outlook refused the write")[:CALENDAR_ERROR_MAX]
+        return row
+
+    def _run_calendar_writes(self, now_ms=None):
+        """OFF THE BEAT: run every owed write, CALENDAR_WRITE_BATCH_MAX a
+        PowerShell run, stage a result row for each, then owe a sync of the
+        weeks they touched, so the hub sees the stamped copy at once (its
+        read-back dedup hides it, and a deleted copy leaves its week)."""
+        cli = session_cli_module()
+        weeks = set()
+        while True:
+            with self._cal_lock:
+                keys = list(self._cal_writes)[:cli.CALENDAR_WRITE_BATCH_MAX]
+                batch = [self._cal_writes.pop(k) for k in keys]
+            if not batch:
+                break
+            try:
+                got = cli.write_calendar_events(batch)
+                # Only an answer FROM Outlook says it is reachable: a batch the
+                # CLI refused whole never started PowerShell.
+                if any(not r.get("refused") for r in got):
+                    self._cal_outlook_ok = True
+            except cli.Refused as e:
+                self._cal_outlook_ok = False
+                why = str(e) or "Outlook could not be written"
+                got = [{"ok": False, "error": why}] * len(batch)
+                log(f"calendar: {len(batch)} write(s) failed: {why}")
+            except Exception as e:
+                got = [{"ok": False, "error": f"the write failed: {type(e).__name__}: {e}"}] * len(batch)
+                log(f"calendar: {len(batch)} write(s) failed: {type(e).__name__}: {e}")
+            self._cal_write_push([self._cal_write_row(c, r) for c, r in zip(batch, got)])
+            for r in got:
+                if r.get("ok") and isinstance(r.get("startMs"), int):
+                    m = r["startMs"]
+                    weeks.add((m - CALENDAR_MONDAY_MS) // CALENDAR_WEEK_MS * CALENDAR_WEEK_MS
+                              + CALENDAR_MONDAY_MS)
+        if not weeks:
+            return
+        lo, hi = min(weeks), max(weeks) + CALENDAR_WEEK_MS
+        with self._cal_lock:
+            if self._cal_want is not None:
+                lo, hi = min(lo, self._cal_want[0]), max(hi, self._cal_want[1])
+            if hi - lo > CALENDAR_SPAN_MAX_MS:
+                # Writes spread wider than one sync may ask: the scheduled window.
+                lo, hi = calendar_default_window(int(time.time() * 1000) if now_ms is None else now_ms)
+            self._cal_want = (lo, hi)
+
+    def _cal_write_push(self, rows):
+        """Stage rows on the `calendarWriteResults` outbox; past
+        CALENDAR_WRITE_OUTBOX_MAX the oldest drop (the hub re-sends a write it
+        heard nothing back for, and the upsert is idempotent)."""
+        if not rows:
+            return
+        with self._cal_lock:
+            self.calendar_write_results.extend(rows)
+            over = len(self.calendar_write_results) - CALENDAR_WRITE_OUTBOX_MAX
+            if over > 0:
+                del self.calendar_write_results[:over]
+        if over > 0:
+            log(f"calendar: write-result outbox past {CALENDAR_WRITE_OUTBOX_MAX}; dropped {over} oldest")
 
     def _cal_push(self, rows):
         """Stage rows on the `calendarSync` outbox. Past CALENDAR_OUTBOX_MAX the
@@ -49250,6 +49381,10 @@ class SessionManager:
                     # The Calendar (XERK-2895): only STAGED here — the Outlook
                     # read runs on its own worker.
                     self._stage_calendar_sync(cmd)
+                elif ctype == "writeCalendarEvent":
+                    # A Turma event written to Outlook (XERK-2984): only STAGED
+                    # here — the write runs on the calendar worker.
+                    self._stage_calendar_write(cmd)
                 elif ctype == "extractMeeting":
                     # Meetings (XERK-2509): only STAGED here — the transcript
                     # fetch, model and duplicate search run on its own worker.
@@ -50911,7 +51046,10 @@ class SessionManager:
             "meetings": self._meetings_payload(),
             # Whether this manager answers the hub's `syncCalendar` (XERK-2895):
             # a WSL or Windows host. Absent = an older agent, which the hub never asks.
-            "calendar": {"available": self.calendar_kind is not None},
+            # `write` (XERK-2984): it also writes Turma events there, true only
+            # while Outlook last answered (absent = an older agent: never a writer).
+            "calendar": {"available": self.calendar_kind is not None,
+                         "write": self.calendar_kind is not None and self._cal_outlook_ok is True},
             # Whether this manager runs the hub's `spawnShadow` (XERK-1847). The
             # hub samples merged tickets only onto a host reporting it;
             # TURMA_MODEL_SHADOW=0 reports false.
@@ -51013,6 +51151,9 @@ class SessionManager:
                         break
                     rows.append(r)
                 payload["calendarSync"] = rows
+            if self.calendar_write_results:
+                payload["calendarWriteResults"] = list(
+                    self.calendar_write_results[:CALENDAR_WRITE_ROWS_MAX])
         if self.spawn_failures:
             # Snapshotted under the lock the export thread's _refuse_start
             # appends under (XERK-397): post() removes exactly these delivered
@@ -51185,6 +51326,12 @@ class SessionManager:
                     x for x in self.calendar_results if id(x) not in delivered]
                 for k in delivered:
                     self._cal_sizes.pop(k, None)
+        wstaged = payload.get("calendarWriteResults")
+        if wstaged:
+            delivered = {id(x) for x in wstaged}
+            with self._cal_lock:
+                self.calendar_write_results[:] = [
+                    x for x in self.calendar_write_results if id(x) not in delivered]
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure

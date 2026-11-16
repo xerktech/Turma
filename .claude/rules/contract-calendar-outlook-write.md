@@ -12,6 +12,7 @@ paths:
   - "agent/tests/test_hub_agent.py"
   - "agent/tests/test_session_cli.py"
   - "agent/tests/calendar_sync_fixture.json"
+  - "agent/tests/calendar_write_fixture.json"
   - "android/app/src/main/java/**/Calendar*.kt"
 ---
 
@@ -79,6 +80,24 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   `Delete()` with no cancellation. Sending is XERK-2989's.
 - `outlookId` = the item's `EntryID` (what `GetItemFromID` takes). The stamp is the fallback when
   a move between stores changes it.
+- **An item counts as the copy only when its stamp IS the turmaId**, however it was found: a stale or
+  wrong `outlookId` naming the user's own appointment never edits or deletes it.
+- **No event text is ever part of the script**: the batch rides STDIN as base64 of UTF-8 JSON
+  (`_CALENDAR_WRITE_PS`), typed and capped first by `prepare_calendar_write` (session CLI).
+- **Times reach Outlook as INSTANTS** (StartUTC/EndUTC, after the Windows zone is set), never wall
+  times: the repeated hour of a fall-back names two instants, and the drift check would then
+  rewrite that copy forever. IANA → Windows is `windows_zone`: CLDR windowsZones + the tzdata
+  `backward` links CLDR can place (Intl may say `Asia/Kolkata`, CLDR keeps `Asia/Calcutta`). A zone
+  it lacks (a few links, `Factory`) is a failed row.
+- An `outlookId` hit outside the default calendar (the user deleted it to Deleted Items) is no copy.
+- **A command the CLI refuses never started PowerShell**, so it says nothing about Outlook: it
+  never sets `calendar.write`, and one unreadable command never fails the rest of its batch.
+- **Single events only** until XERK-2986: a non-null `recurrence` is a failed row in words, never a
+  copy of the first instance. Attendees are not written yet (XERK-2989 owns them).
+- **After a write the worker owes a forced sync of the weeks it touched** (from the saved item's
+  `StartUTC`, so a delete re-syncs the week its copy left); wider than 40 weeks → the default window.
+- **`calendar.write` is true only while Outlook answered the last read or write**
+  (`_cal_outlook_ok`; false before the first one): a closed Outlook stops the host being a writer.
 
 ## Agent → hub: the `calendarWriteResults` outbox
 
@@ -185,5 +204,7 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 
 ## Tests
 
-- Hub: the `XERK-2985:` cases in `server.test.js`; agent: the `XERK-2984:`/`XERK-2986:` cases in
-  `test_hub_agent.py` / `test_session_cli.py`.
+- Hub: the `XERK-2985:` cases in `server.test.js`; agent: `TestCalendarWrite` (`test_hub_agent.py`,
+  the `xerk2984` cases) and `CalendarWriteTest` (`test_session_cli.py`: the real script under `pwsh`
+  against a fake Outlook object model, and `calendar_write_fixture.json`, a reply recorded from it);
+  the reader's `turmaId` in `CalendarSyncReaderTest`. `XERK-2986:` cases for recurrence.
