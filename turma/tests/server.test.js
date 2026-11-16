@@ -35233,6 +35233,336 @@ test("XERK-3010: a copy that sends nothing still re-homes", async () => {
   }
 });
 
+test("XERK-3014: invitations off then on is refused until the moved sending copy is cancelled", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A],
+      { sendInvites: true, attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const holder = rec2985(id).outlook[S2985A].host;
+    const other = holder === D2985A ? D2985A2 : D2985A;
+    await beat2985(holder, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    const saved = agents[holder];
+    delete agents[holder];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, holder, "held (XERK-3010)");
+    // Invitations off: the copy moves as a plain one; the old one is a tombstone that may have sent.
+    assert.equal((await turma2968("PATCH", id, { version: 1, sendInvites: false })).status, 200);
+    assert.equal(rec2985(id).outlook[S2985A].host, other);
+    assert.ok(!rec2985(id).outlook[S2985A].sent, "the new copy has sent nothing");
+    assert.ok(hub.getCalendarOutlookTombstones()[holder].some((x) => x.turmaId === id && x.sent));
+    // Back on: refused in words, nothing sent from the other mailbox, the record unchanged.
+    const r = await turma2968("PATCH", id, { version: 2, sendInvites: true });
+    assert.equal(r.status, 409);
+    assert.match(r.body.error, /second invitation from another mailbox/);
+    assert.ok(!r.body.error.includes("@"), "names the device, never a tenant key");
+    assert.equal(rec2985(id).sendInvites, false);
+    assert.ok(!(writes2985(other) || []).some((x) => x.turmaId === id && x.event && x.event.sendInvites));
+    // An edit that leaves invitations off still goes.
+    assert.equal((await turma2968("PATCH", id, { version: 2, subject: "Moved" })).status, 200);
+    // Its host returns and the cancellation lands: invitations may go out again.
+    agents[holder] = saved;
+    await beat2985(holder, S2985A);
+    hub.calendarOutlookTick(Date.now(), true);
+    await beat2985(holder, S2985A);
+    assert.ok(writes2985(holder).some((x) => x.turmaId === id && x.op === "delete"));
+    await beat2985(holder, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 0, op: "delete", ok: true }] });
+    assert.ok(!(hub.getCalendarOutlookTombstones()[holder] || []).some((x) => x.turmaId === id));
+    assert.equal((await turma2968("PATCH", id, { version: 3, sendInvites: true })).status, 200);
+    assert.ok(writes2985(other).some((x) => x.turmaId === id && x.version === 4 && x.event.sendInvites));
+  } finally {
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
+test("XERK-3014: a moved copy that never sent does not block turning invitations on", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A], { attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const holder = rec2985(id).outlook[S2985A].host;
+    const other = holder === D2985A ? D2985A2 : D2985A;
+    await beat2985(holder, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    const saved = agents[holder];
+    delete agents[holder];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, other);
+    assert.ok(hub.getCalendarOutlookTombstones()[holder].some((x) => x.turmaId === id && !x.sent));
+    assert.equal((await turma2968("PATCH", id, { version: 1, sendInvites: true })).status, 200);
+    assert.equal(rec2985(id).outlook[S2985A].sent, true, "now a sending copy");
+    agents[holder] = saved;
+  } finally {
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
+// A sending event in `orgs` whose org-A copy was acked, then held on its gone host (XERK-3010).
+async function hold3014(orgs, extra = {}) {
+  await beat2985(D2985A, S2985A);
+  await beat2985(D2985A2, S2985A);
+  await beat2985(D2985B, S2985B);
+  const id = (await turma2968("POST", null, ev2968(orgs, { sendInvites: true,
+    attendees: [{ name: "Bo", email: "bo@x.com" }], ...extra }))).body.event.id;
+  const holder = rec2985(id).outlook[S2985A].host;
+  const other = holder === D2985A ? D2985A2 : D2985A;
+  await beat2985(holder, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+  delete agents[holder];
+  hub.calendarOutlookTick(Date.now(), true);
+  assert.equal(rec2985(id).outlook[S2985A].sent, true);
+  return { id, holder, other };
+}
+const sends3014 = (key, id) => (agents[key] ? writes2985(key) : []).filter((x) => x.turmaId === id && x.event && x.event.sendInvites);
+
+test("XERK-3014: a \"following\" split cannot send from another mailbox while the series' sent copy is unsettled", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    // Still held, invitations never off: the new series would invite from the other host.
+    const a = await hold3014([S2985A], { timeZone: "UTC", recurrence: { freq: "weekly" } });
+    const count = () => Object.values(hub.getCalendarTurmaEvents()).reduce((n, b) => n + Object.keys(b).length, 0);
+    const n0 = count();
+    const held = await turma2968("PATCH", `${a.id}:${key2969(2)}`, { version: 1, scope: "following", subject: "v2" });
+    assert.equal(held.status, 409);
+    assert.match(held.body.error, /second invitation from another mailbox/);
+    assert.equal(count(), n0, "no new series");
+    // Off (the copy moves, a sent tombstone stays), then a split turning them back on.
+    assert.equal((await turma2968("PATCH", a.id, { version: 1, sendInvites: false })).status, 200);
+    const on = await turma2968("PATCH", `${a.id}:${key2969(2)}`, { version: 2, scope: "following", sendInvites: true });
+    assert.equal(on.status, 409);
+    assert.equal(sends3014(a.other, a.id).length, 0);
+    // A split that sends nothing is refused too: the new series could turn them on later unchecked.
+    const plain = await turma2968("PATCH", `${a.id}:${key2969(2)}`, { version: 2, scope: "following", subject: "v3" });
+    assert.equal(plain.status, 409);
+    assert.match(plain.body.error, /^this series cannot be split yet/);
+    assert.equal(count(), n0);
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3014: making another org the sender is refused while the held sent copy is unsettled", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    const a = await hold3014([S2985A, S2985B]);
+    for (const orgs of [[S2985B, S2985A], [S2985B]]) {
+      const r = await turma2968("PATCH", a.id, { version: 1, orgs });
+      assert.equal(r.status, 409, JSON.stringify(orgs));
+      assert.equal(sends3014(D2985B, a.id).length, 0);
+      assert.equal(rec2985(a.id).outlook[S2985A].host, a.holder, "still held");
+    }
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3014: a sent copy whose org is dropped leaves a tombstone that blocks invitations back on", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    const id = (await turma2968("POST", null, ev2968([S2985A, S2985B], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const h = rec2985(id).outlook[S2985A].host;
+    await beat2985(h, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    assert.equal((await turma2968("PATCH", id, { version: 1, sendInvites: false })).status, 200);
+    assert.equal((await turma2968("PATCH", id, { version: 2, orgs: [S2985B] })).status, 200);
+    assert.ok(hub.getCalendarOutlookTombstones()[h].some((x) => x.turmaId === id && x.sent), "carried onto the tombstone");
+    delete agents[h];
+    assert.equal((await turma2968("PATCH", id, { version: 3, sendInvites: true })).status, 409);
+    assert.equal(sends3014(D2985B, id).length, 0);
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+// A weekly sending series acked on its host, split "following" at occurrence 2 with
+// invitations off while that host is online; returns the ids and the host's agent.
+async function split3014() {
+  await beat2985(D2985A, S2985A);
+  await beat2985(D2985A2, S2985A);
+  const id = (await turma2968("POST", null, ev2968([S2985A], { timeZone: "UTC", recurrence: { freq: "weekly" },
+    sendInvites: true, attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+  const h = rec2985(id).outlook[S2985A].host;
+  await beat2985(h, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+  const sp = await turma2968("PATCH", `${id}:${key2969(2)}`, { version: 1, scope: "following", sendInvites: false });
+  assert.equal(sp.status, 200);
+  assert.ok(!("splitFrom" in sp.body.event), "never served");
+  return { id, nid: sp.body.event.id, h, other: h === D2985A ? D2985A2 : D2985A, saved: agents[h] };
+}
+
+test("XERK-3014: a series split while its host was online cannot send while the old series' copy is held", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    const { id, nid, h, other } = await split3014();
+    assert.deepEqual(rec2985(nid).splitFrom, [id]);
+    // The old series' shortening never reaches Outlook: its host goes away holding the full series.
+    delete agents[h];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].state, "failed");
+    assert.equal((await turma2968("PATCH", nid, { version: 1, sendInvites: true })).status, 409);
+    assert.equal(sends3014(other, nid).length, 0);
+    // Splitting the new series is refused too: its source chain is unsettled.
+    assert.equal((await turma2968("PATCH", `${nid}:${key2969(4)}`, { version: 1, scope: "following", subject: "g" })).status, 409);
+    // A client cannot set the link itself.
+    const c = (await turma2968("POST", null, ev2968([S2985A], { splitFrom: [id] }))).body.event.id;
+    assert.ok(!("splitFrom" in rec2985(c)));
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3014: deleting the middle series of a split chain keeps the first one's block", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    const { id, nid, h, other } = await split3014();
+    const g = await turma2968("PATCH", `${nid}:${key2969(4)}`, { version: 1, scope: "following", subject: "g" });
+    assert.equal(g.status, 200);
+    const gid = g.body.event.id;
+    assert.deepEqual(rec2985(gid).splitFrom, [nid, id]);
+    delete agents[h];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal((await turma2968("DELETE", nid)).status, 200);
+    assert.equal((await turma2968("PATCH", gid, { version: 1, sendInvites: true })).status, 409);
+    assert.equal(sends3014(other, gid).length, 0);
+    // The first series deleted too: only its sent tombstone is left, and it still blocks.
+    assert.equal((await turma2968("DELETE", id)).status, 200);
+    assert.ok(hub.getCalendarOutlookTombstones()[h].some((x) => x.turmaId === id && x.sent));
+    assert.equal((await turma2968("PATCH", gid, { version: 1, sendInvites: true })).status, 409);
+    assert.equal(sends3014(other, gid).length, 0);
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3014: a former sender's sent tombstone never holds back a sender that has already sent", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    await beat2985(D2985B, S2985B);
+    const id = (await turma2968("POST", null, ev2968([S2985B, S2985A], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const aHost = rec2985(id).outlook[S2985A].host;
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 1)] });
+    await beat2985(aHost, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // A becomes the sender (B online, so allowed), and sends.
+    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985A, S2985B] })).status, 200);
+    assert.equal(rec2985(id).outlook[S2985A].sent, true);
+    // B dropped: its tombstone may have sent, but A's invitation is already live.
+    assert.equal((await turma2968("PATCH", id, { version: 2, orgs: [S2985A] })).status, 200);
+    assert.ok(hub.getCalendarOutlookTombstones()[D2985B].some((x) => x.turmaId === id && x.sent));
+    // A keeps sending its updates…
+    assert.equal((await turma2968("PATCH", id, { version: 3, subject: "Moved" })).status, 200);
+    assert.ok(writes2985(aHost).some((x) => x.turmaId === id && x.version === 4 && x.event.sendInvites));
+    // …and its host going away holds it (XERK-3010), never re-homes it.
+    const other = aHost === D2985A ? D2985A2 : D2985A;
+    delete agents[aHost];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, aHost);
+    assert.match(rec2985(id).outlook[S2985A].error, /^Kept on /);
+    assert.ok(!(writes2985(other) || []).some((x) => x.turmaId === id));
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3014: a copy held before it ever sent is not marked sent, so XERK-3015's hold still stops it", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    await beat2985(D2985B, S2985B);
+    const id = (await turma2968("POST", null, ev2968([S2985B, S2985A], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 1)] });
+    const aHost = rec2985(id).outlook[S2985A].host;
+    await beat2985(aHost, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // A becomes the first org while its host is away: held, nothing queued, so not sent.
+    const saved = agents[aHost];
+    delete agents[aHost];
+    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985A, S2985B] })).status, 200);
+    assert.ok(!rec2985(id).outlook[S2985A].sent);
+    // B (which did send) goes away: its copy becomes a sent tombstone.
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2)] });
+    const savedB = agents[D2985B];
+    delete agents[D2985B];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.ok(hub.getCalendarOutlookTombstones()[D2985B].some((x) => x.turmaId === id && x.sent));
+    // A's host returns: it is written plain until B's cancellation lands.
+    agents[aHost] = saved;
+    await beat2985(aHost, S2985A);
+    hub.calendarOutlookTick(Date.now() + 1, true);
+    assert.equal(sends3014(aHost, id).length, 0);
+    agents[D2985B] = savedB;
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3014: a sent copy given back to its host keeps its sent mark", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const h = rec2985(id).outlook[S2985A].host;
+    await beat2985(h, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // Off and moved while plain: a sent tombstone stays on h. Then the new holder leaves
+    // and h is re-picked: it takes its tombstone back, and with it the mark.
+    const saved = agents[h];
+    delete agents[h];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal((await turma2968("PATCH", id, { version: 1, sendInvites: false })).status, 200);
+    const other = rec2985(id).outlook[S2985A].host;
+    assert.notEqual(other, h);
+    agents[h] = saved;
+    const savedOther = agents[other];
+    delete agents[other];
+    await beat2985(h, S2985A, { calendar: { available: true, write: true } });
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, h, "re-picked");
+    assert.ok(!(hub.getCalendarOutlookTombstones()[h] || []).some((x) => x.turmaId === id), "its tombstone taken back");
+    assert.equal(rec2985(id).outlook[S2985A].sent, true);
+    agents[other] = savedOther;
+  } finally {
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
+test("XERK-3014: a copy's sent mark and a tombstone's survive coercion", () => {
+  const t = "";
+  const o = hub.calOutlookSanitize({ s: { host: "h", outlookId: "", version: 1, state: "pending", sent: true, at: 5 },
+    u: { host: "", outlookId: "", version: 1, state: "pending", sent: true, at: 5 } }, ["s", "u"], t);
+  assert.equal(o.s.sent, true);
+  assert.ok(!("sent" in o.u), "no host, nothing sent");
+  assert.equal(hub.calOutlookSanitize(o, ["s", "u"], t).s.sent, true, "a fixed point");
+  const id = `turma:${"a".repeat(16)}`;
+  const tb = hub.calOutlookTombstonesCoerce({ h: [{ turmaId: id, org: "s", outlookId: "", at: 5, sent: true }] });
+  assert.equal(tb.h[0].sent, true, "a restart keeps the block");
+  const no = hub.calOutlookTombstonesCoerce({ h: [{ turmaId: id, org: "s", outlookId: "", at: 5, sent: "yes" }] });
+  assert.ok(!("sent" in no.h[0]));
+  // splitFrom: ids only, never the record's own, no repeats.
+  const self = `turma:${"b".repeat(16)}`;
+  const r = hub.sanitizeTurmaEvent({ id: self, orgs: ["s"], start: "2027-01-01T09:00:00Z", end: "2027-01-01T10:00:00Z",
+    splitFrom: [id, self, "x", id, 5] }, t);
+  assert.deepEqual(r.splitFrom, [id]);
+  assert.deepEqual(hub.sanitizeTurmaEvent(r, t).splitFrom, [id], "a fixed point");
+  const many = Array.from({ length: 60 }, (_, i) => `turma:${i.toString(16).padStart(16, "0")}`);
+  assert.deepEqual(hub.sanitizeTurmaEvent({ ...r, splitFrom: many }, t).splitFrom, many.slice(0, 50), "nearest 50 kept");
+});
+
 // XERK-3015: the org grace drop makes another org the sender while the dropped org's
 // sent copy still waits for its cancellation: the new first org's copy stays plain.
 async function drop3015() {
