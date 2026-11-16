@@ -334,6 +334,43 @@ test("a reader who scrolled up is not yanked back down by a late image", () => {
   assert.equal(st.scrollTop, 100);
 });
 
+test("the pin's own late scroll event, after an image grew the pane, does not unpin (XERK-2953)", () => {
+  // The image's size is known (the pane grows) before its `load`, and under load
+  // the open's own scroll event lands in between: it is not the reader leaving.
+  const st = staticScroll("trScroll2b");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });
+  assert.equal(st.scrollTop, 1000);
+  // The fake does not clamp scrollTop to scrollHeight - clientHeight (400), so
+  // growing 1000 -> 1800 leaves the view 400px short, as the browser saw it.
+  st.scrollHeight = 1800;
+  st.fire("scroll");
+  st.fire("load");
+  assert.equal(st.scrollTop, 1800);
+  st.scrollTop = 900; st.fire("scroll");   // the reader scrolling up still unpins
+  st.scrollHeight = 2200; st.fire("load");
+  assert.equal(st.scrollTop, 900);
+});
+
+test("a reader back at the bottom by hand pins at that pixel, so scrolling up again unpins (XERK-2953 QA)", () => {
+  const st = staticScroll("trScroll2c");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });   // pins at 1000
+  st.scrollTop = 400; st.fire("scroll");    // up: unpinned
+  st.scrollHeight = 2500;                   // the pane grows below
+  st.scrollTop = 2100; st.fire("scroll");   // back at the bottom by hand: pinned at 2100
+  st.scrollTop = 1500; st.fire("scroll");   // up again, still past the 1000 the open pinned at
+  st.scrollHeight = 3000; st.fire("load");
+  assert.equal(st.scrollTop, 1500, "the reader's scroll up is kept");
+});
+
+test("a sub-pixel wobble under the pin's pixel, after the pane grew, keeps the pin (XERK-2953 QA)", () => {
+  const st = staticScroll("trScroll2d");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });   // pins at 1000
+  st.scrollHeight = 1800;                   // grew 800px below
+  st.scrollTop = 999.5; st.fire("scroll");  // HiDPI rounding of the pin's own write
+  st.fire("load");
+  assert.equal(st.scrollTop, 1800);
+});
+
 test("a search-hit open still lands on its hit, not the bottom", () => {
   const st = staticScroll("trScroll4");
   window.CSS = globalThis.CSS = { escape: (s) => s }; // chat.js checks window.CSS, then calls CSS.escape
@@ -353,11 +390,13 @@ function laidOutScroll(id, nodes) {
   const st = staticScroll(id);
   st.scrollHeight = 20000;
   st.getBoundingClientRect = () => ({ top: 0, bottom: 400 });
-  // `n.hiddenIn` names the node (by dkey) of the closed <details> it sits in.
+  // `n.hiddenIn` names the node (by dkey) of the <details> it sits in, closed
+  // unless that node has `open: true` (then `:not([open])` does not match it).
   const el = (n) => ({ dataset: { uuid: n.uuid, dkey: n.dkey }, classList: [n.cls],
     getBoundingClientRect: () => n.rect,
-    parentElement: { closest: () => {
+    parentElement: { closest: (sel) => {
       const c = n.hiddenIn && nodes.find((x) => x.dkey === n.hiddenIn);
+      if (c && c.open && /:not\(\[open\]\)/.test(sel)) return null;
       return c ? el(c) : null;
     } } });
   st.querySelectorAll = (sel) => {
@@ -527,6 +566,69 @@ test("a thought that folds into a run lands on the run, not its hidden body", ()
   }, get() { return ""; } });
   verb.pick("normal");
   assert.equal(st.scrollTop, 5200, "the run is at +40, not its hidden body");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a thought in an OPENED group is where the reader is (XERK-2953)", () => {
+  // The reader opened the folded run: its bodies are on screen, and the one at
+  // +200 is the first message in view — not the bubble below it.
+  const nodes = [
+    { uuid: "a", cls: "thought", dkey: "thf:a", open: true, rect: { top: -100, bottom: 380 } },
+    { uuid: "b", cls: "thought-body", hiddenIn: "thf:a", rect: { top: 200, bottom: 290 } },
+    { uuid: "c", cls: "tr-msg", rect: { top: 300, bottom: 360 } },
+  ];
+  const st = laidOutScroll("trScroll15", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t15" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[1].rect = { top: 500, bottom: 590 }; nodes[2].rect = { top: 900, bottom: 960 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5300, "the opened thought is back at +200");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("an element ending at the pane's top is not the anchor (XERK-2953)", () => {
+  // A closed run ends exactly at the top edge; below it only its hidden bodies
+  // and then a bubble just under the pane. The bubble anchors, not the run.
+  const nodes = [
+    { uuid: "a", cls: "thought", dkey: "thf:a", rect: { top: -40, bottom: 0 } },
+    { uuid: "b", cls: "thought-body", hiddenIn: "thf:a", rect: { top: 10, bottom: 3000 } },
+    { uuid: "c", cls: "tr-msg", rect: { top: 450, bottom: 510 } },
+  ];
+  const st = laidOutScroll("trScroll16", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t16" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes[0].rect = { top: -400, bottom: -360 }; nodes[2].rect = { top: 600, bottom: 660 };
+  }, get() { return ""; } });
+  verb.pick("verbose");
+  assert.equal(st.scrollTop, 5150, "the bubble is back at +450");
+  delete window.CSS; delete globalThis.CSS;
+});
+
+test("a hidden card lands on the entry's nearest card of its kind (XERK-2953)", () => {
+  // The reader is on u5's second card (Bash); Concise keeps only its first
+  // (a file delivery), so that card — not the entry's bubble — takes its place.
+  const nodes = [
+    { uuid: "u5", cls: "tr-msg", rect: { top: -300, bottom: -200 } },
+    { uuid: "u5", cls: "action-card", dkey: "file", rect: { top: -100, bottom: -10 } },
+    { uuid: "u5", cls: "action-card", dkey: "bash", rect: { top: 40, bottom: 140 } },
+  ];
+  const st = laidOutScroll("trScroll17", nodes);
+  const verb = verbosityHost();
+  window.CSS = globalThis.CSS = { escape: (s) => s };
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, verbHost: verb, transcriptId: "t17" });
+  st.scrollTop = 5000; st.fire("scroll");
+  Object.defineProperty(st, "innerHTML", { set() {
+    nodes.pop(); nodes[0].rect = { top: 300, bottom: 400 }; nodes[1].rect = { top: 500, bottom: 590 };
+  }, get() { return ""; } });
+  verb.pick("concise");
+  assert.equal(st.scrollTop, 5460, "the file card is at +40");
   delete window.CSS; delete globalThis.CSS;
 });
 

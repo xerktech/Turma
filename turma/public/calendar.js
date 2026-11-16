@@ -1307,10 +1307,17 @@ function zoneParts(ms, tz) {
   for (const x of f.formatToParts(ms)) p[x.type] = x.value;
   return { y: +p.year, mo: +p.month, d: +p.day, h: +p.hour % 24, mi: +p.minute, s: +p.second };
 }
-function zoneOffsetMin(ms, tz) {
+function zoneOffsetSec(ms, tz) {
   const p = zoneParts(ms, tz);
-  return Math.round((Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000) / 60000);
+  return (Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - Math.floor(ms / 1000) * 1000) / 1000;
 }
+const zoneOffsetMin = (ms, tz) => Math.round(zoneOffsetSec(ms, tz) / 60);
+// Before a zone adopted standard time it kept local mean time, an offset with
+// seconds (Europe/Brussels +00:17:30 in 1890, Africa/Monrovia -00:44:30 until
+// 1972). An ISO offset carries whole minutes only, so such a time would be saved
+// rounded and reopen off by up to a minute (XERK-2953): the editor refuses it.
+const LMT_ERROR = "That date is before this time zone kept standard time (its offset has seconds); pick a later date.";
+const keepsLmt = (ms, tz) => zoneOffsetSec(ms, tz) % 60 !== 0;
 const ymdOf = (p) => `${p.y}-${pad(p.mo)}-${pad(p.d)}`;
 // "YYYY-MM-DD" + n calendar days.
 function addYmd(ymd, n) {
@@ -1386,8 +1393,10 @@ function formTimes(f) {
   if (!zoneKnown(tz)) return { error: { timeZone: "Pick a time zone." } };
   const s = wallToIso(f.startDate, f.allDay ? "00:00" : f.startTime, tz);
   if (!s) return { error: { start: "Pick a start date and time." } };
+  if (keepsLmt(s.ms, tz)) return { error: { start: LMT_ERROR } };
   const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz);
   if (!e) return { error: { end: "Pick an end date and time." } };
+  if (keepsLmt(e.ms, tz)) return { error: { end: LMT_ERROR } };
   if (e.ms < s.ms || (f.allDay && e.ms <= s.ms)) return { error: { end: "The end is before the start." } };
   return { start: s.iso, end: e.iso, startMs: s.ms, endMs: e.ms };
 }
