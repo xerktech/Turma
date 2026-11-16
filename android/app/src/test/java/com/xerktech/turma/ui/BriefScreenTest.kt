@@ -190,10 +190,12 @@ class BriefScreenTest {
         open("Design review")
         compose.onNodeWithText("Item of Design review").assertExists()
         seed(meetings = meeting("m1", "Design review", archived = true))
-        compose.waitForIdle()
-        compose.onNodeWithText("Run now").assertExists()
-        compose.onNodeWithText("Item of Design review").assertDoesNotExist()
+        // The move off the archived entry lands a frame after the fleet does: wait for it, never
+        // assert on the frame waitForIdle happened to stop at (XERK-3018, a CI flake).
+        waitFor("Run now")
+        waitGone("Item of Design review")
         seed(meetings = meeting("m1", "Design review"))
+        waitFor("Design review")   // listed again, so "does not jump back" is judged on that frame
         compose.waitForIdle()
         compose.onNodeWithText("Run now").assertExists()
         compose.onNode(hasText("Daily meeting") and isSelected()).assertExists()
