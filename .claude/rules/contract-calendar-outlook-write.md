@@ -75,6 +75,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - **A sent-but-unanswered write is re-queued after `CALENDAR_WRITE_RESULT_MS` (10 min)**: an
   agent restart or a dropped outbox loses the row. Safe because the agent's upsert is idempotent.
 - A `failed` entry retries hourly and on any record write; never a tight loop on a permanent error.
+  - Also on its holder's return to `write: true` (XERK-2990): at most once per read cycle, even
+    when every write run is refused while reads succeed.
 
 ## Agent: the write (XERK-2984)
 
