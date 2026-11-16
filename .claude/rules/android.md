@@ -168,8 +168,10 @@ A pure-core/adapter-shell split:
   - **A short event lays out by its DRAWN floor at the current zoom** (XERK-3026,
     `calMinLayoutMin(slot, BLOCK_MIN_DP)`): never under 20 minutes, more when the floor is taller.
     Laid out at 20 while drawn taller, the block covered the next event's top (24h zoom). The floor
-    alone, never floor + gap: that split 30-min-apart events on a short pane. A new floor changes
-    `BLOCK_MIN_DP` only. Tests: `CalendarTest`, `CalendarBlockLayoutTest` (`XERK-3026`).
+    alone, never floor + gap: that split 30-min-apart events on a short pane. The floor is
+    `blockFloor()`: `BLOCK_MIN_DP` or the title line (12sp + 2dp, XERK-3024), whichever is taller,
+    and one value feeds both the draw and the layout. Tests: `CalendarTest`,
+    `CalendarBlockLayoutTest` (`XERK-3026`), `CalendarScreenTest` (`XERK-3024`).
   - An empty slot opens New event on a TAP only: a touch past the slop or held past the long-press
     timeout opens nothing (`awaitSlotTap`). The grid's rows carry 88dp of bottom room so the
     last hour scrolls clear of the FAB. Tests: `CalendarScreenTest` (rollup XERK-2953 cases).
