@@ -33450,6 +33450,9 @@ test("XERK-2968: refusals — Outlook ids, empty or unknown orgs, malformed fiel
     assert.deepEqual(Object.keys(hub.getCalendarTurmaEvents()), [], "no refusal minted anything");
     const okCat = await turma2968("POST", null, ev2968([S2968A], { categories: ["Red - urgent"] }));
     assert.equal(okCat.status, 200);
+    const badPatch = await turma2968("PATCH", okCat.body.event.id, { version: okCat.body.event.version, categories: ["c,d"] });
+    assert.equal(badPatch.status, 400, "a PATCH is refused too");
+    assert.match(badPatch.body.error, /^categories: /);
     assert.equal((await turma2968("DELETE", okCat.body.event.id)).status, 200);
     // Caps: a full tenant refuses in the hub's words with a 409; nothing is dropped.
     const b = Object.create(null);
