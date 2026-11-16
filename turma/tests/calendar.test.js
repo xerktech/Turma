@@ -1094,6 +1094,10 @@ test("XERK-3023: a Turma event's panel wears its block's gradient; an Outlook on
   }
   assert.match(css, /\.cal-detail\.turma :focus-visible\s*\{\s*outline-color:\s*#fff/, "the focus ring shows on the gradient");
   assert.match(rule, /--focus-ring:\s*#fff/, "a field's focus halo shows on the gradient too");
+  assert.match(css, /\.cal-detail select:focus[^{]*\{\s*box-shadow:\s*0 0 0 2px var\(--accent\)/,
+    "a panel field's focus is a solid accent ring on the org tint, not the faint 30% halo");
+  assert.match(css, /\.cal-detail\.turma select:focus[^{]*\{\s*box-shadow:\s*0 0 0 1px rgba\(11, 11, 11, 0\.75\), 0 0 0 3px #fff/,
+    "on the gradient a white field keeps a dark edge inside its white ring");
 });
 
 test("XERK-2954: zoom steps the hours the pane shows, holds the middle, and stops at each end", async () => {

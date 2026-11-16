@@ -381,6 +381,13 @@
   .cal-detail.turma a { text-decoration: underline; }
   .cal-detail.turma .mt-people span, .cal-detail.turma .cal-cat { background: rgba(0, 0, 0, 0.22); }
   .cal-detail.turma :focus-visible { outline-color: #fff; }
+  /* A panel field shows focus by a SOLID ring (XERK-3023 follow-up): app.css's 30% accent halo
+     read ~1.45:1 on the org tint. On the gradient the ring is white with a dark inner line, so a
+     white field's edge still reads against its own white halo. */
+  .cal-detail input:focus, .cal-detail select:focus, .cal-detail textarea:focus {
+    box-shadow: 0 0 0 2px var(--accent); }
+  .cal-detail.turma input:focus, .cal-detail.turma select:focus, .cal-detail.turma textarea:focus {
+    box-shadow: 0 0 0 1px rgba(11, 11, 11, 0.75), 0 0 0 3px #fff; }
   .cal-detail-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
   .cal-detail h2 { flex: 1 1 auto; font-family: var(--font-display); font-size: 18px; margin: 0; overflow-wrap: anywhere; }
   .cal-dstate { font-size: 12px; color: var(--muted); text-transform: capitalize; margin-bottom: 6px; }
