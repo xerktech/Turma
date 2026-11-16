@@ -63,8 +63,9 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   `calTurmaResendError`, on series edits AND "following" splits (the split's source series counts).
   - Unsettled = a `sent` tombstone of the source event (any org), or a `sent` copy held on a host
     that cannot write. Else off-then-on, a new `orgs[0]`, or a split re-invites, dodging XERK-3010.
-  - `sent` is set on an entry whenever its host holds it while `calTurmaSends` (before any upsert,
-    kept through invitations off), carried onto its tombstone, and cleared on re-home.
+  - `sent` is set on an entry only when a SENDING upsert is queued to its host (may have sent), kept
+    through invitations off, carried onto its tombstone, cleared on re-home. Never for a copy merely
+    held: the mark exempts a copy from XERK-3015's hold, so a held never-sent copy would invite (QA).
   - Only `sent` tombstones block: a copy that never sent leaves no live invitation to duplicate.
   - A split's new series stores `splitFrom`: EVERY ancestor id, nearest first (hub-internal, never
     served or client-set), so deleting a middle series cannot cut the chain (QA).

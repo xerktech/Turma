@@ -35475,6 +35475,40 @@ test("XERK-3014: a former sender's sent tombstone never holds back a sender that
   }
 });
 
+test("XERK-3014: a copy held before it ever sent is not marked sent, so XERK-3015's hold still stops it", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    await beat2985(D2985B, S2985B);
+    const id = (await turma2968("POST", null, ev2968([S2985B, S2985A], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 1)] });
+    const aHost = rec2985(id).outlook[S2985A].host;
+    await beat2985(aHost, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // A becomes the first org while its host is away: held, nothing queued, so not sent.
+    const saved = agents[aHost];
+    delete agents[aHost];
+    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985A, S2985B] })).status, 200);
+    assert.ok(!rec2985(id).outlook[S2985A].sent);
+    // B (which did send) goes away: its copy becomes a sent tombstone.
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2)] });
+    const savedB = agents[D2985B];
+    delete agents[D2985B];
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.ok(hub.getCalendarOutlookTombstones()[D2985B].some((x) => x.turmaId === id && x.sent));
+    // A's host returns: it is written plain until B's cancellation lands.
+    agents[aHost] = saved;
+    await beat2985(aHost, S2985A);
+    hub.calendarOutlookTick(Date.now() + 1, true);
+    assert.equal(sends3014(aHost, id).length, 0);
+    agents[D2985B] = savedB;
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
 test("XERK-3014: a sent copy given back to its host keeps its sent mark", async () => {
   cleanup2985(D2985A, D2985A2);
   try {

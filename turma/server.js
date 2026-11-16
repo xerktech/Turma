@@ -7621,9 +7621,6 @@ function calOutlookReconcile(t, rec, now, memo) {
     let e = rec.outlook[org];
     if (!e) e = rec.outlook[org] = { host: "", outlookId: "", version: 0, state: "pending", at: now };
     const holderOk = !!e.host && calWriteHolderOk(e.host, t, org, now);
-    // Marked before any upsert can go, and kept through invitations turned off: its
-    // tombstone must say its invitation may be live (XERK-3014).
-    if (e.host && calTurmaSends(rec, org)) e.sent = true;
     // A sending copy is never re-homed (XERK-3010): the new holder would invite every
     // attendee again from its own mailbox, and the old invitation is cancelled only if
     // its host ever returns. It stays with its host, failed, saying why. Held whether or
@@ -7652,7 +7649,6 @@ function calOutlookReconcile(t, rec, now, memo) {
         if (tb) e.outlookId = tb.outlookId;
         if (tb && tb.sent) e.sent = true;
       }
-      if (e.host && calTurmaSends(rec, org)) e.sent = true;
     }
     if (e.state === "written" && e.version === rec.version) continue;
     if (e.version !== rec.version) {
@@ -7664,8 +7660,13 @@ function calOutlookReconcile(t, rec, now, memo) {
     if (!e.host) continue;
     if (e.state === "failed" && now - e.at < CALENDAR_WRITE_RETRY_MS) continue;
     if (calWriteInFlight(e.host, rec.id, rec.version, "upsert", now)) continue;
+    const event = calWriteEvent(rec, org);
     const id = queueCalendarWrite(e.host, { type: "writeCalendarEvent", op: "upsert", turmaId: rec.id,
-      org: baseOfSite(org), version: rec.version, outlookId: e.outlookId, event: calWriteEvent(rec, org) }, now);
+      org: baseOfSite(org), version: rec.version, outlookId: e.outlookId, event }, now);
+    // `sent` (XERK-3014): a sending upsert went to this host, so its invitation may be live.
+    // Set only here, never for a copy merely held: that one has sent nothing, and the mark
+    // exempts a copy from XERK-3015's hold. Kept through invitations off; cleared on re-home.
+    if (id && event.sendInvites) e.sent = true;
     if (id && e.state === "failed") {
       Object.assign(e, { state: "pending", at: now });
       delete e.error;
