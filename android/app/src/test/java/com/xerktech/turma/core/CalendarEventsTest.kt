@@ -138,6 +138,13 @@ class CalendarEventsTest {
         // XERK-3013: ',' separates names; a ';' would split the Outlook copy.
         assertTrue(calDraftErrors(draft("o").copy(categories = "Red, Blue")).isEmpty())
         assertTrue(calDraftErrors(draft("o").copy(categories = "Red, a;b")).contains("A category name can't contain ';'."))
+        // XERK-3016: invitations go out from one org's Outlook, so a sending event has one org.
+        val oneOrg = "An event that sends invitations belongs to one org: pick one, or turn invitations off."
+        assertTrue(calDraftErrors(draft("o", "p").copy(invites = true)).contains(oneOrg))
+        assertTrue(calDraftErrors(draft("o").copy(invites = true)).isEmpty())
+        assertTrue(calDraftErrors(draft("o", "p")).isEmpty())
+        // One occurrence of an older two-org sending series: its controls are disabled and the hub takes it.
+        assertTrue(calDraftErrors(draft("o", "p").copy(invites = true, scope = "occurrence")).isEmpty())
     }
 
     @Test fun `served Turma fields decode, and an older hub's event reads read-only`() {

@@ -1632,6 +1632,10 @@ function validateForm(f, pickable = null) {
   if (!f.orgs.length) err.orgs = "Pick at least one org.";
   else if (f.orgs.length > ORGS_MAX) err.orgs = `An event belongs to at most ${ORGS_MAX} orgs.`;
   else if (pickable && f.orgs.some((o) => !pickable.includes(o))) err.orgs = "Pick only orgs you can see.";
+  // Invitations go out from one org's Outlook (XERK-3016): the hub refuses them on two orgs.
+  // Not for one occurrence: its orgs and invitations are the series' (both boxes disabled), and
+  // the hub takes it even on an older two-org sending series.
+  else if (f.invites && f.orgs.length > 1 && f.repScope !== "occurrence") err.orgs = "An event that sends invitations belongs to one org: pick one, or turn invitations off.";
   if (cps(f.subject) > 300) err.subject = "The title is longer than 300 characters.";
   if (cps(f.location) > 300) err.location = "The location is longer than 300 characters.";
   if (cps(f.body) > BODY_MAX) err.body = `The details are longer than ${BODY_MAX} characters.`;
@@ -1871,7 +1875,7 @@ function editorHtml() {
     + `<div class="cal-ed-foot"><button type="button" data-ed-cancel>Cancel</button>`
     + `<button type="button" class="primary" data-ed-save${dis}>${ed.busy ? "Saving…" : ed.mode === "edit" ? "Save" : "Save event"}</button></div>`;
 }
-// Invitations (XERK-2989): sent from the first org's Outlook, so attendees get one each.
+// Invitations (XERK-2989): sent from the event's one org's Outlook (XERK-3016).
 // The event's, never one occurrence's: "This event" shows them disabled.
 function invitesRowHtml(f, one) {
   const off = one ? ' disabled aria-describedby="calEdOneNote"' : "";
@@ -1882,7 +1886,7 @@ function invitesRowHtml(f, one) {
     + `</div></div>`
     + (f.invites ? `<div class="cal-ed-row"><span class="k"></span><span class="cal-dnote cal-ed-note">`
       + esc(f.priv ? "A private event sends no invitations: its details are withheld from Outlook."
-        : "Sent once, from the Outlook host of the event's first org; updates and a delete reach the attendees too.")
+        : "Sent once, from the Outlook host of the event's org; updates and a delete reach the attendees too.")
       + `</span></div>` : "");
 }
 // The editor's summary line: a split count series' count is the whole run's, and says so.

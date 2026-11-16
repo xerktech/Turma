@@ -1258,6 +1258,15 @@ test("XERK-2971: form validation mirrors the hub — orgs, emails, times, https 
   f.orgs = ["acme"];
   assert.deepEqual(cal.validateForm(f), {});
   assert.deepEqual(Object.keys(cal.validateForm({ ...f, orgs: ["other"] }, ["acme"])), ["orgs"], "only pickable orgs");
+  // XERK-3016: invitations go out from one org's Outlook, so a sending event has one org.
+  assert.match(cal.validateForm({ ...f, invites: true, orgs: ["acme", "beta"] }).orgs, /sends invitations belongs to one org/);
+  assert.deepEqual(cal.validateForm({ ...f, invites: true }), {});
+  assert.deepEqual(cal.validateForm({ ...f, orgs: ["acme", "beta"] }), {});
+  // One occurrence of an older two-org sending series: both boxes are disabled and the hub takes it.
+  assert.deepEqual(cal.validateForm({ ...f, invites: true, orgs: ["acme", "beta"], repScope: "occurrence" }), {});
+  for (const repScope of ["series", "following"]) {
+    assert.match(cal.validateForm({ ...f, invites: true, orgs: ["acme", "beta"], repScope }).orgs, /one org/, repScope);
+  }
   assert.match(cal.validateForm({ ...f, endTime: "08:00" }).end, /before the start/);
   assert.match(cal.validateForm({ ...f, startDate: "2027-02-30" }).start, /start/);
   assert.match(cal.validateForm({ ...f, reqDraft: "not-an-email" }).reqDraft, /Not an email/);
@@ -1356,7 +1365,7 @@ test("XERK-2989: invitations — the form round-trips them, the editor offers th
   const on = cal.invitesRowHtml({ ...f, invites: true }, false);
   assert.match(on, /data-ed-flag="reqResp" checked/);
   assert.match(on, /data-ed-flag="allowFwd" checked/);
-  assert.match(on, /Sent once, from the Outlook host of the event&#39;s first org/);
+  assert.match(on, /Sent once, from the Outlook host of the event&#39;s org/);
   assert.match(cal.invitesRowHtml({ ...f, invites: true, priv: true }, false), /private event sends no invitations/);
   assert.match(cal.invitesRowHtml({ ...f, invites: true }, true), /data-ed-flag="invites" checked disabled/);
   // The panel: who sends, the options, a tally of the answers the hub read back.

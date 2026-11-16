@@ -6990,6 +6990,19 @@ function calTurmaFind(p, id) {
   }
   return { status: 404, body: { error: "no such Turma event" } };
 }
+// A 400 for a record that sends invitations from more than one org (XERK-3016, operator
+// rule: an invited meeting's people are one org's). Only the first org's copy sends, so a
+// second org let a reorder or re-add hand the sending role to another mailbox while the
+// first invitation stayed live: attendees got two. With one org there is no second sender.
+// Checked on every create, series and following write. An occurrence write cannot change
+// orgs or invitations, so it passes on an older two-org sending record; so does a DELETE.
+// `hidden`: orgs the record keeps that no host is in (not served, so the client never saw
+// them): the refusal names them, or it reads "pick one org" to someone who sees one.
+function turmaInvitesError(rec, hidden = 0) {
+  if (rec.sendInvites !== true || rec.orgs.length < 2) return null;
+  return "an event that sends invitations belongs to exactly one org: pick one org, or turn invitations off" +
+    (hidden ? ` (it keeps ${hidden} org${hidden > 1 ? "s" : ""} no host is in until the 24h grace drops ${hidden > 1 ? "them" : "it"})` : "");
+}
 // A 400 for a record whose rule the whitelist could not keep or that names no
 // occurrence at all, else null. `wanted` = the write asked for a rule.
 function turmaSeriesError(rec, wanted) {
@@ -7014,7 +7027,7 @@ function createTurmaEvent(p, body, now = Date.now()) {
   const rec = sanitizeTurmaEvent({ ...calPick(body), id: calTurmaMintId(t), orgs: body.orgs,
     recurrence: body.recurrence || null, createdBy: calTurmaActor(p), createdAt: now, updatedAt: now, version: 1 }, t);
   if (!rec) return { status: 400, body: { error: "end must not be before start" } };
-  const se = turmaSeriesError(rec, !!body.recurrence);
+  const se = turmaSeriesError(rec, !!body.recurrence) || turmaInvitesError(rec);
   if (se) return { status: 400, body: { error: se } };
   const full = turmaEventCapError(t, rec);
   if (full) return full;
@@ -7159,7 +7172,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     const rec = sanitizeTurmaEvent({ ...f.rec, ...fields, orgs, recurrence: rule,
       updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
     if (!rec) return { status: 400, body: { error: "end must not be before start" } };
-    const se = turmaSeriesError(rec, !!rule);
+    const se = turmaSeriesError(rec, !!rule) || turmaInvitesError(rec, rec.orgs.filter((o) => undecided.includes(o)).length);
     if (se) return { status: 400, body: { error: se } };
     if (calTurmaDropsPrivate(p, f.rec, rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
     const full = turmaEventCapError(f.t, rec);
@@ -7216,7 +7229,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     orgs, recurrence: rule, exceptions, id: calTurmaMintId(f.t), createdAt: now, updatedAt: now, version: 1,
     outlook: {} }, f.t);
   if (!next) return { status: 400, body: { error: "end must not be before start" } };
-  const se = turmaSeriesError(next, !!rule);
+  const se = turmaSeriesError(next, !!rule) || turmaInvitesError(next, next.orgs.filter((o) => undecided.includes(o)).length);
   if (se) return { status: 400, body: { error: se } };
   // Every occurrence before this one already deleted: the old half would serve nothing
   // yet still count toward the tenant's caps, so it is deleted, not kept (XERK-2953),
@@ -32114,7 +32127,7 @@ if (process.env.TURMA_TEST) {
     getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
     CALENDAR_WRITE_REPAIR_MIN_MS, calHeldError, calOutlookSanitize, __calTombstoneAdd: calTombstoneAdd, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
-    sanitizeTurmaEvent, calTurmaResponses, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
+    sanitizeTurmaEvent, calTurmaResponses, calTurmaSends, __calTurmaStore: calTurmaStore, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
