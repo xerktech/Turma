@@ -1067,7 +1067,10 @@ test("XERK-2898: meetingState — proposals pending, a meeting being read, archi
 });
 
 test("XERK-2898: end to end — click a past event on the calendar, review its capture in the panel, the badge counts down", async () => {
-  const start = Date.now() - 2 * 864e5;
+  // A past WEEKDAY: the default wide view is the work week, so "2 days ago" on a Sunday or
+  // Monday fell on a weekend the grid never draws.
+  let start = Date.now() - 2 * 864e5;
+  while ([0, 6].includes(new Date(start).getDay())) start -= 864e5;
   const answers = [];
   const ev = { host: "h1", id: "OUT1", org: SITE, source: "outlook", subject: "Sprint sync", startMs: start, endMs: start + 18e5,
     meetings: [{ site: SITE, meetingId: "m1", title: "Sprint <sync>" }] };
