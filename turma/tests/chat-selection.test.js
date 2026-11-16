@@ -660,6 +660,28 @@ test("a verbosity change at the bottom stays at the bottom", () => {
   assert.equal(st.scrollTop, 26000);
 });
 
+test("content growing with no load event re-pins a reader parked at the bottom (XERK-2993)", () => {
+  // A font swap or a <details> opening resizes the messages, not the pane: the
+  // observer must watch the children, including ones a later repaint adds.
+  const watched = new Set();
+  let cb = null, onChildren = null;
+  globalThis.ResizeObserver = class { constructor(f) { cb = f; } observe(n) { watched.add(n); } };
+  globalThis.MutationObserver = class { constructor(f) { onChildren = f; } observe() {} };
+  const st = staticScroll("trScroll2993");
+  const first = [{ id: "m1" }, { id: "m2" }, { id: "m3" }];
+  st.children = first;
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t2993" });
+  assert.ok(first.every((c) => watched.has(c)), "every message is observed");
+  const later = [{ id: "m4" }, { id: "m5" }];
+  st.children = later;
+  onChildren();
+  assert.ok(later.every((c) => watched.has(c)), "every message a repaint adds is observed");
+  st.scrollHeight = 3100; // the font swapped in: every line got taller
+  cb();
+  assert.equal(st.scrollTop, 3100);
+  delete globalThis.ResizeObserver; delete globalThis.MutationObserver;
+});
+
 test("a pane un-hidden after a hidden render re-pins to the bottom", () => {
   let observed = null;
   globalThis.ResizeObserver = class { constructor(cb) { this.cb = cb; } observe() { observed = this.cb; } };
