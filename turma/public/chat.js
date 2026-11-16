@@ -1875,7 +1875,7 @@
   async function streamVideoFailed(box, v) {
     let st = null;
     try {
-      const r = await fetch(v.getAttribute("src") + "?status=1", { cache: "no-store" });
+      const r = await fetch(v.getAttribute("src") + "?status=1&peek=1", { cache: "no-store" });
       st = r.ok ? await r.json() : null;
     } catch (_) { st = null; }
     if (st && st.state === "ready") {

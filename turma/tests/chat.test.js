@@ -1462,6 +1462,26 @@ test("streamVideoClick: outside the live chat it explains, and never asks the hu
   assert.match(note.textContent, /only while its session is running/);
 });
 
+test("streamVideoClick: the live chat asks the hub with the block's size", async () => {
+  const prevDoc = global.document, prevFetch = global.fetch;
+  const urls = [];
+  global.fetch = async (u) => { urls.push(u); return { ok: true, json: async () => ({ state: "error", error: "x" }) }; };
+  global.document = { getElementById: (id) => (id === "chatScroll" ? { contains: () => true } : null) };
+  const note = { textContent: "" };
+  const btn = { disabled: false };
+  const box = { querySelector: (sel) => (sel === ".md-video-note" ? note : btn),
+    getAttribute: (a) => (a === "data-ref" ? "a".repeat(32) : a === "data-size" ? "21446476" : null), isConnected: true };
+  __setHostKey("h1"); __setSess({ id: "s1" });
+  try {
+    await streamVideoClick(box);
+  } finally {
+    global.document = prevDoc; global.fetch = prevFetch;
+    __setHostKey(null); __setSess(null);
+  }
+  assert.equal(urls.length, 1);
+  assert.equal(urls[0], "/api/agents/h1/sessions/s1/sendfile/" + "a".repeat(32) + "?status=1&size=21446476");
+});
+
 test("streamVideoFailed: a copy still on the hub is the browser's codec, a gone one brings ▶ back", async () => {
   const prevDoc = global.document, prevFetch = global.fetch;
   const el = (tag) => ({ tag, className: "", textContent: "", type: "" });

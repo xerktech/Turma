@@ -9677,18 +9677,22 @@ function sendFileSpoolBytes() {
 }
 
 // Evict ready files, least recently played first, until `need` more bytes fit
-// the budget. Returns whether they do (uploads in flight are never evicted).
+// the budget. Returns whether they do. Evicts NOTHING unless the eviction makes
+// the room (a request that cannot fit must not empty the cache on its way to
+// being refused); pending fetches are never evicted.
 function sendFileMakeRoom(need) {
   let total = sendFileSpoolBytes();
   if (total + need <= SENDFILE_SPOOL_MAX_BYTES) return true;
   const ready = [...sendFiles].filter(([, e]) => e.state === "ready")
     .sort((a, b) => a[1].usedAt - b[1].usedAt);
+  const freeable = ready.reduce((n, [, e]) => n + (e.size || 0), 0);
+  if (total - freeable + need > SENDFILE_SPOOL_MAX_BYTES) return false;
   while (total + need > SENDFILE_SPOOL_MAX_BYTES && ready.length) {
     const [k, e] = ready.shift();
     total -= e.size || 0;
     dropSendFile(k);
   }
-  return total + need <= SENDFILE_SPOOL_MAX_BYTES;
+  return true;
 }
 
 // Boot: the index is in memory, so anything left in the spool belongs to no one.
@@ -28933,22 +28937,29 @@ const server = http.createServer(async (req, res) => {
         e.state = "error"; e.error = "the file is not a video the hub serves"; e.at = Date.now();
         return json(res, 400, { error: "unsupported type" });
       }
-      // The room was reserved when the fetch was asked for (the client names the
-      // size), so the normal upload is never refused here. A body declaring MORE
-      // than that is: drained first and answered on its end, never refused on
-      // the declaration (urllib writes the whole body before it reads, and would
-      // lose the answer — contract-agent-hub.md).
+      // Room was reserved when play was asked (the client names the block's
+      // size). A body declaring more — a client that sent no size, or a stale
+      // one — grows the reservation when the spool has room. Anything else is
+      // DRAINED and answered on its end, never refused on its declaration
+      // (urllib writes the whole body before it reads — contract-agent-hub.md).
       const declared = Number(req.headers["content-length"]);
-      const cap = Math.min(e.reserved || SENDFILE_MAX_BYTES, SENDFILE_MAX_BYTES);
-      if (!Number.isSafeInteger(declared) || declared < 0 || declared > cap) {
-        e.state = "error"; e.at = Date.now();
-        e.error = !Number.isSafeInteger(declared) || declared < 0
-          ? "the host sent the video without a length"
-          : "the video is larger than the hub was told";
-        const status = e.error.includes("length") ? 411 : 413;
+      let refuse = null;
+      if (!Number.isSafeInteger(declared) || declared < 0) {
+        refuse = [411, "the host sent the video without a length"];
+      } else if (declared > SENDFILE_MAX_BYTES) {
+        refuse = [413, `the video is over the hub's ${SENDFILE_MAX_BYTES >> 20} MB limit`];
+      } else if (declared > (e.reserved || 0)) {
+        if (sendFileMakeRoom(declared - (e.reserved || 0))) e.reserved = declared;
+        else refuse = [503, "the hub's video cache is full — try again shortly"];
+      }
+      if (refuse) {
+        e.state = "error"; e.at = Date.now(); e.error = refuse[1];
         let drained = 0;
-        req.on("data", (c) => { drained += c.length; if (drained > cap + RAW_BODY_DRAIN_SLACK) req.destroy(); });
-        req.on("end", () => json(res, status, { error: e.error }));
+        req.on("data", (c) => {
+          drained += c.length;
+          if (drained > SENDFILE_MAX_BYTES + RAW_BODY_DRAIN_SLACK) req.destroy();
+        });
+        req.on("end", () => json(res, refuse[0], { error: refuse[1] }));
         req.on("error", () => {});
         return;
       }
@@ -29888,8 +29899,12 @@ const server = http.createServer(async (req, res) => {
           // The size the block named (the client passes it): reserved now, so a
           // full cache is refused BEFORE the host uploads anything, and is not
           // remembered (a retry once room frees succeeds at once).
+          // A peek (the player checking why it failed) never starts a fetch.
+          if (url.searchParams.has("peek")) return json(res, 200, { state: "gone" });
+          // No size (an older client): reserve nothing now; the upload's own
+          // length is checked against the room when it arrives.
           const want = Number(url.searchParams.get("size"));
-          const reserve = Number.isSafeInteger(want) && want > 0 ? want : SENDFILE_MAX_BYTES;
+          const reserve = Number.isSafeInteger(want) && want > 0 ? want : 0;
           if (reserve > SENDFILE_MAX_BYTES) {
             return json(res, 200, { state: "error", error: `the video is over the hub's ${SENDFILE_MAX_BYTES >> 20} MB limit` });
           }
