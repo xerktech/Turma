@@ -25201,8 +25201,11 @@ def _brief_text(v):
     if not isinstance(v, str):
         return None
     # Cut first: the scrub regexes are superlinear on a long separator-free run.
-    # Zero-width/format chars could split a URL past the regex: drop them too.
-    v = "".join(ch for ch in v[:DAILY_BRIEF_TEXT_MAX * 4] if unicodedata.category(ch) != "Cf")
+    # Zero-width/format and non-space control chars could split a URL or email past
+    # the regex (`https\x00://`): drop them so it rejoins and is scrubbed. A lone
+    # surrogate (Cs; json.loads accepts "\ud800") can't be UTF-8 encoded into the argv.
+    v = "".join(ch for ch in v[:DAILY_BRIEF_TEXT_MAX * 4]
+                if ch.isspace() or unicodedata.category(ch) not in ("Cf", "Cc", "Cs"))
     v = _DAILY_BRIEF_URL_RE.sub("[link]", " ".join(v.split()))
     v = _DAILY_BRIEF_EMAIL_RE.sub("[email]", v)
     return v[:DAILY_BRIEF_TEXT_MAX] or None
@@ -25666,7 +25669,10 @@ def daily_brief_input(data):
         "nextCandidates": len(data.get("next") or []),
     }
     out["countsAreMinimums"] = bool(data.get("truncated"))
-    return json.dumps(out, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    text = json.dumps(out, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    # A lone surrogate in any field (keys skip _brief_text) would make Popen raise
+    # UnicodeEncodeError on every run; replace it rather than fail the brief.
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def _daily_brief_words(s):

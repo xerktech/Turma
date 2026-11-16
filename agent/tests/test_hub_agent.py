@@ -56641,6 +56641,14 @@ class TestDailyBrief(unittest.TestCase):
 
     def test_zero_width_split_and_long_text(self):
         self.assertEqual(ha._brief_text("go https\u200b://evil.com/x"), "go [link]")
+        # XERK-2953: control chars can't split a URL/email past the scrub, and a
+        # lone surrogate (unencodable into the argv) is dropped.
+        self.assertEqual(ha._brief_text("go https\x00://evil.com/x"), "go [link]")
+        self.assertEqual(ha._brief_text("mail bob@evil\x7f.com"), "mail [email]")
+        self.assertEqual(ha._brief_text("a\tb\x00c\nd"), "a bc d")
+        self.assertEqual(ha._brief_text("Stand\ud800up"), "Standup")
+        prompt = ha.daily_brief_input({"open": [{"key": "X-\ud800"}]})
+        prompt.encode("utf-8")   # would raise UnicodeEncodeError before the fix
         start = time.monotonic()
         out = ha._brief_text("a" * 200000)
         self.assertLess(time.monotonic() - start, 1.0)
