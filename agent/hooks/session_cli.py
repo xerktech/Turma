@@ -38,6 +38,7 @@ import base64
 import datetime
 import errno
 import glob
+import hashlib
 import json
 import os
 import re
@@ -105,6 +106,8 @@ CALENDAR_WRITE_BATCH_MAX = 20
 CALENDAR_WRITE_TIMEOUT_SEC = 120
 CALENDAR_WRITE_ERROR_MAX = 300
 CALENDAR_OUTLOOK_ID_MAX = 300
+# Invitees one sent copy carries (XERK-2989): the hub's attendee cap.
+CALENDAR_WRITE_ATTENDEES_MAX = 100
 _TURMA_ID = re.compile(r"turma:[0-9a-f]{16}")
 _BUSY_CODE = {v: k for k, v in _BUSY.items()}
 _SENSITIVITY_CODE = {v: k for k, v in _SENSITIVITY.items()}
@@ -254,7 +257,11 @@ __ATTACH__
 # the `TurmaId` user property (PS_PUBLIC_STRINGS) — and an item only counts when
 # its stamp IS that id, so a stale or foreign EntryID never edits someone's own
 # appointment, and a re-sent upsert finds its copy instead of making a second.
-# Save() only: never Send(), never a MeetingItem, no reminder (XERK-2988's).
+# Save() only, no reminder (XERK-2988's) — except the copy the hub names as the
+# invitation sender (XERK-2989, `event.send`): it becomes a meeting (MeetingStatus
+# olMeeting), its recipients are synced to the attendees, and Send() runs only when
+# the sent fields changed since the last send (`TurmaSent`). A sent copy is deleted,
+# or turned back into a plain copy, by a cancellation first.
 # Delete() of a copy already gone is ok. Times arrive as UTC epoch ms plus a
 # WINDOWS zone id: the zone is set first, then StartUTC/EndUTC, so the reader's
 # StartUTC/EndUTC read back the same instants (a wall time could not tell the
@@ -289,12 +296,39 @@ function FindCopy($c) {
   $null
 }
 function Utc($ms) { [DateTimeOffset]::FromUnixTimeMilliseconds([long]$ms).UtcDateTime }
+# Invitations (XERK-2989). `TurmaSent` = the sentKey last sent to the attendees.
+function SentStamp($it) {
+  $v = ''
+  try { $p = $it.UserProperties.Find('TurmaSent'); if ($p) { $v = [string]$p.Value } } catch {}
+  $v
+}
+function SetSent($it, $v) {
+  $p = $it.UserProperties.Find('TurmaSent')
+  if (-not $p) { $p = $it.UserProperties.Add('TurmaSent', 1, $false) }
+  $p.Value = [string]$v
+}
+function Addr($r) {
+  $a = ''
+  try { $u = $r.AddressEntry.GetExchangeUser(); if ($u) { $a = [string]$u.PrimarySmtpAddress } } catch {}
+  if (-not $a) { try { $a = [string]$r.Address } catch {} }
+  $a.ToLower()
+}
+# A sent copy leaves by a cancellation to its attendees, then is deleted.
+function CancelCopy($it) {
+  $id = [string]$it.EntryID
+  $it.MeetingStatus = 5
+  $it.Send()
+  try { $ol.Session.GetItemFromID($id).Delete() } catch {}
+}
+$dnf = 'http://schemas.microsoft.com/mapi/string/{00020329-0000-0000-C000-000000000046}/DoNotForward'
 try {
   $raw = [Console]::In.ReadToEnd().Trim()
   $doc = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($raw)))
 __ATTACH__
   $folder = $ol.Session.GetDefaultFolder(9)
   $sep = (Get-Culture).TextInfo.ListSeparator
+  $me = ''
+  try { $me = Addr $ol.Session.CurrentUser } catch {}
   $results = New-Object System.Collections.ArrayList
   foreach ($c in @($doc.cmds)) {
     $r = @{ ok = $false }
@@ -302,14 +336,25 @@ __ATTACH__
       if ([string]$c.turmaId -cnotmatch '^turma:[0-9a-f]{16}$') { throw 'not a Turma event id' }
       $it = FindCopy $c
       if ($c.op -eq 'delete') {
-        if ($it) { $r.startMs = Ms $it.StartUTC; $it.Delete() }
+        if ($it) {
+          $r.startMs = Ms $it.StartUTC
+          if ((SentStamp $it) -and $it.MeetingStatus -eq 1) { CancelCopy $it } else { $it.Delete() }
+        }
         $r.ok = $true
       } else {
         $e = $c.event
         $tz = $null
         try { $tz = $ol.TimeZones.Item([string]$e.zone) } catch {}
         if (-not $tz) { throw ('Outlook has no time zone ' + $e.zone) }
+        # Invitations turned off (or moved to another org's copy): the attendees get
+        # a cancellation and a plain appointment replaces the sent copy.
+        if ($it -and (SentStamp $it) -and -not $e.send) { CancelCopy $it; $it = $null }
         if (-not $it) { $it = $ol.CreateItem(1) }
+        # A copy whose invitations never went out keeps no recipients when not sending.
+        if (-not $e.send -and -not (SentStamp $it) -and [int]$it.MeetingStatus -ne 0) {
+          for ($i = $it.Recipients.Count; $i -ge 1; $i--) { $it.Recipients.Remove($i) }
+          $it.MeetingStatus = 0
+        }
         $p = $it.UserProperties.Find('TurmaId')
         if (-not $p) { $p = $it.UserProperties.Add('TurmaId', 1, $true) }
         $p.Value = [string]$c.turmaId
@@ -327,11 +372,47 @@ __ATTACH__
         $it.Sensitivity = [int]$e.sensitivity
         $it.Categories = (@($e.categories) -join $sep)
         $it.ReminderSet = $false
+        if ($e.send) {
+          $it.MeetingStatus = 1
+          $want = @{}
+          foreach ($a in @($e.attendees)) { $want[([string]$a.email).ToLower()] = $a }
+          for ($i = $it.Recipients.Count; $i -ge 1; $i--) {
+            $rc = $it.Recipients.Item($i)
+            $ad = Addr $rc
+            if ($me -and $ad -eq $me) { continue }
+            if ($ad -and $want.ContainsKey($ad)) { $rc.Type = [int]$want[$ad].type; $want.Remove($ad) }
+            else { $it.Recipients.Remove($i) }
+          }
+          foreach ($a in @($e.attendees)) {
+            $k = ([string]$a.email).ToLower()
+            if (-not $want.ContainsKey($k)) { continue }
+            $want.Remove($k)
+            $rc = $it.Recipients.Add([string]$a.email)
+            $rc.Type = [int]$a.type
+          }
+          [void]$it.Recipients.ResolveAll()
+          $it.ResponseRequested = [bool]$e.responseRequested
+          # PidNameMeetingDoNotForward (MS-OXOCAL 2.2.1.51): TRUE = attendees cannot forward.
+          if ($e.allowForward) { try { $it.PropertyAccessor.SetProperty($dnf, $false) } catch {} }
+          else { $it.PropertyAccessor.SetProperty($dnf, $true) }
+        }
         $it.Save()
-        $r.ok = $true
         $r.outlookId = [string]$it.EntryID
         $r.startMs = Ms $it.StartUTC
         try { $r.lastModified = Local $it.LastModificationTime } catch {}
+        # Send only what the attendees have not had: a re-sent or repair upsert of
+        # unchanged fields saves and sends nothing.
+        if ($e.send -and (SentStamp $it) -cne [string]$e.sentKey) {
+          SetSent $it $e.sentKey
+          $it.Save()
+          try { $it.Send() } catch {
+            $m = $_.Exception.Message
+            try { SetSent $it ''; $it.Save() } catch {}
+            throw ('Outlook saved the event but did not send the invitations: ' + $m)
+          }
+          try { $r.lastModified = Local ($ol.Session.GetItemFromID($r.outlookId)).LastModificationTime } catch {}
+        }
+        $r.ok = $true
       }
     } catch { $r.error = $_.Exception.Message }
     [void]$results.Add($r)
@@ -1124,6 +1205,32 @@ def prepare_calendar_write(cmd) -> dict:
         "subject": subject, "location": location, "body": body,
         "startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
         "busy": _BUSY_CODE[busy], "sensitivity": _SENSITIVITY_CODE[sens], "categories": cats}
+    # Invitations (XERK-2989): only the copy the hub names as the sender, never a
+    # private one. Every other copy is a plain appointment with no recipients.
+    send = ev.get("sendInvites") is True and sens not in ("private", "confidential")
+    people = []
+    if send:
+        seen = set()
+        raw = ev.get("attendees") if isinstance(ev.get("attendees"), list) else []
+        for p in raw[:CALENDAR_WRITE_ATTENDEES_MAX]:
+            if not isinstance(p, dict):
+                continue
+            email = _text(p.get("email"), 200)
+            if not _EMAIL.fullmatch(email) or email.lower() in seen:
+                continue
+            seen.add(email.lower())
+            people.append({"email": email, "name": _text(p.get("name"), 100),
+                           "type": 2 if p.get("role") == "optional" else 1})
+        send = bool(people)
+    out["event"]["send"] = send
+    out["event"]["attendees"] = people
+    out["event"]["responseRequested"] = ev.get("responseRequested") is not False
+    out["event"]["allowForward"] = ev.get("allowForward") is not False
+    # What was last SENT is stamped on the copy (`TurmaSent`): an upsert whose
+    # sent fields are unchanged saves without sending, so a re-delivered or
+    # repair write never sends attendees a second update.
+    out["event"]["sentKey"] = hashlib.sha256(json.dumps(
+        out["event"], sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:32] if send else ""
     return out
 
 

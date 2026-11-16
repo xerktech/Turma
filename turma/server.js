@@ -6074,10 +6074,12 @@ const CAL_TENANT_BUCKET_RE = /^(?:[0-9a-f]{32})?$/;
 const CAL_ACTOR_RE = /^[\w.:@-]{1,200}$/;
 // The fields a client writes; everything else on a record is the hub's.
 const CAL_TURMA_FIELDS = ["subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
-  "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity"];
+  "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "sendInvites", "responseRequested", "allowForward"];
+// The invitation options (XERK-2989) are the event's, never one occurrence's.
+const CAL_TURMA_SERIES_FLAGS = ["sendInvites", "responseRequested", "allowForward"];
 // The fields one occurrence of a series may override (XERK-2969): every client
 // field but the zone (the series') — and orgs, which are series-level.
-const CAL_TURMA_OVERRIDE_FIELDS = CAL_TURMA_FIELDS.filter((k) => k !== "timeZone");
+const CAL_TURMA_OVERRIDE_FIELDS = CAL_TURMA_FIELDS.filter((k) => k !== "timeZone" && !CAL_TURMA_SERIES_FLAGS.includes(k));
 const CALENDAR_TURMA_EXCEPTIONS_MAX = 100;        // per series
 // Series-window walks + occurrences one capture-candidate index may spend (XERK-2969).
 const CALENDAR_CANDIDATE_WORK_MAX = 20000;
@@ -6125,6 +6127,9 @@ function sanitizeTurmaEvent(v, t) {
     timeZone: calTimeZone(v.timeZone) || "UTC", allDay: v.allDay === true,
     location: meetingText(v.location, 300), body: meetingText(v.body, CALENDAR_BODY_MAX, true), attendees,
     joinUrl: CAL_URL_RE.test(url) ? url : "", isOnlineMeeting: v.isOnlineMeeting === true,
+    // Invitations (XERK-2989): off by default; Outlook's own defaults for the two options.
+    sendInvites: v.sendInvites === true, responseRequested: v.responseRequested !== false,
+    allowForward: v.allowForward !== false,
     busy: typeof v.busy === "string" && CAL_TURMA_BUSY.has(v.busy) ? v.busy : "busy", categories,
     sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
     // A rule (XERK-2969) only on an event no longer than recurrence.DURATION_MAX_MS.
@@ -6730,6 +6735,11 @@ function turmaEventWire(p, rec, served = rec.orgs) {
     outlook: calOutlookWire(outlook, served),
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
     editable: calTurmaMayEdit(p, rec) && !calTurmaWithheld(p, rec), meeting: calendarLinkCandidate(rec) };
+  // Each invitee's answer, read off the sending copy (XERK-2989); absent = not known.
+  const resp = calTurmaResponses(rec);
+  if (resp && resp.size) {
+    out.attendees = rec.attendees.map((a) => (resp.has(a.email.toLowerCase()) ? { ...a, response: resp.get(a.email.toLowerCase()) } : a));
+  }
   if (calTurmaWithheld(p, rec)) {
     Object.assign(out, { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "",
       categories: [], private: true });
@@ -6856,7 +6866,7 @@ function turmaEventFieldError(b) {
   if ("joinUrl" in b && b.joinUrl.trim() && !CAL_URL_RE.test(meetingText(b.joinUrl, 500))) {
     return "joinUrl must be an https:// link";
   }
-  for (const k of ["allDay", "isOnlineMeeting"]) {
+  for (const k of ["allDay", "isOnlineMeeting", ...CAL_TURMA_SERIES_FLAGS]) {
     if (k in b && typeof b[k] !== "boolean") return `${k} must be true or false`;
   }
   if ("busy" in b && !CAL_TURMA_BUSY.has(b.busy)) return `busy must be one of ${[...CAL_TURMA_BUSY].join(", ")}`;
@@ -7208,6 +7218,10 @@ function patchTurmaOccurrence(p, f, body, now) {
   for (const k of ["recurrence", "timeZone"]) {
     if (k in body) return { status: 400, body: { error: `an occurrence takes no ${k}: change it on the series` } };
   }
+  // Invitations are the series' (XERK-2989); resending its own value unchanged is fine.
+  for (const k of CAL_TURMA_SERIES_FLAGS) {
+    if (k in body && body[k] !== f.rec[k]) return { status: 400, body: { error: `an occurrence takes no ${k}: change it on the series` } };
+  }
   const prevEx = f.rec.exceptions[f.key] || {};
   const shown = turmaOccurrenceRecord(f.rec, f.occ, prevEx);
   const ex = { ...prevEx, ...Object.fromEntries(CAL_TURMA_OVERRIDE_FIELDS.filter((k) => k in body).map((k) => [k, body[k]])) };
@@ -7370,7 +7384,10 @@ function calWritePick(t, org, now, memo) {
 }
 // The record's fields the agent maps onto an AppointmentItem; a private/confidential
 // record (or occurrence) withheld, since the holder's mailbox owner is not its owner.
-function calWriteEvent(rec) {
+// `org`'s copy: only the record's FIRST org's copy sends invitations (XERK-2989), so an
+// event in several orgs never reaches an attendee N times; every other copy is a plain
+// appointment. A withheld (private) event sends nothing: its attendees are withheld too.
+function calWriteEvent(rec, org) {
   const hide = (s) => CAL_TURMA_HIDDEN.has(s);
   const exceptions = {};
   for (const [k, x] of Object.entries(rec.exceptions)) {
@@ -7378,7 +7395,9 @@ function calWriteEvent(rec) {
   }
   const ev = { subject: rec.subject, start: rec.start, end: rec.end, timeZone: rec.timeZone, allDay: rec.allDay,
     location: rec.location, body: rec.body, attendees: rec.attendees, joinUrl: rec.joinUrl, busy: rec.busy,
-    categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions };
+    categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions,
+    sendInvites: rec.sendInvites && org === rec.orgs[0] && !hide(rec.sensitivity),
+    responseRequested: rec.responseRequested, allowForward: rec.allowForward };
   return hide(rec.sensitivity) ? { ...ev, ...CAL_WRITE_WITHHELD } : ev;
 }
 // Whether a write of `op` at `version` for (host, turmaId) is still in flight: sent
@@ -7519,7 +7538,7 @@ function calOutlookReconcile(t, rec, now, memo) {
     if (e.state === "failed" && now - e.at < CALENDAR_WRITE_RETRY_MS) continue;
     if (calWriteInFlight(e.host, rec.id, rec.version, "upsert", now)) continue;
     const id = queueCalendarWrite(e.host, { type: "writeCalendarEvent", op: "upsert", turmaId: rec.id,
-      org: baseOfSite(org), version: rec.version, outlookId: e.outlookId, event: calWriteEvent(rec) }, now);
+      org: baseOfSite(org), version: rec.version, outlookId: e.outlookId, event: calWriteEvent(rec, org) }, now);
     if (id && e.state === "failed") {
       Object.assign(e, { state: "pending", at: now });
       delete e.error;
@@ -7658,7 +7677,7 @@ function calOutlookCheckSync(key, from, until, events, syncedAt, now) {
       let drift = false;
       if (copies.length) {
         // A series' occurrences are compared by XERK-2986; a single copy here.
-        drift = !rec.recurrence && copies.some((c) => calOutlookDrifted(rec, e, c));
+        drift = !rec.recurrence && copies.some((c) => calOutlookDrifted(rec, org, e, c));
       } else if (!rec.recurrence) {
         missing = rec.startMs >= from && rec.startMs < until;
       } else {
@@ -7685,13 +7704,45 @@ function calOutlookCheckSync(key, from, until, events, syncedAt, now) {
 }
 // A stored copy `c` no longer reads as record `rec` maps to (withheld when private):
 // edited in Outlook after our write, or one of the compared fields moved.
-function calOutlookDrifted(rec, e, c) {
-  if (e.lastModified && c.lastModified && Date.parse(c.lastModified) > Date.parse(e.lastModified)) return true;
+// The sending copy's lastModified moves with every attendee response Outlook tracks on
+// it (XERK-2989), so only its fields are compared, or each answer would re-write it.
+function calOutlookDrifted(rec, org, e, c) {
+  if (!calTurmaSends(rec, org) && e.lastModified && c.lastModified && Date.parse(c.lastModified) > Date.parse(e.lastModified)) return true;
   const hidden = CAL_TURMA_HIDDEN.has(rec.sensitivity);
   return c.subject !== (hidden ? CAL_WRITE_WITHHELD.subject : rec.subject) || c.startMs !== rec.startMs ||
     c.endMs !== rec.endMs || c.allDay !== rec.allDay || c.location !== (hidden ? "" : rec.location) ||
     c.busy !== rec.busy || c.sensitivity !== rec.sensitivity;
 }
+// Whether `org`'s copy of `rec` is the one that sends invitations (XERK-2989).
+const calTurmaSends = (rec, org) => rec.sendInvites === true && org === rec.orgs[0] && !CAL_TURMA_HIDDEN.has(rec.sensitivity);
+// The attendee responses Outlook tracked on the sending copy (XERK-2989): its holder's
+// synced copy (stamped with the record's id) -> lowercased email -> response. Null when
+// nothing is known yet. Indexed per stored event list, rebuilt when a sync replaces it.
+const calStampIndex = new WeakMap();
+function calTurmaResponses(rec) {
+  if (rec.recurrence || !calTurmaSends(rec, rec.orgs[0])) return null;
+  const e = rec.outlook && Object.hasOwn(rec.outlook, rec.orgs[0]) ? rec.outlook[rec.orgs[0]] : null;
+  const h = e && e.host && Object.hasOwn(calendarEvents, e.host) ? calendarEvents[e.host] : null;
+  if (!h || !Array.isArray(h.events)) return null;
+  let idx = calStampIndex.get(h.events);
+  if (!idx) {
+    idx = new Map();
+    for (const ev of h.events) if (ev.turmaId && !idx.has(ev.turmaId)) idx.set(ev.turmaId, ev);
+    calStampIndex.set(h.events, idx);
+  }
+  const copy = idx.get(rec.id);
+  if (!copy) return null;
+  const out = new Map();
+  for (const a of copy.attendees || []) {
+    if (!a.email || a.role === "organizer" || !CAL_TURMA_RESPONSES.has(a.response)) continue;
+    // Outlook's "none" on an invitee is "no answer yet" when an answer was asked for.
+    out.set(a.email.toLowerCase(), a.response === "none" && rec.responseRequested ? "notResponded" : a.response);
+  }
+  return out;
+}
+// What a served Turma attendee may say it answered: the reader's words, less "organizer"
+// and "unknown" (no answer an invitee gave).
+const CAL_TURMA_RESPONSES = new Set(["none", "tentative", "accepted", "declined", "notResponded"]);
 // The per-org write state a client is served (only for the served orgs; never the host or outlookId).
 function calOutlookWire(outlook, served) {
   const out = {};

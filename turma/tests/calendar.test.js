@@ -1292,7 +1292,7 @@ test("XERK-2971: the payload is the route's shape — ISO with offset, all-day e
     online: false, joinUrl: "https://meet.example/x", category: "Ops, ops2, Ops", priv: true, location: " R4 " };
   const b = cal.formPayload(f);
   assert.deepEqual(Object.keys(b), ["orgs", "subject", "start", "end", "timeZone", "allDay", "location", "body", "attendees",
-    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "recurrence"]);
+    "joinUrl", "isOnlineMeeting", "busy", "categories", "sensitivity", "sendInvites", "responseRequested", "allowForward", "recurrence"]);
   assert.deepEqual([b.subject, b.start, b.end, b.timeZone, b.location], ["Plan", "2027-05-04T09:00:00-04:00", "2027-05-04T10:00:00-04:00", "America/New_York", "R4"]);
   assert.deepEqual(b.attendees, [{ name: "Ann", email: "ann@acme.com", role: "required" }, { name: "", email: "bob@globex.com", role: "optional" }]);
   assert.equal(b.joinUrl, "", "no link without the online toggle");
@@ -1316,6 +1316,36 @@ test("XERK-2971: the payload is the route's shape — ISO with offset, all-day e
   assert.deepEqual(back.required, [{ name: "Ann", email: "ann@acme.com" }]);
   assert.deepEqual(back.optional, [{ name: "", email: "bob@globex.com" }]);
   assert.equal(cal.formFromEvent(tev({ allDay: true, startMs: at(2027, 5, 4), endMs: at(2027, 5, 6) })).endDate, "2027-05-05", "the last day, inclusive");
+});
+
+test("XERK-2989: invitations — the form round-trips them, the editor offers them, the panel tallies answers", () => {
+  const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme", "globex"], subject: "Plan" };
+  assert.deepEqual([f.invites, f.reqResp, f.allowFwd], [false, true, true], "off by default; Outlook's options");
+  const b = cal.formPayload({ ...f, invites: true, allowFwd: false });
+  assert.deepEqual([b.sendInvites, b.responseRequested, b.allowForward], [true, true, false]);
+  const back = cal.formFromEvent(tev({ sendInvites: true, responseRequested: false }));
+  assert.deepEqual([back.invites, back.reqResp, back.allowFwd], [true, false, true]);
+  // An older hub serves none of the three: the form reads the defaults.
+  const old = cal.formFromEvent(tev());
+  assert.deepEqual([old.invites, old.reqResp, old.allowFwd], [false, true, true]);
+  // The editor: one switch, its options only when on, disabled for one occurrence.
+  assert.match(cal.invitesRowHtml(f, false), /data-ed-flag="invites"/);
+  assert.doesNotMatch(cal.invitesRowHtml(f, false), /reqResp/);
+  const on = cal.invitesRowHtml({ ...f, invites: true }, false);
+  assert.match(on, /data-ed-flag="reqResp" checked/);
+  assert.match(on, /data-ed-flag="allowFwd" checked/);
+  assert.match(on, /Sent once, from the Outlook host of the event&#39;s first org/);
+  assert.match(cal.invitesRowHtml({ ...f, invites: true, priv: true }, false), /private event sends no invitations/);
+  assert.match(cal.invitesRowHtml({ ...f, invites: true }, true), /data-ed-flag="invites" checked disabled/);
+  // The panel: who sends, the options, a tally of the answers the hub read back.
+  const ev = tev({ sendInvites: true, allowForward: false, attendees: [
+    { name: "Ann", email: "ann@acme.com", role: "required", response: "accepted" },
+    { name: "Bo", email: "bo@acme.com", role: "required", response: "declined" },
+    { name: "", email: "cy@globex.com", role: "optional", response: "notResponded" }] });
+  assert.equal(cal.invitesText(ev), "Sent from acme's Outlook · forwarding off · 1 accepted, 1 declined, 1 not responded");
+  assert.equal(cal.invitesText(tev()), "", "no row when it sends none");
+  assert.equal(cal.invitesText(tev({ sendInvites: true, private: true })), "");
+  assert.match(cal.detailHtml(ev), /Invitations/);
 });
 
 test("XERK-2971: a multi-org event renders once, with every org's color, and shows under an org filter", () => withOrgs(async () => {
