@@ -3240,12 +3240,14 @@ function wireExternalStores(store) {
         }
         externalStoresLoading.delete(desc.key);
       }).catch((e) => {
-        // A value that does not parse will never parse: retrying would hold every
-        // replica unready forever with no route left to repair it. It is unreadable
-        // either way, so keep the mirror and let the next write replace it — the
-        // pre-XERK-2995 behaviour, for this case only.
-        if (e instanceof SyntaxError) {
-          console.error(`store ${desc.name}: ERROR the stored value is not valid JSON; serving without it — the next write replaces it: ${e.message}`);
+        // A value that does not parse, or a key of another Valkey type (WRONGTYPE),
+        // will never read: retrying would hold every replica unready forever with no
+        // route left to repair it (QA). It is unreadable either way, so keep the
+        // mirror and let the next write (a SET) replace it — the pre-XERK-2995
+        // behaviour, for these cases only. Every other error (connection, LOADING,
+        // READONLY…) may clear, so it retries.
+        if (e instanceof SyntaxError || /^WRONGTYPE\b/.test((e && e.message) || "")) {
+          console.error(`store ${desc.name}: ERROR the stored value is unreadable; serving without it — the next write replaces it: ${e.message}`);
           externalStoresLoading.delete(desc.key);
           return;
         }

@@ -213,11 +213,14 @@ test("XERK-2995: a watch value clears the wait, and the older GET reply never ro
   assert.deepEqual(usernames(hub.tenancyState()), ["alice", "gina"], "the late reply did not roll it back");
 });
 
-test("XERK-2995: a stored value that does not parse does not hold the replica unready", async () => {
+test("XERK-2995: a stored value that cannot be read does not hold the replica unready", async () => {
   const inner = new FileLiveStore({ persistent: {} });
   const store = Object.create(inner);
   store.get = (key) => (key === "policy:orgColors"
-    ? Promise.reject(new SyntaxError("Unexpected token")) : inner.get(key));
+    ? Promise.reject(new SyntaxError("Unexpected token"))
+    : key === "policy:autoStartOrgs"
+      ? Promise.reject(new Error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+      : inner.get(key));
   hub.__setStoreLoadRetryMs(20);
   hub.__setLiveStore(store, true);
   X.wireExternalStores(store);

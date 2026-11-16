@@ -109,8 +109,8 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   - A watch event carrying a value also counts as loaded, and the GET reply that lands after
     it is DROPPED: it is the same or older, and installing it deleted the other replica's
     write on the next persist (QA-reproduced on Valkey).
-  - A value that does not parse (`SyntaxError`) is NOT retried: it counts as loaded, logged
-    ERROR, and the next write replaces it. Retrying held every replica unready with no route
+  - A value that does not parse (`SyntaxError`) or a key of another Valkey type (`WRONGTYPE`)
+    is NOT retried: it counts as loaded, logged ERROR, and the next write replaces it. Retrying held every replica unready with no route
     left to repair it.
   - The elector's `canLead` also waits for the load: a leader still loading would 503 every
     request its followers forward to it.
