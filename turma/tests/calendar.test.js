@@ -1161,6 +1161,48 @@ test("XERK-2954 QA: the grid opens with 8:00 at the top and keeps it while the p
   }
 });
 
+test("XERK-2954 (XERK-2953): a write the browser clamped does not swallow the next scroll to that pixel", async () => {
+  NOW = at(2026, 11, 12, 10, 30);
+  replies = { "/api/calendar": () => ({ hosts: [], events: [] }) };
+  const [grid] = root.children;
+  // Like a browser, scrollTop is clamped to the scrollable range: a write past the
+  // bottom lands at the bottom, and a pane already there does not move (no event).
+  const pane = { h: 600 };
+  const slotPx = () => Math.max(10, pane.h / (cal._state().zoomHours * 2));
+  let raw = 0;
+  const max = () => Math.max(0, 48 * slotPx() - pane.h);
+  const scroller = { id: "calScroll", get clientHeight() { return pane.h; },
+    get scrollHeight() { return 48 * slotPx(); },
+    get scrollTop() { return Math.min(raw, max()); }, set scrollTop(v) { raw = Math.min(Math.max(0, v), max()); } };
+  const qs = grid.querySelector;
+  grid.querySelector = (sel) => (sel === "#calScroll" ? scroller : null);
+  const ppm = () => scroller.scrollHeight / 1440;
+  const topAt = () => scroller.scrollTop / ppm();
+  const fire = () => { for (const f of grid.listeners.scroll || []) f({ target: scroller }); };
+  try {
+    cal._reopen();
+    cal._go(at(2026, 11, 12));
+    cal.setActive(true);
+    for (let i = 0; i < 4; i++) await tick();
+    fire();                                   // the open's own write
+    scroller.scrollTop = 1e9; fire();         // the operator scrolls to the bottom: 14:00 at the top
+    assert.ok(Math.abs(topAt() - 840) < 1e-6);
+    // Zooming out holds the middle (19:00), asking for 13:00 at the top, past the
+    // 12:00 the 12-hour day can show: the write clamps to where the pane already is.
+    cal._zoom(-1);
+    assert.equal(cal._state().zoomHours, 12);
+    assert.ok(Math.abs(topAt() - 720) < 1e-6, `clamped at the bottom (top ${topAt()})`);
+    fire();                                   // the operator's (or the clamp's) event at that same pixel
+    pane.h = 150;                             // a much shorter pane can show 13:00
+    cal.setActive(true);
+    assert.ok(Math.abs(topAt() - 720) < 1e-6, `the resize keeps the 12:00 that was on screen (top ${topAt()})`);
+  } finally {
+    while (cal._state().zoomHours !== cal.ZOOM_DEFAULT) cal._zoom(cal._state().zoomHours > cal.ZOOM_DEFAULT ? 1 : -1);
+    grid.querySelector = qs;
+    cal.setActive(false);
+  }
+});
+
 test("XERK-2954 QA: Ctrl+wheel zooms one step per notch, a stale leftover never fires, the pick is saved", () => {
   const saved = {};
   globalThis.localStorage = { getItem: (k) => saved[k] ?? null, setItem: (k, v) => { saved[k] = v; } };
@@ -1226,6 +1268,16 @@ test("XERK-2971: form validation mirrors the hub — orgs, emails, times, https 
   assert.match(cal.validateForm({ ...f, body: "😀".repeat(4001) }).body, /4000/, "code points, like the hub");
   assert.equal(cal.validateForm({ ...f, body: "😀".repeat(4000) }).body, undefined);
   assert.match(cal.validateForm({ ...f, timeZone: "Mars/Olympus" }).timeZone, /time zone/);
+  // XERK-2953: local mean time (an offset with seconds) cannot round-trip an ISO
+  // offset, so a time it governs is refused rather than saved a fraction of a minute off.
+  const lmt = { ...f, timeZone: "Europe/Brussels", startDate: "1890-06-02", endDate: "1890-06-02", startTime: "10:00", endTime: "11:00" };
+  assert.match(cal.validateForm(lmt).start, /before this time zone kept standard time/);
+  assert.match(cal.validateForm({ ...lmt, allDay: true }).start, /standard time/, "all-day too");
+  assert.match(cal.validateForm({ ...f, timeZone: "Africa/Monrovia", startDate: "1960-03-01", endDate: "1960-03-01" }).start,
+    /standard time/, "not only before 1900: Monrovia kept -00:44:30 until 1972");
+  assert.deepEqual(cal.validateForm({ ...f, timeZone: "Africa/Monrovia", startDate: "1980-03-01", endDate: "1980-03-01" }), {});
+  assert.deepEqual(cal.validateForm({ ...lmt, startDate: "1960-06-02", endDate: "1960-06-02" }), {});
+  assert.match(cal.validateForm({ ...lmt, startDate: "1960-06-02" }).end, /standard time/, "the end is checked on its own");
   // The hub's email rule: one @, a dot after it, nothing that breaks markup.
   assert.deepEqual(cal.parseAttendee("Ann Lee <Ann@Acme.COM>"), { name: "Ann Lee", email: "ann@acme.com" });
   assert.deepEqual(cal.parseAttendee(" o'brien@x.org "), { name: "", email: "o'brien@x.org" });

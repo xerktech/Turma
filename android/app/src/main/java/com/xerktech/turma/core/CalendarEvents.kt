@@ -356,6 +356,12 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
             }
         }
         val (s, e) = calDraftSpan(d)!!
+        // Local mean time (Europe/Brussels +00:17:30 in 1890, Africa/Monrovia -00:44:30
+        // until 1972) has seconds an ISO offset cannot carry; the web rounds it, the hub
+        // refuses it, so neither may save it (XERK-2953, calendar.js keepsLmt).
+        for ((label, at) in listOf("start" to s, "end" to e)) {
+            if (at.offset.totalSeconds % 60 != 0) add("The $label is before ${zone.id} kept standard time (its offset has seconds); pick a later date.")
+        }
         if (e.isBefore(s)) add("The event must end after it starts.")
     }
     if (jsTrim(d.location).codePointCount() > 300) add("The location is longer than 300 characters.")

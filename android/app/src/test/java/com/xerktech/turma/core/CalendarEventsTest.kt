@@ -151,6 +151,19 @@ class CalendarEventsTest {
         assertTrue(calDraftErrors(skipped).any { "does not exist" in it })
     }
 
+    @Test fun `XERK-2953 a time a zone kept local mean time is refused, like the web editor`() {
+        val ok = draft("o").copy(timeZone = "Europe/Brussels")
+        val d1890 = LocalDate.of(1890, 6, 2)
+        val lmt = ok.copy(startDate = d1890, endDate = d1890)
+        assertTrue(calDraftErrors(lmt).any { "The start is before Europe/Brussels kept standard time" in it })
+        assertTrue(calDraftErrors(lmt.copy(allDay = true)).any { "standard time" in it })
+        val monrovia = ok.copy(timeZone = "Africa/Monrovia", startDate = LocalDate.of(1960, 3, 1), endDate = LocalDate.of(1960, 3, 1))
+        assertTrue(calDraftErrors(monrovia).any { "standard time" in it })
+        val d1980 = LocalDate.of(1980, 3, 1)
+        assertTrue(calDraftErrors(monrovia.copy(startDate = d1980, endDate = d1980)).isEmpty())
+        assertTrue(calDraftErrors(lmt.copy(endDate = LocalDate.of(1960, 6, 2))).any { "The start is before" in it })
+    }
+
     @Test fun `XERK-2972 QA a withheld private event is never editable`() {
         val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:p", "orgs": ["o"], "org": "o", "editable": true,
             "version": 1, "private": true, "subject": "Private event", "startMs": 1, "endMs": 2 } ]""").single()

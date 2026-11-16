@@ -140,6 +140,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   dsh chat, and is NOT being generalized to Claude/Qwen nor to the ended-session view here.
   Recorded web-only like the archive Restore picker (XERK-453); a later ticket can port the shared
   view to the phone if a need appears. Shape/renderer invariants: `.claude/rules/trajectory.md`.
+- **Read-only transcript bottom pin (XERK-2956, XERK-2953)**: the web keeps the pin when the pin's
+  own late scroll event lands after an image grew the pane (`stPinTop`). No Android change:
+  `ReadOnlyTranscript` decides the pin only when a scroll settles, so it has no such event.
   The XERK-720 additions — an absolute wall-clock timestamp on the head/turn/call and an
   expand-to-full toggle for any ellipsis-snippeted field — are part of this same web-only pane, so
   no Android change; a future port carries them with it. So is XERK-734: each turn header is
@@ -236,6 +239,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     read `turma/tests/fixtures/calendar-repeat-vectors.json`). An occurrence's Edit / Delete asks
     This event / This and following / All events; This event locks orgs, zone and rule.
   - Platform difference: the scope prompt is a dialog, the web's is inline in the panel.
+  - Both editors refuse a start / end the zone kept local mean time at (an offset with seconds,
+    e.g. Europe/Brussels 1890, Africa/Monrovia before 1972): an ISO offset carries whole minutes
+    (XERK-2953; web `keepsLmt`, Android `calDraftErrors`).
   - An event of several orgs is ONE block with a "+N" mark, its detail naming every org; the hub's
     `?org=` filter matches any of them. Edit / Delete only on a Turma event served `editable:true`
     with a `version` (absent = an older hub, read-only); Outlook events are unchanged.

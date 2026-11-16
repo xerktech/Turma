@@ -3871,6 +3871,12 @@
   // a lazy image or file preview loading, the pane being un-hidden, a verbosity
   // re-render — re-pins to the bottom. The reader scrolling up clears it.
   let stPinned = false;
+  // The scrollTop the last pin wrote. That write's own scroll event lands a
+  // frame later; an image whose size is known before its `load` can grow the
+  // pane in between, and the event then reads as the reader scrolling up and
+  // unpins, leaving the view short of the bottom (XERK-2953). Only a scroll
+  // ABOVE this pixel is the reader leaving the bottom.
+  let stPinTop = 0;
 
   function loadStaticVerbosity(tid) {
     // Same per-key store as the live view (keyed by transcript id), so a reader's
@@ -3896,7 +3902,7 @@
     stScroll.innerHTML = html || '<div class="tr-empty">This session\'s transcript is empty.</div>';
   }
   function pinStaticBottom() {
-    if (stScroll && stPinned) stScroll.scrollTop = stScroll.scrollHeight;
+    if (stScroll && stPinned) { stScroll.scrollTop = stScroll.scrollHeight; stPinTop = stScroll.scrollTop; }
   }
   // A verbosity change re-renders the whole pane, which changes every height
   // above the reader, so a kept pixel offset lands on some other message. Keep
@@ -4006,7 +4012,9 @@
     // The bottom pin (XERK-2956). Every listener reads the module's CURRENT
     // stScroll: one element is wired once and reused across opens.
     const el = stScroll;
-    el.addEventListener("scroll", () => { if (stScroll === el) stPinned = scrolledToBottom(el); });
+    el.addEventListener("scroll", () => {
+      if (stScroll === el) stPinned = scrolledToBottom(el) || (stPinned && el.scrollTop >= stPinTop - 1);
+    });
     // `load` doesn't bubble; capture it so a lazy image/iframe finishing below
     // the fold doesn't leave the view short of the last message.
     el.addEventListener("load", () => { if (stScroll === el) pinStaticBottom(); }, true);
