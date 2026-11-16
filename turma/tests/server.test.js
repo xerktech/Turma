@@ -35300,13 +35300,20 @@ test("XERK-3014: a moved copy that never sent does not block turning invitations
   }
 });
 
+// A sending event in `orgs`. Two or more orgs is a record from before XERK-3016 (the API
+// refuses one now): made in its first org, the rest given straight in the store.
+async function post3016(orgs, extra) {
+  const r = await turma2968("POST", null, ev2968(orgs.slice(0, 1), extra));
+  if (r.status === 200 && orgs.length > 1) hub.__calTurmaStore("", { ...rec2985(r.body.event.id), orgs: orgs.slice() });
+  return r;
+}
 // A sending event in `orgs` whose org-A copy was acked, then held on its gone host (XERK-3010).
 async function hold3014(orgs, extra = {}) {
   await beat2985(D2985A, S2985A);
   await beat2985(D2985A2, S2985A);
   await beat2985(D2985B, S2985B);
-  const id = (await turma2968("POST", null, ev2968(orgs, { sendInvites: true,
-    attendees: [{ name: "Bo", email: "bo@x.com" }], ...extra }))).body.event.id;
+  const id = (await post3016(orgs, { sendInvites: true,
+    attendees: [{ name: "Bo", email: "bo@x.com" }], ...extra })).body.event.id;
   const holder = rec2985(id).outlook[S2985A].host;
   const other = holder === D2985A ? D2985A2 : D2985A;
   await beat2985(holder, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
@@ -35348,9 +35355,10 @@ test("XERK-3014: making another org the sender is refused while the held sent co
   cleanup2985(D2985A, D2985A2, D2985B);
   try {
     const a = await hold3014([S2985A, S2985B]);
-    for (const orgs of [[S2985B, S2985A], [S2985B]]) {
+    // A reorder is refused first by XERK-3016 (one org sends), moving the one sender by XERK-3014.
+    for (const [orgs, code] of [[[S2985B, S2985A], 400], [[S2985B], 409]]) {
       const r = await turma2968("PATCH", a.id, { version: 1, orgs });
-      assert.equal(r.status, 409, JSON.stringify(orgs));
+      assert.equal(r.status, code, JSON.stringify(orgs));
       assert.equal(sends3014(D2985B, a.id).length, 0);
       assert.equal(rec2985(a.id).outlook[S2985A].host, a.holder, "still held");
     }
@@ -35365,8 +35373,8 @@ test("XERK-3014: a sent copy whose org is dropped leaves a tombstone that blocks
   try {
     await beat2985(D2985A, S2985A);
     await beat2985(D2985B, S2985B);
-    const id = (await turma2968("POST", null, ev2968([S2985A, S2985B], { sendInvites: true,
-      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const id = (await post3016([S2985A, S2985B], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] })).body.event.id;
     const h = rec2985(id).outlook[S2985A].host;
     await beat2985(h, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
     assert.equal((await turma2968("PATCH", id, { version: 1, sendInvites: false })).status, 200);
@@ -35448,13 +35456,14 @@ test("XERK-3014: a former sender's sent tombstone never holds back a sender that
     await beat2985(D2985A, S2985A);
     await beat2985(D2985A2, S2985A);
     await beat2985(D2985B, S2985B);
-    const id = (await turma2968("POST", null, ev2968([S2985B, S2985A], { sendInvites: true,
-      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const id = (await post3016([S2985B, S2985A], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] })).body.event.id;
     const aHost = rec2985(id).outlook[S2985A].host;
     await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 1)] });
     await beat2985(aHost, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
-    // A becomes the sender (B online, so allowed), and sends.
-    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985A, S2985B] })).status, 200);
+    // A becomes the sender (B online, so allowed), and sends. The API refuses this reorder since
+    // XERK-3016, so it is written as an older hub did: straight in the store, as version 2.
+    hub.__calTurmaStore("", { ...rec2985(id), orgs: [S2985A, S2985B], version: 2 });
     assert.equal(rec2985(id).outlook[S2985A].sent, true);
     // B dropped: its tombstone may have sent, but A's invitation is already live.
     assert.equal((await turma2968("PATCH", id, { version: 2, orgs: [S2985A] })).status, 200);
@@ -35481,15 +35490,16 @@ test("XERK-3014: a copy held before it ever sent is not marked sent, so XERK-301
     await beat2985(D2985A, S2985A);
     await beat2985(D2985A2, S2985A);
     await beat2985(D2985B, S2985B);
-    const id = (await turma2968("POST", null, ev2968([S2985B, S2985A], { sendInvites: true,
-      attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const id = (await post3016([S2985B, S2985A], { sendInvites: true,
+      attendees: [{ name: "Bo", email: "bo@x.com" }] })).body.event.id;
     await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 1)] });
     const aHost = rec2985(id).outlook[S2985A].host;
     await beat2985(aHost, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
     // A becomes the first org while its host is away: held, nothing queued, so not sent.
     const saved = agents[aHost];
     delete agents[aHost];
-    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985A, S2985B] })).status, 200);
+    // (A reorder the API refuses since XERK-3016: written as an older hub did, as version 2.)
+    hub.__calTurmaStore("", { ...rec2985(id), orgs: [S2985A, S2985B], version: 2 });
     assert.ok(!rec2985(id).outlook[S2985A].sent);
     // B (which did send) goes away: its copy becomes a sent tombstone.
     await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2)] });
