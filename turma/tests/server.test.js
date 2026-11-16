@@ -34548,6 +34548,17 @@ test("XERK-2953: a 'following' edit moving the occurrence to another date moves 
       }
       assert.equal(hub.getCalendarTurmaEvents()[""][x.id].version, 1);
     }
+    // A zone change alone keeps the instants (Fri 21:00 New York is Sat 10:00 Tokyo, FR,SA
+    // would be SA,SU): the same refusal, worded for the zone change (XERK-2993).
+    const z = (await turma2968("POST", null, ev2968([S2968A], { timeZone: "America/New_York",
+      start: "2027-07-16T21:00:00-04:00", end: "2027-07-16T22:00:00-04:00",
+      recurrence: { freq: "weekly", interval: 2, byDay: ["FR", "SA"] } }))).body.event;
+    for (const [id, scope] of [[z.id, "series"], [`${z.id}:2027-07-31T01:00:00Z`, "following"]]) {
+      const r = await turma2968("PATCH", id, { version: 1, scope, timeZone: "Asia/Tokyo" });
+      assert.equal(r.status, 400, `${scope}: ${JSON.stringify(r.body)}`);
+      assert.match(r.body.error, /in the new time zone .*change the repeat days too, or keep the time zone/, scope);
+    }
+    assert.equal(hub.getCalendarTurmaEvents()[""][z.id].version, 1);
     // ...within the week it re-anchors, every 2 weeks too.
     const w2 = await mk("2027-07-05T09:00:00Z", { freq: "weekly", interval: 2, byDay: ["MO", "WE"] });
     const w2m = await turma2968("PATCH", `${w2.id}:2027-07-19T09:00:00Z`, { version: 1, scope: "following",

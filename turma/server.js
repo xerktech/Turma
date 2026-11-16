@@ -7043,13 +7043,17 @@ function calTurmaEndBefore(rec, occ, t, now) {
 // one counts as left. A day the client changed stays as sent. -> {rule} | {status, body}.
 const CAL_TURMA_WEEK_REFUSAL = { status: 400, body: { error: "moving this occurrence would carry an every-few-weeks " +
   "pattern across a week boundary; change the repeat days instead" } };
-function calTurmaMovedRule(sent, rec, from, to) {
+// The same refusal for a time-zone change that keeps the instants (XERK-2993): the dates
+// move only because the wall clock does, so say that rather than "moving this occurrence".
+const CAL_TURMA_ZONE_WEEK_REFUSAL = { status: 400, body: { error: "in the new time zone this every-few-weeks " +
+  "pattern's days would fall across a week boundary; change the repeat days too, or keep the time zone" } };
+function calTurmaMovedRule(sent, rec, from, to, zoneOnly = false) {
   if (!sent || !rec.recurrence || from === to) return { rule: sent };
   const anchor = recurrence.localDate(rec.startMs, rec.timeZone);
   if (!recurrence.sameDays(recurrence.withAnchorDays(recurrence.sanitizeRule(sent), anchor),
     recurrence.withAnchorDays(rec.recurrence, anchor))) return { rule: sent };
   const rule = recurrence.reanchorDays(sent, from, to);
-  return rule ? { rule } : CAL_TURMA_WEEK_REFUSAL;
+  return rule ? { rule } : zoneOnly ? CAL_TURMA_ZONE_WEEK_REFUSAL : CAL_TURMA_WEEK_REFUSAL;
 }
 function patchTurmaEvent(p, id, body, now = Date.now()) {
   const f = calTurmaTarget(p, id);
@@ -7121,7 +7125,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     const tz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
     const startMs = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.rec.startMs;
     const mr = calTurmaMovedRule("recurrence" in body ? body.recurrence : f.rec.recurrence, f.rec,
-      recurrence.localDate(f.rec.startMs, f.rec.timeZone), recurrence.localDate(startMs, tz));
+      recurrence.localDate(f.rec.startMs, f.rec.timeZone), recurrence.localDate(startMs, tz),
+      startMs === f.rec.startMs && tz !== f.rec.timeZone);
     if (mr.status) return mr;
     const rule = mr.rule;
     const rec = sanitizeTurmaEvent({ ...f.rec, ...fields, orgs, recurrence: rule,
@@ -7160,7 +7165,7 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   //   moves with a moved occurrence (XERK-2953): kept as is, "the 31st" moved to Jul 30
   //   started the new series on Jul 31, its first instance not one of its own occurrences.
   //   A day the client CHANGED is the one it asked for.
-  const mr = calTurmaMovedRule(sent, f.rec, oldDate, newDate);
+  const mr = calTurmaMovedRule(sent, f.rec, oldDate, newDate, newStart === f.occ.startMs && newTz !== f.rec.timeZone);
   if (mr.status) return mr;
   const moved = mr.rule;
   const rest = sent && count && Number.isSafeInteger(sent.count) ? { count: sent.count - prev.recurrence.count } : {};

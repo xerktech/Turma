@@ -4023,9 +4023,17 @@
     // the fold doesn't leave the view short of the last message.
     el.addEventListener("load", () => { if (stScroll === el) pinStaticBottom(); }, true);
     // A pane rendered while hidden (Trajectory pressed mid-load) has no height
-    // to scroll; re-pin once it is laid out again.
+    // to scroll; re-pin once it is laid out again. The CONTENT is observed too:
+    // growth that fires no `load` (a web font swapping in, a <details> opening)
+    // changes the messages' size, never the pane's, and left the view short of
+    // the bottom (XERK-2993). Each repaint replaces the children, so new ones
+    // are picked up as they arrive.
     if (typeof ResizeObserver === "function") {
-      new ResizeObserver(() => { if (stScroll === el) pinStaticBottom(); }).observe(el);
+      const ro = new ResizeObserver(() => { if (stScroll === el) pinStaticBottom(); });
+      ro.observe(el);
+      const watchChildren = () => { for (const c of Array.from(el.children || [])) ro.observe(c); };
+      watchChildren();
+      if (typeof MutationObserver === "function") new MutationObserver(watchChildren).observe(el, { childList: true });
     }
   }
 

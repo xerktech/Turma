@@ -215,6 +215,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
     occurrence id, "following" from the first occurrence, or the series' own start.
   - **Every N > 1 weeks, a move carrying the days across different week boundaries is a 400**
     in words (weeks start Sunday): FR,SA every 2 weeks moved Sat -> Sun is no one week's days.
+    A time-zone change that keeps the instants gets the same refusal worded for the zone
+    (`CAL_TURMA_ZONE_WEEK_REFUSAL`, XERK-2993): nothing was "moved".
   - `version` is the SERIES' (one version per series; every scope bumps it). Occurrence PATCH
     answers the occurrence, series PATCH the series record.
 - Tests: `recurrence.test.js` (DST both ways and east of +12, month-end, nth/last weekday,
