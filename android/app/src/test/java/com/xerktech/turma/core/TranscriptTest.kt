@@ -29,6 +29,9 @@ class TranscriptTest {
         // A seed repeating a restamped pr-link id must not pull a later turn up.
         assertEquals(listOf("u1", "a1", "P", "u2", "a2", "u3"),
             m(listOf("u1", "a1", "P", "u2", "a2"), listOf(a("P"), a("u2"), a("a2"), a("P"), a("u3"))))
+        // A backward jump to a repeated id must not anchor a waiting new id early.
+        assertEquals(listOf("P", "u2", "a2", "X", "u3"),
+            m(listOf("P", "u2", "a2", "u3"), listOf(a("P"), a("u2"), a("a2"), a("X"), a("P"), a("u3"))))
         // A live DELTA [grown X, new N] omits unchanged entries: N is appended.
         assertEquals(listOf("X", "Y", "Z", "N"), m(listOf("X", "Y", "Z"), listOf(a("X", "X grown"), a("N"))))
         val rep = mergeTail(listOf(a("c")), listOf(a("a"), a("a", "longer a"), a("c")))

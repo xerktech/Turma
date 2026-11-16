@@ -46,6 +46,9 @@ test("mergeTail: a new incoming id lands where it happened, not at the end (XERK
   // A seed repeating a restamped pr-link id must not pull a later turn up.
   const restamp = mergeTail(["u1", "a1", "P", "u2", "a2"].map(e), ["P", "u2", "a2", "P", "u3"].map(e));
   assert.deepEqual(restamp.map((x) => x.id), ["u1", "a1", "P", "u2", "a2", "u3"]);
+  // A backward jump to a repeated id must not anchor a waiting new id early.
+  const back = mergeTail(["P", "u2", "a2", "u3"].map(e), ["P", "u2", "a2", "X", "P", "u3"].map(e));
+  assert.deepEqual(back.map((x) => x.id), ["P", "u2", "a2", "X", "u3"]);
   // A live DELTA [grown X, new N] omits unchanged entries: N is appended.
   const delta = mergeTail(["X", "Y", "Z"].map(e), [{ id: "X", role: "assistant", text: "X grown" }, e("N")]);
   assert.deepEqual(delta.map((x) => x.id), ["X", "Y", "Z", "N"]);
