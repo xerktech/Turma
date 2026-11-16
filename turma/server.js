@@ -6395,8 +6395,12 @@ function normalizeCalendarCapability(payload) {
   const c = payload.calendar;
   if (!c || typeof c !== "object" || Array.isArray(c)) { payload.calendar = null; return; }
   // `write` (XERK-2985): this host writes Turma events into its Outlook. Only a
-  // strict true is kept; absent = an older agent, which would ack and never answer.
-  payload.calendar = c.write === true ? { available: c.available === true, write: true } : { available: c.available === true };
+  // strict true makes it a writer; absent = an older agent, which would ack and never
+  // answer. A strict false (Outlook did not answer its last run) is kept apart from
+  // absent, since a holder reporting it keeps its copies for a grace (XERK-2990).
+  const out = { available: c.available === true };
+  if (c.write === true || c.write === false) out.write = c.write;
+  payload.calendar = out;
 }
 const calendarCapable = (a) => !!(a && a.calendar && a.calendar.available === true);
 const calendarHostOnline = (a, now) => !!(a && a.lastSeen && now - a.lastSeen < OFFLINE_AFTER_MS);
@@ -7356,6 +7360,7 @@ const calWriteCapable = (a) => !!(a && a.calendar && a.calendar.available === tr
 // (the agent's upsert is idempotent, so that is safe).
 const calWriteSent = new Map();       // host\0turmaId -> {at, version, op, failed?}
 const calWriteOrgLostAt = new Map();  // host\0org -> when the holder first read out of the org
+const calWriteDownAt = new Map();     // host -> when it first reported write:false
 const calWriteRepairAt = new Map();   // tenant\0turmaId\0org -> the last repair
 const calMemoSet = (m, k, v) => {
   m.delete(k);
@@ -7366,9 +7371,19 @@ const calMemoSet = (m, k, v) => {
 // Whether `key` may keep tenant `t`'s copy for `org`: registered, still writing, not
 // offline for CALENDAR_WRITE_REHOME_MS, and decided into the org (a drift out of it
 // is tolerated for that long too, so a brief one re-homes nothing).
+// An Outlook that failed a run reports `write: false`; that too is tolerated for
+// CALENDAR_WRITE_REHOME_MS (XERK-2990): one Outlook restart or slow read must not move
+// a sending copy, which cancels and re-invites every attendee from another mailbox.
+// `write` ABSENT (an older agent) still gives the copy up at once.
+function calWriteHolderDownOk(key, a, now) {
+  if (calWriteCapable(a)) { calWriteDownAt.delete(key); return true; }
+  if (!(a.calendar && a.calendar.available === true && a.calendar.write === false)) return false;
+  if (!calWriteDownAt.has(key)) calMemoSet(calWriteDownAt, key, now);
+  return now - calWriteDownAt.get(key) < CALENDAR_WRITE_REHOME_MS;
+}
 function calWriteHolderOk(key, t, org, now) {
   const a = agents[key];
-  if (!a || tenantOfKey(key) !== t || !calWriteCapable(a)) return false;
+  if (!a || tenantOfKey(key) !== t || !calWriteHolderDownOk(key, a, now)) return false;
   if (!a.lastSeen || now - a.lastSeen >= CALENDAR_WRITE_REHOME_MS) return false;
   const lk = `${key}\u0000${org}`;
   if (decidedOrgOf(a) === org) { calWriteOrgLostAt.delete(lk); return true; }
@@ -31986,7 +32001,7 @@ if (process.env.TURMA_TEST) {
     // XERK-2968: Turma-created events.
     getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
-    CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calOutlookTickAt = 0; },
+    CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
     sanitizeTurmaEvent, calTurmaResponses, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,

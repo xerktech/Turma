@@ -35065,6 +35065,40 @@ test("XERK-2985: the writer is sticky through a blip and re-homed once gone; the
   }
 });
 
+test("XERK-2990: a holder whose Outlook fails a run keeps its copy for the re-home grace", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A]))).body.event.id;
+    const holder = rec2985(id).outlook[S2985A].host;
+    const other = holder === D2985A ? D2985A2 : D2985A;
+    await beat2985(holder, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // One failed Outlook run (write:false): the copy stays put, and an edit waits for it.
+    await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
+    assert.deepEqual(agents[holder].calendar, { available: true, write: false });
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, holder, "a transient failure re-homes nothing");
+    const n = writes2985(holder).length;
+    assert.equal((await turma2968("PATCH", id, { version: 1, subject: "Moved" })).status, 200);
+    assert.deepEqual([rec2985(id).outlook[S2985A].host, rec2985(id).outlook[S2985A].state], [holder, "pending"]);
+    assert.equal(writes2985(holder).length, n, "nothing queued to a host not writing");
+    assert.ok(!(writes2985(other) || []).some((x) => x.turmaId === id), "no copy on the other host");
+    // Outlook answers again: the owed write goes to the same holder.
+    await beat2985(holder, S2985A);
+    assert.equal(writes2985(holder).filter((x) => x.turmaId === id && x.version === 2).length, 1);
+    // Down past the grace: the holder gives the copy up (the clock jump leaves no
+    // online candidate, so it is owed and unassigned) and its old copy is a tombstone.
+    await beat2985(holder, S2985A, { calendar: { available: true, write: false } });
+    hub.calendarOutlookTick(Date.now() + hub.CALENDAR_WRITE_REHOME_MS + 1000, true);
+    assert.notEqual(rec2985(id).outlook[S2985A].host, holder);
+    assert.ok(hub.getCalendarOutlookTombstones()[holder].some((x) => x.turmaId === id));
+  } finally {
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
 test("XERK-2985: a Turma event's own Outlook copy is hidden, so it is served once", async () => {
   cleanup2985(D2985A);
   try {
