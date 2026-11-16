@@ -13,6 +13,11 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
+import com.xerktech.turma.net.FleetRepository
+import com.xerktech.turma.net.FleetState
+import androidx.compose.ui.test.junit4.StateRestorationTester
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.runBlocking
 import com.xerktech.turma.vm.ArchiveViewModel
 import com.xerktech.turma.vm.FleetViewModel
 import org.junit.Assert.assertEquals
@@ -89,6 +94,41 @@ class SessionsBackPositionTest {
         // Only that one card (the bottom nav's selected tab is the other selected node).
         val markedCards = compose.onAllNodes(isSelected().and(hasAnyDescendant(hasText("Session ", substring = true))))
         assertEquals(1, markedCards.fetchSemanticsNodes().size)
+    }
+
+    @Test
+    fun aRestoreOverAStillLoadingFleetKeepsTheListPosition() {
+        val sessions = (0 until 40).joinToString(",") { i ->
+            """{ "id": "s$i", "status": "running", "summary": "${name(i)}", "repo": "Turma" }"""
+        }
+        val fleetJson = """{ "now": 1, "agents": [ { "key": "h1", "device": "h1", "online": true,
+                 "repos": [ { "name": "Turma", "lastActivity": "2026-08-12T00:00:00Z" } ],
+                 "sessions": [ $sessions ] } ] }"""
+        hub.seedFleet(fleetJson)
+        val fleetVm = main.track(FleetViewModel(hub.app))
+        val archiveVm = main.track(ArchiveViewModel(hub.app))
+        val restore = StateRestorationTester(compose)
+        restore.setContent {
+            SessionsRoute(wide = false, onNavigate = {}, onTerminal = { _, _ -> }, fleetVm = fleetVm, archiveVm = archiveVm)
+        }
+        val target = name(30)
+        compose.onNode(hasScrollAction()).performScrollToNode(hasText(target))
+        compose.waitForIdle()
+
+        // Process death: the saved state comes back, but the new process's fleet has not
+        // loaded yet (the repository's initial state: loading, no hosts).
+        val state = FleetRepository::class.java.getDeclaredField("_state").apply { isAccessible = true }
+            .get(hub.container.fleet) as MutableStateFlow<FleetState>
+        state.value = FleetState()
+        restore.emulateSavedInstanceStateRestore()
+        compose.waitForIdle()
+        compose.onNodeWithText("Loading…").assertIsDisplayed()
+
+        // The fleet lands: the list is where it was, not clamped to the top by the empty one.
+        runBlocking { hub.container.fleet.refresh() }
+        compose.waitForIdle()
+        compose.onNodeWithText(target).assertIsDisplayed()
+        assertEquals(0, compose.onAllNodes(hasText(name(0))).fetchSemanticsNodes().size)
     }
 
     @Test

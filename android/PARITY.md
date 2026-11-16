@@ -231,6 +231,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   slot opens a full-screen editor (title, required / optional attendees, start / end, all-day, time
   zone, location, online + join link, details, show as, categories, private, orgs ≥1, Repeat)
   → `POST|PATCH|DELETE /api/calendar/events`.
+  - A touch that moved is never a create, as on the web (its 10px pointerup check). Platform
+    difference: Android also ignores a long press on an empty slot, and its grid scrolls the last
+    hour clear of the FAB (the web's New event is a toolbar button that covers nothing).
   - Repeat (XERK-2973) is the web's control: the same presets, custom interval / unit / days /
     month mode, end never / on date / after N, and summary (`core/CalendarRepeat.kt`, both clients
     read `turma/tests/fixtures/calendar-repeat-vectors.json`). An occurrence's Edit / Delete asks

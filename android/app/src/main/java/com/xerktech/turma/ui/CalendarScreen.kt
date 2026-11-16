@@ -28,7 +28,6 @@ import com.xerktech.turma.core.calZoomClamp
 import com.xerktech.turma.core.calZoomStep
 import kotlin.math.roundToInt
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.detectTapGestures
 import com.xerktech.turma.core.calDefaultOrgs
 import com.xerktech.turma.core.calDefaultStart
 import com.xerktech.turma.core.calDraftOf
@@ -783,26 +782,36 @@ private fun WeekGrid(
             // A zoom holds the minute under the fingers (or the pane's middle) in place; any
             // other row-height change (the pane resized by a notice, a rotation) holds the
             // minute at the top. The scroll moves once the new rows are laid out.
-            var hold by remember { mutableStateOf<Pair<Double, Float>?>(null) }
+            // Never-equal: each zoom step's hold is its own write, so the identity check below
+            // tells a newer step's hold (often an EQUAL pair, the minute kept) from its own.
+            var hold by remember { mutableStateOf<Pair<Double, Float>?>(null, androidx.compose.runtime.neverEqualPolicy()) }
             var lastSlotPx by remember { mutableStateOf(0f) }
             LaunchedEffect(slot) {
                 val was = lastSlotPx
                 lastSlotPx = with(density) { slot.toPx() }
-                val (min, y) = hold ?: (if (was > 0f) scroll.value / was * 30.0 to 0f else return@LaunchedEffect)
+                val held = hold
+                val (min, y) = held ?: (if (was > 0f) scroll.value / was * 30.0 to 0f else return@LaunchedEffect)
                 withFrameNanos { }
                 // A raw delta, never scrollTo: that takes the scroll's lock and cancels a fling in
                 // flight. A swipe landing at a vertical flick's down changes the band (so the pane)
                 // under it, and this hold then killed the flick (QA, emulator).
                 val to = with(density) { (slot.toPx() * min / 30 - y).roundToInt().coerceAtLeast(0) }
                 scroll.dispatchRawDelta((to - scroll.value).toFloat())
-                hold = null
+                // Only the hold this pass applied: the next pinch move can land before this
+                // frame (one per frame on a 120 Hz panel) and set the next step's hold, which
+                // clearing it here dropped to the top-hold fallback (rollup XERK-2953, measured).
+                if (hold === held) hold = null
             }
             val hours by rememberUpdatedState(zoomHours)
             fun zoomTo(h: Float, y: Float, end: Boolean) {
                 val next = calZoomClamp(h)
                 if (next != hours) {
+                    // A hold not yet applied keeps its minute: the scroll still stands for the
+                    // rows before it, so reading the minute off it now would drift the anchor
+                    // (two pinch moves inside one frame, rollup XERK-2953).
+                    val pending = hold?.first
                     val slotPx = with(density) { calSlotDp(paneDp, hours).dp.toPx() }
-                    hold = (scroll.value + y) / slotPx * 30.0 to y
+                    hold = (pending ?: ((scroll.value + y) / slotPx * 30.0)) to y
                 }
                 onZoom(next, end)
             }
@@ -835,7 +844,9 @@ private fun WeekGrid(
                     }
                     .verticalScroll(scroll).testTag("cal-scroll"),
             ) {
-                Row(Modifier.fillMaxWidth().height(hourDp * 24)) {
+                // Room below midnight for the New event FAB (16dp margin + 56dp + 16dp): the last
+                // hours scroll clear of it, so a late block's corner is never under it (XERK-2953).
+                Row(Modifier.fillMaxWidth().padding(bottom = 88.dp).height(hourDp * 24)) {
                     Box(Modifier.width(gutter).fillMaxHeight()) {
                         for (h in 1 until 24) {
                             Text(
@@ -861,9 +872,21 @@ private fun WeekGrid(
                                 }
                                 .then(if (off) Modifier.hatch(offShade) else Modifier)
                                 // A tap on an empty slot starts a new event there (XERK-2972); a block's
-                                // own click consumes its tap first, so this hears only the gaps.
+                                // own click consumes its tap first, so this hears only the gaps. Only a
+                                // TAP: a touch that moved past the slop (a short swipe under the day
+                                // step) or was held past the long-press timeout opens nothing, as the
+                                // web drops a moved touch (rollup XERK-2953).
                                 .pointerInput(d, slot) {
-                                    detectTapGestures { p -> onSlot(d, (p.y / slot.toPx() * 30).toInt()) }
+                                    awaitEachGesture {
+                                        val down = awaitFirstDown()
+                                        val up = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                                            awaitSlotTap(down, viewConfiguration.touchSlop)
+                                        }
+                                        if (up != null) {
+                                            up.consume()
+                                            onSlot(d, (down.position.y / slot.toPx() * 30).toInt())
+                                        }
+                                    }
                                 }
                                 .shown(d, "cal-col-${calDayKey(d)}"),
                         ) {
@@ -1386,3 +1409,20 @@ private fun RelinkControls(
 /** A daily entry is the daily meeting's when its scheduled time is within 20 min of [at]. */
 internal fun dailyEntryNear(entries: List<TriageEntry>, at: Long): TriageEntry? =
     entries.firstOrNull { it.daily && kotlin.math.abs(it.at - at) <= CAL_DAILY_EVENT_MS }
+
+/**
+ * The rest of an empty-slot tap after its [down]: the up, or null once the touch
+ * moved past [slop], a second finger landed, or anything else consumed it.
+ */
+private suspend fun androidx.compose.ui.input.pointer.AwaitPointerEventScope.awaitSlotTap(
+    down: androidx.compose.ui.input.pointer.PointerInputChange,
+    slop: Float,
+): androidx.compose.ui.input.pointer.PointerInputChange? {
+    while (true) {
+        val ev = awaitPointerEvent()
+        val c = ev.changes.firstOrNull { it.id == down.id } ?: return null
+        if (c.isConsumed || ev.changes.count { it.pressed } > 1) return null
+        if ((c.position - down.position).getDistance() > slop) return null
+        if (!c.pressed) return c
+    }
+}
