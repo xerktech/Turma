@@ -48,6 +48,8 @@ const ROUTES = [
   ["GET", "/auth/oidc/login", "public"], ["GET", "/auth/oidc/callback", "public"],
   ["GET POST", "/auth/oidc/logout", "public"],
   ["GET HEAD", "/term-font.woff2", "public"],
+  // The subscribable calendar feed (XERK-2992): its secret link is the credential.
+  ["GET HEAD", "/feeds/calendar/:token", "public"],
   // agent transport
   ["POST", "/api/heartbeat", "agent"],
   ["GET", "/api/agent/token", "agent"], ["POST", "/api/agent/enroll", "agent"],
@@ -76,6 +78,7 @@ const ROUTES = [
   ["GET", "/api/me", "signed-in"],
   // The caller's own tenant's Tenir token (XERK-2551; the handler 404s a principal with no tenant).
   ["GET POST", "/api/meetings-token", "signed-in"],
+  ["GET POST DELETE", "/api/calendar/feed", "signed-in"],
   // Push devices: a phone's own registration. WHICH alerts reach it is the push
   // partition's (XERK-2551).
   ["POST DELETE", "/api/devices", "signed-in"],
