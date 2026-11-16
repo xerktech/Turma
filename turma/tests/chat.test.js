@@ -1490,10 +1490,13 @@ test("streamVideoFailed: a copy still on the hub is the browser's codec, a gone 
     replaceChildren(...k) { this.kids = k; } });
   const v = { getAttribute: () => "/api/agents/h/sessions/s/sendfile/" + "a".repeat(32) };
   try {
-    global.fetch = async () => ({ ok: true, json: async () => ({ state: "ready", size: 9 }) });
+    const asked = [];
+    global.fetch = async (u) => { asked.push(u); return { ok: true, json: async () => ({ state: "ready", size: 9 }) }; };
     const b1 = box();
     await streamVideoFailed(b1, v);
     assert.match(b1.kids[0].textContent, /can't play it/);
+    // Only a PEEK: checking why it failed must never start a new fetch.
+    assert.deepEqual(asked, ["/api/agents/h/sessions/s/sendfile/" + "a".repeat(32) + "?status=1&peek=1"]);
     global.fetch = async () => ({ ok: true, json: async () => ({ state: "pending" }) });
     const b2 = box();
     await streamVideoFailed(b2, v);

@@ -29881,6 +29881,9 @@ const server = http.createServer(async (req, res) => {
         }
         if (e && e.state === "ready") { e.usedAt = Date.now(); return json(res, 200, { state: "ready", size: e.size }); }
         if (e && e.state === "error") return json(res, 200, { state: "error", error: e.error });
+        // A peek (the player checking why it failed) never starts a fetch, and
+        // never evicts a cached clip to make an entry for one.
+        if (!e && url.searchParams.has("peek")) return json(res, 200, { state: "gone" });
         if (!e) {
           const a = agents[key];
           if (Date.now() - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) {
@@ -29899,8 +29902,6 @@ const server = http.createServer(async (req, res) => {
           // The size the block named (the client passes it): reserved now, so a
           // full cache is refused BEFORE the host uploads anything, and is not
           // remembered (a retry once room frees succeeds at once).
-          // A peek (the player checking why it failed) never starts a fetch.
-          if (url.searchParams.has("peek")) return json(res, 200, { state: "gone" });
           // No size (an older client): reserve nothing now; the upload's own
           // length is checked against the room when it arrives.
           const want = Number(url.searchParams.get("size"));

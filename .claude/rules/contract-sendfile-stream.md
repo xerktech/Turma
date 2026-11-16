@@ -44,9 +44,12 @@ both clients.
   - No `size` (an older client) reserves 0. An upload declaring more than reserved GROWS the
     reservation if there is room; otherwise (and for no length / past the cap) it is DRAINED, then
     answered 503/411/413 — never refused on its declaration (`contract-agent-hub.md`).
-  - A streamed player that errors asks `?status=1&peek=1` (a peek never starts a fetch): still
+  - A streamed player that errors asks `?status=1&peek=1` (a peek never starts a fetch or evicts
+    for one): still
     `ready` = the browser can't decode it (the codec chip); otherwise ▶ comes back
     (`streamVideoFailed`).
+  - Accepted: a refusal at UPLOAD time (an older/wrong-size client) stays cached
+    `SENDFILE_ERROR_KEEP_MS` (60s); dropping it would make a polling player re-upload in a loop.
   - An agent upload that fails in transport posts `?error=`, so the player stops waiting; an
     upload stuck past 2 x `SENDFILE_PENDING_MS` is given up.
 - Web: ▶ polls, then swaps in `<video src=…/sendfile/<ref>>`; only in the LIVE chat (an ended
