@@ -884,7 +884,73 @@ function queuedDisplay(queue) {
 // poll (same file, same mtime+size) — pollWatcher ticks this ~1s per session and
 // most ticks find nothing new. sessionTranscript already stat'd the candidates,
 // so one more stat of the winner is cheap next to re-reading the tail.
-function transcriptTail(worktreePath, cache, transcriptId, agentState) {
+// The rows Claude Code has kept but not yet written (XERK-2959). It files a
+// response's rows only once every tool call in it has finished, so while an
+// AskUserQuestion waits on the operator (the ask.py hook blocks), that
+// response's text, a SendUserFile beside it and its result are on the
+// session's screen and in no transcript. The bridge mod mirrors the current
+// turn's rows from the engine's `session.append` into
+// ~/.turma/mod-requests/<sessionId>/unsaved.json, under the uuids the
+// transcript later files them by. Mirrored in hub-agent.py
+// (_with_unsaved / _merge_unsaved).
+const MOD_REQUESTS_DIR = path.join(os.homedir(), ".turma", "mod-requests");
+const UNSAVED_MAX_BYTES = 4 << 20;
+
+function unsavedPath(sessionId, dir = MOD_REQUESTS_DIR) {
+  if (!sessionId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sessionId)) return null;
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  return path.join(dir, sessionId, "unsaved.json");
+}
+
+// The file is session-written: never followed through a link, never a FIFO
+// (a blocking open would hang this event loop), bounded. null on any doubt.
+function readUnsaved(p) {
+  if (!p) return null;
+  let fd;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > UNSAVED_MAX_BYTES) return null;
+    return { doc: JSON.parse(fs.readFileSync(fd, "utf8")), mtimeMs: st.mtimeMs, size: st.size };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+}
+
+// The unsaved rows to show after a transcript tail. Pure. A row rides only when
+// the doc names THIS conversation, its uuid is not in the tail already, and it
+// is no older than the tail's newest message: a row the transcript filed and
+// the 128 KB window has since dropped must not come back at the end.
+function mergeUnsaved(entries, doc, claudeSessionId) {
+  const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+  if (!isObj(doc) || doc.v !== 1 || !claudeSessionId || doc.claudeSessionId !== claudeSessionId
+      || !Array.isArray(doc.rows)) return [];
+  const seen = new Set();
+  let newest = null;
+  for (const e of entries) {
+    if (!isObj(e)) continue;
+    if (typeof e.uuid === "string") seen.add(e.uuid);
+    if (e.type !== "user" && e.type !== "assistant") continue;
+    const t = tsMs(e.timestamp);
+    if (t !== null && (newest === null || t > newest)) newest = t;
+  }
+  const out = [];
+  for (const r of doc.rows) {
+    if (!isObj(r) || (r.type !== "user" && r.type !== "assistant")) continue;
+    if (typeof r.uuid !== "string" || !r.uuid || seen.has(r.uuid)) continue;
+    if (!isObj(r.message) || !Array.isArray(r.message.content)) continue;
+    const t = tsMs(r.timestamp);
+    if (t === null || (newest !== null && t < newest)) continue;
+    seen.add(r.uuid);
+    out.push({ type: r.type, uuid: r.uuid, timestamp: r.timestamp,
+      message: { role: r.type, content: r.message.content } });
+  }
+  return out;
+}
+
+function transcriptTail(worktreePath, cache, transcriptId, agentState, unsaved) {
   const p = sessionTranscript(worktreePath, transcriptId);
   if (!p) {
     if (cache) { cache.path = null; cache.result = { entries: [], queued: [] }; }
@@ -892,12 +958,23 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
   }
   let st = null;
   try { st = fs.statSync(p); } catch {}
+  // Keyed on a stat, so an unchanged file is not re-read each poll. lstat: a
+  // link reads as no file (readUnsaved refuses one anyway).
+  let pendingKey = "";
+  if (unsaved) {
+    try {
+      const ust = fs.lstatSync(unsaved);
+      if (ust.isFile()) pendingKey = `${ust.mtimeMs}:${ust.size}`;
+    } catch {}
+  }
   if (cache && cache.path === p && st &&
-      cache.mtimeMs === st.mtimeMs && cache.size === st.size) {
+      cache.mtimeMs === st.mtimeMs && cache.size === st.size && cache.pendingKey === pendingKey) {
     return cache.result; // unchanged since last poll -> reuse, no read+parse
   }
+  const pending = pendingKey ? readUnsaved(unsaved) : null;
   const tail = [];
   const queued = [];
+  const parsed = [];
   for (const raw of readTailLines(p, TAIL_READ_BYTES)) {
     let entry;
     try { entry = JSON.parse(raw); } catch { continue; }
@@ -906,7 +983,13 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
     // persists across polls, so an entry scrolling out of the tail window never
     // un-does what it established; and because a launch always precedes its own
     // notification in the file, a window holding the launch holds the stop too.
+    // Unsaved rows are not folded: they are display only, and the transcript
+    // files the same rows soon after.
     if (agentState) scanAgentEntry(entry, agentState);
+    parsed.push(entry);
+  }
+  const held = pending ? mergeUnsaved(parsed, pending.doc, path.basename(p, ".jsonl")) : [];
+  for (const entry of parsed.concat(held)) {
     if (entry.type === "queue-operation") { foldQueueOp(entry, queued); continue; }
     const text = entryText(entry);
     const blocks = entryBlocks(entry, BLOCK_CAPS);
@@ -926,6 +1009,7 @@ function transcriptTail(worktreePath, cache, transcriptId, agentState) {
     cache.path = p;
     cache.mtimeMs = st ? st.mtimeMs : 0;
     cache.size = st ? st.size : 0;
+    cache.pendingKey = pendingKey;
     cache.result = result;
   }
   return result;
@@ -2465,7 +2549,7 @@ function pollWatcher(sessionId) {
   //    queue op is a transcript line that changes NO entry — without it, the
   //    frame that reports "your prompt is queued" would never fire.
   let tail = null;
-  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState); }
+  try { tail = transcriptTail(w.worktreePath, w.tailCache, w.transcriptId, w.agentState, unsavedPath(sessionId)); }
   catch { tail = null; }
   // The cache hands back the SAME result OBJECT while the transcript is
   // unchanged, so an identity compare retires the whole section on an idle
@@ -3087,7 +3171,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { mergeUnsaved, readUnsaved, unsavedPath, queuedPromptEntry, ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, tnFingerprint, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

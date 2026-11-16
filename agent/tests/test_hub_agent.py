@@ -4078,6 +4078,108 @@ class TestHookQuestion(unittest.TestCase):
         self.assertEqual(ha._hook_question("s")["question"], "Big?")
 
 
+class TestUnsavedRows(ProjectDirMixin, unittest.TestCase):
+    """XERK-2959: while an AskUserQuestion waits, Claude Code has not written
+    that response's rows (its text, a SendUserFile beside it and the file's
+    result); the bridge mod mirrors them to unsaved.json and the preview and
+    /history show them until the transcript files them. Mirrors the
+    mergeUnsaved case in tunnel-agent.test.js."""
+
+    ROWS = [
+        {"type": "assistant", "uuid": "a1", "timestamp": "2026-11-16T02:37:12.000Z",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "Working on it"}]}},
+        {"type": "assistant", "uuid": "a2", "timestamp": "2026-11-16T02:37:46.700Z",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "Here is the screenshot"}]}},
+        {"type": "assistant", "uuid": "a3", "timestamp": "2026-11-16T02:37:46.729Z",
+         "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu1",
+                     "name": "AskUserQuestion", "input": {"questions": [{"question": "Looks right?"}]}}]}},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.path = os.path.join(self.proj, "conv-9.jsonl")
+        write_jsonl(self.path, [
+            {"uuid": "p1", "type": "user", "timestamp": "2026-11-16T02:37:09.000Z",
+             "message": {"content": "show me"}},
+            self.ROWS[0],
+        ])
+        self.unsaved = os.path.join(self.proj, "unsaved.json")
+
+    def _doc(self, csid="conv-9", rows=None):
+        with open(self.unsaved, "w") as f:
+            json.dump({"v": 1, "claudeSessionId": csid, "rows": self.ROWS if rows is None else rows}, f)
+
+    def test_the_preview_shows_unsaved_rows_once(self):
+        self._doc()
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)],
+                         ["p1", "a1", "a2", "a3"])
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path)], ["p1", "a1"])
+        # The transcript files them: each once.
+        with open(self.path, "a") as f:
+            for r in self.ROWS[1:]:
+                f.write(json.dumps(r) + "\n")
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)],
+                         ["p1", "a1", "a2", "a3"])
+
+    def test_history_shows_unsaved_rows(self):
+        self._doc()
+        entries, _, _ = ha._history_entries(self.path, self.unsaved)
+        self.assertEqual([e["id"] for e in entries], ["p1", "a1", "a2", "a3"])
+
+    def test_another_conversation_or_a_malformed_file_adds_nothing(self):
+        self._doc(csid="other")
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)], ["p1", "a1"])
+        self._doc(rows=[{"type": "assistant", "uuid": "z"}, None, 7, {"type": "system", "uuid": "s",
+                         "timestamp": "2026-11-16T03:00:00Z", "message": {"content": []}}])
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)], ["p1", "a1"])
+        with open(self.unsaved, "w") as f:
+            f.write("{not json")
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)], ["p1", "a1"])
+
+    def test_a_row_older_than_the_tail_never_comes_back(self):
+        old = {"type": "assistant", "uuid": "gone", "timestamp": "2026-11-16T02:00:00.000Z",
+               "message": {"role": "assistant", "content": [{"type": "text", "text": "old"}]}}
+        self._doc(rows=[old])
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)], ["p1", "a1"])
+
+    def test_a_planted_link_or_fifo_is_never_read(self):
+        real = os.path.join(self.proj, "real.json")
+        with open(real, "w") as f:
+            json.dump({"v": 1, "claudeSessionId": "conv-9", "rows": self.ROWS}, f)
+        os.symlink(real, self.unsaved)
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)], ["p1", "a1"])
+        os.unlink(self.unsaved)
+        os.mkfifo(self.unsaved)
+        self.assertEqual([r["id"] for r in ha.transcript_tail(self.path, self.unsaved)], ["p1", "a1"])
+
+    def test_the_history_command_reads_the_sessions_unsaved_rows(self):
+        self._doc()
+        with mock.patch.object(ha, "unsaved_rows_path", return_value=self.unsaved) as up, \
+             mock.patch.object(ha, "_history_entries", wraps=ha._history_entries) as he:
+            sm = ha.SessionManager.__new__(ha.SessionManager)
+            sm.history_results = []
+            sm._find = lambda sid: {"id": sid}
+            with mock.patch.object(ha, "_session_transcript_path", return_value=self.path):
+                sm._stage_history("s-1")
+        up.assert_called_with("s-1")
+        he.assert_called_with(self.path, self.unsaved)
+        self.assertEqual([e["id"] for e in sm.history_results[-1]["entries"]], ["p1", "a1", "a2", "a3"])
+
+    def test_the_heartbeat_preview_reads_the_sessions_unsaved_rows(self):
+        self._doc()
+        with mock.patch.object(ha, "unsaved_rows_path", return_value=self.unsaved) as up, \
+             mock.patch.object(ha, "transcript_tail", wraps=ha.transcript_tail) as tt:
+            report = ha.session_report(self.WORKDIR, {}, session_id="s-1", claude_sid="conv-9")
+        up.assert_called_with("s-1")
+        self.assertTrue(any(c.args[1:] == (self.unsaved,) for c in tt.call_args_list), tt.call_args_list)
+        self.assertEqual([r["id"] for r in report["tail"]], ["p1", "a1", "a2", "a3"])
+
+    def test_the_path_is_the_sessions_mod_request_dir(self):
+        self.assertEqual(ha.unsaved_rows_path("abc-1"),
+                         os.path.join(ha.MOD_REQUESTS_DIR, "abc-1", "unsaved.json"))
+        self.assertIsNone(ha.unsaved_rows_path("../etc"))
+
+
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
     def test_missing_file(self):
         self.assertEqual(ha.transcript_tail(os.path.join(self.proj, "nope.jsonl")), [])
