@@ -74,7 +74,8 @@ A pure-core/adapter-shell split:
   - `endedOpen` is hoisted too: a collapsed Ended section on Back loses an ended row and its anchor.
   - The hoisted state attaches only once the fleet has loaded: measured against an empty list (a
     restore after process death) it clamps to the top.
-  Tests: `ui/SessionsBackPositionTest`.
+  Tests: `ui/SessionsBackPositionTest` (the restore case resets the repository's `_state` to model
+  the new process: `StateRestorationTester` alone keeps the loaded fleet).
 - No in-place chat/terminal toggle (terminal is its own screen), so the compose draft lives in
   `data/DraftStore.kt` keyed per (host, session); `ChatViewModel` mirrors it into
   `ChatUiState.draft`, writing every change (dictation, send-clears) back through it. Tests:
@@ -160,6 +161,17 @@ A pure-core/adapter-shell split:
     `BoxWithConstraints`; pinch on the grid (consumed in the Initial pass so the scroll and the
     day swipe never see it) and TalkBack "Zoom in/out" custom actions stand in for the web's − / +.
     `CalendarViewModel.zoom`, saved once per pinch (prefs `zoom-hours`). Default 10h = 8 AM–6 PM.
+    - The pinch anchor (`hold`) is never-equal state, cleared only if it is still the one applied,
+      and a pending hold keeps its minute: several pinch moves land per frame, and an unconditional
+      clear (or an equal-pair write) dropped the anchor to the top-hold. Tests: `CalendarScreenTest`
+      (pinch holds the minute).
+  - An empty slot opens New event on a TAP only: a touch past the slop or held past the long-press
+    timeout opens nothing (`awaitSlotTap`). The grid's rows carry 88dp of bottom room so the
+    last hour scrolls clear of the FAB. Tests: `CalendarScreenTest` (rollup XERK-2953 cases).
+  - A short, wide pane (a phone in landscape, under 480dp tall) has no FAB: New event is a toolbar
+    icon (same `cal-new-event` tag). A FAB there covered a column at every scroll.
+  - The grid's top minute is hoisted to `CalendarBody` (`topMin`, saveable): a phone's detail and
+    editor replace the grid, and a scroll held inside it reopened at 8 AM on every close.
   - **The swipe follows the finger** (XERK-2980): the grid draws the days a swipe slides in
     off-screen either side (`calSwipeNeighbours`, a `DayStrip` per row), shifted in placement
     only. Day / 3 days swipe ONE day (`calSwipeStep`); ‹ › still page by what is shown.

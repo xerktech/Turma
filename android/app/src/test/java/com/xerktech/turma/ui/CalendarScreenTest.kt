@@ -17,6 +17,10 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.pinch
+import androidx.compose.foundation.layout.requiredSize
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.swipeLeft
@@ -131,10 +135,18 @@ class CalendarScreenTest {
 
     private fun calendarVm(view: String? = null) = main.track(CalendarViewModel(hub.app)).also { v -> view?.let { v.setView(it) } }
 
-    private fun show(cvm: CalendarViewModel = calendarVm(), wide: Boolean = false, push: String? = null) {
+    private fun show(
+        cvm: CalendarViewModel = calendarVm(), wide: Boolean = false, push: String? = null,
+        box: androidx.compose.ui.Modifier? = null,
+    ) {
         val vm = main.track(BriefViewModel(hub.app))
         val mvm = main.track(MeetingsViewModel(hub.app))
-        compose.setContent { BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = wide, openSite = push) }
+        compose.setContent {
+            if (box == null) BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = wide, openSite = push)
+            else androidx.compose.foundation.layout.Box(box) {
+                BriefScreen(vm = vm, meetingsVm = mvm, calendarVm = cvm, wide = wide, openSite = push)
+            }
+        }
     }
 
     private fun event(text: String) = hasTestTag("cal-ev") and hasContentDescription(text, substring = true)
@@ -478,6 +490,116 @@ class CalendarScreenTest {
         compose.waitForIdle()
         assertTrue(shown("cal-dh-${today.plusDays(1)}"))
         assertTrue("mid-settle: ${scrollY() - y1}", scrollY() - y1 > 120f)
+    }
+
+    @Test fun `a pinch holds the minute under the fingers (rollup XERK-2953)`() {
+        seed()
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        // The centroid sits on 10 AM, the top of the 10:00 block; a top-hold would move it.
+        val top0 = compose.onAllNodes(event(subject))[0].fetchSemanticsNode().positionInRoot.y
+        compose.onRoot().performTouchInput {
+            val c = Offset(width * 0.6f, top0)
+            pinch(c - Offset(0f, 40f), c - Offset(0f, 80f), c + Offset(0f, 40f), c + Offset(0f, 80f), durationMillis = 400)
+        }
+        compose.waitForIdle()
+        assertTrue("the pinch zoomed in: ${cvm.zoom.value}", cvm.zoom.value < 7f)
+        assertEquals(top0, compose.onAllNodes(event(subject))[0].fetchSemanticsNode().positionInRoot.y, 4f)
+    }
+
+    // A point just inside the visible grid's top, on today's empty column (events start at 10).
+    private fun emptySlot(): Offset {
+        val top = compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().positionInRoot.y
+        val root = compose.onRoot().fetchSemanticsNode().size
+        return Offset(root.width * 0.6f, top + 20f)
+    }
+
+    @Test fun `only a tap on an empty slot opens New event, never a moved touch or a long press (rollup XERK-2953)`() {
+        seed()
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent(subject)
+        val p = emptySlot()
+        // Past the slop, but neither a swipe (dx under 2 dy) nor a scroll (dy under the slop).
+        compose.onRoot().performTouchInput {
+            val s = viewConfiguration.touchSlop
+            down(p); moveBy(Offset(s * 1.5f, s * 0.9f), delayMillis = 16); up()
+        }
+        compose.waitForIdle()
+        assertTrue("a moved touch opened ${cvm.editor.value}", cvm.editor.value == null)
+        // A short horizontal drag, under the day's step.
+        compose.onRoot().performTouchInput {
+            down(p); repeat(4) { moveBy(Offset(-viewConfiguration.touchSlop, 0f), delayMillis = 16) }; up()
+        }
+        compose.waitForIdle()
+        assertTrue("a short drag opened ${cvm.editor.value}", cvm.editor.value == null)
+        compose.onRoot().performTouchInput { down(p); advanceEventTime(900); up() }
+        compose.waitForIdle()
+        assertTrue("a long press opened ${cvm.editor.value}", cvm.editor.value == null)
+        // The same point tapped opens it, so none of the above is vacuous.
+        compose.onRoot().performTouchInput { click(p) }
+        compose.waitForIdle()
+        assertTrue("a tap opens the editor", cvm.editor.value != null)
+    }
+
+    @Test fun `the last hour scrolls clear of the New event button (rollup XERK-2953)`() {
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
+        serve(true, """
+            { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "L1", "source": "outlook", "subject": "Late call",
+              "startMs": ${t(today, 23)}, "endMs": ${t(today, 23, 59)}, "busy": "busy", "myResponse": "accepted" }""")
+        hub.json("/api/holidays", "[]")
+        show(calendarVm())
+        awaitEvent("Late call")
+        compose.onNodeWithTag("cal-scroll").performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, 1e6f) }
+        compose.waitForIdle()
+        val ev = compose.onAllNodes(event("Late call"))[0].fetchSemanticsNode().boundsInRoot
+        val fab = compose.onNodeWithTag("cal-new-event").fetchSemanticsNode().boundsInRoot
+        assertTrue("block bottom ${ev.bottom} vs button top ${fab.top}", ev.bottom <= fab.top)
+    }
+
+    @Test fun `closing a detail or the editor keeps the grid where it was (rollup XERK-2953)`() {
+        hub.seedFleet("""{ "now": 1, "agents": [ $host ] }""")
+        serve(true, """
+            { "host": "h1", "org": "$site", "matchOrg": "$site", "id": "L1", "source": "outlook", "subject": "Late call",
+              "startMs": ${t(today, 23)}, "endMs": ${t(today, 23, 59)}, "busy": "busy", "myResponse": "accepted" }""")
+        hub.json("/api/holidays", "[]")
+        val cvm = calendarVm()
+        show(cvm)
+        awaitEvent("Late call")
+        val opened = scrollY()
+        compose.onNodeWithTag("cal-scroll").performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, 1e6f) }
+        compose.waitForIdle()
+        val end = scrollY()
+        assertTrue("scrolled past the 8 AM open: $opened -> $end", end > opened + 50f)
+        // The detail replaces the grid on a phone; Back brings it back at the same place.
+        compose.onAllNodes(event("Late call"))[0].performClick()
+        compose.onNodeWithTag("cal-detail").assertExists()
+        compose.onNodeWithTag("cal-detail-close").performClick()
+        compose.waitForIdle()
+        assertEquals(end, scrollY(), 2f)
+        // So does the editor, opened by a tap on an empty slot.
+        compose.onRoot().performTouchInput { click(emptySlot()) }
+        compose.waitForIdle()
+        assertTrue(cvm.editor.value != null)
+        cvm.closeEditor()
+        compose.waitForIdle()
+        assertEquals(end, scrollY(), 2f)
+    }
+
+    @Test fun `a short wide pane puts New event in the toolbar, never over the grid (rollup XERK-2953)`() {
+        seed()
+        val cvm = calendarVm()
+        show(cvm, box = androidx.compose.ui.Modifier.requiredSize(androidx.compose.ui.unit.DpSize(720.dp, 320.dp)))
+        // Work week by width; today may be a weekend, so wait on the grid, not an event.
+        compose.waitUntil(10_000) { shown("cal-scroll") && shown("cal-new-event") }
+        val btn = compose.onNodeWithTag("cal-new-event").fetchSemanticsNode().boundsInRoot
+        val grid = compose.onNodeWithTag("cal-scroll").fetchSemanticsNode().positionInRoot.y
+        assertTrue("button bottom ${btn.bottom} vs grid top $grid", btn.bottom <= grid)
+        // A semantics click: the 720dp box overhangs the 320dp test window.
+        compose.onNodeWithTag("cal-new-event").performSemanticsAction(SemanticsActions.OnClick)
+        compose.waitForIdle()
+        assertTrue("the toolbar action opens the editor", cvm.editor.value != null)
     }
 
     @Test fun `the view switch is kept on this phone and a push opens the notes review`() {
