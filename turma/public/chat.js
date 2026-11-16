@@ -4013,7 +4013,11 @@
     // stScroll: one element is wired once and reused across opens.
     const el = stScroll;
     el.addEventListener("scroll", () => {
-      if (stScroll === el) stPinned = scrolledToBottom(el) || (stPinned && el.scrollTop >= stPinTop - 1);
+      if (stScroll !== el) return;
+      // The reader reaching the bottom by hand pins at THIS pixel: a pixel left
+      // from an earlier pin would let a later scroll up stay pinned (QA).
+      if (scrolledToBottom(el)) { stPinned = true; stPinTop = el.scrollTop; }
+      else stPinned = stPinned && el.scrollTop >= stPinTop - 1;
     });
     // `load` doesn't bubble; capture it so a lazy image/iframe finishing below
     // the fold doesn't leave the view short of the last message.

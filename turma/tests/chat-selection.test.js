@@ -351,6 +351,26 @@ test("the pin's own late scroll event, after an image grew the pane, does not un
   assert.equal(st.scrollTop, 900);
 });
 
+test("a reader back at the bottom by hand pins at that pixel, so scrolling up again unpins (XERK-2953 QA)", () => {
+  const st = staticScroll("trScroll2c");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });   // pins at 1000
+  st.scrollTop = 400; st.fire("scroll");    // up: unpinned
+  st.scrollHeight = 2500;                   // the pane grows below
+  st.scrollTop = 2100; st.fire("scroll");   // back at the bottom by hand: pinned at 2100
+  st.scrollTop = 1500; st.fire("scroll");   // up again, still past the 1000 the open pinned at
+  st.scrollHeight = 3000; st.fire("load");
+  assert.equal(st.scrollTop, 1500, "the reader's scroll up is kept");
+});
+
+test("a sub-pixel wobble under the pin's pixel, after the pane grew, keeps the pin (XERK-2953 QA)", () => {
+  const st = staticScroll("trScroll2d");
+  window.TurmaChat.renderStatic({ entries: twoEntries(), scrollEl: st, transcriptId: "t1" });   // pins at 1000
+  st.scrollHeight = 1800;                   // grew 800px below
+  st.scrollTop = 999.5; st.fire("scroll");  // HiDPI rounding of the pin's own write
+  st.fire("load");
+  assert.equal(st.scrollTop, 1800);
+});
+
 test("a search-hit open still lands on its hit, not the bottom", () => {
   const st = staticScroll("trScroll4");
   window.CSS = globalThis.CSS = { escape: (s) => s }; // chat.js checks window.CSS, then calls CSS.escape
