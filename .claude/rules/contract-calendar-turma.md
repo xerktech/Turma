@@ -51,6 +51,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
   - `busy` free|tentative|busy|outOfOffice|workingElsewhere (default busy).
   - `recurrence`: a rule (below) or `null` for a single event; `exceptions` its per-occurrence edits.
   - `createdBy`: the creating principal (`user:<id>`, or its kind for open/legacy/break-glass).
+    Stored only, never served (`turmaEventWire` drops it): it named the creator's hub user id to
+    every org viewer, a withheld private event's too, and no client reads it (XERK-2953).
   - `version` starts at 1 and every write bumps it.
 - **Caps, refused with a 409 in the hub's words, never a silent drop**: ≤`CALENDAR_TURMA_EVENTS_MAX`
   (1500) events and ≤`CALENDAR_TURMA_BYTES_MAX` (2 MiB of JSON) per tenant — the Outlook
@@ -70,7 +72,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
   caller may not see, is a 404 (never says which tenant holds it); `orgs: []` is a 400 (an event
   must belong to an org); an id the caller's tenants do not hold is a 404.
 - Malformed fields are a 400 naming the field, never coerced into a different event: `start`/`end`
-  must parse with an offset, `end ≥ start`, `orgs` must not repeat an org, a given `timeZone` must be a known zone, a given
+  must parse with an offset and be after 1970 (GET ranges are epoch ms > 0, `calMs`: an earlier
+  event was stored but never served, so nobody could reach it; XERK-2953), `end ≥ start`, `orgs` must not repeat an org, a given `timeZone` must be a known zone, a given
   `joinUrl` https, `busy`/`sensitivity` from their enums.
 - **Served on `GET /api/calendar`** beside the Outlook events, each ONCE (not per org):
   `{source:"turma", host:"", ...record, orgs, org: orgs[0], editable, meeting}`.
@@ -170,6 +173,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
   costs the oldest captures a re-match, never a series; an existing link still resolves by id, and
   a relink LEAVES a row whose window was not walked (`index.covers`) untouched — else its
   ambiguous flag was wiped with nothing decided (QA).
+  - **A series in several orgs is walked ONCE over any span** (`calSpanTake`): per org it spent the
+    budget twice on coinciding windows, and one heavy org cut another org's older captures (XERK-2953).
 - **`recurrence.wallOf` caches a zone's offset per 15-minute UTC bucket**, validated at both ends
   (some zones move at 00:01): Intl was the whole cost of expansion (~0.15 ms a call). A bucket
   holding a transition is computed exactly each call. Checked against Intl at every minute around
@@ -188,6 +193,10 @@ Events made IN Turma, owned by the hub. Every child of the epic
     occurrences before it) and PATCH creates a NEW series at it carrying the edit and the
     exceptions from it on → `{ok, event: <new series>, previous: <old series>}`. DELETE only ends
     the old one. From the first occurrence it is `series`.
+  - **When every occurrence before it is deleted, the old series is DELETED** (no `previous`; a
+    DELETE answers `{ok}`): it served nothing yet counted toward the tenant's caps (XERK-2953).
+    `calTurmaDropsPrivate` still applies, as to a series delete.
+    Every removal goes through `calTurmaRemove`, so its Outlook copies are deleted too (XERK-2985).
   - A `recurrence` SENT with it is the series' rule as the client edited it (XERK-2973): the hub
     re-anchors it like the kept one — the day pin below, and on a count series a sent `count` is
     the WHOLE run's (clients say "in the whole series"): the new series gets what is left, a 400
@@ -196,8 +205,19 @@ Events made IN Turma, owned by the hub. Every child of the epic
     series: split at Apr 30 of "the 31st", it must stay on the 31st, not move to the 30th. Not
     when the edit moves the occurrence to another DATE (the local date, not the day number, never on
     whether `start`/`timeZone` were sent — edit forms resend them): the new start names the day.
+  - **An EXPLICIT day moves with an occurrence moved to another date** (`recurrence.reanchorDays`,
+    XERK-2953) when the rule's day fields are the series' own (unsent or resent unchanged): "the
+    31st" moved to Jul 30 is the 30th; byDay shifts by the weekday delta (MO,WE moved a day is
+    TU,TH); byWeekday takes the new date's nth (a 5th = last). Why: kept as is, the new series'
+    first instance was not one of its own occurrences. A day the client changed is kept as sent;
+    one equal to the series' implicit day (`withAnchorDays`) counts as unchanged.
+  - **A `series` move to another date re-anchors the same way** (`calTurmaMovedRule`): through an
+    occurrence id, "following" from the first occurrence, or the series' own start.
+  - **Every N > 1 weeks, a move carrying the days across different week boundaries is a 400**
+    in words (weeks start Sunday): FR,SA every 2 weeks moved Sat -> Sun is no one week's days.
   - `version` is the SERIES' (one version per series; every scope bumps it). Occurrence PATCH
     answers the occurrence, series PATCH the series record.
 - Tests: `recurrence.test.js` (DST both ways and east of +12, month-end, nth/last weekday,
   until/count, range cut, bounds); the `XERK-2969:` cases in `server.test.js` (ids, moved/deleted
-  occurrences, rule edit dropping exceptions, the following split, the serve cap).
+  occurrences, rule edit dropping exceptions, the following split, the serve cap); the `XERK-2953:`
+  cases (dead old half, explicit-day re-anchor, the serve cap's early stop, one walk per span).

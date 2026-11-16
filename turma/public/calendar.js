@@ -1269,7 +1269,7 @@ async function relink(k, body, target) {
   paintDetail(true);
 }
 // ---- Turma events: create / edit / delete (XERK-2971) ----------------------------
-// Events made in Turma, owned by the hub, in one or many orgs (contract-calendar.md
+// Events made in Turma, owned by the hub, in one or many orgs (contract-calendar-turma.md
 // "Turma-created events"). Outlook events stay read-only: only an event served with
 // source "turma" AND editable offers Edit / Delete. No optimistic paint: a write
 // answers, the hub's `calendar` frame (and our own refetch) re-reads the weeks.
@@ -1394,7 +1394,7 @@ function formTimes(f) {
 const categoriesOf = (f) => [...new Set(String(f.category || "").split(",").map((c) => c.trim()).filter(Boolean))];
 
 // ---- Repeat (XERK-2973) ---------------------------------------------------------
-// The editor's Repeat control ⇄ the hub's rule (contract-calendar.md "Recurring
+// The editor's Repeat control ⇄ the hub's rule (contract-calendar-turma.md "Recurring
 // Turma events"). Android's core/CalendarRepeat.kt is a port: both read
 // turma/tests/fixtures/calendar-repeat-vectors.json, so the rule a pick sends
 // and the summary line are the same on both clients. Pure; `ymd` is the

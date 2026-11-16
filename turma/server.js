@@ -5923,6 +5923,7 @@ const CALENDAR_HOST_BYTES_MAX = 1536 << 10;
 const CALENDAR_TENANT_BYTES_MAX = 4 << 20;
 const CALENDAR_RANGES_MAX = 8;
 const CALENDAR_SERVE_MAX = 5000;
+const CALENDAR_SERVE_UNTIL_MAX = Date.UTC(10000, 0, 1);
 const CALENDAR_SERVE_SPAN_MS = 100 * 86400000;
 const CALENDAR_ONDEMAND_MIN_MS = 60 * 1000;
 const CALENDAR_HOST_RETAIN_MS = 30 * 86400000;
@@ -6722,7 +6723,9 @@ const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify({ ...rec, outloo
 // The served form for principal `p`; `served` = the orgs still decided.
 function turmaEventWire(p, rec, served = rec.orgs) {
   // A series' exceptions ride its occurrences, never the wire; nor do its copies' hosts and ids.
-  const { exceptions, outlook, ...fields } = rec;
+  // Nor does `createdBy`: it names the creator's hub user id, which no client reads (`editable`
+  // says who may change it), and a private event must not tell every org viewer who made it (XERK-2953).
+  const { exceptions, outlook, createdBy, ...fields } = rec;
   const out = { source: "turma", host: "", ...fields, orgs: served, org: served[0] || "",
     outlook: calOutlookWire(outlook, served),
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
@@ -6840,6 +6843,9 @@ function turmaEventFieldError(b) {
   const cps = (s) => [...s].length;
   for (const k of ["start", "end"]) {
     if (k in b && !calIso(b[k])) return `${k} must be an ISO 8601 time with its offset, e.g. 2026-11-16T09:00:00-05:00`;
+    // GET /api/calendar serves epoch-ms ranges after 1970 only (calMs): an earlier event was
+    // stored but never served, so nobody could see, edit or delete it (XERK-2953).
+    if (k in b && !(Date.parse(b[k]) > 0)) return `${k} must be after 1970-01-01T00:00:00Z`;
   }
   if ("timeZone" in b && !calTimeZone(b.timeZone)) return "timeZone must be an IANA time zone, e.g. America/New_York";
   for (const [k, max] of [["subject", 300], ["location", 300], ["body", CALENDAR_BODY_MAX], ["joinUrl", 500]]) {
@@ -6902,16 +6908,17 @@ function turmaEventOrgsError(p, orgs) {
   return null;
 }
 // A 409 when putting `rec` (replacing its id) would take tenant `t` past its caps.
-function turmaEventCapError(t, rec) {
+// `gone`: the id of a record the same write deletes, which no longer counts.
+function turmaEventCapError(t, rec, gone = null) {
   const bucket = calendarTurmaEvents[t] || {};
   const isNew = !Object.hasOwn(bucket, rec.id);
-  const count = Object.keys(bucket).length + (isNew ? 1 : 0);
+  const count = Object.keys(bucket).length + (isNew ? 1 : 0) - (gone && Object.hasOwn(bucket, gone) ? 1 : 0);
   if (isNew && count > CALENDAR_TURMA_EVENTS_MAX) {
     return { status: 409, body: { error: `the hub keeps at most ${CALENDAR_TURMA_EVENTS_MAX} Turma events per tenant; ` +
       "delete some before creating more" } };
   }
   let bytes = calTurmaBytes(rec);
-  for (const [id, r] of Object.entries(bucket)) if (id !== rec.id) bytes += calTurmaBytes(r);
+  for (const [id, r] of Object.entries(bucket)) if (id !== rec.id && id !== gone) bytes += calTurmaBytes(r);
   if (bytes > CALENDAR_TURMA_BYTES_MAX) {
     return { status: 409, body: { error: `the hub keeps at most ${CALENDAR_TURMA_BYTES_MAX >> 20} MiB of Turma events ` +
       "per tenant; delete some or shorten their descriptions" } };
@@ -6927,6 +6934,24 @@ function calTurmaStore(t, rec) {
   persistCalendarTurmaEvents();
   broadcastCalendarSoon(calTurmaFrameKey(t));
   scheduleCalendarRelink(t);  // captures may now link to it, or leave it (XERK-2970)
+}
+// Every removal of a stored record goes here, so its Outlook copies are always deleted
+// (XERK-2985) — a "following" split's dead old half as much as a series delete (XERK-2953).
+function calTurmaRemove(t, id, now = Date.now()) {
+  const rec = calendarTurmaEvents[t][id];
+  delete calendarTurmaEvents[t][id];
+  calOutlookAfterWrite(t, rec, null, now);  // every copy is deleted (XERK-2985)
+  if (!Object.keys(calendarTurmaEvents[t]).length) delete calendarTurmaEvents[t];
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(t));
+  scheduleCalendarRelink(t);  // its auto-linked captures rematch (XERK-2970)
+}
+// Whether series `rec` still serves an occurrence (one not deleted). Called on an
+// ENDED series (a "following" split's old half), whose run is bounded; past
+// CALENDAR_TURMA_EXCEPTIONS_MAX occurrences one of them must be undeleted.
+function calTurmaServesAny(rec) {
+  return recurrence.occurrences(calTurmaSeries(rec), rec.startMs, Infinity, CALENDAR_TURMA_EXCEPTIONS_MAX + 1)
+    .some((o) => !(rec.exceptions[o.key] && rec.exceptions[o.key].deleted));
 }
 // The event `id` among the tenants `p` may see and edit -> {t, rec} | {status, body}.
 function calTurmaFind(p, id) {
@@ -7011,6 +7036,21 @@ function calTurmaEndBefore(rec, occ, t, now) {
     { ...rule, until: recurrence.localDate(occ.startMs, rec.timeZone, -1) },
   updatedAt: Math.max(now, rec.updatedAt), version: rec.version + 1 }, t);
 }
+// The rule `sent` (what an edit asks the series to run) once the series' anchor moves from
+// local date `from` to `to`: an EXPLICIT day the edit left as series `rec` had it moves along
+// (XERK-2953), so the moved first instance is one of its own occurrences — "the 31st" moved
+// to Jul 30 is the 30th, MO,WE moved a day is TU,TH. A sent day equal to the series' implicit
+// one counts as left. A day the client changed stays as sent. -> {rule} | {status, body}.
+const CAL_TURMA_WEEK_REFUSAL = { status: 400, body: { error: "moving this occurrence would carry an every-few-weeks " +
+  "pattern across a week boundary; change the repeat days instead" } };
+function calTurmaMovedRule(sent, rec, from, to) {
+  if (!sent || !rec.recurrence || from === to) return { rule: sent };
+  const anchor = recurrence.localDate(rec.startMs, rec.timeZone);
+  if (!recurrence.sameDays(recurrence.withAnchorDays(recurrence.sanitizeRule(sent), anchor),
+    recurrence.withAnchorDays(rec.recurrence, anchor))) return { rule: sent };
+  const rule = recurrence.reanchorDays(sent, from, to);
+  return rule ? { rule } : CAL_TURMA_WEEK_REFUSAL;
+}
 function patchTurmaEvent(p, id, body, now = Date.now()) {
   const f = calTurmaTarget(p, id);
   if (f.status) return f;
@@ -7062,6 +7102,10 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     // Moving one occurrence "for the series" moves the series by the same amount.
     if ("start" in body && calIso(body.start)) fields.start = calIsoZ(f.rec.startMs + Date.parse(body.start) - shown.startMs);
     if ("end" in body && calIso(body.end)) fields.end = calIsoZ(f.rec.endMs + Date.parse(body.end) - shown.endMs);
+    // Moving a later occurrence back by its delta can take the FIRST one before 1970.
+    if (!(Date.parse(fields.start || f.rec.start) > 0)) {
+      return { status: 400, body: { error: "this would move the series' first occurrence before 1970-01-01T00:00:00Z" } };
+    }
   }
   // An org no host is decided into is not served, so a client cannot resend it:
   // an edit keeps it (the 24h grace in calendarTurmaTick decides its fate).
@@ -7072,7 +7116,14 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
       `${undecided.length} it keeps while no host is in them` } };
   }
   if (sc.scope === "series") {
-    const rule = "recurrence" in body ? body.recurrence : f.rec.recurrence;
+    // A series moved to another date (through an occurrence, "following" from the first
+    // one, or its own start) carries an explicit day along, as a "following" split does.
+    const tz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
+    const startMs = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.rec.startMs;
+    const mr = calTurmaMovedRule("recurrence" in body ? body.recurrence : f.rec.recurrence, f.rec,
+      recurrence.localDate(f.rec.startMs, f.rec.timeZone), recurrence.localDate(startMs, tz));
+    if (mr.status) return mr;
+    const rule = mr.rule;
     const rec = sanitizeTurmaEvent({ ...f.rec, ...fields, orgs, recurrence: rule,
       updatedAt: Math.max(now, f.rec.updatedAt), version: f.rec.version + 1 }, f.t);
     if (!rec) return { status: 400, body: { error: "end must not be before start" } };
@@ -7101,15 +7152,23 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   const newTz = "timeZone" in fields ? calTimeZone(fields.timeZone) || f.rec.timeZone : f.rec.timeZone;
   const newStart = "start" in fields && calIso(fields.start) ? Date.parse(fields.start) : f.occ.startMs;
   const sent = "recurrence" in body ? body.recurrence : f.rec.recurrence;
+  const oldDate = recurrence.localDate(f.occ.startMs, f.rec.timeZone);
+  const newDate = recurrence.localDate(newStart, newTz);
   const day = sent && (sent.freq === "monthly" || sent.freq === "yearly") && !sent.byMonthDay && !sent.byWeekday &&
-    recurrence.localDate(newStart, newTz) === recurrence.localDate(f.occ.startMs, f.rec.timeZone)
-    ? { byMonthDay: dom(f.rec.startMs, f.rec.timeZone) } : {};
+    newDate === oldDate ? { byMonthDay: dom(f.rec.startMs, f.rec.timeZone) } : {};
+  // - An EXPLICIT day (byDay, byMonthDay, byWeekday) the edit leaves as the series had it
+  //   moves with a moved occurrence (XERK-2953): kept as is, "the 31st" moved to Jul 30
+  //   started the new series on Jul 31, its first instance not one of its own occurrences.
+  //   A day the client CHANGED is the one it asked for.
+  const mr = calTurmaMovedRule(sent, f.rec, oldDate, newDate);
+  if (mr.status) return mr;
+  const moved = mr.rule;
   const rest = sent && count && Number.isSafeInteger(sent.count) ? { count: sent.count - prev.recurrence.count } : {};
   if (rest.count !== undefined && rest.count < 1) {
     return { status: 400, body: { error: `${prev.recurrence.count} of this series' occurrences come before this one: ` +
       `end it after more than ${prev.recurrence.count} in all` } };
   }
-  const rule = sent ? { ...sent, ...day, ...rest } : null;
+  const rule = sent ? { ...moved, ...day, ...rest } : null;
   // The new series is anchored at this occurrence's ORIGINAL start, so the
   // exceptions from it on still land; a start/end in the edit re-times it (and,
   // like any re-timed series, drops those exceptions). The occurrence's own
@@ -7127,12 +7186,17 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   if (!next) return { status: 400, body: { error: "end must not be before start" } };
   const se = turmaSeriesError(next, !!rule);
   if (se) return { status: 400, body: { error: se } };
-  if (calTurmaDropsPrivate(p, f.rec, prev, next)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
-  const full = turmaEventCapError(f.t, prev) || turmaEventCapError(f.t, next);
+  // Every occurrence before this one already deleted: the old half would serve nothing
+  // yet still count toward the tenant's caps, so it is deleted, not kept (XERK-2953),
+  // and the answer has no `previous`.
+  const keep = calTurmaServesAny(prev);
+  if (calTurmaDropsPrivate(p, f.rec, keep ? prev : null, next)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
+  const full = (keep && turmaEventCapError(f.t, prev)) || turmaEventCapError(f.t, next, keep ? null : f.rec.id);
   if (full) return full;
-  calTurmaStore(f.t, prev);
+  if (keep) calTurmaStore(f.t, prev);
+  else calTurmaRemove(f.t, f.rec.id, now);
   calTurmaStore(f.t, next);
-  return { status: 200, body: { ok: true, event: turmaEventWire(p, next), previous: turmaEventWire(p, prev) } };
+  return { status: 200, body: { ok: true, event: turmaEventWire(p, next), ...(keep ? { previous: turmaEventWire(p, prev) } : {}) } };
 }
 // One occurrence's edit: its exception's override, merged over any it had.
 function patchTurmaOccurrence(p, f, body, now) {
@@ -7167,16 +7231,18 @@ function deleteTurmaEvent(p, id, scope, now = Date.now()) {
   if (sc.error) return sc.error;
   if (sc.scope === "series") {
     if (calTurmaDropsPrivate(p, f.rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
-    delete calendarTurmaEvents[f.t][f.rec.id];
-    calOutlookAfterWrite(f.t, f.rec, null, now);  // every copy is deleted (XERK-2985)
-    if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
-    persistCalendarTurmaEvents();
-    broadcastCalendarSoon(calTurmaFrameKey(f.t));
-    scheduleCalendarRelink(f.t);  // its auto-linked captures rematch (XERK-2970)
+    calTurmaRemove(f.t, f.rec.id, now);
     return { status: 200, body: { ok: true } };
   }
   if (sc.scope === "following") {
     const rec = calTurmaEndBefore(f.rec, f.occ, f.t, now);
+    // Every occurrence before this one already deleted: what is left serves nothing
+    // but still counts toward the tenant's caps, so the whole series goes (XERK-2953).
+    if (!calTurmaServesAny(rec)) {
+      if (calTurmaDropsPrivate(p, f.rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
+      calTurmaRemove(f.t, f.rec.id, now);
+      return { status: 200, body: { ok: true } };
+    }
     if (calTurmaDropsPrivate(p, f.rec, rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
     calTurmaStore(f.t, rec);
     return { status: 200, body: { ok: true, event: turmaEventWire(p, rec) } };
@@ -7728,6 +7794,21 @@ function calendarLinkCandidate(ev) {
   return ev.attendees.some((p) => p.role !== "organizer" && p.role !== "resource") ||
     !!ev.joinUrl || ev.isOnlineMeeting;
 }
+// The parts of [from, until) not yet in `done` (sorted, disjoint [a, b) spans), which
+// then takes [from, until) in. Binary-searched: a series meets every capture window.
+function calSpanTake(done, from, until) {
+  let i = 0, j = done.length;
+  while (i < j) { const m = (i + j) >> 1; if (done[m][1] <= from) i = m + 1; else j = m; }
+  const gaps = [];
+  let lo = from, k = i;
+  for (; k < done.length && done[k][0] < until; k++) {
+    if (done[k][0] > lo) gaps.push([lo, done[k][0]]);
+    lo = Math.max(lo, done[k][1]);
+  }
+  if (lo < until) gaps.push([lo, until]);
+  done.splice(i, k - i, [i < k ? Math.min(from, done[i][0]) : from, i < k ? Math.max(until, done[k - 1][1]) : until]);
+  return gaps;
+}
 // Every event a capture of tenant `t` could link to, with the org it counts for,
 // sorted by start, plus the lookup.
 function calendarCandidateIndex(t, captures = []) {
@@ -7754,7 +7835,7 @@ function calendarCandidateIndex(t, captures = []) {
     if (!ev.recurrence) { add(ev); continue; }
     // An override can make one occurrence a meeting of a series that is not.
     if (!calendarLinkCandidate(ev) && !Object.keys(ev.exceptions).length) continue;
-    const s = { ev, add, seen: new Set() };
+    const s = { ev, add, seen: new Set(), done: [] };
     for (const org of ev.orgs) (seriesByOrg[org] || (seriesByOrg[org] = [])).push(s);
   }
   const wins = [];   // [org, from, until], one per capture window, merged per org
@@ -7780,11 +7861,17 @@ function calendarCandidateIndex(t, captures = []) {
   for (const win of merged) {
     const [org, from, until] = win;
     for (const s of seriesByOrg[org]) {
-      if (--work < 0) return { ...calendarEventLookup(t), list: list.sort((a, b) => a.ev.startMs - b.ev.startMs), cut: true, covers };
-      eachTurmaOccurrence(s.ev, from, until, (o) => {
-        if (!s.seen.has(o.key)) { s.seen.add(o.key); s.add(turmaInstance(s.ev, o)); }
-        return --work > 0;
-      });
+      // A series in several orgs is walked ONCE over any span: only the parts of this
+      // window another org's window has not already walked it in (XERK-2953: walking it
+      // per org spent the budget twice, and a heavy org cut another's older captures).
+      const gaps = calSpanTake(s.done, from, until);
+      for (const [gf, gu] of gaps) {
+        if (--work < 0) return { ...calendarEventLookup(t), list: list.sort((a, b) => a.ev.startMs - b.ev.startMs), cut: true, covers };
+        eachTurmaOccurrence(s.ev, gf, gu, (o) => {
+          if (!s.seen.has(o.key)) { s.seen.add(o.key); s.add(turmaInstance(s.ev, o)); }
+          return --work > 0;
+        });
+      }
     }
     if (work > 0) walked.push(win);
   }
@@ -7933,9 +8020,33 @@ function relinkTenantMeetings(t) {
   if (changed) {
     persistMeetings();
     invalidateAgentsCache();
+  }
+  // A relink runs because events changed. A link it KEEPS (an event moved, renamed or
+  // made private: `moved`, the subject) still changes the row's served `calendarEvent`,
+  // and a client that only listens to the meetings frame showed the stale one
+  // (XERK-2953): broadcast when the tenant's served linked events changed too.
+  const sig = meetingsCalendarSig(t);
+  if (changed || sig !== (meetingsCalendarSigs.get(t) || "")) {
+    if (sig) meetingsCalendarSigs.set(t, sig);
+    else meetingsCalendarSigs.delete(t);
     broadcastMeetingsSoon();
   }
   return changed;
+}
+// tenant -> a digest of the `calendarEvent`s its linked wire rows carry, as last broadcast.
+const meetingsCalendarSigs = new Map();
+function meetingsCalendarSig(t) {
+  const h = crypto.createHash("sha256");
+  let lookup = null;
+  for (const [site, list] of Object.entries(meetingProposals)) {
+    if (tenantOfSite(site) !== t) continue;
+    for (const m of list.slice(0, MEETINGS_WIRE_TAIL)) {
+      if (!m.calendarEventId) continue;
+      if (!lookup) lookup = calendarEventLookup(t);
+      h.update(JSON.stringify([site, m.meetingId, meetingCalendarEventWire(site, m, lookup)]));
+    }
+  }
+  return lookup ? h.digest("hex") : "";
 }
 // A linked row's event as clients show it beside the capture: withheld like the
 // calendar withholds it (private), `moved` when it no longer overlaps the capture.
@@ -17149,10 +17260,12 @@ class BodyTooLarge extends Error {
 // 413): the request is not too big, the hub is momentarily too busy, and the
 // caller should retry rather than shrink anything.
 class BodyBudgetExceeded extends Error {
-  constructor(held) {
+  constructor() {
     super("hub busy: too many large requests in flight");
     this.budgetExceeded = true;
-    this.held = held;
+    // Everything in flight, BOTH lanes: a refusal because another body holds the big
+    // lane reported held:0 when it counted the shared budget alone (XERK-2953).
+    this.held = bodyInflightHeld();
     this.limit = BODY_INFLIGHT_TOTAL_MAX;
   }
 }
@@ -17531,7 +17644,7 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
     // hub anyway. Refusing on the claim keeps that to nothing, and a client that
     // under-declares is still caught by the incremental charge below.
     if (Number.isFinite(declared) && declared > 0 && !bodyLaneFor(costOf(declared)))
-      return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+      return refuse(new BodyBudgetExceeded(), 0);
 
     req.on("data", (c) => {
       len += c.length;
@@ -17551,7 +17664,7 @@ function readBody(req, cap = BODY_MAX, costPerByte = BODY_PARSE_COST) {
       const want = costOf(len);
       if (want > held) {
         const next = laneForCharge(lane, want - held);
-        if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        if (!next) return refuse(new BodyBudgetExceeded(), len);
         if (lane !== "big" && next === "big") {
           // Carry what is already charged into the lane this read now occupies.
           if (lane === "shared") migrateToBigLane(held);
@@ -17812,7 +17925,7 @@ function readRawBody(req, cap, pressure = null) {
     // and NOT refused early for being oversize — see readBody for why.
     const declared = Number(req.headers["content-length"]);
     if (Number.isFinite(declared) && declared > 0 && !bodyLaneFor(declared))
-      return refuse(new BodyBudgetExceeded(bodyInflightBytes), 0);
+      return refuse(new BodyBudgetExceeded(), 0);
 
     req.on("data", (c) => {
       len += c.length;
@@ -17833,7 +17946,7 @@ function readRawBody(req, cap, pressure = null) {
       if (len > cap) return refuse(new BodyTooLarge(cap));
       if (len > held) {
         const next = laneForCharge(lane, len - held);
-        if (!next) return refuse(new BodyBudgetExceeded(bodyInflightBytes), len);
+        if (!next) return refuse(new BodyBudgetExceeded(), len);
         if (lane !== "big" && next === "big") {
           // Carry what is already charged into the lane this read now occupies.
           if (lane === "shared") migrateToBigLane(held);
@@ -27067,9 +27180,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/calendar") {
       const from = Number(url.searchParams.get("from"));
       const until = Number(url.searchParams.get("until"));
-      if (!calMs(from) || !calMs(until) || until <= from || until - from > CALENDAR_SERVE_SPAN_MS) {
+      // Ends by year 9999 (XERK-2953): an occurrence id names its start as a 4-digit-year
+      // ISO stamp, and past Date's range (8.64e15) zone math throws instead of answering.
+      if (!calMs(from) || !calMs(until) || until <= from || until - from > CALENDAR_SERVE_SPAN_MS ||
+          until > CALENDAR_SERVE_UNTIL_MAX) {
         return json(res, 400, { error: "from and until must be epoch ms, until after from, " +
-          `at most ${CALENDAR_SERVE_SPAN_MS / 86400000} days apart` });
+          `at most ${CALENDAR_SERVE_SPAN_MS / 86400000} days apart, ending by the year 9999` });
       }
       const orgParam = url.searchParams.get("org");
       const orgFilter = orgParam === null ? null : new Set(orgParam.split(",").slice(0, 100));
@@ -31775,7 +31891,7 @@ if (process.env.TURMA_TEST) {
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
     CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calOutlookTickAt = 0; },
     sanitizeTurmaEvent, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
-    CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
+    CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,
     tenantMigrationMarker: () => tenantMigrationMarker, migratedTenant,

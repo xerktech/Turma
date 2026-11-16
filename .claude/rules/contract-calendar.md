@@ -181,6 +181,8 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 ## Served
 
 - `GET /api/calendar?from=&until=[&org=a,b]` (filtered route): `until - from` ≤ 100 days.
+  - `until` ≤ `CALENDAR_SERVE_UNTIL_MAX` (year 10000), else a 400: an occurrence id is a 4-digit-year
+    stamp (`recurrence.KEY_RE`), and past Date's range zone math throws (XERK-2953).
   Answers `{from, until, hosts: [{host, device, online, syncedAt, windowFrom, windowUntil,
   ranges, lastError?, lastErrorAt?, pending?}], events: [{host, org, ...event}]}` — only hosts the
   caller may drive (`principalMayDriveHost`), only events overlapping the range, `org` filter on
@@ -230,6 +232,9 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
   happened). An auto link to a still-overlapping event yields only to another event scoring over
   it by the margin (a late invite); one whose event left the store (sync, `calendarTick`) or
   now counts for another org rematches. An operator's choice is never touched by the matcher.
+  - **A relink that keeps every link still broadcasts the meetings frame when a linked row's served
+    `calendarEvent` changed** (moved, renamed, made private; `meetingsCalendarSig`): an SSE-only
+    client otherwise showed the stale one (XERK-2953).
   - A Turma event deleted, or the meeting's org dropped from its `orgs`, has left the store for
     that org: an auto link rematches; an operator link is kept and served `calendarEventMissing`
     (never the event as another org's copy: `meetingCalendarEventWire`, `calendarTenirView`).
