@@ -25636,7 +25636,7 @@ const server = http.createServer(async (req, res) => {
       url.pathname === "/api/oidc/mobile/exchange";
     // The subscribable calendar feed (XERK-2992): Google/Apple fetch it with no
     // session; the secret link IS the credential (calendarFeedPrincipal).
-    const isCalendarFeed = req.method === "GET" && parts.length === 3 && parts[0] === "feeds" && parts[1] === "calendar";
+    const isCalendarFeed = (req.method === "GET" || req.method === "HEAD") && parts.length === 3 && parts[0] === "feeds" && parts[1] === "calendar";
 
     // The archive-ingest endpoint is agent-pushed (bearer token), like the
     // heartbeat — it must not require the user login the rest of /api/* does.
@@ -25889,7 +25889,8 @@ const server = http.createServer(async (req, res) => {
 
     // GET /feeds/calendar/<token>.ics[?org=<site>] — the feed itself (public
     // route: the token is the credential). Every refusal is the same 404.
-    if (req.method === "GET" && parts.length === 3 && parts[0] === "feeds" && parts[1] === "calendar") {
+    // HEAD answers the same headers (Node sends no body): some clients probe with it.
+    if (isCalendarFeed) {
       const m = /^([A-Za-z0-9_-]{43})\.ics$/.exec(parts[2]);
       const p = m ? calendarFeedPrincipal(m[1]) : null;
       if (!p) return json(res, 404, { error: "no such calendar feed" });

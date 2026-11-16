@@ -72,3 +72,25 @@ test("XERK-2992: a UID is stable per event, distinct across hosts, and leaks no 
   assert.notEqual(a, eventUid({ source: "outlook", host: "desk", id: "GLOBAL-ID" }));
   assert.match(a, /^[0-9a-f]{32}@turma$/);
 });
+
+test("XERK-2992: a recurring all-day occurrence east of UTC keeps its own wall date", () => {
+  // turmaOccurrenceRecord serves an occurrence's start in UTC: Berlin Monday
+  // midnight is Sunday 23:00Z.
+  const out = calendarIcs([{ source: "turma", host: "", id: "turma:ab:2026-11-15T23:00:00Z", subject: "Off",
+    allDay: true, timeZone: "Europe/Berlin", start: "2026-11-15T23:00:00Z", end: "2026-11-16T23:00:00Z",
+    startMs: Date.parse("2026-11-15T23:00:00Z"), endMs: Date.parse("2026-11-16T23:00:00Z") },
+  { source: "turma", host: "", id: "turma:cd", subject: "Tokyo", allDay: true, timeZone: "Asia/Tokyo",
+    start: "2026-11-17T15:00:00Z", end: "2026-11-18T15:00:00Z",
+    startMs: Date.parse("2026-11-17T15:00:00Z"), endMs: Date.parse("2026-11-18T15:00:00Z") }], { now: NOW });
+  assert.match(out, /DTSTART;VALUE=DATE:20261116\r\nDTEND;VALUE=DATE:20261117\r\n/);
+  assert.match(out, /DTSTART;VALUE=DATE:20261118\r\nDTEND;VALUE=DATE:20261119\r\n/);
+});
+
+test("XERK-2992: a URL value is written as a URI (no TEXT escaping); an owner's private event says CLASS:PRIVATE", () => {
+  const base = { host: "h", start: "2026-11-16T09:00:00Z", end: "2026-11-16T10:00:00Z",
+    startMs: Date.parse("2026-11-16T09:00:00Z"), endMs: Date.parse("2026-11-16T10:00:00Z") };
+  const out = calendarIcs([{ ...base, id: "u", subject: "Teams", joinUrl: "https://teams.microsoft.com/l/x?a=1,b;c" },
+    { ...base, id: "o", subject: "Mine", sensitivity: "private" }], { now: NOW });
+  assert.match(out, /\r\nURL:https:\/\/teams\.microsoft\.com\/l\/x\?a=1,b;c\r\n/);
+  assert.match(out, /SUMMARY:Mine\r\n[\s\S]*?CLASS:PRIVATE\r\n/);
+});

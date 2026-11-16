@@ -59,6 +59,18 @@ function wallDate(iso) {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso || ""));
   return m ? `${m[1]}${m[2]}${m[3]}` : "";
 }
+// The wall date of an instant in IANA zone `tz` ("" when the zone is unknown).
+// A recurring Turma occurrence is served with a UTC start, so its wall date
+// must be read in the event's own zone, never off the string (XERK-2992 QA:
+// a Berlin Monday all-day series read as Sundays).
+function zoneDate(ms, tz) {
+  if (!tz || !Number.isFinite(ms)) return "";
+  try {
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" })
+      .formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+    return p.year && p.month && p.day ? `${p.year}${p.month}${p.day}` : "";
+  } catch { return ""; }
+}
 function nextDate(yyyymmdd) {
   const d = new Date(Date.UTC(+yyyymmdd.slice(0, 4), +yyyymmdd.slice(4, 6) - 1, +yyyymmdd.slice(6, 8) + 1));
   return `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
@@ -79,9 +91,12 @@ function veventLines(ev, now, orgName) {
   if (!Number.isFinite(ev.startMs) || !Number.isFinite(ev.endMs)) return [];
   const lines = ["BEGIN:VEVENT", `UID:${eventUid(ev)}`, `DTSTAMP:${utcStamp(now)}`];
   if (ev.allDay === true) {
-    const s = wallDate(ev.start);
+    // A Turma event names its zone; an Outlook one carries Outlook's wall time
+    // (with its offset) in the string itself.
+    const tz = typeof ev.timeZone === "string" ? ev.timeZone : "";
+    const s = zoneDate(ev.startMs, tz) || wallDate(ev.start);
     if (!s) return [];
-    let e = wallDate(ev.end);
+    let e = zoneDate(ev.endMs, tz) || wallDate(ev.end);
     if (!e || e <= s) e = nextDate(s);
     lines.push(`DTSTART;VALUE=DATE:${s}`, `DTEND;VALUE=DATE:${e}`);
   } else {
@@ -99,12 +114,17 @@ function veventLines(ev, now, orgName) {
   if (orgLabels.length) desc.push(`${orgLabels.length > 1 ? "Orgs" : "Org"}: ${orgLabels.join(", ")}`);
   if (desc.length) lines.push(`DESCRIPTION:${icsText(desc.join("\n\n"))}`);
   // An https link only (the store's whitelist already enforces it for joinUrl).
-  if (typeof ev.joinUrl === "string" && /^https:\/\//.test(ev.joinUrl)) lines.push(`URL:${icsText(ev.joinUrl)}`);
+  // A URI value is not TEXT (RFC 5545 §3.3.13): no backslash escaping, which
+  // Thunderbird's parser would leave in the link. Commas/semicolons are legal
+  // in it; anything that could break the line framing is refused instead.
+  if (typeof ev.joinUrl === "string" && /^https:\/\/[^\s"<>\\]+$/.test(ev.joinUrl)) lines.push(`URL:${ev.joinUrl}`);
   if (orgLabels.length) lines.push(`CATEGORIES:${orgLabels.map(icsText).join(",")}`);
   if (ev.canceled === true) lines.push("STATUS:CANCELLED");
   else if (ev.busy === "tentative" || ev.myResponse === "tentative") lines.push("STATUS:TENTATIVE");
   lines.push(`TRANSP:${ev.busy === "free" ? "TRANSPARENT" : "OPAQUE"}`);
-  if (ev.private === true) lines.push("CLASS:PRIVATE");
+  // Withheld (`private`) or served in full to its owner: either way the
+  // subscriber's client should treat it as private.
+  if (ev.private === true || ev.sensitivity === "private" || ev.sensitivity === "confidential") lines.push("CLASS:PRIVATE");
   lines.push("END:VEVENT");
   return lines;
 }

@@ -49,7 +49,7 @@ const ROUTES = [
   ["GET POST", "/auth/oidc/logout", "public"],
   ["GET HEAD", "/term-font.woff2", "public"],
   // The subscribable calendar feed (XERK-2992): its secret link is the credential.
-  ["GET", "/feeds/calendar/:token", "public"],
+  ["GET HEAD", "/feeds/calendar/:token", "public"],
   // agent transport
   ["POST", "/api/heartbeat", "agent"],
   ["GET", "/api/agent/token", "agent"], ["POST", "/api/agent/enroll", "agent"],

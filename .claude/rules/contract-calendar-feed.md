@@ -29,7 +29,7 @@ A secret iCal link Google/Apple/Outlook subscribe to, serving exactly the calend
 
 ## The feed route
 
-- `GET /feeds/calendar/<token>.ics[?org=<site>]` is `public` in the route table and exempt from
+- `GET|HEAD /feeds/calendar/<token>.ics[?org=<site>]` is `public` in the route table and exempt from
   the human gate (`isCalendarFeed`): Google fetches with no session, the token IS the credential.
 - **Every refusal is the same 404** (unknown token, dead owner, an org not decided or not the
   owner's): the body never tells a guesser which. The tenant-migration gate 503s a tenant user.
@@ -43,10 +43,17 @@ A secret iCal link Google/Apple/Outlook subscribe to, serving exactly the calend
 
 - One VEVENT per served event, recurring occurrences included (no RRULE): the hub's own rules
   (month-end, moved/deleted occurrences) are exactly what a subscriber sees.
-- Timed events in UTC (`…Z`, no VTIMEZONE); all-day as `VALUE=DATE` from the ISO's wall date,
-  end exclusive. UIDs are a hash of source + host + id: stable across fetches, leaking no id or
-  tenant. Lines fold at 75 octets on UTF-8 boundaries; TEXT escapes `\ ; , newline`.
-- A private event is served withheld (as `/api/calendar` does) with `CLASS:PRIVATE`.
+- Timed events in UTC (`…Z`, no VTIMEZONE); all-day as `VALUE=DATE`, end exclusive.
+  - **A Turma all-day date is read in the event's `timeZone`**, never off the ISO string: an
+    occurrence is served with a UTC start, so a Berlin Monday read as Sunday (QA). Outlook events
+    carry no zone; their string keeps Outlook's own offset.
+  - `URL:` is a URI value, written unescaped (TEXT escaping left backslashes in Thunderbird).
+- UIDs are a hash of source + host + id: stable across fetches, leaking no id or tenant.
+- Lines fold at 75 octets on UTF-8 boundaries; TEXT escapes `\ ; , newline`.
+- A private event is withheld for non-owners (as `/api/calendar` does) and marked
+  `CLASS:PRIVATE` for everyone, its owner's full copy included.
+- Break-glass has no epoch: rotating `TURMA_PASSWORD` does not end its link (as with its
+  sessions). Only a local user's reset revokes by epoch.
 - Google refreshes a subscription on its own schedule (hours); `REFRESH-INTERVAL` only helps
   Apple/Outlook. Say so in the UI rather than promising live sync.
 

@@ -34447,3 +34447,28 @@ test("XERK-2992: a minted feed link serves the caller's calendar as iCal, with n
     forget2533(D2968A, D2968B);
   }
 });
+
+test("XERK-2992: a feed fetch is covered by a host's regular sync window and queues no on-demand sync", async () => {
+  const D = "cal2992sync";
+  forget2891(D);
+  try {
+    const now = Date.now();
+    await calBeat2891(D);
+    // The host answers the default window, as its schedule does.
+    await calBeat2891(D, { calendarSync: [{ windowFrom: now - 8 * 7 * 864e5, windowUntil: now + 26 * 7 * 864e5,
+      syncedAt: now, events: [] }] });
+    agents[D].commands = [];
+    hub.calendarOnDemandAt.delete(D);
+    const m = await request("POST", "/api/calendar/feed", { headers: userHeaders });
+    assert.equal((await request("GET", m.body.path)).status, 200);
+    assert.deepEqual(calCmds2891(D), [], "the feed's window lies inside the synced one");
+    // HEAD answers like GET, with no body.
+    const h = await request("HEAD", m.body.path);
+    assert.equal(h.status, 200);
+    assert.match(h.headers["content-type"], /^text\/calendar/);
+    assert.equal(h.raw, "");
+  } finally {
+    await request("DELETE", "/api/calendar/feed", { headers: userHeaders });
+    forget2891(D);
+  }
+});
