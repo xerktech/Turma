@@ -84,6 +84,11 @@ test("XERK-2992: a recurring all-day occurrence east of UTC keeps its own wall d
     startMs: Date.parse("2026-11-17T15:00:00Z"), endMs: Date.parse("2026-11-18T15:00:00Z") }], { now: NOW });
   assert.match(out, /DTSTART;VALUE=DATE:20261116\r\nDTEND;VALUE=DATE:20261117\r\n/);
   assert.match(out, /DTSTART;VALUE=DATE:20261118\r\nDTEND;VALUE=DATE:20261119\r\n/);
+  // A multi-day occurrence: the END date is read in the zone too (QA: the last day was lost).
+  const three = calendarIcs([{ source: "turma", host: "", id: "turma:ef:x", subject: "Trip", allDay: true,
+    timeZone: "Europe/Berlin", start: "2026-11-17T23:00:00Z", end: "2026-11-20T23:00:00Z",
+    startMs: Date.parse("2026-11-17T23:00:00Z"), endMs: Date.parse("2026-11-20T23:00:00Z") }], { now: NOW });
+  assert.match(three, /DTSTART;VALUE=DATE:20261118\r\nDTEND;VALUE=DATE:20261121\r\n/);
 });
 
 test("XERK-2992: a URL value is written as a URI (no TEXT escaping); an owner's private event says CLASS:PRIVATE", () => {
