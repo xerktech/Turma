@@ -305,6 +305,10 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 - Tests: `holidays.test.js` (rules over several years), the `XERK-2892:` cases in
   `server.test.js` (round-trip, SSE, tenant isolation pinned by mutation, purge).
 
-## Turma-created and recurring events
+## The subscribable feed (XERK-2992)
 
-In `contract-calendar-turma.md` (same `paths:`): the store, routes, serving, recurrence.
+- A secret iCal link serving one principal's calendar; rules in `contract-calendar-feed.md`.
+
+## Turma-created events
+
+- Store, routes, serving and recurrence → `contract-calendar-turma.md` (XERK-2967).

@@ -267,7 +267,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 
 ## Turma-made events (XERK-2971)
 
-- Wire: `contract-calendar-turma.md` "Turma-created events". The web half is all in `calendar.js`.
+- Wire: `contract-calendar-turma.md`. The web half is all in `calendar.js`.
 - **Create**: "+ New event" in the bar, or a click/drag on an empty grid slot (30-min rows,
   `slotMinAt`); a TOUCH that moved >10px is a swipe, never a create. The header's org pick
   (∩ pickable orgs) pre-fills the orgs; a lone org is picked for you.

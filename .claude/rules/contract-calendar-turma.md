@@ -20,16 +20,18 @@ paths:
   - "android/app/src/main/java/**/Calendar*.kt"
 ---
 
-# Turma-created and recurring events (epic XERK-2967)
+# Turma-created calendar events (epic XERK-2967)
 
-The hub-owned half of the calendar: events made IN Turma and their recurrence. The rest of the
-Calendar wire contract (Outlook sync, the event whitelist, serving, captures, holidays) is in
-`contract-calendar.md`; both load on the same paths.
+Split out of `contract-calendar.md` (size cap); that file holds the Outlook sync, the event
+whitelist and the Tenir matcher this builds on.
 
 ## Turma-created events (hub, epic XERK-2967; store + routes XERK-2968)
 
-Events made IN Turma, owned by the hub, never written to Outlook. Every child of the epic
+Events made IN Turma, owned by the hub. Every child of the epic
 (recurrence XERK-2969, matching + brief XERK-2970, web XERK-2971, Android XERK-2972) builds here.
+- **Written to each org's Outlook by one host of that org** (epic XERK-2982): writer pick,
+  `writeCalendarEvent`, `calendarWriteResults`, the `outlook` record field, read-back dedup and the
+  field mapping → `contract-calendar-outlook-write.md`.
 - **Store**: `/data/calendar-turma-events.json` (`CALENDAR_TURMA_EVENTS_FILE`),
   `registerExternalStore`, tenant id ("" = untenanted) → eventId → record. Keyed by TENANT, not
   host or org: one event may belong to several orgs of one tenant.
@@ -39,7 +41,7 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
 - **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
   order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
   timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
-  sensitivity, recurrence, exceptions, createdBy, createdAt, updatedAt, version}`.
+  sensitivity, recurrence, exceptions, createdBy, createdAt, updatedAt, version, outlook}`.
   - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
     `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
   - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.
@@ -91,6 +93,8 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
       that tenant's user (`calTurmaOwner`), or nobody could ever change or delete it.
     - So is one whose creator `user:<id>` is gone or of another tenant (XERK-2978); untenanted,
       any admin-role principal owns it (not `legacy`). A disabled creator still counts as live.
+    - "Gone" is judged only once the users store has loaded (`tenancyHydrated`, XERK-2993): an
+      HA replica's `/data` is empty until then, so an absent creator reads as live, never orphaned.
     - Only the owner may make an event private/confidential: a non-owner hiding one locked every
       other viewer out, itself included, with no way back. Both refusals carry no `event`.
 - **Clients send `recurrence` (the rule, or null) and an occurrence's `scope`** (XERK-2973): never a
@@ -192,6 +196,7 @@ Events made IN Turma, owned by the hub, never written to Outlook. Every child of
   - **When every occurrence before it is deleted, the old series is DELETED** (no `previous`; a
     DELETE answers `{ok}`): it served nothing yet counted toward the tenant's caps (XERK-2953).
     `calTurmaDropsPrivate` still applies, as to a series delete.
+    Every removal goes through `calTurmaRemove`, so its Outlook copies are deleted too (XERK-2985).
   - A `recurrence` SENT with it is the series' rule as the client edited it (XERK-2973): the hub
     re-anchors it like the kept one — the day pin below, and on a count series a sent `count` is
     the WHOLE run's (clients say "in the whole series"): the new series gets what is left, a 400

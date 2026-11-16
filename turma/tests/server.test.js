@@ -120,7 +120,9 @@ process.env.MEETING_FOCUS_FILE = path.join(scratchDir(), `turma-test-meeting-foc
 process.env.HOLIDAY_SETTINGS_FILE = path.join(scratchDir(), `turma-test-holiday-settings-${process.pid}.json`);
 process.env.CALENDAR_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-events-${process.pid}.json`);
 process.env.CALENDAR_HOST_SETTINGS_FILE = path.join(scratchDir(), `turma-test-calendar-host-settings-${process.pid}.json`);
+process.env.CALENDAR_FEEDS_FILE = path.join(scratchDir(), `turma-test-calendar-feeds-${process.pid}.json`);
 process.env.CALENDAR_TURMA_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-turma-events-${process.pid}.json`);
+process.env.CALENDAR_OUTLOOK_TOMBSTONES_FILE = path.join(scratchDir(), `turma-test-calendar-outlook-tombstones-${process.pid}.json`);
 process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
 process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
 process.env.MEETING_TOKENS_FILE = path.join(scratchDir(), `turma-test-meeting-tokens-${process.pid}.json`);
@@ -33634,6 +33636,33 @@ test("XERK-2978: an untenanted private series whose creator user is gone is the 
   }
 });
 
+test("XERK-2993: before the users store hydrates, an absent creator is not orphaned", async () => {
+  const D = "cal2993";
+  const bg = { kind: "breakglass", userId: null, tenantId: null, roles: ["admin"] };
+  const legacy = { kind: "legacy", userId: null, tenantId: null, roles: [] };
+  try {
+    await beat1574(D, S2968A);
+    const c = hub.createTurmaEvent(legacy, ev2968([S2968A]));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const rec = hub.getCalendarTurmaEvents()[""][c.body.event.id];
+    rec.createdBy = "user:not-loaded-yet";
+    rec.sensitivity = "private";
+    // An HA replica serving before its tenancy store landed: withheld, not editable.
+    hub.__setTenancyHydrated(false);
+    const v = hub.calendarView(bg, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === rec.id);
+    assert.deepEqual([v.subject, v.editable], ["Private event", false]);
+    assert.equal(hub.deleteTurmaEvent(bg, rec.id).status, 409);
+    // Once hydrated, a creator still absent is gone: the operators own it (XERK-2978).
+    hub.__setTenancyHydrated(true);
+    const w = hub.calendarView(bg, T2968 - 864e5, T2968 + 864e5, null).events.find((x) => x.id === rec.id);
+    assert.deepEqual([w.subject, w.editable], ["Planning", true]);
+    assert.equal(hub.deleteTurmaEvent(bg, rec.id).status, 200);
+  } finally {
+    hub.__setTenancyHydrated(true);
+    cleanup2968(D);
+  }
+});
+
 test("XERK-2968: each tenant sees and edits only its own Turma events; private ones are the creator's", async () => {
   const T = tenants2533();
   let F;
@@ -34720,5 +34749,488 @@ test("XERK-2953: a Turma event before 1970 is refused in words, so every stored 
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);
+  }
+});
+
+// ---- XERK-2992: the subscribable calendar feed ---------------------------------
+test("XERK-2992: a minted feed link serves the caller's calendar as iCal, with no session", async () => {
+  cleanup2968(D2968A, D2968B);
+  try {
+    await beat1574(D2968A, S2968A);
+    await beat1574(D2968B, S2968B);
+    assert.equal((await turma2968("POST", null, ev2968([S2968A], { subject: "Alpha, sync; now" }))).status, 200);
+    assert.equal((await turma2968("POST", null, ev2968([S2968B], { subject: "Bravo" }))).status, 200);
+    assert.deepEqual((await request("GET", "/api/calendar/feed", { headers: userHeaders })).body,
+      { available: true, exists: false, at: 0 });
+    const m = await request("POST", "/api/calendar/feed", { headers: userHeaders });
+    assert.equal(m.status, 200, m.raw);
+    assert.match(m.body.path, /^\/feeds\/calendar\/[A-Za-z0-9_-]{43}\.ics$/);
+    assert.equal(m.body.path, `/feeds/calendar/${m.body.token}.ics`);
+    assert.equal((await request("GET", "/api/calendar/feed", { headers: userHeaders })).body.exists, true);
+    // No credential at all: the link is the credential.
+    const f = await request("GET", m.body.path);
+    assert.equal(f.status, 200, f.raw);
+    assert.match(f.headers["content-type"], /^text\/calendar/);
+    assert.match(f.raw, /^BEGIN:VCALENDAR\r\n/);
+    assert.ok(f.raw.includes("SUMMARY:Alpha\\, sync\\; now\r\n"), f.raw);
+    assert.match(f.raw, /SUMMARY:Bravo\r\n/);
+    assert.match(f.raw, /X-WR-CALNAME:Turma\r\n/);
+    // One org: the other org's event is not in it, and the calendar is named for it.
+    const one = await request("GET", `${m.body.path}?org=${encodeURIComponent(S2968A)}`);
+    assert.equal(one.status, 200);
+    assert.match(one.raw, /SUMMARY:Alpha/);
+    assert.doesNotMatch(one.raw, /SUMMARY:Bravo/);
+    assert.match(one.raw, /X-WR-CALNAME:Turma · a2968\r\n/);
+    // An org the caller does not have answers the unknown link's 404.
+    const nope = await request("GET", `${m.body.path}?org=nobody.atlassian.net`);
+    assert.equal(nope.status, 404);
+    // A new link revokes the old one; DELETE turns it off.
+    const m2 = await request("POST", "/api/calendar/feed", { headers: userHeaders });
+    assert.equal((await request("GET", m.body.path)).status, 404);
+    assert.equal((await request("GET", m2.body.path)).status, 200);
+    assert.equal((await request("DELETE", "/api/calendar/feed", { headers: userHeaders })).body.revoked, true);
+    assert.equal((await request("GET", m2.body.path)).status, 404);
+    // Malformed links and the management route without a session.
+    assert.equal((await request("GET", "/feeds/calendar/short.ics")).status, 404);
+    assert.equal((await request("GET", `/feeds/calendar/${"a".repeat(43)}.ics`)).status, 404);
+    assert.equal((await request("POST", "/api/calendar/feed")).status, 401);
+    // Only the hash is stored.
+    const stored = JSON.parse(fs.readFileSync(process.env.CALENDAR_FEEDS_FILE, "utf8"));
+    assert.doesNotMatch(JSON.stringify(stored), new RegExp(m2.body.token));
+  } finally {
+    await request("DELETE", "/api/calendar/feed", { headers: userHeaders });
+    cleanup2968(D2968A, D2968B);
+    forget2533(D2968A, D2968B);
+  }
+});
+
+test("XERK-2992: a feed fetch is covered by a host's regular sync window and queues no on-demand sync", async () => {
+  const D = "cal2992sync";
+  forget2891(D);
+  try {
+    const now = Date.now();
+    await calBeat2891(D);
+    // The host answers the default window, as its schedule does.
+    await calBeat2891(D, { calendarSync: [{ windowFrom: now - 8 * 7 * 864e5, windowUntil: now + 26 * 7 * 864e5,
+      syncedAt: now, events: [] }] });
+    agents[D].commands = [];
+    hub.calendarOnDemandAt.delete(D);
+    const m = await request("POST", "/api/calendar/feed", { headers: userHeaders });
+    assert.equal((await request("GET", m.body.path)).status, 200);
+    assert.deepEqual(calCmds2891(D), [], "the feed's window lies inside the synced one");
+    // HEAD answers like GET, with no body.
+    const h = await request("HEAD", m.body.path);
+    assert.equal(h.status, 200);
+    assert.match(h.headers["content-type"], /^text\/calendar/);
+    assert.equal(h.raw, "");
+  } finally {
+    await request("DELETE", "/api/calendar/feed", { headers: userHeaders });
+    forget2891(D);
+  }
+});
+
+// ---- XERK-2985: Turma events written to each org's Outlook, their state, the read-back -------
+const S2985A = "a2985.atlassian.net", S2985B = "b2985.atlassian.net";
+const D2985A = "cal2985a", D2985A2 = "cal2985a2", D2985B = "cal2985b";
+const WRITE2985 = { calendar: { available: true, write: true } };
+const beat2985 = (device, site, extra = {}) => beat1574(device, site, { sessions: [], ...WRITE2985, ...extra });
+const writes2985 = (key) => (agents[key].commands || []).filter((c) => c.type === "writeCalendarEvent");
+const rec2985 = (id, t = "") => hub.getCalendarTurmaEvents()[t][id];
+const ok2985 = (id, org, version, extra = {}) => ({ turmaId: id, org, version, op: "upsert", ok: true,
+  outlookId: "EID-1", lastModified: "2026-11-15T10:00:00Z", ...extra });
+// A synced Outlook copy of Turma event `rec` (as the reader reports it), stamped.
+const copy2985 = (rec, extra = {}) => ({ id: `OUT-${rec.id.slice(6)}`, seriesId: "", subject: rec.subject,
+  start: rec.start, end: rec.end, allDay: false, location: "", organizer: "Ann", busy: "busy", myResponse: "organizer",
+  canceled: false, recurring: false, attendees: [], joinUrl: "", lastModified: "2026-11-15T10:00:00Z",
+  sensitivity: "normal", turmaId: rec.id, ...extra });
+const sync2985 = (events) => ({ calendarSync: [{ windowFrom: T2968 - 864e5, windowUntil: T2968 + 864e5,
+  syncedAt: Date.now(), events }] });
+// A sync row is judged against the copy's last change (QA D3), so it must be read after it.
+const later2985 = () => new Promise((r) => setTimeout(r, 3));
+function cleanup2985(...devices) {
+  cleanup2968(...devices);
+  for (const k of Object.keys(hub.getCalendarOutlookTombstones())) delete hub.getCalendarOutlookTombstones()[k];
+  hub.__resetCalendarWriteMemo();
+}
+
+test("XERK-2985: a create queues one upsert to each org's writer; its result marks the copy written", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    await beat1574(D2985A2, S2985A, { sessions: [], calendar: { available: true } });  // reads only: never a writer
+    assert.deepEqual(agents[D2985A].calendar, { available: true, write: true });
+    assert.deepEqual(agents[D2985A2].calendar, { available: true }, "write is kept only as a strict true");
+    const c = await turma2968("POST", null, ev2968([S2985A, S2985B], { body: "agenda", createdBy: "x" }));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const id = c.body.event.id;
+    assert.deepEqual(Object.keys(c.body.event.outlook), [S2985A, S2985B]);
+    assert.equal(c.body.event.outlook[S2985A].state, "pending");
+    const [w] = writes2985(D2985A);
+    assert.deepEqual([w.op, w.turmaId, w.org, w.version, w.outlookId], ["upsert", id, S2985A, 1, ""]);
+    assert.deepEqual([w.event.subject, w.event.body, w.event.timeZone], ["Planning", "agenda", "America/New_York"]);
+    for (const k of ["createdBy", "orgs", "version", "outlook"]) assert.ok(!(k in w.event), `never ${k}`);
+    assert.equal(writes2985(D2985B).length, 1);
+    assert.equal(writes2985(D2985A2).length, 0, "a host not reporting write is never a writer");
+    // Another host's row for this copy changes nothing; the holder's marks it written.
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    assert.equal(rec2985(id).outlook[S2985A].state, "pending");
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    assert.deepEqual([rec2985(id).outlook[S2985A].state, rec2985(id).outlook[S2985A].outlookId], ["written", "EID-1"]);
+    // A failure is recorded in Outlook's words.
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [{ turmaId: id, org: S2985B, version: 1, op: "upsert",
+      ok: false, error: "Outlook is not open" }] });
+    // Served per org, never the host or the copy's id; the record stays a fixed point.
+    const [e] = await served2968();
+    assert.deepEqual(Object.keys(e.outlook[S2985A]), ["state", "at"]);
+    assert.equal(e.outlook[S2985A].state, "written");
+    assert.deepEqual([e.outlook[S2985B].state, e.outlook[S2985B].error], ["failed", "Outlook is not open"]);
+    assert.ok(!JSON.stringify(e).includes("EID-1") && !JSON.stringify(e.outlook).includes(D2985A));
+    const stored = hub.getCalendarTurmaEvents()[""];
+    assert.equal(JSON.stringify(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]), JSON.stringify(stored));
+    // A route body never sets it, and an edit keeps it (a new version is owed again).
+    const p = await turma2968("PATCH", id, { version: 1, subject: "Planning 2",
+      outlook: { [S2985A]: { host: D2985B, state: "written" } } });
+    assert.equal(p.status, 200, JSON.stringify(p.body));
+    assert.deepEqual([rec2985(id).outlook[S2985A].host, rec2985(id).outlook[S2985A].outlookId,
+      rec2985(id).outlook[S2985A].state], [D2985A, "EID-1", "pending"]);
+    const w2 = writes2985(D2985A).filter((x) => x.version === 2);
+    assert.deepEqual(w2.map((x) => [x.outlookId, x.event.subject]), [["EID-1", "Planning 2"]]);
+    assert.equal(writes2985(D2985B).filter((x) => x.version === 2).length, 1, "a record write retries a failure");
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-2985: removing an org deletes that org's copy; deleting the event deletes every copy", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    const id = (await turma2968("POST", null, ev2968([S2985A]))).body.event.id;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    assert.equal((await turma2968("PATCH", id, { version: 1, orgs: [S2985A, S2985B] })).status, 200);
+    assert.equal(writes2985(D2985B).length, 1, "an org added gets its copy");
+    assert.equal((await turma2968("PATCH", id, { version: 2, orgs: [S2985B] })).status, 200);
+    assert.deepEqual(Object.keys(rec2985(id).outlook), [S2985B]);
+    assert.deepEqual(hub.getCalendarOutlookTombstones()[D2985A].map((x) => [x.turmaId, x.org, x.outlookId]), [[id, S2985A, "EID-1"]]);
+    // One undelivered write per (host, event): the delete replaced the owed upsert.
+    const pend = writes2985(D2985A).filter((x) => !x.deliveredAt);
+    assert.deepEqual(pend.map((x) => [x.op, x.outlookId]), [["delete", "EID-1"]]);
+    // "Not found" counts as deleted; the tombstone goes.
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 0, op: "delete",
+      ok: false, error: "The item was not found" }] });
+    assert.ok(!hub.getCalendarOutlookTombstones()[D2985A]);
+    assert.equal((await turma2968("DELETE", id)).status, 200);
+    assert.deepEqual(hub.getCalendarOutlookTombstones()[D2985B].map((x) => x.turmaId), [id]);
+    assert.equal(writes2985(D2985B).filter((x) => !x.deliveredAt).at(-1).op, "delete");
+    // A failed delete keeps its tombstone (retried later, not in a loop).
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [{ turmaId: id, org: S2985B, version: 0, op: "delete",
+      ok: false, error: "Outlook is not open" }] });
+    assert.equal(hub.getCalendarOutlookTombstones()[D2985B].length, 1);
+    const n = writes2985(D2985B).length;
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(writes2985(D2985B).length, n, "no tight retry of a failed delete");
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-2985: a write owed to an offline holder waits for its reconnect; an unanswered one is re-sent", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A]))).body.event.id;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    agents[D2985A].lastSeen = Date.now() - 10 * 60e3;  // well past OFFLINE_AFTER_MS
+    const n = writes2985(D2985A).length;
+    assert.equal((await turma2968("PATCH", id, { version: 1, subject: "Moved" })).status, 200);
+    assert.equal(writes2985(D2985A).length, n, "nothing queued to an offline host");
+    assert.deepEqual([rec2985(id).outlook[S2985A].host, rec2985(id).outlook[S2985A].state], [D2985A, "pending"]);
+    await beat2985(D2985A, S2985A);   // the reconnect beat
+    const v2 = writes2985(D2985A).filter((x) => x.version === 2);
+    assert.equal(v2.length, 1, "re-queued on its reconnect");
+    // Sent and never answered (an agent restart lost the row): the next pass re-sends it.
+    for (const c of agents[D2985A].commands) c.deliveredAt = Date.now();
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(writes2985(D2985A).filter((x) => x.version === 2).length, 1, "not while it may still be answered");
+    hub.__resetCalendarWriteMemo();
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(writes2985(D2985A).filter((x) => x.version === 2).length, 2);
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: the writer is sticky through a blip and re-homed once gone; the pick is deterministic", async () => {
+  cleanup2985(D2985A, D2985A2);
+  try {
+    hub.getCalendarEvents()[D2985A] = { syncedAt: 1, windowFrom: 1, windowUntil: 2, ranges: [], events: [],
+      lastError: "Outlook is not open", lastErrorAt: 1 };
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985A2, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A]))).body.event.id;
+    assert.equal(rec2985(id).outlook[S2985A].host, D2985A2, "a host with no calendar error is picked first");
+    await beat2985(D2985A2, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // Offline an hour: kept. Decided into another org briefly: kept.
+    agents[D2985A2].lastSeen = Date.now() - 3600e3;
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, D2985A2);
+    // Gone past the re-home window: the copy moves, the old one is a tombstone.
+    agents[D2985A2].lastSeen = Date.now() - hub.CALENDAR_WRITE_REHOME_MS - 1000;
+    hub.calendarOutlookTick(Date.now(), true);
+    const e = rec2985(id).outlook[S2985A];
+    assert.deepEqual([e.host, e.outlookId, e.state], [D2985A, "", "pending"]);
+    assert.deepEqual(hub.getCalendarOutlookTombstones()[D2985A2].map((x) => [x.turmaId, x.outlookId]), [[id, "EID-1"]]);
+    assert.equal(writes2985(D2985A).at(-1).op, "upsert");
+    // A host that stops reporting write gives its copy up at once.
+    await beat1574(D2985A, S2985A, { sessions: [], calendar: { available: true } });
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985A].host, "", "no writer left: owed, unassigned");
+  } finally {
+    delete hub.getCalendarEvents()[D2985A];
+    cleanup2985(D2985A, D2985A2);
+    forget2533(D2985A, D2985A2);
+  }
+});
+
+test("XERK-2985: a Turma event's own Outlook copy is hidden, so it is served once", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A], { attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+    const stray = `turma:${"0".repeat(16)}`;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)],
+      ...sync2985([copy2985(rec2985(id)), copy2985({ ...rec2985(id), id: stray })]) });
+    assert.equal(hub.getCalendarEvents()[D2985A].events.find((x) => x.turmaId === id).turmaId, id, "stored like any event");
+    const all = (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events;
+    assert.deepEqual(all.filter((x) => x.subject === "Planning").map((x) => [x.source, x.id]).sort(),
+      [["outlook", `OUT-${stray.slice(6)}`], ["turma", id]], "a stamp naming nothing is an Outlook event");
+    // The capture matcher scores the Turma event, never the copy as a second candidate.
+    const ix = hub.calendarCandidateIndex("", [{ site: S2985A, startedAt: T2968, endedAt: T2968 + 3.6e6 }]);
+    assert.ok(!ix.list.some((c) => c.ev.turmaId === id));
+    // Deleted: the tombstone still hides the copy until its delete settles.
+    assert.equal((await turma2968("DELETE", id)).status, 200);
+    const after = (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events;
+    assert.ok(!after.some((x) => x.turmaId === id));
+    // A stamp that is not a Turma id is dropped by the whitelist.
+    assert.equal(hub.sanitizeCalendarEvent({ ...copy2985({ id: stray, subject: "x", start: iso2968(T2968),
+      end: iso2968(T2968) }), turmaId: "turma:XYZ" }).turmaId, "");
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: Turma wins — a drifted copy is re-written and a deleted one re-created, once per window", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A]))).body.event.id;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    // In step: nothing owed.
+    const n0 = writes2985(D2985A).length;
+    await later2985();
+    await beat2985(D2985A, S2985A, sync2985([copy2985(rec2985(id))]));
+    assert.equal(writes2985(D2985A).length, n0);
+    // Edited in Outlook: an upsert at the record's version, state pending.
+    await beat2985(D2985A, S2985A, sync2985([copy2985(rec2985(id), { subject: "Renamed in Outlook" })]));
+    assert.equal(rec2985(id).outlook[S2985A].state, "pending");
+    assert.deepEqual(writes2985(D2985A).slice(n0).map((x) => [x.op, x.version, x.outlookId]), [["upsert", 1, "EID-1"]]);
+    // Answered, then drifted again inside the repair window: left alone (no loop).
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+    const n1 = writes2985(D2985A).length;
+    await later2985();
+    await beat2985(D2985A, S2985A, sync2985([copy2985(rec2985(id), { location: "Room 9" })]));
+    assert.equal(writes2985(D2985A).length, n1);
+    assert.equal(rec2985(id).outlook[S2985A].state, "written");
+    // A row read BEFORE the last write cannot show it: no false "missing" (QA D3).
+    hub.__resetCalendarWriteMemo();
+    const n2 = writes2985(D2985A).length;
+    const stale = sync2985([]);
+    stale.calendarSync[0].syncedAt = rec2985(id).outlook[S2985A].at - 1;
+    await beat2985(D2985A, S2985A, stale);
+    assert.equal(writes2985(D2985A).length, n2);
+    assert.ok(!rec2985(id).outlook[S2985A].recreatedAt);
+    // Deleted in Outlook (missing from a window holding its start): re-created, and the client is told.
+    await later2985();
+    await beat2985(D2985A, S2985A, sync2985([]));
+    const w = writes2985(D2985A).at(-1);
+    assert.deepEqual([w.op, w.outlookId], ["upsert", ""]);
+    const [e] = await served2968();
+    assert.equal(e.outlook[S2985A].state, "pending");
+    assert.ok(e.outlook[S2985A].recreatedAt > 0);
+    // The record is never deleted because its copy is missing.
+    assert.ok(rec2985(id));
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: tenant isolation — writes, results and stamps never cross tenants", async () => {
+  const T = tenants2533();
+  let F;
+  try {
+    cleanup2985();
+    F = await fleet2551(T, "t2985");
+    assert.equal((await beat2533(F.ta, "t2985", jira2551(undefined, WRITE2985))).status, 200);
+    assert.equal((await beat2533(F.tb, "t2985", jira2551(undefined, WRITE2985))).status, 200);
+    const a = await turma2968("POST", null, ev2968([F.SA]), T.A.h);
+    assert.equal(a.status, 200, JSON.stringify(a.body));
+    const id = a.body.event.id;
+    assert.deepEqual(writes2985(F.ka).map((x) => [x.turmaId, x.org]), [[id, S2551]], "the agent gets its org plain");
+    assert.equal(writes2985(F.kb).length, 0, "another tenant's host on the same site is never a writer");
+    // B's host answering for A's event changes nothing.
+    await beat2533(F.tb, "t2985", jira2551(undefined, { ...WRITE2985, calendarWriteResults: [ok2985(id, S2551, 1)] }));
+    assert.equal(rec2985(id, T.A.t).outlook[F.SA].state, "pending");
+    await beat2533(F.ta, "t2985", jira2551(undefined, { ...WRITE2985, calendarWriteResults: [ok2985(id, S2551, 1)] }));
+    assert.equal(rec2985(id, T.A.t).outlook[F.SA].state, "written");
+    // A copy in B's Outlook stamped with A's id hides nothing for B.
+    const copy = copy2985(rec2985(id, T.A.t), { subject: "B's meeting" });
+    await beat2533(F.tb, "t2985", jira2551(undefined, { ...WRITE2985, ...sync2985([copy]) }));
+    const bView = (await calGet2891(T2968 - 864e5, T2968 + 864e5, T.B.h)).body.events;
+    assert.deepEqual(bView.map((x) => [x.source, x.subject]), [["outlook", "B's meeting"]]);
+    // The tombstones go with the tenant.
+    assert.equal((await turma2968("DELETE", id, undefined, T.A.h)).status, 200);
+    assert.ok(hub.getCalendarOutlookTombstones()[F.ka]);
+    hub.purgeTenantData(T.A.t);
+    assert.ok(!hub.getCalendarOutlookTombstones()[F.ka]);
+  } finally {
+    cleanup2985(F && F.ka, F && F.kb);
+    if (F) forget2533("t2985", F.ka, F.kb, F.kl);
+    T.restore();
+  }
+});
+
+test("XERK-2985: a private event's copy is written withheld, categories included; so is a private occurrence", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const fields = { body: "diagnosis", location: "Clinic", categories: ["Medical"], joinUrl: "https://zoom.us/j/9",
+      attendees: [{ name: "Dr Who", email: "dr@x.com" }] };
+    const p = await turma2968("POST", null, ev2968([S2985A], { ...fields, sensitivity: "private" }));
+    assert.equal(p.status, 200, JSON.stringify(p.body));
+    const ev = writes2985(D2985A).at(-1).event;
+    assert.deepEqual([ev.subject, ev.body, ev.location, ev.categories, ev.joinUrl, ev.attendees, ev.sensitivity, ev.busy],
+      ["Private event", "", "", [], "", [], "private", "busy"]);
+    assert.ok(!JSON.stringify(ev).includes("Medical") && !JSON.stringify(ev).includes("Clinic"));
+    // A public series with one occurrence made private: that override is withheld.
+    const s = await turma2968("POST", null, ev2968([S2985A], { subject: "Standup", recurrence: { freq: "daily", interval: 1, count: 3 } }));
+    const occ = `${s.body.event.id}:${iso2968(T2968 + 864e5)}`;
+    const o = await turma2968("PATCH", occ, { version: 1, scope: "occurrence", sensitivity: "private", ...fields });
+    assert.equal(o.status, 200, JSON.stringify(o.body));
+    const sev = writes2985(D2985A).filter((x) => x.turmaId === s.body.event.id).at(-1).event;
+    assert.equal(sev.subject, "Standup");
+    const ex = Object.values(sev.exceptions)[0];
+    assert.deepEqual([ex.subject, ex.body, ex.location, ex.categories, ex.attendees], ["Private event", "", "", [], []]);
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: a settled delete drops the host's stored copy, so no ghost is served", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const id = (await turma2968("POST", null, ev2968([S2985A], { subject: "Ghost" }))).body.event.id;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)], ...sync2985([copy2985(rec2985(id))]) });
+    assert.equal((await turma2968("DELETE", id)).status, 200);
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 0, op: "delete", ok: true }] });
+    assert.ok(!hub.getCalendarOutlookTombstones()[D2985A]);
+    assert.ok(!hub.getCalendarEvents()[D2985A].events.some((x) => x.turmaId === id));
+    const all = (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events;
+    assert.ok(!all.some((x) => x.subject === "Ghost"), "the deleted event's copy is not served as an Outlook event");
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: limits — a scoped org in a result is refused, ≤50 undelivered writes a host, a failure retries hourly", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const ids = [];
+    for (let i = 0; i < 55; i++) ids.push((await turma2968("POST", null, ev2968([S2985A], { subject: `E${i}` }))).body.event.id);
+    assert.equal(writes2985(D2985A).filter((x) => !x.deliveredAt).length, 50, "the rest wait a pass");
+    const owed = ids.filter((id) => !writes2985(D2985A).some((x) => x.turmaId === id));
+    assert.equal(owed.length, 5);
+    for (const c of agents[D2985A].commands) c.deliveredAt = Date.now();
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.ok(owed.every((id) => writes2985(D2985A).some((x) => x.turmaId === id)), "the next pass sends them");
+    // A result naming its org with a tenant suffix is not the agent's plain org: refused.
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(ids[0], `${S2985A}@${"a".repeat(32)}`, 1)] });
+    assert.equal(rec2985(ids[0]).outlook[S2985A].state, "pending");
+    // A failure waits an hour before its retry, however many passes run.
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [{ turmaId: ids[1], org: S2985A, version: 1, op: "upsert",
+      ok: false, error: "Outlook is not open" }] });
+    hub.__resetCalendarWriteMemo();
+    const n = writes2985(D2985A).filter((x) => x.turmaId === ids[1]).length;
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(writes2985(D2985A).filter((x) => x.turmaId === ids[1]).length, n);
+    assert.equal(rec2985(ids[1]).outlook[S2985A].state, "failed");
+    rec2985(ids[1]).outlook[S2985A].at -= 3600e3 + 1000;
+    for (const c of agents[D2985A].commands) c.deliveredAt = Date.now();   // room under the per-host cap
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(writes2985(D2985A).filter((x) => x.turmaId === ids[1]).length, n + 1, "retried after the hour");
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: the Daily Brief lists a Turma event once, never its Outlook copy too", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const at = Date.now() + 3 * 3.6e6;
+    const id = (await turma2968("POST", null, { orgs: [S2985A], subject: "Brief me", start: iso2968(at), end: iso2968(at + 3.6e6),
+      attendees: [{ name: "Bo", email: "bo@x.com" }] })).body.event.id;
+    const copy = copy2985(rec2985(id), { attendees: [{ name: "Bo", email: "bo@x.com", role: "required", response: "none" }] });
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)], calendarSync: [{ windowFrom: at - 864e5,
+      windowUntil: at + 864e5, syncedAt: Date.now(), events: [copy] }] });
+    const cal = hub.dailyBriefCalendar(S2985A, Date.now(), Date.now() - 864e5, "UTC");
+    assert.deepEqual(cal.map((x) => x.title), ["Brief me"]);
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
+  }
+});
+
+test("XERK-2985: copies the hub writes never count against a tenant's Turma event cap", () => {
+  const rec = { id: "turma:0123456789abcdef", outlook: { a: { host: "h", outlookId: "x".repeat(300) } } };
+  assert.equal(hub.calTurmaBytes(rec), Buffer.byteLength(JSON.stringify({ id: rec.id })));
+});
+
+test("XERK-2953: a 'following' split that deletes the dead old series deletes its Outlook copies too", async () => {
+  cleanup2985(D2985A);
+  try {
+    await beat2985(D2985A, S2985A);
+    const s = (await turma2968("POST", null, ev2968([S2985A], { timeZone: "UTC", recurrence: { freq: "weekly" } }))).body.event;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(s.id, S2985A, 1)] });
+    assert.equal(rec2985(s.id).outlook[S2985A].outlookId, "EID-1");
+    assert.equal((await turma2968("DELETE", `${s.id}:${key2969(0)}`)).status, 200);
+    const sp = await turma2968("PATCH", `${s.id}:${key2969(1)}`, { version: 2, scope: "following", subject: "v2" });
+    assert.equal(sp.status, 200, JSON.stringify(sp.body));
+    assert.ok(!Object.hasOwn(hub.getCalendarTurmaEvents()[""], s.id), "the dead old half is gone");
+    assert.deepEqual(hub.getCalendarOutlookTombstones()[D2985A].map((x) => [x.turmaId, x.outlookId]), [[s.id, "EID-1"]],
+      "its Outlook copy is deleted, never left orphaned");
+    assert.ok(writes2985(D2985A).some((w) => w.turmaId === sp.body.event.id && w.op === "upsert"), "the new series is written");
+    // DELETE "following" over a dead old half likewise deletes its copy.
+    const u = (await turma2968("POST", null, ev2968([S2985A], { timeZone: "UTC", recurrence: { freq: "weekly" } }))).body.event;
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(u.id, S2985A, 1, { outlookId: "EID-2" })] });
+    assert.equal((await turma2968("DELETE", `${u.id}:${key2969(0)}`)).status, 200);
+    const d = await request("DELETE", `/api/calendar/events/${encodeURIComponent(`${u.id}:${key2969(1)}`)}?scope=following`,
+      { headers: userHeaders });
+    assert.equal(d.status, 200);
+    assert.ok(hub.getCalendarOutlookTombstones()[D2985A].some((x) => x.turmaId === u.id && x.outlookId === "EID-2"));
+  } finally {
+    cleanup2985(D2985A);
+    forget2533(D2985A);
   }
 });

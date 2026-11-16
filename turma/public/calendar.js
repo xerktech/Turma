@@ -854,6 +854,86 @@ function hostSettingsHtml(rows) {
         + `</div>`;
     }).join("") + `</div>`;
 }
+// ---- The subscribable feed (XERK-2992) -------------------------------------
+// A secret iCal link Google/Apple/Outlook subscribe to. The hub keeps only its
+// hash, so the link is shown once, right after "Create link"; afterwards only
+// "a link exists" is known. One link per org (?org=) lets Google colour each org.
+const feed = { loaded: false, loading: false, available: true, exists: false, at: 0, token: "", busy: false, err: "", copied: "" };
+async function loadFeed() {
+  if (feed.loading) return;
+  feed.loading = true;
+  try {
+    const res = await fetch("/api/calendar/feed");
+    const out = await res.json().catch(() => ({}));
+    if (res.ok) Object.assign(feed, { available: out.available !== false, exists: !!out.exists, at: Number(out.at) || 0 });
+    else feed.err = refusal(res, out);
+  } catch { feed.err = "Could not reach the hub."; }
+  feed.loading = false;
+  feed.loaded = true;
+  paint(true);
+}
+function refusal(res, out) {
+  return typeof TurmaNav !== "undefined" && TurmaNav.refusalText ? TurmaNav.refusalText(res, out)
+    : (out && typeof out.error === "string" ? out.error : `the hub answered HTTP ${res.status}`);
+}
+// "new": POST (mint, revoking the last); "off": DELETE.
+async function feedAction(kind) {
+  if (feed.busy) return;
+  feed.busy = true;
+  feed.err = "";
+  paint(true);
+  try {
+    const res = await fetch("/api/calendar/feed", { method: kind === "new" ? "POST" : "DELETE" });
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) feed.err = refusal(res, out);
+    else if (kind === "new") Object.assign(feed, { exists: true, at: Number(out.at) || Date.now(), token: String(out.token || "") });
+    else Object.assign(feed, { exists: false, at: 0, token: "" });
+  } catch { feed.err = "Could not reach the hub."; }
+  feed.busy = false;
+  paint(true);
+}
+function feedUrl(org) {
+  const origin = typeof location !== "undefined" && location.origin ? location.origin : "";
+  return `${origin}/feeds/calendar/${encodeURIComponent(feed.token)}.ics${org ? `?org=${encodeURIComponent(org)}` : ""}`;
+}
+async function copyFeed(url) {
+  let ok = false;
+  try { if (navigator.clipboard) { await navigator.clipboard.writeText(url); ok = true; } } catch { ok = false; }
+  feed.copied = ok ? url : "";
+  if (!ok) feed.err = "Copy failed — select the link and copy it by hand.";
+  paint(true);
+}
+function feedSettingsHtml() {
+  const dis = feed.busy ? ' aria-disabled="true"' : "";
+  const head = `<div class="cal-feed" role="group" aria-label="Subscribe from another calendar"><b>Subscribe in Google Calendar</b>`;
+  if (!feed.loaded) return `${head}<p class="cal-dnote">Loading…</p></div>`;
+  if (!feed.available) return `${head}<p class="cal-dnote">Sign in with your own account to get a calendar link.</p></div>`;
+  const err = feed.err ? `<p class="mt-err">${esc(feed.err)}</p>` : "";
+  const help = `<p class="cal-dnote">A private link to every org's meetings and Turma events. In Google Calendar choose `
+    + `Other calendars → + → From URL and paste it. Google refreshes a subscribed calendar every few hours. `
+    + `Anyone with the link can read your calendar: make a new link to replace a leaked one.</p>`;
+  if (!feed.token) {
+    const made = feed.exists ? `<p class="cal-dnote">A link is on${feed.at ? ` (made ${esc(new Date(feed.at).toLocaleDateString())})` : ""}. `
+      + `It is shown only once — make a new one to see it again (the old one stops working).</p>` : "";
+    return `${head}${help}${made}<div class="cal-feedbtns">`
+      + `<button type="button" class="btn-sm" data-feed-new${dis}>${feed.exists ? "Make a new link" : "Create link"}</button>`
+      + (feed.exists ? `<button type="button" class="btn-sm" data-feed-off${dis}>Turn off</button>` : "")
+      + `</div>${err}</div>`;
+  }
+  const colors = colorMap();
+  const row = (label, url, color) => `<div class="cal-feedrow">`
+    + (color !== undefined ? `<span class="cal-orgdot"${color ? ` style="--org:${esc(color)}"` : ""} aria-hidden="true"></span>` : "")
+    + `<span class="cal-feedlbl">${esc(label)}</span>`
+    + `<input type="text" readonly value="${esc(url)}" aria-label="${esc(`${label} calendar link`)}" data-feed-url>`
+    + `<button type="button" class="btn-sm" data-feed-copy="${esc(url)}">${feed.copied === url ? "Copied" : "Copy"}</button></div>`;
+  const orgs = sites();
+  return `${head}${help}<p class="cal-dnote"><b>Copy it now</b> — this link is shown only once.</p>`
+    + row("All orgs", feedUrl(""))
+    + (orgs.length > 1 ? `<p class="cal-dnote">Google shows a subscribed calendar in one colour. For a colour per org, add each org's link instead:</p>`
+      + orgs.map((o) => row(orgLabel(o.siteKey), feedUrl(o.siteKey), colors.get(o.siteKey) || "")).join("") : "")
+    + `<div class="cal-feedbtns"><button type="button" class="btn-sm" data-feed-new${dis}>Make a new link</button>`
+    + `<button type="button" class="btn-sm" data-feed-off${dis}>Turn off</button></div>${err}</div>`;
+}
 // POST /api/agents/<host>/calendar/settings; the hub's `calendar` frame re-reads too.
 async function saveHost(host, body) {
   if (setBusy.has(host)) return;
@@ -973,7 +1053,7 @@ function calendarHtml() {
   }).join("");
   const label = `Calendar, ${rangeLabel(days)}`;
   return headerHtml(days)
-    + (hostSetOpen ? hostSettingsHtml(got.hostRows) : "")
+    + (hostSetOpen ? hostSettingsHtml(got.hostRows) + feedSettingsHtml() : "")
     + (notes.length ? `<div class="cal-notes" aria-live="polite">${notes.join("")}</div>` : "")
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
@@ -990,7 +1070,7 @@ function focusSig() {
   if (d.ev !== undefined) { const ev = shown[Number(d.ev)]; return ev ? { ev: `${ev.host}\u0000${ev.id}`, day: d.day } : null; }
   for (const k of ["step", "mode", "pick", "pmonth", "zoom"]) if (d[k] !== undefined) return { sel: `[data-${k}="${d[k]}"]` };
   for (const k of ["hostPrivate"]) if (d[k] !== undefined) return { attr: k, v: d[k] };
-  for (const k of ["calToday", "calNew", "openPicker", "closeDetail", "hostSettings"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
+  for (const k of ["calToday", "calNew", "openPicker", "closeDetail", "hostSettings", "feedNew", "feedOff"]) if (d[k] !== undefined) return { sel: `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}]` };
   return null;
 }
 function restoreFocusSig(sig) {
@@ -2055,7 +2135,7 @@ function mount(el, opts = {}) {
   $root.addEventListener("click", (ev) => {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
-        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom],"
+        + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom],[data-feed-new],[data-feed-off],[data-feed-copy],"
         + "[data-cal-new],[data-ev-edit],[data-ev-delete],[data-ev-delete-yes],[data-ev-delete-no],[data-ev-scope],[data-ev-scope-no]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
@@ -2095,7 +2175,16 @@ function mount(el, opts = {}) {
       if (d.evDeleteNo !== undefined) { delConfirm = false; paintDetail(true); return void focusInfo("[data-ev-delete]"); }
       return void deleteEvent();
     }
-    if (d.hostSettings !== undefined) { hostSetOpen = !hostSetOpen; return void paint(true); }
+    if (d.hostSettings !== undefined) {
+      hostSetOpen = !hostSetOpen;
+      if (hostSetOpen && !feed.loaded) loadFeed();
+      return void paint(true);
+    }
+    if (d.feedNew !== undefined || d.feedOff !== undefined) {
+      if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
+      return void feedAction(d.feedNew !== undefined ? "new" : "off");
+    }
+    if (d.feedCopy !== undefined) return void copyFeed(d.feedCopy);
     if (d.openNotes !== undefined) {
       const t = notesTarget(detail, nowFn());
       if (t && openNotes) openNotes(t);
@@ -2215,7 +2304,7 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
-  detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost,
+  detailHtml, panelSpec, badgeOf, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
   _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
   _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },
