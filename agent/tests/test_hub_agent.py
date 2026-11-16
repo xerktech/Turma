@@ -4087,6 +4087,35 @@ class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
         open(path, "w").close()
         self.assertEqual(ha.transcript_tail(path), [])
 
+    def test_xerk2998_a_big_meta_line_never_empties_the_tail(self):
+        # Claude Code writes ~100-700 KB api-request-blob/attachment lines
+        # right after a prompt; one of them filled the whole 128 KB window and
+        # the preview went blank while the transcript held messages.
+        path = os.path.join(self.proj, "blob.jsonl")
+        msgs = [{"uuid": f"m{i}", "type": "user" if i % 2 == 0 else "assistant",
+                 "message": {"content": f"message {i}"}} for i in range(8)]
+        blob = {"type": "api-request-blob", "blob": "x" * (300 * 1024)}
+        write_jsonl(path, msgs + [blob])
+        tail = ha.transcript_tail(path)
+        self.assertEqual([e["id"] for e in tail], [f"m{i}" for i in range(8)])
+
+    def test_xerk2998_only_messages_stop_the_widening(self):
+        # Small meta rows (mode, last-prompt, …) must not count toward the
+        # minimum, or a tail of them would stop the window short of a message.
+        path = os.path.join(self.proj, "meta.jsonl")
+        msg = {"uuid": "m1", "type": "user", "message": {"content": "the prompt"}}
+        blob = {"type": "api-request-blob", "blob": "z" * (300 * 1024)}
+        small = [{"type": "last-prompt", "lastPrompt": f"p{i}"} for i in range(10)]
+        write_jsonl(path, [msg, blob] + small)
+        self.assertEqual([e["id"] for e in ha.transcript_tail(path)], ["m1"])
+
+    def test_xerk2998_the_widened_window_is_capped(self):
+        path = os.path.join(self.proj, "huge.jsonl")
+        early = {"uuid": "early", "type": "user", "message": {"content": "too far back"}}
+        filler = [{"type": "api-request-blob", "blob": "y" * (600 * 1024)} for _ in range(4)]
+        write_jsonl(path, [early] + filler)
+        self.assertEqual(ha.transcript_tail(path), [])
+
     def test_mixed_entries_ansi_stripped_and_garbage_skipped(self):
         path = os.path.join(self.proj, "t.jsonl")
         ansi_text = "\x1b[31mred\x1b[0m alert"

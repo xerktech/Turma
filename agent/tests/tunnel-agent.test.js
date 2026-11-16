@@ -546,6 +546,33 @@ test("foldQueueOp: FIFO enqueue/dequeue/remove; unmatched ops are no-ops", () =>
   assert.deepEqual(empty, []);
 });
 
+test("transcriptTail: a big meta line never empties the live tail (XERK-2998)", () => {
+  const wt = "/wt/blob-tail";
+  const msgs = [];
+  for (let i = 0; i < 8; i++) {
+    msgs.push({ uuid: `m${i}`, type: i % 2 ? "assistant" : "user", message: { content: `message ${i}` } });
+  }
+  writeTranscript(wt, "t.jsonl", [...msgs, { type: "api-request-blob", blob: "x".repeat(300 * 1024) }]);
+  assert.deepEqual(transcriptTail(wt).entries.map((e) => e.id), msgs.map((m) => m.uuid));
+});
+
+test("transcriptTail: only messages stop the widening (XERK-2998)", () => {
+  const wt = "/wt/meta-tail";
+  const small = [];
+  for (let i = 0; i < 10; i++) small.push({ type: "last-prompt", lastPrompt: `p${i}` });
+  writeTranscript(wt, "t.jsonl", [{ uuid: "m1", type: "user", message: { content: "the prompt" } },
+    { type: "api-request-blob", blob: "z".repeat(300 * 1024) }, ...small]);
+  assert.deepEqual(transcriptTail(wt).entries.map((e) => e.id), ["m1"]);
+});
+
+test("transcriptTail: the widened window is capped (XERK-2998)", () => {
+  const wt = "/wt/huge-tail";
+  const filler = [];
+  for (let i = 0; i < 4; i++) filler.push({ type: "api-request-blob", blob: "y".repeat(600 * 1024) });
+  writeTranscript(wt, "t.jsonl", [{ uuid: "early", type: "user", message: { content: "far" } }, ...filler]);
+  assert.deepEqual(transcriptTail(wt).entries, []);
+});
+
 test("transcriptTail: still-queued prompts ride beside the entries", () => {
   const wt = "/wt/queued";
   writeTranscript(wt, "t.jsonl", [

@@ -215,6 +215,34 @@ class AskHookTest(unittest.TestCase):
         # Stale request file cleaned up so it can't surface as a phantom.
         self.assertFalse(os.path.exists(self.req))
 
+    def test_cancelled_hook_removes_its_request_file(self):
+        # XERK-2998: Esc on a pending AskUserQuestion makes Claude Code signal
+        # the blocked hook. The real script (signal handlers installed at its
+        # shell entry) must still remove the req file, or the question card
+        # lingers until the stale sweep.
+        import signal
+        import subprocess
+        env = {**os.environ, **self.env, "TURMA_QUESTION_TIMEOUT_SEC": "30"}
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(sig=sig):
+                proc = subprocess.Popen(
+                    [sys.executable, "-I", MODULE_PATH], env=env,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE)
+                proc.stdin.write(ask_event(
+                    [{"question": "q", "options": [{"label": "a"}]}]).encode())
+                proc.stdin.close()
+                deadline = time.time() + 5
+                while not os.path.exists(self.req) and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(os.path.exists(self.req), "hook never asked")
+                proc.send_signal(sig)
+                proc.wait(timeout=5)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertFalse(os.path.exists(self.req))
+                self.assertFalse(os.path.exists(self.ans))
+
     def test_multiple_questions_sequenced(self):
         # Answer each question in turn: the req file is re-published per question,
         # so a single answering worker that loops handles both.

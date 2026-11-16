@@ -10483,20 +10483,46 @@ def _last_activity_ts(path):
     return None
 
 
+# The live tail's window (XERK-2998). Claude Code 2.1.3xx writes single
+# api-request-blob / api-request-shape / attachment lines of 100 KB-700 KB right
+# after a prompt, so a fixed 128 KB window could hold NO message at all and the
+# preview went blank. The window starts at TAIL_READ_BYTES and grows 4x until it
+# holds TAIL_WINDOW_MIN_ROWS user/assistant entries, the file is read whole, or
+# TAIL_READ_MAX_BYTES. The minimum is small on purpose: this runs every beat for
+# every session, and an ordinary session meets it in the first window, so only a
+# blob-heavy tail pays for the wider read. Mirrored by tunnel-agent.js
+# transcriptTail (TAIL_READ_BYTES / TAIL_READ_MAX_BYTES / TAIL_WINDOW_MIN_ROWS).
+TAIL_READ_BYTES = 1 << 17       # ~128 KB
+TAIL_READ_MAX_BYTES = 1 << 21   # 2 MiB
+TAIL_WINDOW_MIN_ROWS = 6
+
+
 def _tail_entries(path):
-    """Parsed dict entries from roughly the last 128 KB of a transcript JSONL,
-    in file order. Tolerant JSONL parse: lines that fail json.loads or don't
-    decode to a dict (a truncated seek-point fragment, a partial write) are
-    silently skipped rather than aborting the read."""
-    entries = []
-    for raw in _read_tail_lines(path, 1 << 17):  # ~128 KB
-        try:
-            entry = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(entry, dict):
-            entries.append(entry)
-    return entries
+    """Parsed dict entries from the tail of a transcript JSONL, in file order:
+    the last ~128 KB, widened (TAIL_WINDOW_MIN_ROWS) when that holds too few
+    messages. Tolerant JSONL parse: lines that fail json.loads or don't decode
+    to a dict (a truncated seek-point fragment, a partial write) are silently
+    skipped rather than aborting the read."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    window = TAIL_READ_BYTES
+    while True:
+        entries = []
+        rows = 0
+        for raw in _read_tail_lines(path, window):
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+                if entry.get("type") in ("user", "assistant"):
+                    rows += 1
+        if rows >= TAIL_WINDOW_MIN_ROWS or window >= size or window >= TAIL_READ_MAX_BYTES:
+            return entries
+        window = min(window * 4, TAIL_READ_MAX_BYTES)
 
 
 # A background Task/agent finishing injects a `<task-notification>…` payload as a
@@ -30123,11 +30149,14 @@ class SessionManager:
                 self.created_cmds[cid]["kind"] = kind
             self._save_created_cmds()
         row = do_create()
-        results.append(row)
+        # Record the answer BEFORE staging it (XERK-2998): once the row is
+        # visible the create is finished, so nothing about it is left to write
+        # after a caller (or the beat) has moved on.
         with _CREATED_CMDS_LOCK:
             self.created_cmds.pop(cid, None)
             self.created_cmds[cid] = {"at": time.time(), "row": row}
             self._save_created_cmds()
+        results.append(row)
 
     def _load_blocks_links(self):
         try:

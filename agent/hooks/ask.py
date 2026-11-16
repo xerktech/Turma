@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -152,18 +153,23 @@ def _ask_one(req_path: str, ans_path: str, question: dict, index: int,
 
     deadline = time.time() + timeout_sec
     answer = None
-    while time.time() < deadline:
-        answer = _read_answer(ans_path)
-        if answer is not None:
-            break
-        time.sleep(POLL_INTERVAL_SEC)
-
-    # Consume the rendezvous files regardless of outcome.
-    for p in (req_path, ans_path):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
+    try:
+        while time.time() < deadline:
+            answer = _read_answer(ans_path)
+            if answer is not None:
+                break
+            time.sleep(POLL_INTERVAL_SEC)
+    finally:
+        # Consume the rendezvous files regardless of outcome — including the
+        # operator pressing Esc, which makes Claude Code signal this hook
+        # mid-poll (main() turns that signal into SystemExit so this runs).
+        # Without it the req file outlived the cancelled question and its card
+        # lingered until the stale sweep (XERK-2998).
+        for p in (req_path, ans_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     if answer is None:
         return {"question": q_text, "optionIndex": -1, "label": None,
@@ -195,6 +201,22 @@ def _ask_one(req_path: str, ans_path: str, question: dict, index: int,
     return {"question": q_text,
             "optionIndex": idxs[0] if idxs else -1,
             "label": labels[0] if labels else None, "custom": custom}
+
+
+def _exit_on_signal(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def _install_signal_exit() -> None:
+    """A cancelled tool call (Esc) ends the hook by signal. Raising SystemExit
+    from the handler unwinds _ask_one's finally, which removes the req file; a
+    SIGKILL still can't be caught and is left to the stale sweep. Installed
+    only at the shell entry so importing main() (tests) leaves the host
+    process's handlers alone."""
+    for signum in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(signal, signum, None)
+        if sig is not None:
+            signal.signal(sig, _exit_on_signal)
 
 
 def main() -> int:
@@ -246,4 +268,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":  # pragma: no cover - shell entry
+    _install_signal_exit()
     sys.exit(main())
