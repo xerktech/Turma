@@ -4,6 +4,7 @@ paths:
   - turma/ha-config.js
   - turma/tests/store.test.js
   - turma/tests/ha-config.test.js
+  - turma/tests/store-hydration.test.js
 ---
 
 # The HA storage-abstraction seam (XERK-754, epic XERK-751)
@@ -96,6 +97,17 @@ NOT load on `server.js`, so re-read it here before touching that wiring**:
   existing single-process `/data` state into a fresh shared store with no operator
   action. `afterLoad` re-applies a BOOT-ONLY default (repoTiers' `REPO_TIER_SEED`) after
   the adapter load — never on a remote watch (a runtime change is authoritative).
+- **Under HA nothing writes or serves a store before it is LOADED** (XERK-2995,
+  `externalStoresLoading`/`externalStoresPending`). `persist()` writes the WHOLE mirror and
+  an HA mirror is empty until the boot GET returns (emptyDir `/data`), so a write in that
+  window replaced the shared value — an admin user create deleted every user.
+  - Until every key loaded: `/readyz` 503 (`loading: [names]`), every request this replica
+    would serve itself and every upgrade 503 + `Retry-After`, `masterOrchestrationTick`
+    skips, and `persist()` skips (logged) for in-process callers.
+  - A failed load RETRIES (`storeLoadRetryMs`), never gives up: a store down at boot keeps
+    the replica unready, by design — never loosen that to "serve the empty mirror".
+  - A watch event carrying a value also counts as loaded. HA off: no gate at all.
+  - Tests: `turma/tests/store-hydration.test.js`.
 - **Accepted residual (low-churn):** `watch` carries the value SET, not a re-read, so
   two replicas writing the SAME key in the same millisecond can briefly disagree with
   the store; self-heals on the next write. These are one-human-flips-one-switch stores.
