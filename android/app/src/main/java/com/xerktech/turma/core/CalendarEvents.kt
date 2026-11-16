@@ -469,6 +469,8 @@ fun calDraftErrors(d: TurmaEventDraft): List<String> = buildList {
     if (d.body.codePointCount() > CAL_BODY_MAX) add("The details are longer than $CAL_BODY_MAX characters.")
     val cats = calCategories(d.categories)
     if (cats.size > 20 || cats.any { it.codePointCount() > 100 }) add("At most 20 categories of at most 100 characters.")
+    // A ',' separates names here; a ';' would split the Outlook copy, so the hub refuses it (XERK-3013).
+    else if (cats.any { ';' in it }) add("A category name can't contain ';'.")
     if (!d.oneOccurrence) calRepeatError(d.repeat, calRepeatDay(d), calSplitDay(d) ?: calRepeatDay(d)).takeIf { it.isNotEmpty() }?.let { add(it) }
     if (d.orgs.isEmpty()) add("Pick at least one org.")
     if (d.orgs.size > CAL_TURMA_ORGS_MAX) add("An event belongs to at most $CAL_TURMA_ORGS_MAX orgs.")

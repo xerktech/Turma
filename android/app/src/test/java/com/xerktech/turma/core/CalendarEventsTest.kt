@@ -130,6 +130,9 @@ class CalendarEventsTest {
         assertTrue(calDraftErrors(draft("o").copy(timeZone = "Mars/Base")).isNotEmpty())
         assertTrue(calDraftErrors(draft("o").copy(endTime = LocalTime.of(8, 0))).isNotEmpty())
         assertTrue(calDraftErrors(draft("o").copy(online = true, joinUrl = "http://x")).isNotEmpty())
+        // XERK-3013: ',' separates names; a ';' would split the Outlook copy.
+        assertTrue(calDraftErrors(draft("o").copy(categories = "Red, Blue")).isEmpty())
+        assertTrue(calDraftErrors(draft("o").copy(categories = "Red, a;b")).contains("A category name can't contain ';'."))
     }
 
     @Test fun `served Turma fields decode, and an older hub's event reads read-only`() {

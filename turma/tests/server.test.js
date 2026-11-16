@@ -33441,7 +33441,16 @@ test("XERK-2968: refusals — Outlook ids, empty or unknown orgs, malformed fiel
       const r = await turma2968("POST", null, ev2968([S2968A], bad));
       assert.equal(r.status, 400, JSON.stringify(bad));
     }
+    // XERK-3013: Outlook splits a category on ',' or ';', so the hub refuses both, naming the field.
+    for (const cats of [["Red, urgent"], ["a;b"]]) {
+      const r = await turma2968("POST", null, ev2968([S2968A], { categories: cats }));
+      assert.equal(r.status, 400, JSON.stringify(cats));
+      assert.match(r.body.error, /^categories: .*',' or ';'/);
+    }
     assert.deepEqual(Object.keys(hub.getCalendarTurmaEvents()), [], "no refusal minted anything");
+    const okCat = await turma2968("POST", null, ev2968([S2968A], { categories: ["Red - urgent"] }));
+    assert.equal(okCat.status, 200);
+    assert.equal((await turma2968("DELETE", okCat.body.event.id)).status, 200);
     // Caps: a full tenant refuses in the hub's words with a 409; nothing is dropped.
     const b = Object.create(null);
     for (let i = 0; i < hub.CALENDAR_TURMA_EVENTS_MAX; i++) {

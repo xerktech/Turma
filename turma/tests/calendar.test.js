@@ -1265,6 +1265,8 @@ test("XERK-2971: form validation mirrors the hub — orgs, emails, times, https 
   assert.match(cal.validateForm({ ...f, online: true, joinUrl: "http://x.org" }).joinUrl, /https/);
   assert.equal(cal.validateForm({ ...f, online: false, joinUrl: "http://x.org" }).joinUrl, undefined, "a link only counts online");
   assert.match(cal.validateForm({ ...f, subject: "x".repeat(301) }).subject, /300/);
+  assert.match(cal.validateForm({ ...f, category: "Red, a;b" }).category, /';'/, "XERK-3013: Outlook splits on ';'");
+  assert.equal(cal.validateForm({ ...f, category: "Red, Blue" }).category, undefined, "',' separates names");
   assert.match(cal.validateForm({ ...f, body: "😀".repeat(4001) }).body, /4000/, "code points, like the hub");
   assert.equal(cal.validateForm({ ...f, body: "😀".repeat(4000) }).body, undefined);
   assert.match(cal.validateForm({ ...f, timeZone: "Mars/Olympus" }).timeZone, /time zone/);
