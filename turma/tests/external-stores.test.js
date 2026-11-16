@@ -218,35 +218,61 @@ test("XERK-757: boot load adopts the store's value; a fresh store is SEEDED from
   store.close();
 });
 
-test("XERK-2993: the tenancy store marks itself loaded on every boot-load branch and on install", async () => {
-  // Under HA the users mirror starts empty, so the flag starts false there
-  // (`!HA_ON`, pinned on the source: this process runs HA off) and only the
-  // backend's answer may flip it — stored, seeded up, or a later watch install.
+test("XERK-2993: an HA hub starts with the users store NOT loaded", () => {
+  // Behavioural, in its own process: HA is read at require time. Nothing dials
+  // under TURMA_TEST, and every store file goes to scratch.
+  const { spawnSync } = require("child_process");
+  const dir = fs.mkdtempSync(path.join(scratchDir(), "x2993-"));
+  const env = { ...process.env, TURMA_TEST: "1", HA_MODE: "1",
+    TURMA_STORE_URL: "redis://127.0.0.1:1/0", DATABASE_URL: "postgres://q:q@127.0.0.1:1/q",
+    ARCHIVE_S3_ENDPOINT: "http://127.0.0.1:1", ARCHIVE_S3_BUCKET: "q",
+    ARCHIVE_S3_ACCESS_KEY: "q", ARCHIVE_S3_SECRET_KEY: "q",
+    KUBERNETES_SERVICE_HOST: "127.0.0.1", KUBERNETES_SERVICE_PORT: "1" };
   const src = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
-  assert.match(src, /let tenancyHydrated = !HA_ON;/);
-  const settle = () => new Promise((r) => setTimeout(r, 50));
+  for (const m of src.matchAll(/process\.env\.([A-Z0-9_]+_(?:FILE|DIR))\b/g)) {
+    env[m[1]] = path.join(dir, m[1].toLowerCase());
+  }
+  const r = spawnSync(process.execPath, ["-e",
+    "const s=require(process.argv[1]);" +
+    "process.stdout.write(JSON.stringify([s.__getHaOn(), s.__externalStores.tenancyHydrated()]));" +
+    "process.exit(0)", path.join(__dirname, "..", "server.js")], { env, encoding: "utf8", timeout: 60000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout.trim().split("\n").pop()), [true, false]);
+});
+
+test("XERK-2993: the users store reads loaded only once the backend answered it", async () => {
+  // A fake backend, so no other test's on-disk store leaks in: `tenancy` answers
+  // through a promise the test holds; every other key reads absent.
   const tdesc = X.list().find((d) => d.name === "tenancy");
-  const run = async (prep) => {
+  const tick = () => new Promise((r) => setImmediate(r));
+  const settle = async () => { for (let i = 0; i < 10; i++) await tick(); };
+  const run = async (answer) => {
     srv.__setTenancyHydrated(false);
-    const store = fileStore({ ...X.persistentConfig() });
-    await prep(store);
+    let release;
+    const held = new Promise((res, rej) => { release = () => answer(res, rej); });
+    const store = {
+      watch() {}, ready: () => Promise.resolve(), set: () => Promise.resolve(),
+      get: (k) => (k === tdesc.key ? held : Promise.resolve(null)),
+    };
     X.wireExternalStores(store);
     await settle();
-    const v = X.tenancyHydrated();
-    store.close();
-    return v;
+    const before = X.tenancyHydrated();
+    release();
+    await settle();
+    return [before, X.tenancyHydrated()];
   };
-  // Key absent: the seed branch (no afterLoad) still marks it loaded.
-  assert.equal(await run(async () => {}), true, "seed branch");
-  // Stored value equal to the mirror: the dedup skips install, onLoaded still fires.
-  assert.equal(await run((s) => s.set(tdesc.key, tdesc.read())), true, "equal stored value");
+  // Key absent: the seed branch (no afterLoad) marks it loaded, not before.
+  assert.deepEqual(await run((res) => res(null)), [false, true], "seed branch");
+  // Stored value equal to the mirror: install is deduped away; still loaded.
+  assert.deepEqual(await run((res) => res(tdesc.read())), [false, true], "equal stored value");
   // A different stored value installs it.
-  const other = { users: {} };
-  assert.equal(await run((s) => s.set(tdesc.key, other)), true, "different stored value");
-  // A remote replica's watch install marks it loaded after a failed boot load.
-  srv.__setTenancyHydrated(false);
+  assert.deepEqual(await run((res) => res({ users: {}, groups: { x: ["user"] } })), [false, true], "new value");
+  // A failed load proves nothing: still not loaded.
+  assert.deepEqual(await run((res, rej) => rej(new Error("boom"))), [false, false], "failed load");
+  // ...until a remote replica's watch installs a value.
   tdesc.install(tdesc.coerce({ users: {} }));
   assert.equal(X.tenancyHydrated(), true, "install");
+  srv.__setTenancyHydrated(true);
 });
 
 // ---- XERK-769: epic-run / epic-builder stores are externalized -------------
