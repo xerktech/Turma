@@ -71,13 +71,15 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - An ancestor's held copy blocks even if its shortening was written: held marks it failed, so
     the hub cannot tell. Conservative; it clears when that host returns.
   - A split is refused while unsettled even if it sends nothing: the old series' shortening is held.
-  - The 24h org-grace drop can still make another org the sender with no request (XERK-3015).
+  - The 409 judges "asked to send" (`sendInvites`, `orgs[0]`, not hidden), NOT `calTurmaSends`: that
+    is false while a sent tombstone waits (XERK-3015), which would turn the 409 into a silent hold.
+  - Re-homing a `sent` copy writes a SENT tombstone, so XERK-3015's hold also covers it.
   - Tests: server.test.js "XERK-3014: …" (off-then-on, "following" split, another org the sender).
 
 ## Tombstones: deleting a copy a record no longer names
 
 - `/data/calendar-outlook-tombstones.json`, `registerExternalStore`, hostKey →
-  `[{turmaId, org, outlookId, at}]`. Written when a copy is orphaned: the record deleted, its org
+  `[{turmaId, org, outlookId, at, sent?}]`. Written when a copy is orphaned: the record deleted, its org
   dropped from `orgs` (also by the 24h org grace), or the copy re-homed.
 - Each is sent as a `delete` command when that host is next online and reports `write`; removed
   on an ok row (or "not found", which is ok), which also drops that host's stored stamped copy:
@@ -317,6 +319,15 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   - Its holder's mailbox is the ORGANIZER the attendees see, not necessarily the event's creator.
   - `orgs[0]` changing (org dropped, 24h grace) cancels from the old copy (its tombstone delete)
     and sends afresh from the new one: attendees get a cancellation and a new invitation.
+  - **No copy sends while a dropped sending copy's cancellation is owed** (XERK-3015, operator
+    decision): its tombstone carries `sent: true`, and `calTurmaSends` is false for that event
+    until the delete is answered ok/"not found", or the tombstone ages out or is evicted by the
+    cap; then `calSendTombstoneSettled` re-writes the first org's copy, sending, whatever its state
+    (a plain write still queued or unanswered must not land as the last word). Else the gone
+    host's invitation stays live and a second one goes out from another mailbox.
+    Tests: server.test.js "XERK-3015: a grace drop never makes another org send…".
+    - `calSentTombstoneIdx` is dropped only when a SENT tombstone comes or goes, so a mass
+      re-home tick never rebuilds it per copy.
   - A sending copy is never re-homed (XERK-3010, "Re-homing" above): it stays with its host,
     failed, until that host returns or invitations are turned off.
 - **A private/confidential event sends nothing**: its attendees are withheld from every copy.

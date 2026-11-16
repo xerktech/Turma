@@ -7449,7 +7449,7 @@ function calWriteEvent(rec, org) {
   const ev = { subject: rec.subject, start: rec.start, end: rec.end, timeZone: rec.timeZone, allDay: rec.allDay,
     location: rec.location, body: rec.body, attendees: rec.attendees, joinUrl: rec.joinUrl, busy: rec.busy,
     categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions,
-    sendInvites: rec.sendInvites && org === rec.orgs[0] && !hide(rec.sensitivity),
+    sendInvites: calTurmaSends(rec, org),
     responseRequested: rec.responseRequested, allowForward: rec.allowForward, reminderMinutes: rec.reminderMinutes };
   return hide(rec.sensitivity) ? { ...ev, ...CAL_WRITE_WITHHELD } : ev;
 }
@@ -7496,26 +7496,79 @@ function calOutlookTombstonesCoerce(raw) {
       const org = typeof x.org === "string" && x.org && x.org.length <= 200 && tenantOfSite(x.org) === t ? x.org : "";
       if (!turmaId || !org || seen.has(turmaId)) continue;
       seen.add(turmaId);
-      keep.push({ turmaId, org, outlookId: meetingText(x.outlookId, 300), at: calMs(x.at), ...(x.sent === true ? { sent: true } : {}) });
+      const tb = { turmaId, org, outlookId: meetingText(x.outlookId, 300), at: calMs(x.at) };
+      if (x.sent === true) tb.sent = true;
+      keep.push(tb);
     }
     if (keep.length) out[k] = keep;
   }
   return out;
 }
 let calendarOutlookTombstones = calOutlookTombstonesCoerce(readJsonFile(CALENDAR_OUTLOOK_TOMBSTONES_FILE));
-const persistCalendarOutlookTombstones = registerExternalStore({
+// tenant\0turmaId of every tombstone of a copy that sent invitations (XERK-3015):
+// derived and rebuilt on demand. Dropped whenever a SENT tombstone is added or removed
+// (rare), never on a plain one, so a mass re-home tick never rebuilds it per copy.
+let calSentTombstoneIdx = null;
+const persistCalendarOutlookTombstonesStore = registerExternalStore({
   name: "calendarOutlookTombstones", file: CALENDAR_OUTLOOK_TOMBSTONES_FILE,
   coerce: calOutlookTombstonesCoerce, read: () => calendarOutlookTombstones,
-  install: (v) => { calendarOutlookTombstones = v; },
+  install: (v) => { calendarOutlookTombstones = v; calSentTombstoneIdx = null; },
 });
+// `sentChanged` false: the caller proved no sent tombstone came or went. Bulk callers
+// (aging, tenant purge and migration) leave it true.
+function persistCalendarOutlookTombstones(sentChanged = true) {
+  if (sentChanged) calSentTombstoneIdx = null;
+  persistCalendarOutlookTombstonesStore();
+}
+// Whether an orphaned copy of `turmaId` that sent invitations still waits for its
+// cancellation in tenant `t` (XERK-3015). While one does, no other copy sends: the
+// attendees already hold that copy's invitation, and a second org's copy would invite
+// them all again from another mailbox. Settled when the delete is answered (or the
+// tombstone ages out after CALENDAR_HOST_RETAIN_MS); then the first org's copy sends.
+function calSendTombstoned(t, turmaId) {
+  if (!calSentTombstoneIdx) {
+    calSentTombstoneIdx = new Set();
+    for (const list of Object.values(calendarOutlookTombstones)) {
+      for (const x of list) if (x.sent) calSentTombstoneIdx.add(`${tenantOfSite(x.org)}\u0000${x.turmaId}`);
+    }
+  }
+  return calSentTombstoneIdx.has(`${t}\u0000${turmaId}`);
+}
+// A sent copy's tombstone of `turmaId` settled: its record's sending copy, written
+// plain while it waited, is re-written now so its invitations go out (XERK-3015).
+// Whatever its state: a plain write still queued or in flight is superseded (the queued
+// one replaced; one already delivered is answered, then this one lands after it).
+function calSendTombstoneSettled(t, turmaId, now) {
+  calSentTombstoneIdx = null;
+  const bucket = calendarTurmaEvents[t];
+  const rec = bucket && Object.hasOwn(bucket, turmaId) ? bucket[turmaId] : null;
+  if (!rec || !calTurmaSends(rec, rec.orgs[0])) return false;
+  const e = Object.hasOwn(rec.outlook, rec.orgs[0]) ? rec.outlook[rec.orgs[0]] : null;
+  if (!e || !e.host) return false;
+  calWriteSent.delete(`${e.host}\u0000${turmaId}`);
+  Object.assign(e, { state: "pending", at: now });
+  delete e.error;
+  calOutlookReconcile(t, rec, now);
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(t));
+  return true;
+}
 // Orphan host `key`'s copy of `turmaId` (one per host: a host is in one org), and
 // send its delete now when the host can take it.
-// `sent`: the copy was ever a sending one (XERK-3014), so its invitation may be live.
+// `sent`: the copy may have sent invitations (XERK-3014/3015), so its invitation may be live.
 function calTombstoneAdd(key, turmaId, org, outlookId, now, sent = false) {
-  const list = (calendarOutlookTombstones[key] || []).filter((x) => x.turmaId !== turmaId);
-  list.push({ turmaId, org, outlookId, at: now, ...(sent ? { sent: true } : {}) });
-  calendarOutlookTombstones[key] = list.slice(-CALENDAR_TOMBSTONES_MAX);
-  persistCalendarOutlookTombstones();
+  const old = calendarOutlookTombstones[key] || [];
+  const list = old.filter((x) => x.turmaId !== turmaId);
+  const tb = { turmaId, org, outlookId, at: now };
+  if (sent) tb.sent = true;
+  list.push(tb);
+  const kept = list.slice(-CALENDAR_TOMBSTONES_MAX);
+  calendarOutlookTombstones[key] = kept;
+  // A sent tombstone evicted by the cap (or replaced) gives up on its cancellation:
+  // its event's first copy sends from now on (XERK-3015).
+  const lost = old.filter((x) => x.sent && !kept.includes(x));
+  persistCalendarOutlookTombstones(sent || lost.length > 0);
+  for (const x of lost) calSendTombstoneSettled(tenantOfKey(key), x.turmaId, now);
   calOutlookFlushHost(key, now);
 }
 // A copy being given back to its host (re-picked for the record): its tombstone
@@ -7526,7 +7579,7 @@ function calTombstoneTake(key, turmaId) {
   if (i < 0) return null;
   const [x] = list.splice(i, 1);
   if (!list.length) delete calendarOutlookTombstones[key];
-  persistCalendarOutlookTombstones();
+  persistCalendarOutlookTombstones(!!x.sent);
   return x;
 }
 function calOutlookFlushHost(key, now) {
@@ -7635,9 +7688,12 @@ function calOutlookReconcile(t, rec, now, memo) {
 function calTurmaResendError(t, before, after, now = Date.now()) {
   const org = after.orgs[0];
   const split = before.id !== after.id;
-  if (!split && !calTurmaSends(after, org)) return null;
-  // Already sending from that org: its own copy is the one that sent.
-  if (!split && calTurmaSends(before, org)) return null;
+  // Asked to send, judged before XERK-3015's hold (calTurmaSends is false while a sent
+  // tombstone of the event waits): the operator is told, not left with a silent hold.
+  const wants = (rec) => rec.sendInvites === true && org === rec.orgs[0] && !CAL_TURMA_HIDDEN.has(rec.sensitivity);
+  if (!split && !wants(after)) return null;
+  // Already asked to send from that org: its own copy is the one that sent (or is held).
+  if (!split && wants(before)) return null;
   const refuse = (host) => ({ status: 409, body: { error: `${split ? "this series cannot be split" :
     "invitations cannot go out from this event"} yet: its Outlook copy on ${meetingText(baseOfKey(host), 80)} may ` +
     "have sent invitations and has not been cancelled or updated, so attendees would get a second invitation from " +
@@ -7669,7 +7725,11 @@ const calIsHeldError = (s) => typeof s === "string" && s.startsWith(CAL_HELD_PRE
 // record no longer names becomes a tombstone, then the rest are reconciled.
 function calOutlookAfterWrite(t, before, after, now = Date.now()) {
   for (const [org, e] of Object.entries((before && before.outlook) || {})) {
-    if (e.host && !(after && after.orgs.includes(org))) calTombstoneAdd(e.host, before.id, org, e.outlookId, now, e.sent === true);
+    // A copy that was sending, or ever may have (`sent`, XERK-3014), is marked, so no other
+    // copy sends until its cancellation lands (XERK-3015).
+    if (e.host && !(after && after.orgs.includes(org))) {
+      calTombstoneAdd(e.host, before.id, org, e.outlookId, now, e.sent === true || calTurmaSends(before, org));
+    }
   }
   if (after) calOutlookReconcile(t, after, now);
 }
@@ -7693,14 +7753,17 @@ function calendarOutlookTick(now = Date.now(), force = false) {
   let n = 0;
   for (const t of Object.keys(calendarTurmaEvents)) n += calOutlookReconcileTenant(t, now);
   let aged = false;
+  const settled = [];
   for (const [k, list] of Object.entries(calendarOutlookTombstones)) {
     const keep = list.filter((x) => now - x.at < CALENDAR_HOST_RETAIN_MS);
     if (keep.length !== list.length) aged = true;
+    for (const x of list) if (x.sent && !keep.includes(x)) settled.push([tenantOfKey(k), x.turmaId]);
     if (keep.length) calendarOutlookTombstones[k] = keep;
     else delete calendarOutlookTombstones[k];
     if (keep.length) calOutlookFlushHost(k, now);
   }
   if (aged) persistCalendarOutlookTombstones();
+  for (const [t, id] of settled) calSendTombstoneSettled(t, id, now);
   return n;
 }
 // The host's `calendarWriteResults` outbox. A row counts only from the host the
@@ -7711,6 +7774,7 @@ function ingestCalendarWriteResults(key, rows, now = Date.now()) {
   const t = tenantOfKey(key);
   const bucket = calendarTurmaEvents[t];
   const touched = new Set();
+  const sentSettled = [];
   let tombs = false;
   for (const r of rows.slice(0, CALENDAR_WRITE_ROWS_MAX)) {
     if (!r || typeof r !== "object" || Array.isArray(r)) continue;
@@ -7726,7 +7790,8 @@ function ingestCalendarWriteResults(key, rows, now = Date.now()) {
       const i = list.findIndex((x) => x.turmaId === turmaId && x.org === org);
       if (i < 0) continue;
       if (ok || /not found/i.test(error)) {
-        list.splice(i, 1);
+        const [gone] = list.splice(i, 1);
+        if (gone.sent) sentSettled.push(turmaId);
         if (!list.length) delete calendarOutlookTombstones[key];
         calWriteSent.delete(sk);
         tombs = true;
@@ -7765,7 +7830,8 @@ function ingestCalendarWriteResults(key, rows, now = Date.now()) {
     }
     touched.add(rec);
   }
-  if (tombs) persistCalendarOutlookTombstones();
+  if (tombs) persistCalendarOutlookTombstones(sentSettled.length > 0);
+  for (const id of sentSettled) calSendTombstoneSettled(t, id, now);
   if (!touched.size) return tombs;
   for (const rec of touched) rec.outlook = calOutlookSanitize(rec.outlook, rec.orgs, t);
   persistCalendarTurmaEvents();
@@ -7836,7 +7902,9 @@ function calOutlookDrifted(rec, org, e, c) {
     c.busy !== rec.busy || c.sensitivity !== rec.sensitivity;
 }
 // Whether `org`'s copy of `rec` is the one that sends invitations (XERK-2989).
-const calTurmaSends = (rec, org) => rec.sendInvites === true && org === rec.orgs[0] && !CAL_TURMA_HIDDEN.has(rec.sensitivity);
+// Not while a dropped org's sending copy still waits for its cancellation (XERK-3015).
+const calTurmaSends = (rec, org) => rec.sendInvites === true && org === rec.orgs[0] &&
+  !CAL_TURMA_HIDDEN.has(rec.sensitivity) && !calSendTombstoned(tenantOfSite(org), rec.id);
 // The attendee responses Outlook tracked on the sending copy (XERK-2989): its holder's
 // synced copy (stamped with the record's id) -> lowercased email -> response. Null when
 // nothing is known yet. Indexed per stored event list, rebuilt when a sync replaces it.
@@ -32103,7 +32171,7 @@ if (process.env.TURMA_TEST) {
     // XERK-2968: Turma-created events.
     getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
-    CALENDAR_WRITE_REPAIR_MIN_MS, calHeldError, calOutlookSanitize, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
+    CALENDAR_WRITE_REPAIR_MIN_MS, calHeldError, calOutlookSanitize, __calTombstoneAdd: calTombstoneAdd, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
     sanitizeTurmaEvent, calTurmaResponses, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,

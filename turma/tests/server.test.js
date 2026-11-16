@@ -35464,6 +35464,129 @@ test("XERK-3014: a copy's sent mark and a tombstone's survive coercion", () => {
   assert.deepEqual(hub.sanitizeTurmaEvent({ ...r, splitFrom: many }, t).splitFrom, many.slice(0, 50), "nearest 50 kept");
 });
 
+// XERK-3015: the org grace drop makes another org the sender while the dropped org's
+// sent copy still waits for its cancellation: the new first org's copy stays plain.
+async function drop3015() {
+  await beat2985(D2985A, S2985A);
+  await beat2985(D2985B, S2985B);
+  const id = (await turma2968("POST", null, ev2968([S2985A, S2985B],
+    { sendInvites: true, attendees: [{ name: "Bo", email: "bo@x.com" }] }))).body.event.id;
+  assert.equal(writes2985(D2985A).at(-1).event.sendInvites, true);
+  assert.equal(writes2985(D2985B).at(-1).event.sendInvites, false);
+  await beat2985(D2985A, S2985A, { calendarWriteResults: [ok2985(id, S2985A, 1)] });
+  await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 1, { outlookId: "EID-B" })] });
+  const saved = agents[D2985A];
+  delete agents[D2985A];
+  // A gone since past the grace (backdated, so B is still online at the drop).
+  const now = Date.now();
+  hub.calendarTurmaTick(now - hub.CALENDAR_TURMA_ORG_GRACE_MS - 1);
+  hub.calendarTurmaTick(now);
+  assert.deepEqual(rec2985(id).orgs, [S2985B]);
+  const tb = hub.getCalendarOutlookTombstones()[D2985A].find((x) => x.turmaId === id);
+  assert.equal(tb.sent, true, "the dropped sending copy's tombstone is marked");
+  return { id, saved, now };
+}
+
+test("XERK-3015: a grace drop never makes another org send while the sent copy is uncancelled", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    const { id, saved } = await drop3015();
+    const v2 = () => writes2985(D2985B).filter((x) => x.turmaId === id && x.version === 2);
+    assert.equal(v2().length, 1);
+    assert.equal(v2()[0].event.sendInvites, false, "plain while A's cancellation is owed");
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2, { outlookId: "EID-B" })] });
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.equal(rec2985(id).outlook[S2985B].state, "written");
+    assert.ok(!writes2985(D2985B).some((x) => x.turmaId === id && x.event && x.event.sendInvites && !x.deliveredAt),
+      "nothing sending queued");
+    // An edit meanwhile is plain too.
+    assert.equal((await turma2968("PATCH", id, { version: 2, subject: "Moved" })).status, 200);
+    assert.equal(writes2985(D2985B).filter((x) => x.turmaId === id).at(-1).event.sendInvites, false);
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 3, { outlookId: "EID-B" })] });
+    // A failed delete keeps it plain.
+    agents[D2985A] = saved;
+    await beat2985(D2985A, S2985A);
+    hub.calendarOutlookTick(Date.now(), true);
+    assert.ok(writes2985(D2985A).some((x) => x.turmaId === id && x.op === "delete"));
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 0, op: "delete",
+      ok: false, error: "Outlook did not answer" }] });
+    assert.equal(rec2985(id).outlook[S2985B].state, "written");
+    // The cancellation lands: B's copy is re-written, now sending.
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 0, op: "delete",
+      ok: true }] });
+    assert.ok(!(hub.getCalendarOutlookTombstones()[D2985A] || []).some((x) => x.turmaId === id));
+    const last = writes2985(D2985B).filter((x) => x.turmaId === id).at(-1);
+    assert.deepEqual([last.version, last.event.sendInvites, last.outlookId], [3, true, "EID-B"]);
+    assert.equal(rec2985(id).outlook[S2985B].state, "pending");
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-3015: a cancellation landing while the plain write is still owed still sends", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    const { id, saved } = await drop3015();
+    // B's plain v2 is queued, not yet answered, when A's cancellation lands.
+    agents[D2985A] = saved;
+    await beat2985(D2985A, S2985A);
+    hub.calendarOutlookTick(Date.now(), true);
+    await beat2985(D2985A, S2985A, { calendarWriteResults: [{ turmaId: id, org: S2985A, version: 0, op: "delete",
+      ok: true }] });
+    const owed = writes2985(D2985B).filter((x) => x.turmaId === id && !x.deliveredAt);
+    assert.deepEqual(owed.map((x) => [x.version, x.event.sendInvites]), [[2, true]], "the plain write is replaced");
+    // Delivered but unanswered: a plain answer landing first still leaves the send owed.
+    await beat2985(D2985B, S2985B);
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2, { outlookId: "EID-B" })] });
+    assert.equal(writes2985(D2985B).filter((x) => x.turmaId === id).at(-1).event.sendInvites, true);
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-3015: a sent tombstone evicted by the per-host cap releases the send", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    const { id, now } = await drop3015();
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2, { outlookId: "EID-B" })] });
+    const tbs = hub.getCalendarOutlookTombstones();
+    for (let i = tbs[D2985A].length; i < 1500; i++) {
+      tbs[D2985A].push({ turmaId: `turma:${i.toString(16).padStart(16, "0")}`, org: S2985A, outlookId: "", at: now });
+    }
+    assert.ok(tbs[D2985A].some((x) => x.turmaId === id && x.sent));
+    // One more orphan on A's host evicts the oldest: the sent one.
+    hub.__calTombstoneAdd(D2985A, "turma:ffffffffffffffff", S2985A, "", Date.now());
+    assert.ok(!hub.getCalendarOutlookTombstones()[D2985A].some((x) => x.turmaId === id));
+    assert.equal(writes2985(D2985B).filter((x) => x.turmaId === id).at(-1).event.sendInvites, true);
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-3015: a sent tombstone that ages out releases the send; the mark survives a reload", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    const { id, saved, now } = await drop3015();
+    const stored = JSON.parse(JSON.stringify(hub.getCalendarOutlookTombstones()));
+    assert.equal(hub.calOutlookTombstonesCoerce(stored)[D2985A].find((x) => x.turmaId === id).sent, true);
+    assert.equal(hub.calOutlookTombstonesCoerce({ [D2985A]: [{ turmaId: id, org: S2985A, sent: "yes" }] })[D2985A][0].sent,
+      undefined, "only true is kept");
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(id, S2985B, 2, { outlookId: "EID-B" })] });
+    const later = now + 30 * 864e5 + 1;
+    agents[D2985B].lastSeen = later;
+    hub.calendarOutlookTick(later, true);
+    assert.ok(!(hub.getCalendarOutlookTombstones()[D2985A] || []).some((x) => x.turmaId === id));
+    assert.equal(writes2985(D2985B).filter((x) => x.turmaId === id).at(-1).event.sendInvites, true);
+    agents[D2985A] = saved;
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
 test("XERK-2985: a Turma event's own Outlook copy is hidden, so it is served once", async () => {
   cleanup2985(D2985A);
   try {
