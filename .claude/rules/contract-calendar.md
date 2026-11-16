@@ -300,6 +300,10 @@ Hub half: XERK-2891. Agent half: XERK-2895 (below).
 - Tests: `holidays.test.js` (rules over several years), the `XERK-2892:` cases in
   `server.test.js` (round-trip, SSE, tenant isolation pinned by mutation, purge).
 
+## The subscribable feed (XERK-2992)
+
+- A secret iCal link serving one principal's calendar; rules in `contract-calendar-feed.md`.
+
 ## Turma-created events (hub, epic XERK-2967; store + routes XERK-2968)
 
 Events made IN Turma, owned by the hub. Every child of the epic

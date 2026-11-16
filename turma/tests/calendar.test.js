@@ -1840,3 +1840,36 @@ test("XERK-2973 QA: the whole-series count is said visibly, only on a split, kep
   assert.match(visible(), /8 times in the whole series/);
   cal.closeEditor();
 }));
+
+// ---- XERK-2992: the subscribe-by-link settings section ---------------------------
+test("XERK-2992: the feed section mints a link shown once, per org, escaped, and turns it off", async () => {
+  Object.assign(cal.feed, { loaded: false, loading: false, available: true, exists: false, at: 0, token: "", busy: false, err: "", copied: "" });
+  replies["/api/calendar/feed"] = (url, init) => (init.method === "POST"
+    ? { ok: true, token: "TOK_en-1", path: "/feeds/calendar/TOK_en-1.ics", at: 1 }
+    : init.method === "DELETE" ? { ok: true, revoked: true } : { available: true, exists: false, at: 0 });
+  globalThis.location = { href: "", origin: "https://hub.example" };
+  try {
+    assert.match(cal.feedSettingsHtml(), /Loading/);
+    await cal.loadFeed();
+    assert.match(cal.feedSettingsHtml(), /data-feed-new[^>]*>Create link</);
+    assert.doesNotMatch(cal.feedSettingsHtml(), /data-feed-off/);
+    await cal.feedAction("new");
+    const html = cal.feedSettingsHtml();
+    assert.match(html, /value="https:\/\/hub\.example\/feeds\/calendar\/TOK_en-1\.ics"/);
+    assert.match(html, /shown only once/);
+    assert.ok(posts.some((p) => p.url === "/api/calendar/feed"));
+    await cal.feedAction("off");
+    assert.equal(cal.feed.token, "");
+    assert.match(cal.feedSettingsHtml(), /Create link/);
+    // A principal that cannot own one is told so; a refusal is shown in the hub's words.
+    cal.feed.available = false;
+    assert.match(cal.feedSettingsHtml(), /your own account/);
+    cal.feed.available = true;
+    replies["/api/calendar/feed"] = () => ({ status: 409, body: { error: "no <b>link</b> for you" } });
+    await cal.feedAction("new");
+    assert.match(cal.feedSettingsHtml(), /no &lt;b&gt;link&lt;\/b&gt; for you/);
+  } finally {
+    delete replies["/api/calendar/feed"];
+    globalThis.location = { href: "" };
+  }
+});

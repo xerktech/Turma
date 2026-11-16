@@ -120,6 +120,7 @@ process.env.MEETING_FOCUS_FILE = path.join(scratchDir(), `turma-test-meeting-foc
 process.env.HOLIDAY_SETTINGS_FILE = path.join(scratchDir(), `turma-test-holiday-settings-${process.pid}.json`);
 process.env.CALENDAR_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-events-${process.pid}.json`);
 process.env.CALENDAR_HOST_SETTINGS_FILE = path.join(scratchDir(), `turma-test-calendar-host-settings-${process.pid}.json`);
+process.env.CALENDAR_FEEDS_FILE = path.join(scratchDir(), `turma-test-calendar-feeds-${process.pid}.json`);
 process.env.CALENDAR_TURMA_EVENTS_FILE = path.join(scratchDir(), `turma-test-calendar-turma-events-${process.pid}.json`);
 process.env.MEETING_LABELS_FILE = path.join(scratchDir(), `turma-test-meeting-labels-${process.pid}.json`);
 process.env.MEETING_LABEL_MISSES_FILE = path.join(scratchDir(), `turma-test-meeting-label-misses-${process.pid}.json`);
@@ -34392,5 +34393,57 @@ test("XERK-2969: an occurrence made private by its owner is the owner's alone to
   } finally {
     cleanup2968(D2968A);
     forget2533(D2968A);
+  }
+});
+
+// ---- XERK-2992: the subscribable calendar feed ---------------------------------
+test("XERK-2992: a minted feed link serves the caller's calendar as iCal, with no session", async () => {
+  cleanup2968(D2968A, D2968B);
+  try {
+    await beat1574(D2968A, S2968A);
+    await beat1574(D2968B, S2968B);
+    assert.equal((await turma2968("POST", null, ev2968([S2968A], { subject: "Alpha, sync; now" }))).status, 200);
+    assert.equal((await turma2968("POST", null, ev2968([S2968B], { subject: "Bravo" }))).status, 200);
+    assert.deepEqual((await request("GET", "/api/calendar/feed", { headers: userHeaders })).body,
+      { available: true, exists: false, at: 0 });
+    const m = await request("POST", "/api/calendar/feed", { headers: userHeaders });
+    assert.equal(m.status, 200, m.raw);
+    assert.match(m.body.path, /^\/feeds\/calendar\/[A-Za-z0-9_-]{43}\.ics$/);
+    assert.equal(m.body.path, `/feeds/calendar/${m.body.token}.ics`);
+    assert.equal((await request("GET", "/api/calendar/feed", { headers: userHeaders })).body.exists, true);
+    // No credential at all: the link is the credential.
+    const f = await request("GET", m.body.path);
+    assert.equal(f.status, 200, f.raw);
+    assert.match(f.headers["content-type"], /^text\/calendar/);
+    assert.match(f.raw, /^BEGIN:VCALENDAR\r\n/);
+    assert.ok(f.raw.includes("SUMMARY:Alpha\\, sync\\; now\r\n"), f.raw);
+    assert.match(f.raw, /SUMMARY:Bravo\r\n/);
+    assert.match(f.raw, /X-WR-CALNAME:Turma\r\n/);
+    // One org: the other org's event is not in it, and the calendar is named for it.
+    const one = await request("GET", `${m.body.path}?org=${encodeURIComponent(S2968A)}`);
+    assert.equal(one.status, 200);
+    assert.match(one.raw, /SUMMARY:Alpha/);
+    assert.doesNotMatch(one.raw, /SUMMARY:Bravo/);
+    assert.match(one.raw, /X-WR-CALNAME:Turma · a2968\r\n/);
+    // An org the caller does not have answers the unknown link's 404.
+    const nope = await request("GET", `${m.body.path}?org=nobody.atlassian.net`);
+    assert.equal(nope.status, 404);
+    // A new link revokes the old one; DELETE turns it off.
+    const m2 = await request("POST", "/api/calendar/feed", { headers: userHeaders });
+    assert.equal((await request("GET", m.body.path)).status, 404);
+    assert.equal((await request("GET", m2.body.path)).status, 200);
+    assert.equal((await request("DELETE", "/api/calendar/feed", { headers: userHeaders })).body.revoked, true);
+    assert.equal((await request("GET", m2.body.path)).status, 404);
+    // Malformed links and the management route without a session.
+    assert.equal((await request("GET", "/feeds/calendar/short.ics")).status, 404);
+    assert.equal((await request("GET", `/feeds/calendar/${"a".repeat(43)}.ics`)).status, 404);
+    assert.equal((await request("POST", "/api/calendar/feed")).status, 401);
+    // Only the hash is stored.
+    const stored = JSON.parse(fs.readFileSync(process.env.CALENDAR_FEEDS_FILE, "utf8"));
+    assert.doesNotMatch(JSON.stringify(stored), new RegExp(m2.body.token));
+  } finally {
+    await request("DELETE", "/api/calendar/feed", { headers: userHeaders });
+    cleanup2968(D2968A, D2968B);
+    forget2533(D2968A, D2968B);
   }
 });

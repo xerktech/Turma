@@ -312,6 +312,9 @@ those are marked `[MODEL]`.
 - Phone-only: the "N proposals from <meeting>" push (channel "Meeting proposals"); a tap opens
   the Meetings tab with that org unfolded on Needs review.
 
+- **Calendar feed link (XERK-2992) is web-only for now**: the calendar ⚙'s "Subscribe in Google
+  Calendar" mints the link (`/api/calendar/feed`). Android has no control; the link works anywhere.
+
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in
   with SSO" button beside the Hub-URL + break-glass credential fields. It opens the hub's existing

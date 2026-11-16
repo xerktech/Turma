@@ -380,6 +380,13 @@
   .cal-hostrow b { overflow-wrap: anywhere; min-width: 0; }
   .cal-hostrow .cal-dnote { margin: 0; overflow-wrap: anywhere; min-width: 0; }
   .cal-hostrow label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+  .cal-feed { border: 1px solid var(--hairline); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; font-size: 13px; }
+  .cal-feed .cal-dnote { margin: 4px 0; }
+  .cal-feedrow { display: flex; align-items: center; gap: 8px; padding: 4px 0; min-width: 0; }
+  .cal-feedlbl { flex: 0 1 9em; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cal-feedrow input { flex: 1 1 auto; min-width: 0; font: 12px var(--mono, ui-monospace, monospace); padding: 4px 6px;
+    border: 1px solid var(--hairline); border-radius: 6px; background: var(--surface); color: var(--ink); }
+  .cal-feedbtns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
   .cal-drow .v { min-width: 0; overflow-wrap: anywhere; }
   .cal-drow a { color: var(--accent-text); }
   .cal-dnote { color: var(--muted); font-size: 12.5px; margin: 10px 0 0; }

@@ -32,7 +32,7 @@ for (const k of [
   "TRIAGE_POLICIES_FILE", "TRIAGE_ACTIONS_FILE", "USAGE_LEDGER_FILE", "ADMIN_AUDIT_FILE",
   "ARCHIVE_PURGED_TENANTS_FILE", "AUTOMERGE_ORGS_FILE", "DAILY_BRIEFS_FILE",
   "DAILY_BRIEF_SCHEDULES_FILE", "DECISIONS_FILE", "DEDUPE_LINK_ORGS_FILE", "ENROLL_CODES_FILE",
-  "EPIC_BUILDERS_FILE", "EPIC_RUNS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_HOST_SETTINGS_FILE", "CALENDAR_TURMA_EVENTS_FILE", "MEETING_TOKENS_FILE",
+  "EPIC_BUILDERS_FILE", "EPIC_RUNS_FILE", "MEETING_PROPOSALS_FILE", "MEETING_LABELS_FILE", "MEETING_LABEL_MISSES_FILE", "MEETING_FOCUS_FILE", "HOLIDAY_SETTINGS_FILE", "CALENDAR_EVENTS_FILE", "CALENDAR_HOST_SETTINGS_FILE", "CALENDAR_TURMA_EVENTS_FILE", "CALENDAR_FEEDS_FILE", "MEETING_TOKENS_FILE",
   "MODEL_POLICY_FILE", "NAME_TOKEN_GENS_FILE", "PERMISSION_POLICIES_FILE",
   "PRIORITY_WRITEBACK_ORGS_FILE", "REPO_TIERS_FILE", "TENANT_MIGRATION_FILE",
   "TICKET_PLATFORMS_FILE",
@@ -1607,4 +1607,46 @@ test("XERK-2626: a tenant's prune that leaves the hard total full goes on to the
   const forget = (k) => k === `s0.net@${T("a")}` || k === `gone.net@${T("d")}`;
   assert.deepEqual(hub.makeRoomForOrg(store, `new.net@${T("a")}`, 100, forget), { full: "", pruned: true });
   assert.equal(Object.keys(store).length, 299);
+});
+
+// XERK-2992: a tenant user's calendar feed link serves its own tenant only.
+test("XERK-2992: a feed link serves only its owner's tenant, and dies with a password reset", async () => {
+  const { A, B } = await isoFleet();
+  const mkEv = async (who) => {
+    const t = Math.floor(Date.now() / 3.6e6) * 3.6e6 + 864e5;
+    const r = await request("POST", "/api/calendar/events", { headers: { ...who.h, "content-type": "application/json" },
+      body: { orgs: [who.site], subject: `${who.canary} meeting`, start: new Date(t).toISOString(),
+        end: new Date(t + 3.6e6).toISOString(), timeZone: "UTC" } });
+    assert.equal(r.status, 200, r.raw);
+    return JSON.parse(r.raw).event.id;
+  };
+  const ids = [await mkEv(A), await mkEv(B)];
+  try {
+    const m = await request("POST", "/api/calendar/feed", { headers: A.h });
+    assert.equal(m.status, 200, m.raw);
+    const { path: feed } = JSON.parse(m.raw);
+    const all = await request("GET", feed);
+    assert.equal(all.status, 200, all.raw);
+    assert.ok(all.raw.includes(`${A.canary} meeting`));
+    assertNoneOf(all.raw, [B], "A's feed");
+    assert.ok(!all.raw.includes(A.t), "the feed names no tenant id");
+    // B's org through A's link is the unknown link's 404.
+    const cross = await request("GET", `${feed}?org=${encodeURIComponent(B.site)}`);
+    assert.equal(cross.status, 404);
+    assert.equal(cross.raw, (await request("GET", `/feeds/calendar/${"b".repeat(43)}.ics`)).raw);
+    const own = await request("GET", `${feed}?org=${encodeURIComponent(A.site)}`);
+    assert.equal(own.status, 200);
+    assert.match(own.raw, /X-WR-CALNAME:Turma · iso2556\r\n/);
+    // A password reset bumps the user's epoch: the link stops answering.
+    const u = hub.tenancyState().users[A.user.id];
+    const was = u.sessionEpoch;
+    u.sessionEpoch = (was || 0) + 1;
+    try { assert.equal((await request("GET", feed)).status, 404); } finally { u.sessionEpoch = was; }
+    assert.equal((await request("GET", feed)).status, 200);
+  } finally {
+    await request("DELETE", "/api/calendar/feed", { headers: A.h });
+    for (const [id, who] of [[ids[0], A], [ids[1], B]]) {
+      await request("DELETE", `/api/calendar/events/${encodeURIComponent(id)}`, { headers: who.h });
+    }
+  }
 });

@@ -28,6 +28,7 @@ const os = require("os");
 const v8 = require("v8");
 const path = require("path");
 const crypto = require("crypto");
+const ics = require("./ics.js");
 const { Duplex, Readable } = require("stream");
 // Only the archive's raw layer uses this (XERK-338): agents gzip a session's own
 // bytes on the wire, and the hub gunzips them under a hard output bound.
@@ -692,6 +693,7 @@ const CALENDAR_HOST_SETTINGS_FILE = process.env.CALENDAR_HOST_SETTINGS_FILE || "
 const CALENDAR_TURMA_EVENTS_FILE = process.env.CALENDAR_TURMA_EVENTS_FILE || "/data/calendar-turma-events.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
+const CALENDAR_FEEDS_FILE = process.env.CALENDAR_FEEDS_FILE || "/data/calendar-feeds.json";
 // Tenants whose archive data was purged (XERK-2549): tombstones every replica reads.
 const ARCHIVE_PURGED_TENANTS_FILE =
   process.env.ARCHIVE_PURGED_TENANTS_FILE || "/data/archive-purged-tenants.json";
@@ -5519,6 +5521,30 @@ const persistMeetingTokens = registerExternalStore({
   name: "meetingTokens", file: MEETING_TOKENS_FILE, debounceMs: 0, mode: 0o600,
   coerce: meetingTokensCoerce, read: () => meetingTokens, install: (v) => { meetingTokens = v; },
 });
+// Subscribable calendar feed links (XERK-2992, contract-calendar.md "The
+// subscribable feed"): owner -> {hash, at, epoch}. The owner is the principal
+// that minted it (`user:<id>`, `breakglass`, `open`); the feed serves exactly
+// what that principal's GET /api/calendar would. The token is random and kept
+// as a SHA-256 only, shown once at mint; a new mint revokes the old link. A
+// user's password reset (sessionEpoch bump) ends its link like its sessions.
+// Inline literals: runs at module init.
+const CALENDAR_FEED_OWNER_RE = /^(user:[A-Za-z0-9_-]{1,64}|breakglass|open)$/;
+function calendarFeedsCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [o, e] of Object.entries(raw).slice(0, 1000)) {
+    if (!CALENDAR_FEED_OWNER_RE.test(o) || !e || typeof e !== "object") continue;
+    if (typeof e.hash !== "string" || !/^[0-9a-f]{64}$/.test(e.hash)) continue;
+    out[o] = { hash: e.hash, at: Number.isSafeInteger(e.at) && e.at > 0 ? e.at : 0,
+      epoch: Number.isSafeInteger(e.epoch) && e.epoch >= 0 ? e.epoch : 0 };
+  }
+  return out;
+}
+let calendarFeeds = calendarFeedsCoerce(readJsonFile(CALENDAR_FEEDS_FILE));
+const persistCalendarFeeds = registerExternalStore({
+  name: "calendarFeeds", file: CALENDAR_FEEDS_FILE, debounceMs: 0, mode: 0o600,
+  coerce: calendarFeedsCoerce, read: () => calendarFeeds, install: (v) => { calendarFeeds = v; },
+});
 // ---- The archive's tenant purge (XERK-2549) ---------------------------------
 // `archivePurgedTenants` (tenantId -> purged-at ms) is a TOMBSTONE set, HA-shared:
 // under HA a follower's local working copy can still hold files the leader purged,
@@ -6436,6 +6462,98 @@ function setCalendarHostSettings(key, body) {
   persistCalendarHostSettings();
   broadcastCalendarSoon(key);
   return { status: 200, body: { ok: true, settings: calendarHostSettings[key] } };
+}
+
+// ---- The subscribable feed (XERK-2992) --------------------------------------
+// One secret link per principal, serving that principal's calendar as iCal so
+// Google/Apple/Outlook can subscribe. `?org=<site>` narrows it to one org: a
+// subscribed calendar is one colour in Google, so per-org colours = one link
+// per org. Rules: contract-calendar.md "The subscribable feed".
+const CALENDAR_FEED_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;   // 32 random bytes, base64url
+// The served window sits a week inside the default sync window
+// (CALENDAR_PAST_MS/FUTURE_MS), so a feed fetch is covered by the hosts'
+// regular syncs and never queues an on-demand one.
+const CALENDAR_FEED_PAST_MS = CALENDAR_PAST_MS - CALENDAR_WEEK_MS;
+const CALENDAR_FEED_FUTURE_MS = CALENDAR_FUTURE_MS - CALENDAR_WEEK_MS;
+function calendarFeedOwner(p) {
+  if (!p) return null;
+  if (p.kind === "user") return typeof p.userId === "string" && CALENDAR_FEED_OWNER_RE.test(`user:${p.userId}`) ? `user:${p.userId}` : null;
+  if (p.kind === "breakglass") return "breakglass";
+  if (p.kind === "open") return "open";
+  return null;   // legacy: no identity to tie the link to
+}
+const calendarFeedHash = (token) => crypto.createHash("sha256").update(String(token)).digest("hex");
+function calendarFeedEpoch(owner) {
+  if (!owner.startsWith("user:")) return 0;
+  const u = Object.hasOwn(tenancyState.users, owner.slice(5)) ? tenancyState.users[owner.slice(5)] : null;
+  return u && Number.isSafeInteger(u.sessionEpoch) ? u.sessionEpoch : 0;
+}
+function calendarFeedStatus(p) {
+  const owner = calendarFeedOwner(p);
+  const e = owner && Object.hasOwn(calendarFeeds, owner) ? calendarFeeds[owner] : null;
+  return { available: !!owner, exists: !!e, at: e ? e.at : 0 };
+}
+// Mints a new link for `p`, revoking its last one. Returns the token (shown
+// once), or null for a principal that cannot own one.
+function mintCalendarFeed(p) {
+  const owner = calendarFeedOwner(p);
+  if (!owner) return null;
+  const token = crypto.randomBytes(32).toString("base64url");
+  calendarFeeds = calendarFeedsCoerce({ ...calendarFeeds,
+    [owner]: { hash: calendarFeedHash(token), at: Date.now(), epoch: calendarFeedEpoch(owner) } });
+  persistCalendarFeeds();
+  return token;
+}
+function revokeCalendarFeed(p) {
+  const owner = calendarFeedOwner(p);
+  if (!owner || !Object.hasOwn(calendarFeeds, owner)) return false;
+  const next = { ...calendarFeeds };
+  delete next[owner];
+  calendarFeeds = calendarFeedsCoerce(next);
+  persistCalendarFeeds();
+  return true;
+}
+// The principal a link names, re-read from the user store on every fetch (a
+// disabled, deleted or password-reset user's link answers nothing), else null.
+function calendarFeedPrincipal(token) {
+  if (typeof token !== "string" || !CALENDAR_FEED_TOKEN_RE.test(token)) return null;
+  const want = Buffer.from(calendarFeedHash(token), "hex");
+  let owner = null;
+  for (const [o, e] of Object.entries(calendarFeeds)) {
+    if (crypto.timingSafeEqual(Buffer.from(e.hash, "hex"), want)) owner = o;
+  }
+  if (!owner) return null;
+  if (owner === "breakglass") return breakGlassEnabled() ? BREAKGLASS_PRINCIPAL : null;
+  if (owner === "open") return authEnabled() ? null : OPEN_PRINCIPAL;
+  const id = owner.slice(5);
+  const user = Object.hasOwn(tenancyState.users, id) ? tenancyState.users[id] : null;
+  if (!user || user.mustChangePassword) return null;
+  if ((user.sessionEpoch || 0) !== calendarFeeds[owner].epoch) return null;
+  return userPrincipal(user);
+}
+// An org's name as the clients show it (board.js `orgName`): a host's
+// configured name, else the site without its tenant / Jira suffix / ADO path.
+function calendarFeedOrgNames() {
+  const names = new Map();
+  for (const a of Object.values(agents)) {
+    const n = a && a.jira && typeof a.jira.orgName === "string" ? a.jira.orgName.slice(0, 100).trim() : "";
+    const org = n ? decidedOrgOf(a) : "";
+    if (org && !names.has(org)) names.set(org, n);
+  }
+  return (site) => {
+    if (names.has(site)) return names.get(site);
+    const b = baseOfSite(String(site));
+    return b.includes("/") ? (b.split("/").filter(Boolean).pop() || b) : b.replace(/\.atlassian\.net$/i, "");
+  };
+}
+// The feed body for `p`, or null when `org` is given and is not a decided org
+// of the caller's (404, like every org route).
+function calendarFeedIcs(p, org, now = Date.now()) {
+  if (org !== null && (!decidedOrgs().has(org) || !principalMaySite(p, org))) return null;
+  const view = calendarView(p, now - CALENDAR_FEED_PAST_MS, now + CALENDAR_FEED_FUTURE_MS,
+    org === null ? null : new Set([org]), now);
+  const orgName = calendarFeedOrgNames();
+  return ics.calendarIcs(view.events, { now, orgName, name: org === null ? "Turma" : `Turma · ${orgName(org)}` });
 }
 
 // ---- Turma-created events: routes' logic and serving (XERK-2968) ----------------
@@ -25516,6 +25634,9 @@ const server = http.createServer(async (req, res) => {
       // session until it succeeds.
       url.pathname === "/api/oidc/config" ||
       url.pathname === "/api/oidc/mobile/exchange";
+    // The subscribable calendar feed (XERK-2992): Google/Apple fetch it with no
+    // session; the secret link IS the credential (calendarFeedPrincipal).
+    const isCalendarFeed = req.method === "GET" && parts.length === 3 && parts[0] === "feeds" && parts[1] === "calendar";
 
     // The archive-ingest endpoint is agent-pushed (bearer token), like the
     // heartbeat — it must not require the user login the rest of /api/* does.
@@ -25632,6 +25753,8 @@ const server = http.createServer(async (req, res) => {
       // through, like the login route.
     } else if (isLoginRoute) {
       // fall through to the handlers below
+    } else if (isCalendarFeed) {
+      // authenticated by its own token in the handler
     } else if (!userAuthorized(req)) {
       // The HUMAN gate (XERK-593). Reached only after every agent-transport
       // route above (heartbeat, archive/updating/migration/upload blobs, the
@@ -25749,6 +25872,37 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, e ? { exists: true, at: e.at } : { exists: false });
       }
       return json(res, 200, { token: mintMeetingsTenantToken(t) });
+    }
+
+    // GET|POST|DELETE /api/calendar/feed — the caller's subscribable calendar
+    // link (XERK-2992). GET says whether one exists ({available, exists, at});
+    // POST mints a new one, revoking the last, and answers it ONCE ({token,
+    // path}) — only its hash is kept; DELETE turns it off.
+    if (url.pathname === "/api/calendar/feed" && ["GET", "POST", "DELETE"].includes(req.method)) {
+      const p = requestPrincipal(req);
+      if (req.method === "GET") return json(res, 200, calendarFeedStatus(p));
+      if (req.method === "DELETE") return json(res, 200, { ok: true, revoked: revokeCalendarFeed(p) });
+      const token = mintCalendarFeed(p);
+      if (!token) return json(res, 409, { error: "this sign-in cannot own a calendar link — sign in with your own account" });
+      return json(res, 200, { ok: true, token, path: `/feeds/calendar/${token}.ics`, at: calendarFeeds[calendarFeedOwner(p)].at });
+    }
+
+    // GET /feeds/calendar/<token>.ics[?org=<site>] — the feed itself (public
+    // route: the token is the credential). Every refusal is the same 404.
+    if (req.method === "GET" && parts.length === 3 && parts[0] === "feeds" && parts[1] === "calendar") {
+      const m = /^([A-Za-z0-9_-]{43})\.ics$/.exec(parts[2]);
+      const p = m ? calendarFeedPrincipal(m[1]) : null;
+      if (!p) return json(res, 404, { error: "no such calendar feed" });
+      if (tenantMigrationRefuses(p, { cls: "filtered", pattern: "/feeds/calendar/:token" })) {
+        res.setHeader("Retry-After", "30");
+        return json(res, 503, { error: "this hub is moving its existing data into its owner's tenant — try again shortly" });
+      }
+      const org = url.searchParams.get("org");
+      const body = calendarFeedIcs(p, org === null || org === "" ? null : org.slice(0, 300));
+      if (body === null) return json(res, 404, { error: "no such calendar feed" });
+      res.writeHead(200, { "Content-Type": "text/calendar; charset=utf-8", "Cache-Control": "private, no-cache",
+        "Content-Disposition": 'inline; filename="turma.ics"', "X-Robots-Tag": "noindex", "Referrer-Policy": "no-referrer" });
+      return res.end(body);
     }
 
     // Login form (public). Already-authenticated visitors skip straight in.
