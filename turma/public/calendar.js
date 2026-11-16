@@ -733,6 +733,21 @@ function whenText(ev) {
 function linesHtml(t) {
   return typeof t === "string" && t.trim() ? t.trim().split(/\r?\n/).map(esc).join("<br>") : "";
 }
+// A Turma event's invitations (XERK-2989): which org's Outlook sends them, the options,
+// and a tally of the answers the hub read off that copy. "" when it sends none.
+function invitesText(ev) {
+  // A series is not written to Outlook yet (XERK-2986), so it sends nothing either.
+  if (ev.sendInvites !== true || ev.private === true || ev.recurring === true) return "";
+  const orgs = evOrgs(ev);
+  const bits = [orgs.length ? `Sent from ${orgLabel(orgs[0])}'s Outlook` : "Sent from Outlook"];
+  if (ev.responseRequested === false) bits.push("no responses requested");
+  if (ev.allowForward === false) bits.push("forwarding off");
+  const n = {};
+  for (const a of Array.isArray(ev.attendees) ? ev.attendees : []) if (a && RESPONSE[a.response]) n[a.response] = (n[a.response] || 0) + 1;
+  const tally = ["accepted", "tentative", "declined", "notResponded"].filter((k) => n[k]).map((k) => `${n[k]} ${RESPONSE[k].toLowerCase()}`);
+  if (tally.length) bits.push(tally.join(", "));
+  return bits.join(" · ");
+}
 function attendeesHtml(list) {
   const rows = list.filter((a) => a && typeof a === "object" && (a.name || a.email)).map((a) => {
     const who = a.name ? String(a.name) : String(a.email);
@@ -829,6 +844,7 @@ function detailHtml(ev, now, hasPanel = false) {
     const one = olk.length === 1;
     row("Outlook", olk.map((x) => `<span class="cal-olk-row ${x.state}">${one ? "" : `${esc(orgLabel(x.org))}: `}${esc(x.text)}</span>`).join(""), true);
   }
+  if (turma) row("Invitations", invitesText(ev));
   const cats = (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string" && c);
   if (cats.length) row("Categories", cats.map((c) => `<span class="cal-cat">${esc(c)}</span>`).join(""), true);
   const join = safeHttps(ev.joinUrl);
@@ -1400,6 +1416,7 @@ function blankForm(startMs, endMs, orgs = []) {
   return { subject: "", startDate: ymdOf(s), startTime: `${pad(s.h)}:${pad(s.mi)}`, endDate: ymdOf(e),
     endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay: false, timeZone: tz, location: "", online: false, joinUrl: "",
     body: "", busy: "busy", category: "", priv: false, sensitivity: "normal", orgs: orgs.slice(0, ORGS_MAX),
+    invites: false, reqResp: true, allowFwd: true,
     required: [], optional: [], reqDraft: "", optDraft: "", repeat: blankRepeat() };
 }
 // The form for an event the hub served: its wall times in the zone it was made in.
@@ -1418,6 +1435,7 @@ function formFromEvent(ev) {
     body: typeof ev.body === "string" ? ev.body : "", busy: Object.prototype.hasOwnProperty.call(SHOW_AS, ev.busy) ? ev.busy : "busy",
     category: (Array.isArray(ev.categories) ? ev.categories : []).filter((c) => typeof c === "string").join(", "),
     priv: sens === "private" || sens === "confidential", sensitivity: sens, orgs: evOrgs(ev).slice(0, ORGS_MAX),
+    invites: ev.sendInvites === true, reqResp: ev.responseRequested !== false, allowFwd: ev.allowForward !== false,
     required: att.filter((a) => a.role === "required").map(({ name, email }) => ({ name, email })),
     optional: att.filter((a) => a.role === "optional").map(({ name, email }) => ({ name, email })),
     reqDraft: "", optDraft: "", repeat: repeatFromRule(ev.recurrence) };
@@ -1631,7 +1649,8 @@ function formPayload(f, version, scope) {
   const body = { orgs: f.orgs.slice(), subject: String(f.subject || "").trim(), start: t.start, end: t.end, timeZone: f.timeZone,
     allDay: !!f.allDay, location: String(f.location || "").trim(), body: String(f.body || ""), attendees,
     joinUrl: f.online ? String(f.joinUrl || "").trim() : "", isOnlineMeeting: !!f.online, busy: f.busy,
-    categories: categoriesOf(f), sensitivity: f.priv ? keepPriv : (f.sensitivity === "personal" ? "personal" : "normal") };
+    categories: categoriesOf(f), sensitivity: f.priv ? keepPriv : (f.sensitivity === "personal" ? "personal" : "normal"),
+    sendInvites: !!f.invites, responseRequested: f.reqResp !== false, allowForward: f.allowFwd !== false };
   if (scope !== "occurrence") body.recurrence = ruleFromRepeat(f.repeat, repDay(f));
   if (version !== undefined) body.version = version;
   if (scope) body.scope = scope;
@@ -1805,6 +1824,7 @@ function editorHtml() {
         + `<input type="text" data-ed-field="${d}" data-ed-chipin="${role}" placeholder="${role === "required" ? "Invite people" : "Optional attendees"} (name@example.com)"`
         + ` aria-label="${role === "required" ? "Required" : "Optional"} attendees" value="${esc(f[d])}"${inv(d)}></div></div>${fieldErr(d)}`;
     }).join("")
+    + invitesRowHtml(f, one)
     + `<div class="cal-ed-row"><span class="k">Starts</span><div class="cal-ed-when">`
     + `<input type="date" data-ed-field="startDate" aria-label="Start date" value="${esc(f.startDate)}"${inv("start")}>`
     + (f.allDay ? "" : `<input type="time" data-ed-field="startTime" step="300" aria-label="Start time" value="${esc(f.startTime)}"${inv("start")}>`)
@@ -1831,6 +1851,20 @@ function editorHtml() {
     + (ed.err ? `<div class="mt-err cal-ed-err" role="alert">${esc(ed.err)}</div>` : "")
     + `<div class="cal-ed-foot"><button type="button" data-ed-cancel>Cancel</button>`
     + `<button type="button" class="primary" data-ed-save${dis}>${ed.busy ? "Saving…" : ed.mode === "edit" ? "Save" : "Save event"}</button></div>`;
+}
+// Invitations (XERK-2989): sent from the first org's Outlook, so attendees get one each.
+// The event's, never one occurrence's: "This event" shows them disabled.
+function invitesRowHtml(f, one) {
+  const off = one ? ' disabled aria-describedby="calEdOneNote"' : "";
+  return `<div class="cal-ed-row"><span class="k">Invitations</span><div class="cal-ed-when">`
+    + `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="invites"${f.invites ? " checked" : ""}${off}> Send invitations from Outlook</label>`
+    + (f.invites ? `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="reqResp"${f.reqResp ? " checked" : ""}${off}> Request responses</label>`
+      + `<label class="cal-ed-check"><input type="checkbox" data-ed-flag="allowFwd"${f.allowFwd ? " checked" : ""}${off}> Allow forwarding</label>` : "")
+    + `</div></div>`
+    + (f.invites ? `<div class="cal-ed-row"><span class="k"></span><span class="cal-dnote cal-ed-note">`
+      + esc(f.priv ? "A private event sends no invitations: its details are withheld from Outlook."
+        : "Sent once, from the Outlook host of the event's first org; updates and a delete reach the attendees too.")
+      + `</span></div>` : "");
 }
 // The editor's summary line: a split count series' count is the whole run's, and says so.
 function editorSummary(f) {
@@ -2349,7 +2383,7 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
-  detailHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
+  detailHtml, invitesText, invitesRowHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
   _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
   _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },

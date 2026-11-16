@@ -830,7 +830,20 @@ _FAKE_WRITE_OUTLOOK = r"""
       Sensitivity = 0; Categories = ''; AllDayEvent = $false; ReminderSet = $true
       StartTimeZone = $null; EndTimeZone = $null; StartInStartTimeZone = $null; EndInEndTimeZone = $null
       StartUTC = [datetime]'2026-11-18T12:00:00'; EndUTC = [datetime]'2026-11-18T13:00:00'
-      LastModificationTime = [datetime]'2026-11-16T09:30:00'; props = @{}; Parent = $script:cal }
+      LastModificationTime = [datetime]'2026-11-16T09:30:00'; props = @{}; Parent = $script:cal
+      MeetingStatus = 0; ResponseRequested = $true; mapi = @{} }
+    # Recipients (XERK-2989): a 1-based list, as Outlook's.
+    $rl = [pscustomobject]@{ list = (New-Object System.Collections.ArrayList) }
+    $rl | Add-Member ScriptProperty Count { $this.list.Count }
+    $rl | Add-Member ScriptMethod Item { param($i) $this.list[$i - 1] }
+    $rl | Add-Member ScriptMethod Remove { param($i) $this.list.RemoveAt($i - 1) }
+    $rl | Add-Member ScriptMethod Add { param($a)
+      $r = [pscustomobject]@{ Address = $a; Type = 1; AddressEntry = $null }; [void]$this.list.Add($r); $r }
+    $rl | Add-Member ScriptMethod ResolveAll { $true }
+    $it | Add-Member NoteProperty Recipients $rl
+    $pa = [pscustomobject]@{ owner = $it }
+    $pa | Add-Member ScriptMethod SetProperty { param($k, $v) $this.owner.mapi[$k] = $v }
+    $it | Add-Member NoteProperty PropertyAccessor $pa
     $up = [pscustomobject]@{ owner = $it }
     $up | Add-Member ScriptMethod Find { param($k) $this.owner.props[$k] }
     $up | Add-Member ScriptMethod Add { param($k, $t, $f)
@@ -843,15 +856,22 @@ _FAKE_WRITE_OUTLOOK = r"""
       $z = [TimeZoneInfo]::FindSystemTimeZoneById($this.StartTimeZone.ID)
       $this.StartInStartTimeZone = [TimeZoneInfo]::ConvertTimeFromUtc($this.StartUTC, $z)
       $st = ''; if ($this.props['TurmaId']) { $st = $this.props['TurmaId'].Value }
+      $sent = ''; if ($this.props['TurmaSent']) { $sent = $this.props['TurmaSent'].Value }
       [Console]::Error.WriteLine('SAVE ' + (ConvertTo-Json -Compress -InputObject @{
         id = $this.EntryID; stamp = $st; subject = $this.Subject; location = $this.Location
         body = $this.Body; busy = $this.BusyStatus; sens = $this.Sensitivity; cats = $this.Categories
         allDay = $this.AllDayEvent; reminder = $this.ReminderSet; tz = $this.StartTimeZone.ID
         wall = $this.StartInStartTimeZone.ToString('s')
-        startUtc = $this.StartUTC.ToString('s'); endUtc = $this.EndUTC.ToString('s') })) }
+        startUtc = $this.StartUTC.ToString('s'); endUtc = $this.EndUTC.ToString('s')
+        status = $this.MeetingStatus; sent = $sent; resp = $this.ResponseRequested
+        dnf = $this.mapi.Values | Select-Object -First 1
+        to = @($this.Recipients.list | ForEach-Object { "$($_.Address):$($_.Type)" }) })) }
     $it | Add-Member ScriptMethod Delete {
       [Console]::Error.WriteLine("DELETE $($this.EntryID)"); $script:store.Remove($this.EntryID) }
-    $it | Add-Member ScriptMethod Send { [Console]::Error.WriteLine("SEND $($this.EntryID)"); throw 'SENT' }
+    $it | Add-Member ScriptMethod Send {
+      if ($script:failSend -or ($this.Subject -eq 'Boom' -and $this.MeetingStatus -eq 1)) { throw 'The send failed.' }
+      [Console]::Error.WriteLine("SEND $($this.EntryID) status=$($this.MeetingStatus) to=" +
+        (@($this.Recipients.list | ForEach-Object { $_.Address }) -join ',')) }
     $it
   }
   $mine = NewItem 'U1'; $mine.Subject = 'My own lunch'; $script:store['U1'] = $mine
@@ -873,7 +893,8 @@ _FAKE_WRITE_OUTLOOK = r"""
   $tzs | Add-Member ScriptMethod Item { param($id)
     if ($id -eq 'Russia Time Zone 11') { throw 'no such zone' }
     [pscustomobject]@{ ID = $id } }
-  $ol = [pscustomobject]@{ Session = [pscustomobject]@{}; TimeZones = $tzs }
+  $ol = [pscustomobject]@{ Session = [pscustomobject]@{
+    CurrentUser = [pscustomobject]@{ Address = 'Me@Example.com'; AddressEntry = $null } }; TimeZones = $tzs }
   $ol.Session | Add-Member ScriptMethod GetItemFromID { param($id)
     if ($script:store.Contains($id)) { $script:store[$id] } else { throw 'The operation failed.' } }
   $script:cal.Items = $items
@@ -960,6 +981,104 @@ class CalendarWriteTest(unittest.TestCase):
         self.assertTrue(any(l.startswith("FIND @SQL=\"http://schemas.microsoft.com/mapi/string/"
                                          "{00020329-0000-0000-C000-000000000046}/TurmaId\" = '"
                                          + self.A + "'") for l in err))
+
+    PEOPLE = [{"name": "Ann", "email": "ann@example.com", "role": "required"},
+              {"name": "Bo", "email": "bo@example.com", "role": "optional"}]
+
+    def sends(self, err):
+        return [l for l in err if l.startswith("SEND ")]
+
+    def test_xerk2989_the_sending_copy_sends_once_and_updates_only_on_change(self):
+        inv = dict(sendInvites=True, attendees=self.PEOPLE)
+        got, err, _ = self.run_write([
+            self.up(self.A, **inv),                                  # new: a meeting, sent
+            self.up(self.A, **inv),                                  # a replay: saved, NOT sent
+            self.up(self.A, subject="Plan v2", **inv),               # changed: an update is sent
+            self.up(self.A, subject="Plan v2", sendInvites=True, attendees=self.PEOPLE[:1]),
+        ])
+        self.assertTrue(all(r["ok"] for r in got))
+        self.assertEqual(self.sends(err), ["SEND E1 status=1 to=ann@example.com,bo@example.com",
+                                           "SEND E1 status=1 to=ann@example.com,bo@example.com",
+                                           "SEND E1 status=1 to=ann@example.com"])
+        saves = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual(saves[0]["to"], ["ann@example.com:1", "bo@example.com:2"])
+        self.assertEqual((saves[0]["resp"], saves[0]["dnf"]), (True, False))
+        self.assertTrue(saves[-1]["sent"])                         # the stamp of what went out
+        self.assertEqual(sum(l.startswith("CREATE") for l in err), 1)
+
+    def test_xerk2989_invites_off_cancels_then_writes_a_plain_copy(self):
+        inv = dict(sendInvites=True, attendees=self.PEOPLE)
+        got, err, _ = self.run_write([self.up(self.A, **inv), self.up(self.A, attendees=self.PEOPLE),
+                                      self.up(self.B, **inv), {"op": "delete", "turmaId": self.B, "outlookId": ""}])
+        self.assertTrue(all(r["ok"] for r in got))
+        self.assertIn("SEND E1 status=5 to=ann@example.com,bo@example.com", err)   # a cancellation
+        self.assertIn("DELETE E1", err)
+        plain = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")][2]
+        self.assertEqual((plain["status"], plain["to"], plain["sent"]), (0, [], ""))
+        self.assertNotEqual(got[1]["outlookId"], "E1")
+        # Deleting a sent copy cancels it first.
+        b = got[2]["outlookId"]
+        self.assertIn(f"SEND {b} status=5 to=ann@example.com,bo@example.com", err)
+        self.assertIn(f"DELETE {b}", err)
+
+    def test_xerk2989_no_invitations_for_a_plain_private_or_forward_locked_copy(self):
+        got, err, _ = self.run_write([
+            self.up(self.A, attendees=self.PEOPLE),                                  # not the sender
+            self.up(self.B, sensitivity="private", sendInvites=True, attendees=self.PEOPLE),
+            self.up(self.C, sendInvites=True, attendees=self.PEOPLE, allowForward=False,
+                    responseRequested=False)])
+        self.assertTrue(all(r["ok"] for r in got))
+        a, b, c = [json.loads(l[5:]) for l in err if l.startswith("SAVE ") and '"sent":""' in l][:2] + \
+            [json.loads(l[5:]) for l in err if l.startswith("SAVE ")][-1:]
+        self.assertEqual((a["to"], a["status"], b["to"], b["status"]), ([], 0, [], 0))
+        self.assertEqual((c["dnf"], c["resp"]), (True, False))
+        self.assertEqual(len(self.sends(err)), 1)
+
+    def test_xerk2989_a_failed_send_is_a_failed_row_and_retried(self):
+        cmd = self.up(self.A, sendInvites=True, attendees=self.PEOPLE)
+        script = cli._CALENDAR_WRITE_PS
+        with mock.patch.object(cli, "_CALENDAR_WRITE_PS",
+                               script.replace("$it.Send() } catch {", "$script:failSend = $true; $it.Send() } catch {")):
+            got, err, _ = self.run_write([cmd])
+        self.assertFalse(got[0]["ok"])
+        self.assertIn("did not send the invitations", got[0]["error"])
+        self.assertIn("The send failed.", got[0]["error"])
+        self.assertEqual(json.loads([l for l in err if l.startswith("SAVE ")][-1][5:])["sent"], "")
+
+    def test_xerk2989_qa_a_failed_update_keeps_the_sent_stamp_so_a_delete_still_cancels(self):
+        inv = dict(sendInvites=True, attendees=self.PEOPLE)
+        got, err, _ = self.run_write([self.up(self.A, **inv), self.up(self.A, subject="Boom", **inv),
+                                      {"op": "delete", "turmaId": self.A, "outlookId": ""}])
+        self.assertEqual([r["ok"] for r in got], [True, False, True])
+        self.assertIn("SEND E1 status=5 to=ann@example.com,bo@example.com", err)   # still cancelled
+        self.assertIn("DELETE E1", err)
+
+    def test_xerk2989_qa_the_mailbox_owner_is_never_its_own_recipient(self):
+        inv = dict(sendInvites=True, attendees=self.PEOPLE + [{"email": "me@example.com"}])
+        got, err, _ = self.run_write([self.up(self.A, **inv), self.up(self.A, **inv), self.up(self.A, subject="v2", **inv)])
+        self.assertTrue(all(r["ok"] for r in got))
+        for save in [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]:
+            self.assertEqual(save["to"], ["ann@example.com:1", "bo@example.com:2"])
+
+    def test_xerk2989_qa_only_the_owner_listed_sends_nothing(self):
+        got, err, _ = self.run_write([self.up(self.A, sendInvites=True, attendees=[{"email": "me@example.com"}])])
+        self.assertTrue(got[0]["ok"])
+        self.assertFalse(self.sends(err))
+        (save,) = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual((save["status"], save["to"], save["sent"]), (0, [], ""))
+
+    def test_xerk2989_prepare_types_the_invitation(self):
+        p = cli.prepare_calendar_write(self.up(self.A, sendInvites=True, attendees=[
+            {"email": "ann@example.com", "role": "optional"}, {"email": "ANN@example.com"},
+            {"email": "not-an-email"}, "x"]))["event"]
+        self.assertTrue(p["send"])
+        self.assertEqual(p["attendees"], [{"email": "ann@example.com", "name": "", "type": 2}])
+        self.assertEqual(len(p["sentKey"]), 32)
+        same = cli.prepare_calendar_write(self.up(self.A, sendInvites=True, attendees=[
+            {"email": "ann@example.com", "role": "optional"}]))["event"]
+        self.assertEqual(p["sentKey"], same["sentKey"])
+        none = cli.prepare_calendar_write(self.up(self.A, sendInvites=True, attendees=[]))["event"]
+        self.assertEqual((none["send"], none["sentKey"]), (False, ""))
 
     def test_an_all_day_event_keeps_its_midnights(self):
         got, err, _ = self.run_write([self.up(self.A, allDay=True, start="2026-11-16T00:00:00-05:00",

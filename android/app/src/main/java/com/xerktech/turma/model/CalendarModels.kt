@@ -107,6 +107,11 @@ data class CalendarEvent(
     // calOutlookStates; raw, so a shape this build cannot read shows no state, never a failed decode.
     // null = an older hub: the panel reads as before.
     val outlook: kotlinx.serialization.json.JsonElement? = null,
+    // Invitations (XERK-2989): sent from the first org's Outlook copy; the hub's defaults
+    // (an older hub sends none: no invitations, Outlook's two options).
+    val sendInvites: Boolean = false,
+    val responseRequested: Boolean = true,
+    val allowForward: Boolean = true,
 ) {
     val tenir: Boolean get() = source == "tenir"
 

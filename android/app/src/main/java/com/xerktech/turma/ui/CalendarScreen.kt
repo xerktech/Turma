@@ -1213,6 +1213,7 @@ private fun CalendarDetail(
                 }
             }
             if (ev.turma && !ev.private && ev.sensitivity == "private") DetailRow("Privacy", "Private: only you see its details")
+            if (ev.turma) com.xerktech.turma.core.calInvitesText(ev, orgLabel).takeIf { it.isNotEmpty() }?.let { DetailRow("Invitations", it) }
             val cats = ev.categories.filter { it.isNotEmpty() }
             if (cats.isNotEmpty()) DetailRow("Categories", cats.joinToString(", "))
             // Only a Turma event the hub says this caller may change offers these (XERK-2972);

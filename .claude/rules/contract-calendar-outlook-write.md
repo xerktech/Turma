@@ -76,8 +76,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   the `TurmaId` named property), else create. So a re-sent upsert never makes a second copy.
 - **Stamp**: a `UserProperties` text property `TurmaId` = the turma id, added at create, re-checked
   at every upsert. **Never Categories**: they are visible and user-editable.
-- **No meeting request is sent**: `Save()` only, never `Send()`, no `MeetingItem`; delete is
-  `Delete()` with no cancellation. Sending is XERK-2989's.
+- **Only the sending copy sends** (XERK-2989, below); every other write is `Save()` only, and its
+  delete is `Delete()` with no cancellation.
 - `outlookId` = the item's `EntryID` (what `GetItemFromID` takes). The stamp is the fallback when
   a move between stores changes it.
 - **An item counts as the copy only when its stamp IS the turmaId**, however it was found: a stale or
@@ -93,7 +93,7 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - **A command the CLI refuses never started PowerShell**, so it says nothing about Outlook: it
   never sets `calendar.write`, and one unreadable command never fails the rest of its batch.
 - **Single events only** until XERK-2986: a non-null `recurrence` is a failed row in words, never a
-  copy of the first instance. Attendees are not written yet (XERK-2989 owns them).
+  copy of the first instance. A non-sending copy carries no recipients.
 - **After a write the worker owes a forced sync of the weeks it touched** (from the saved item's
   `StartUTC`, so a delete re-syncs the week its copy left); wider than 40 weeks → the default window.
 - **`calendar.write` is true only while Outlook answered the last read or write**
@@ -154,7 +154,9 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   `subject`, `startMs`, `endMs`, `allDay`, `location`, `busy` or `sensitivity` differ from what
   the record maps to (the withheld values for a private record), is re-written: an upsert at the
   record's version, state `pending`. Body, attendees and categories are not compared (Outlook
-  reformats a body; XERK-2989 owns attendees).
+  reformats a body; the sending copy's recipients are its own).
+  - **The sending copy's `lastModified` is not compared** (XERK-2989): every attendee answer
+    Outlook tracks on it moves it, so each response would re-write the copy.
 - **Missing**: a `written` single event whose start lies in a good sync row's window with no
   stamped event in that row was deleted by the user in Outlook. It is re-created (upsert with
   `outlookId: ""`) and `recreatedAt` is stamped, so the client can say "re-created in Outlook".
@@ -178,7 +180,8 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 | `busy` | `BusyStatus`: free 0, tentative 1, busy 2, outOfOffice 3, workingElsewhere 4 |
 | `sensitivity` | `Sensitivity`: normal 0, personal 1, private 2, confidential 3 |
 | `categories` | `Categories`, joined by the locale's list separator |
-| `attendees` | `Recipients.Add(email or name)`, `Type` olRequired 1 / olOptional 2; `MeetingStatus` olMeeting only when any, never sent |
+| `attendees` | the sending copy only: `Recipients` synced to them (`Type` olRequired 1 / olOptional 2), `MeetingStatus` olMeeting |
+| `sendInvites`, `responseRequested`, `allowForward` | the sending copy only: `Send()`, `ResponseRequested`, `PidNameMeetingDoNotForward` |
 | `recurrence` + `exceptions` | `GetRecurrencePattern()` + per-occurrence edit/delete (XERK-2986) |
 | `isOnlineMeeting`, `createdBy`, `orgs`, `version` | not written |
 | — | `ReminderSet = false` until XERK-2988 defines reminders |
@@ -207,9 +210,50 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 - Drift is compared for single events only; a series is checked for a MISSING occurrence
   (XERK-2986 owns writing series and comparing their occurrences).
 
+## Invitations (XERK-2989)
+
+- Record fields `sendInvites` (default false), `responseRequested`, `allowForward` (default true),
+  after `isOnlineMeeting`. The event's, never an occurrence's: an occurrence PATCH changing one is a
+  400 in words (resending the series' value is fine), and overrides never carry them.
+- **Only `orgs[0]`'s copy sends** (operator decision): the command's `event.sendInvites` is true for
+  that org alone, so an event in N orgs reaches an attendee once. The others are plain appointments.
+  - Its holder's mailbox is the ORGANIZER the attendees see, not necessarily the event's creator.
+  - `orgs[0]` changing (org dropped, 24h grace) cancels from the old copy (its tombstone delete)
+    and sends afresh from the new one: attendees get a cancellation and a new invitation.
+  - A RE-HOMED sending copy re-invites from the new holder's mailbox, and the old copy is cancelled
+    only if its host returns (open: XERK-3010).
+- **A private/confidential event sends nothing**: its attendees are withheld from every copy.
+- Agent (`_CALENDAR_WRITE_PS`): the sending copy is `MeetingStatus` olMeeting with its recipients
+  synced (the mailbox owner's own recipient kept); `Send()` runs only when `sentKey` (a hash of every
+  sent field, `prepare_calendar_write`) differs from the copy's `TurmaSent` property, so a re-sent,
+  re-delivered or repair upsert never mails the attendees again. A failed `Send()` RESTORES the
+  previous stamp (never clears it: an earlier invitation still went out, so a later delete must still
+  cancel it) and fails the row in Outlook's words (retried like any failed write).
+  - The mailbox owner is the organizer: never added as its own recipient, even when listed.
+  - A sent copy's delete, or an upsert no longer sending, is a CANCELLATION (`MeetingStatus` 5,
+    `Send()`) then `Delete()`; the no-longer-sending upsert then writes a fresh plain copy.
+  - Forwarding: `PidNameMeetingDoNotForward` (MS-OXOCAL 2.2.1.51, PS_PUBLIC_STRINGS `DoNotForward`)
+    via `PropertyAccessor`; set TRUE only when forwarding is off (a failure then fails the row).
+  - Unverified on a real Outlook (CI drives a fake object model): removed recipients' cancellation
+    on `Send()`, and `PropertyAccessor` typing the named boolean. Spike them on a host.
+- **Responses**: the reader already reports each recipient's `response`; `GET /api/calendar` serves
+  them on the Turma event's `attendees[].response` from the SENDING copy's synced read-back (its
+  holder's stored event stamped with the record's id; `calTurmaResponses`). `none` reads
+  `notResponded` when responses were requested; `organizer`/`unknown` never ride. Single events only.
+  Clients show them per attendee and tally them on an "Invitations" row (not for a series, which
+  is not written to Outlook until XERK-2986).
+- **Teams link: the pasted `joinUrl` stays.** The Teams Meeting add-in exposes no COM/object-model
+  API; creating a Teams meeting means pressing its ribbon button in a displayed Inspector — UI
+  automation on the user's desktop, which the off-beat writer must never do. Revisit only if
+  Microsoft ships an object-model or Graph-free API for it.
+- An agent predating XERK-2989 ignores `sendInvites` and writes a plain copy (no invitations, no
+  responses); agents self-update, so no capability gate.
+
 ## Tests
 
 - Hub: the `XERK-2985:` cases in `server.test.js`; agent: `TestCalendarWrite` (`test_hub_agent.py`,
   the `xerk2984` cases) and `CalendarWriteTest` (`test_session_cli.py`: the real script under `pwsh`
   against a fake Outlook object model, and `calendar_write_fixture.json`, a reply recorded from it);
   the reader's `turmaId` in `CalendarSyncReaderTest`. `XERK-2986:` cases for recurrence.
+- Invitations: `XERK-2989:` in `server.test.js` and `calendar.test.js`; the `xerk2989` cases in
+  `CalendarWriteTest`; Android `CalendarEventsTest`.

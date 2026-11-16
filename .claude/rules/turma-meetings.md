@@ -324,6 +324,10 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     "in the whole series", `wholeCount`) — `contract-calendar-turma.md`.
   - "This event" disables the orgs and zone (with a note) and sends no `recurrence`: the hub refuses
     an occurrence's own rule, orgs or zone.
+- **Invitations (XERK-2989)**: one "Send invitations from Outlook" switch, its two options only
+  when on, disabled for "This event"; the panel's Invitations row names the sending org and
+  tallies the served answers (`invitesText`; Android `calInvitesText`). Wire:
+  `contract-calendar-outlook-write.md`.
 - **Every repeating event wears `RECUR_SVG`** (Outlook's circling arrows) beside its title and in
   the panel's Repeats row; a Turma series' row reads its summary (`evAnchorYmd`: the original day).
 - Tests: the `XERK-2971:` and `XERK-2973:` cases in `calendar.test.js`; Android `CalendarRepeatTest`.
