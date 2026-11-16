@@ -13578,7 +13578,7 @@ def transcript_tail(path, unsaved=None):
         text = text or ""
         spent += _blocks_weight(blocks)
         row = {
-            "id": entry.get("uuid"),
+            "id": _entry_id(entry),
             "role": _entry_role(entry),
             # NOT clipped. The flat `text` is the text feed and the chat's
             # fallback when an entry carries no blocks; a cap here is what put
@@ -17810,10 +17810,16 @@ def _tool_calls(entries):
     """(uses, results) off transcript entries: uses = [(id, name, input, message
     key)] in file order — the key groups the calls of ONE assistant message
     (Claude Code writes each block of it as its own entry, sharing message.id) —
-    and results = {tool_use_id: (is_error, text)}."""
+    and results = {tool_use_id: (is_error, text)}. Only an `assistant` entry's
+    tool_use and a `user` entry's tool_result count: other entries (e.g.
+    `api-request-blob`) echo old calls, and a tail window that keeps the echo
+    but cuts off its result would report a phantom open call (XERK-2999)."""
     uses, results = [], {}
     for n, entry in enumerate(entries):
-        msg = entry.get("message") if isinstance(entry, dict) else None
+        etype = entry.get("type") if isinstance(entry, dict) else None
+        if etype not in ("assistant", "user"):
+            continue
+        msg = entry.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, list):
             continue
@@ -17822,10 +17828,11 @@ def _tool_calls(entries):
         for block in content:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+            if (etype == "assistant" and block.get("type") == "tool_use"
+                    and isinstance(block.get("id"), str)):
                 uses.append((block["id"], block.get("name") or "", block.get("input"),
                              mkey))
-            elif (block.get("type") == "tool_result"
+            elif (etype == "user" and block.get("type") == "tool_result"
                   and isinstance(block.get("tool_use_id"), str)):
                 body = block.get("content")
                 if isinstance(body, list):
