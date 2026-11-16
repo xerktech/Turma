@@ -320,7 +320,7 @@ Events made IN Turma, owned by the hub. Every child of the epic
 - **Record** (`sanitizeTurmaEvent`, the ONE whitelist: routes, boot restore, HA watch; field
   order fixed, a coerce FIXED POINT): `{id, orgs[], subject, start, end, startMs, endMs,
   timeZone, allDay, location, body, attendees[], joinUrl, isOnlineMeeting, busy, categories,
-  sensitivity, recurrence, exceptions, createdBy, createdAt, updatedAt, version}`.
+  sensitivity, recurrence, exceptions, createdBy, createdAt, updatedAt, version, outlook}`.
   - Text, `start`/`end` (ISO WITH offset), `body` (`CALENDAR_BODY_MAX`), `joinUrl` (https only),
     `categories`, `sensitivity` and attendee `name`/`email` follow `sanitizeCalendarEvent`'s rules.
   - `orgs` 1..`CALENDAR_TURMA_ORGS_MAX` (20) org keys, all of the record's tenant; none = no record.

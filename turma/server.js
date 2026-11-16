@@ -691,6 +691,7 @@ const CALENDAR_EVENTS_FILE = process.env.CALENDAR_EVENTS_FILE || "/data/calendar
 const CALENDAR_HOST_SETTINGS_FILE = process.env.CALENDAR_HOST_SETTINGS_FILE || "/data/calendar-host-settings.json";
 // Events made in Turma (XERK-2968): tenant -> eventId -> record, each in one or more orgs.
 const CALENDAR_TURMA_EVENTS_FILE = process.env.CALENDAR_TURMA_EVENTS_FILE || "/data/calendar-turma-events.json";
+const CALENDAR_OUTLOOK_TOMBSTONES_FILE = process.env.CALENDAR_OUTLOOK_TOMBSTONES_FILE || "/data/calendar-outlook-tombstones.json";
 // Each tenant's Tenir bearer, as its SHA-256 only (XERK-2551).
 const MEETING_TOKENS_FILE = process.env.MEETING_TOKENS_FILE || "/data/meeting-tokens.json";
 const CALENDAR_FEEDS_FILE = process.env.CALENDAR_FEEDS_FILE || "/data/calendar-feeds.json";
@@ -5933,6 +5934,9 @@ function sanitizeCalendarEvent(v) {
     body: meetingText(v.body, CALENDAR_BODY_MAX, true), categories,
     sensitivity: typeof v.sensitivity === "string" && CAL_SENSITIVITY.has(v.sensitivity) ? v.sensitivity : "normal",
     isOnlineMeeting: v.isOnlineMeeting === true,
+    // The `TurmaId` stamp on a copy the hub wrote (XERK-2985); an inline literal of
+    // CAL_TURMA_ID_RE, which is in its TDZ when the boot restore runs this.
+    turmaId: typeof v.turmaId === "string" && /^turma:[0-9a-f]{16}$/.test(v.turmaId) ? v.turmaId : "",
   };
 }
 const calEventOrder = (a, b) => a.startMs - b.startMs || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -5999,7 +6003,7 @@ const persistCalendarHostSettings = registerExternalStore({
 });
 
 // ---- Turma-created events (XERK-2968) ------------------------------------------
-// Events made in Turma, owned by the hub and never written to Outlook: tenant id
+// Events made in Turma, owned by the hub (written to Outlook by XERK-2985): tenant id
 // ("" = untenanted) -> eventId -> record. Keyed by TENANT because one event may
 // belong to several orgs of that tenant. Contract: contract-calendar.md
 // ("Turma-created events").
@@ -6074,6 +6078,7 @@ function sanitizeTurmaEvent(v, t) {
     createdBy: typeof v.createdBy === "string" && CAL_ACTOR_RE.test(v.createdBy) ? v.createdBy : "",
     createdAt: calMs(v.createdAt), updatedAt: calMs(v.updatedAt),
     version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
+    outlook: calOutlookSanitize(v.outlook, orgs, t),
   };
   // Exceptions: original start -> {deleted:true} | an override. Kept only while
   // the key is still an occurrence of the rule, so editing the rule (or moving
@@ -6105,6 +6110,30 @@ function turmaOverride(base, ex, t) {
   if (!keys.length) return null;
   const merged = sanitizeTurmaEvent({ ...base, ...picked, recurrence: null, exceptions: null }, t);
   return merged ? Object.fromEntries(keys.map((k) => [k, merged[k]])) : null;
+}
+// A record's `outlook` (XERK-2985): org -> {host, outlookId, version, state, error?,
+// lastModified?, recreatedAt?, at}, only for orgs the record names, a host of its
+// tenant. Hub-owned. Inline literals only: the boot restore runs this (TDZ).
+function calOutlookSanitize(v, orgs, t) {
+  const out = {};
+  if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+  for (const org of orgs) {
+    const e = Object.hasOwn(v, org) ? v[org] : null;
+    if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+    const host = typeof e.host === "string" && e.host && e.host.length <= 300 && tenantOfKey(e.host) === t ? e.host : "";
+    const state = e.state === "written" || e.state === "failed" ? e.state : "pending";
+    const x = { host, outlookId: meetingText(e.outlookId, 300),
+      version: Number.isSafeInteger(e.version) && e.version >= 0 ? e.version : 0, state };
+    const err = state === "failed" ? meetingText(e.error, 300) : "";
+    if (err) x.error = err;
+    const lm = calIso(e.lastModified);
+    if (lm) x.lastModified = lm;
+    const rc = calMs(e.recreatedAt);
+    if (rc) x.recreatedAt = rc;
+    x.at = calMs(e.at);
+    out[org] = x;
+  }
+  return out;
 }
 function calendarTurmaEventsCoerce(raw) {
   const out = Object.create(null);
@@ -6267,6 +6296,12 @@ function applyCalendarSync(key, row, now) {
   }
   calendarEvents[key] = sanitizeCalendarHost(h);
   calendarEnforceTenant(tenantOfKey(key), now, { key, total, hostDropped: dropped });
+  // Turma wins (XERK-2985): a copy this host holds that drifted or went missing is re-written.
+  try {
+    calOutlookCheckSync(key, from, until, [...incoming.values()], now);
+  } catch (e) {
+    console.error(`calendar write repair failed: ${e && e.message}`);
+  }
   // "events" when the stored events differ: only that can change a capture's link.
   return !prev || JSON.stringify(prev.events) !== JSON.stringify(calendarEvents[key].events) ? "events" : true;
 }
@@ -6293,7 +6328,10 @@ function ingestCalendarSync(key, rows, now = Date.now()) {
 function normalizeCalendarCapability(payload) {
   if (!payload || typeof payload !== "object" || !("calendar" in payload)) return;
   const c = payload.calendar;
-  payload.calendar = c && typeof c === "object" && !Array.isArray(c) ? { available: c.available === true } : null;
+  if (!c || typeof c !== "object" || Array.isArray(c)) { payload.calendar = null; return; }
+  // `write` (XERK-2985): this host writes Turma events into its Outlook. Only a
+  // strict true is kept; absent = an older agent, which would ack and never answer.
+  payload.calendar = c.write === true ? { available: c.available === true, write: true } : { available: c.available === true };
 }
 const calendarCapable = (a) => !!(a && a.calendar && a.calendar.available === true);
 const calendarHostOnline = (a, now) => !!(a && a.lastSeen && now - a.lastSeen < OFFLINE_AFTER_MS);
@@ -6312,11 +6350,23 @@ function queueCalendarSync(key, from, until) {
 // On every beat: fold the outbox, then queue the default window on a reconnect
 // (a first beat, a beat after OFFLINE_AFTER_MS of silence, or the capability
 // just appearing — an agent that updated).
-function calendarOnBeat(key, prev, next, rows, now = Date.now()) {
+function calendarOnBeat(key, prev, next, rows, now = Date.now(), writeRows = null) {
   try {
     ingestCalendarSync(key, rows, now);
   } catch (e) {
     console.error(`calendar ingest failed: ${e && e.message}`);
+  }
+  // Its Outlook writes (XERK-2985): fold the answers, and on a reconnect (or `write`
+  // just appearing) give it every copy still owed and every pending delete.
+  try {
+    ingestCalendarWriteResults(key, writeRows, now);
+    const wasWriter = prev && calWriteCapable(prev) && prev.lastSeen && now - prev.lastSeen <= OFFLINE_AFTER_MS;
+    if (calWriteCapable(next) && !wasWriter) {
+      calOutlookReconcileTenant(tenantOfKey(key), now);
+      calOutlookFlushHost(key, now);
+    }
+  } catch (e) {
+    console.error(`calendar write ingest failed: ${e && e.message}`);
   }
   // Every event takes its host's org (XERK-2964), so the host's decided org moving (a
   // drift, its recovery) moves all of them: clients re-read, and captures linked to them
@@ -6377,6 +6427,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
   const hosts = [];
   let events = [];
   const tenir = calendarTenirView(p, from, until, orgFilter);
+  const stampHidden = calStampHidden();   // a Turma event's own copy is served as the Turma event (XERK-2985)
   for (const key of [...keys].sort()) {
     if (!principalMayDriveHost(p, key)) continue;
     const a = agents[key];
@@ -6403,6 +6454,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
     const hs = calendarHostSettings[key];
     for (const ev of h.events) {
       if (ev.startMs >= until || ev.endMs < from || (ev.endMs === from && ev.endMs !== ev.startMs)) continue;
+      if (stampHidden(key, ev)) continue;
       const w = calendarEventWire(key, ev, hs);
       if (orgFilter && !orgFilter.has(w.org)) continue;
       const lk = `${tenantOfKey(key)}\u0000${ev.id}`;
@@ -6610,8 +6662,10 @@ const calTurmaBytes = (rec) => Buffer.byteLength(JSON.stringify(rec));
 
 // The served form for principal `p`; `served` = the orgs still decided.
 function turmaEventWire(p, rec, served = rec.orgs) {
-  const { exceptions, ...fields } = rec;   // a series' exceptions ride its occurrences, never the wire
+  // A series' exceptions ride its occurrences, never the wire; nor do its copies' hosts and ids.
+  const { exceptions, outlook, ...fields } = rec;
   const out = { source: "turma", host: "", ...fields, orgs: served, org: served[0] || "",
+    outlook: calOutlookWire(outlook, served),
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
     editable: calTurmaMayEdit(p, rec) && !calTurmaWithheld(p, rec), meeting: calendarLinkCandidate(rec) };
   if (calTurmaWithheld(p, rec)) {
@@ -6808,7 +6862,9 @@ function turmaEventCapError(t, rec) {
 const calPick = (b) => Object.fromEntries(CAL_TURMA_FIELDS.filter((k) => k in b).map((k) => [k, b[k]]));
 function calTurmaStore(t, rec) {
   if (!calendarTurmaEvents[t]) calendarTurmaEvents[t] = Object.create(null);
+  const before = Object.hasOwn(calendarTurmaEvents[t], rec.id) ? calendarTurmaEvents[t][rec.id] : null;
   calendarTurmaEvents[t][rec.id] = rec;
+  calOutlookAfterWrite(t, before, rec);  // queue its Outlook copies (XERK-2985)
   persistCalendarTurmaEvents();
   broadcastCalendarSoon(calTurmaFrameKey(t));
   scheduleCalendarRelink(t);  // captures may now link to it, or leave it (XERK-2970)
@@ -7007,7 +7063,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     exceptions[f.key] = own;
   }
   const next = sanitizeTurmaEvent({ ...f.rec, start: calIsoZ(f.occ.startMs), end: calIsoZ(f.occ.endMs), ...fields,
-    orgs, recurrence: rule, exceptions, id: calTurmaMintId(f.t), createdAt: now, updatedAt: now, version: 1 }, f.t);
+    orgs, recurrence: rule, exceptions, id: calTurmaMintId(f.t), createdAt: now, updatedAt: now, version: 1,
+    outlook: {} }, f.t);
   if (!next) return { status: 400, body: { error: "end must not be before start" } };
   const se = turmaSeriesError(next, !!rule);
   if (se) return { status: 400, body: { error: se } };
@@ -7052,6 +7109,7 @@ function deleteTurmaEvent(p, id, scope, now = Date.now()) {
   if (sc.scope === "series") {
     if (calTurmaDropsPrivate(p, f.rec)) return CAL_TURMA_DROP_PRIVATE_REFUSAL;
     delete calendarTurmaEvents[f.t][f.rec.id];
+    calOutlookAfterWrite(f.t, f.rec, null, now);  // every copy is deleted (XERK-2985)
     if (!Object.keys(calendarTurmaEvents[f.t]).length) delete calendarTurmaEvents[f.t];
     persistCalendarTurmaEvents();
     broadcastCalendarSoon(calTurmaFrameKey(f.t));
@@ -7115,6 +7173,7 @@ function calendarTurmaTick(now = Date.now()) {
       if (keep.length) bucket[id] = sanitizeTurmaEvent({ ...rec, orgs: keep, updatedAt: Math.max(now, rec.updatedAt),
         version: rec.version + 1 }, t);
       else delete bucket[id];
+      calOutlookAfterWrite(t, rec, bucket[id] || null, now);  // the dropped org's copy goes (XERK-2985)
     }
     if (!Object.keys(bucket).length) delete calendarTurmaEvents[t];
     if (touched) { broadcastCalendarSoon(calTurmaFrameKey(t)); scheduleCalendarRelink(t); }
@@ -7122,6 +7181,387 @@ function calendarTurmaTick(now = Date.now()) {
   for (const o of calTurmaOrgGoneAt.keys()) if (!seen.has(o)) calTurmaOrgGoneAt.delete(o);
   if (changed) persistCalendarTurmaEvents();
   return changed;
+}
+
+// ---- Turma events written to Outlook (XERK-2985) --------------------------------
+// One host per org writes a Turma event's copy into its Outlook (`writeCalendarEvent`),
+// answers on its `calendarWriteResults` outbox, and the hub keeps each copy's state on
+// the record (`outlook`). Turma wins: a drifted or deleted copy is re-written. Contract:
+// .claude/rules/contract-calendar-outlook-write.md.
+const CALENDAR_WRITE_REHOME_MS = 2 * 3600e3;       // a holder gone this long loses the copy
+const CALENDAR_WRITE_RESULT_MS = 10 * 60e3;        // a sent write unanswered this long is re-sent
+const CALENDAR_WRITE_RETRY_MS = 3600e3;            // a failed write retries this often
+const CALENDAR_WRITE_REPAIR_MIN_MS = 10 * 60e3;    // per copy, between drift/missing repairs
+const CALENDAR_WRITE_ROWS_MAX = 50;                // result rows read per beat
+const CALENDAR_WRITE_INFLIGHT_MAX = 50;            // undelivered writes queued per host at once
+const CALENDAR_WRITE_TICK_MS = 60e3;               // the leader's full reconcile, at most this often
+const CALENDAR_WRITE_MEMO_MAX = 20000;             // the in-memory sent/repair/org-loss maps
+const CALENDAR_TOMBSTONES_MAX = 1500;              // per host, oldest dropped first
+const CAL_WRITE_WITHHELD = { subject: "Private event", body: "", location: "", attendees: [], joinUrl: "" };
+const calWriteCapable = (a) => !!(a && a.calendar && a.calendar.available === true && a.calendar.write === true);
+// In memory: a restart forgets them, and the first pass re-sends what is still pending
+// (the agent's upsert is idempotent, so that is safe).
+const calWriteSent = new Map();       // host\0turmaId -> {at, version, op, failed?}
+const calWriteOrgLostAt = new Map();  // host\0org -> when the holder first read out of the org
+const calWriteRepairAt = new Map();   // tenant\0turmaId\0org -> the last repair
+const calMemoSet = (m, k, v) => {
+  m.delete(k);
+  m.set(k, v);
+  if (m.size > CALENDAR_WRITE_MEMO_MAX) m.delete(m.keys().next().value);
+};
+
+// Whether `key` may keep tenant `t`'s copy for `org`: registered, still writing, not
+// offline for CALENDAR_WRITE_REHOME_MS, and decided into the org (a drift out of it
+// is tolerated for that long too, so a brief one re-homes nothing).
+function calWriteHolderOk(key, t, org, now) {
+  const a = agents[key];
+  if (!a || tenantOfKey(key) !== t || !calWriteCapable(a)) return false;
+  if (!a.lastSeen || now - a.lastSeen >= CALENDAR_WRITE_REHOME_MS) return false;
+  const lk = `${key}\u0000${org}`;
+  if (decidedOrgOf(a) === org) { calWriteOrgLostAt.delete(lk); return true; }
+  if (!calWriteOrgLostAt.has(lk)) calMemoSet(calWriteOrgLostAt, lk, now);
+  return now - calWriteOrgLostAt.get(lk) < CALENDAR_WRITE_REHOME_MS;
+}
+// A NEW writer for `org`: an online writing host of the tenant decided into it, one
+// with no calendar error first, then the smallest key (two passes never pick two).
+function calWritePick(t, org, now, memo) {
+  const mk = `${t}\u0000${org}`;
+  if (memo && memo.has(mk)) return memo.get(mk);
+  let best = null;
+  for (const [k, a] of Object.entries(agents)) {
+    if (tenantOfKey(k) !== t || decidedOrgOf(a) !== org || !calWriteCapable(a) || !calendarHostOnline(a, now)) continue;
+    const err = calendarEvents[k] && calendarEvents[k].lastError ? 1 : 0;
+    if (!best || err < best.err || (err === best.err && k < best.k)) best = { k, err };
+  }
+  const pick = best ? best.k : "";
+  if (memo) memo.set(mk, pick);
+  return pick;
+}
+// The record's fields the agent maps onto an AppointmentItem; a private/confidential
+// record (or occurrence) withheld, since the holder's mailbox owner is not its owner.
+function calWriteEvent(rec) {
+  const hide = (s) => CAL_TURMA_HIDDEN.has(s);
+  const exceptions = {};
+  for (const [k, x] of Object.entries(rec.exceptions)) {
+    exceptions[k] = !x.deleted && hide(x.sensitivity ?? rec.sensitivity) ? { ...x, ...CAL_WRITE_WITHHELD } : x;
+  }
+  const ev = { subject: rec.subject, start: rec.start, end: rec.end, timeZone: rec.timeZone, allDay: rec.allDay,
+    location: rec.location, body: rec.body, attendees: rec.attendees, joinUrl: rec.joinUrl, busy: rec.busy,
+    categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions };
+  return hide(rec.sensitivity) ? { ...ev, ...CAL_WRITE_WITHHELD } : ev;
+}
+// Whether a write of `op` at `version` for (host, turmaId) is still in flight: sent
+// under CALENDAR_WRITE_RESULT_MS ago (a failed delete waits CALENDAR_WRITE_RETRY_MS).
+function calWriteInFlight(key, turmaId, version, op, now) {
+  const s = calWriteSent.get(`${key}\u0000${turmaId}`);
+  return !!s && s.op === op && s.version === version &&
+    now - s.at < (s.failed ? CALENDAR_WRITE_RETRY_MS : CALENDAR_WRITE_RESULT_MS);
+}
+// Queue one write to an online writing host: at most one undelivered per (host,
+// turmaId) — a newer one replaces it in place, a delete an upsert and vice versa —
+// and at most CALENDAR_WRITE_INFLIGHT_MAX undelivered per host (the rest wait a pass).
+function queueCalendarWrite(key, cmd, now) {
+  const a = agents[key];
+  if (!a || !calWriteCapable(a) || !calendarHostOnline(a, now)) return null;
+  const list = a.commands || [];
+  let undelivered = 0;
+  let replaced = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const c = list[i];
+    if (!c || c.type !== "writeCalendarEvent" || c.deliveredAt) continue;
+    if (c.turmaId === cmd.turmaId) { list.splice(i, 1); replaced = true; } else undelivered++;
+  }
+  if (!replaced && undelivered >= CALENDAR_WRITE_INFLIGHT_MAX) return null;
+  const id = queueCommand(key, cmd);
+  calMemoSet(calWriteSent, `${key}\u0000${cmd.turmaId}`, { at: now, version: cmd.version, op: cmd.op });
+  return id;
+}
+
+// Tombstones: a copy no record names any more (record deleted, org dropped, copy
+// re-homed), deleted from that host's Outlook when it is next online.
+function calOutlookTombstonesCoerce(raw) {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [k, list] of Object.entries(raw).slice(0, 2000)) {
+    if (!k || k.length > 300 || !Array.isArray(list)) continue;
+    const t = tenantOfKey(k);
+    const seen = new Set();
+    const keep = [];
+    for (const x of list.slice(-CALENDAR_TOMBSTONES_MAX)) {
+      if (!x || typeof x !== "object" || Array.isArray(x)) continue;
+      const turmaId = typeof x.turmaId === "string" && CAL_TURMA_ID_RE.test(x.turmaId) ? x.turmaId : "";
+      const org = typeof x.org === "string" && x.org && x.org.length <= 200 && tenantOfSite(x.org) === t ? x.org : "";
+      if (!turmaId || !org || seen.has(turmaId)) continue;
+      seen.add(turmaId);
+      keep.push({ turmaId, org, outlookId: meetingText(x.outlookId, 300), at: calMs(x.at) });
+    }
+    if (keep.length) out[k] = keep;
+  }
+  return out;
+}
+let calendarOutlookTombstones = calOutlookTombstonesCoerce(readJsonFile(CALENDAR_OUTLOOK_TOMBSTONES_FILE));
+const persistCalendarOutlookTombstones = registerExternalStore({
+  name: "calendarOutlookTombstones", file: CALENDAR_OUTLOOK_TOMBSTONES_FILE,
+  coerce: calOutlookTombstonesCoerce, read: () => calendarOutlookTombstones,
+  install: (v) => { calendarOutlookTombstones = v; },
+});
+// Orphan host `key`'s copy of `turmaId` (one per host: a host is in one org), and
+// send its delete now when the host can take it.
+function calTombstoneAdd(key, turmaId, org, outlookId, now) {
+  const list = (calendarOutlookTombstones[key] || []).filter((x) => x.turmaId !== turmaId);
+  list.push({ turmaId, org, outlookId, at: now });
+  calendarOutlookTombstones[key] = list.slice(-CALENDAR_TOMBSTONES_MAX);
+  persistCalendarOutlookTombstones();
+  calOutlookFlushHost(key, now);
+}
+// A copy being given back to its host (re-picked for the record): its tombstone
+// goes, and its outlookId is reused (the upsert then finds the copy).
+function calTombstoneTake(key, turmaId) {
+  const list = calendarOutlookTombstones[key];
+  const i = list ? list.findIndex((x) => x.turmaId === turmaId) : -1;
+  if (i < 0) return null;
+  const [x] = list.splice(i, 1);
+  if (!list.length) delete calendarOutlookTombstones[key];
+  persistCalendarOutlookTombstones();
+  return x;
+}
+function calOutlookFlushHost(key, now) {
+  const list = calendarOutlookTombstones[key];
+  if (!list || !calWriteCapable(agents[key]) || !calendarHostOnline(agents[key], now)) return;
+  for (const x of list) {
+    if (calWriteInFlight(key, x.turmaId, 0, "delete", now)) continue;
+    queueCalendarWrite(key, { type: "writeCalendarEvent", op: "delete", turmaId: x.turmaId, org: baseOfSite(x.org),
+      version: 0, outlookId: x.outlookId }, now);
+  }
+}
+// The ids an Outlook copy's `TurmaId` stamp may name and be hidden for, in tenant
+// `t`: its live Turma records and its hosts' tombstones (a stamp is never trusted
+// across tenants). A stamp naming nothing is served as an Outlook event.
+function calTurmaStampSet(t) {
+  const ids = new Set(Object.keys(calendarTurmaEvents[t] || {}));
+  for (const [k, list] of Object.entries(calendarOutlookTombstones)) {
+    if (tenantOfKey(k) === t) for (const x of list) ids.add(x.turmaId);
+  }
+  return ids;
+}
+// Per-tenant memo of calTurmaStampSet for one read pass.
+function calStampHidden() {
+  const sets = new Map();
+  return (key, ev) => {
+    if (!ev.turmaId) return false;
+    const t = tenantOfKey(key);
+    if (!sets.has(t)) sets.set(t, calTurmaStampSet(t));
+    return sets.get(t).has(ev.turmaId);
+  };
+}
+
+// Bring tenant `t`'s record `rec` in step with Outlook: keep, pick or re-home each
+// org's writer and queue the upserts owed. Mutates rec.outlook (re-coerced, so the
+// record stays a fixed point); returns whether it changed.
+function calOutlookReconcile(t, rec, now, memo) {
+  const before = JSON.stringify(rec.outlook);
+  for (const org of rec.orgs) {
+    let e = rec.outlook[org];
+    if (!e) e = rec.outlook[org] = { host: "", outlookId: "", version: 0, state: "pending", at: now };
+    if (e.host && !calWriteHolderOk(e.host, t, org, now)) {
+      calTombstoneAdd(e.host, rec.id, org, e.outlookId, now);
+      Object.assign(e, { host: "", outlookId: "", state: "pending", at: now });
+      delete e.error;
+      delete e.lastModified;
+    }
+    if (!e.host) {
+      const pick = calWritePick(t, org, now, memo);
+      if (pick) {
+        e.host = pick;
+        const tb = calTombstoneTake(pick, rec.id);
+        if (tb) e.outlookId = tb.outlookId;
+      }
+    }
+    if (e.state === "written" && e.version === rec.version) continue;
+    if (e.version !== rec.version) {
+      // A newer version is owed whatever the last answer was (a record write retries a failure).
+      if (e.state !== "pending") e.at = now;
+      Object.assign(e, { version: rec.version, state: "pending" });
+      delete e.error;
+    }
+    if (!e.host) continue;
+    if (e.state === "failed" && now - e.at < CALENDAR_WRITE_RETRY_MS) continue;
+    if (calWriteInFlight(e.host, rec.id, rec.version, "upsert", now)) continue;
+    const id = queueCalendarWrite(e.host, { type: "writeCalendarEvent", op: "upsert", turmaId: rec.id,
+      org: baseOfSite(org), version: rec.version, outlookId: e.outlookId, event: calWriteEvent(rec) }, now);
+    if (id && e.state === "failed") {
+      Object.assign(e, { state: "pending", at: now });
+      delete e.error;
+    }
+  }
+  rec.outlook = calOutlookSanitize(rec.outlook, rec.orgs, t);
+  return JSON.stringify(rec.outlook) !== before;
+}
+// After a record write (`before` -> `after`, either null): every copy whose org the
+// record no longer names becomes a tombstone, then the rest are reconciled.
+function calOutlookAfterWrite(t, before, after, now = Date.now()) {
+  for (const [org, e] of Object.entries((before && before.outlook) || {})) {
+    if (e.host && !(after && after.orgs.includes(org))) calTombstoneAdd(e.host, before.id, org, e.outlookId, now);
+  }
+  if (after) calOutlookReconcile(t, after, now);
+}
+function calOutlookReconcileTenant(t, now) {
+  const memo = new Map();
+  let n = 0;
+  for (const rec of Object.values(calendarTurmaEvents[t] || {})) if (calOutlookReconcile(t, rec, now, memo)) n++;
+  if (n) {
+    persistCalendarTurmaEvents();
+    broadcastCalendarSoon(calTurmaFrameKey(t));
+  }
+  return n;
+}
+// The leader's pass (on calendarTick, at most every CALENDAR_WRITE_TICK_MS): re-home a
+// copy whose holder is gone, re-send a write left unanswered, retry a failure hourly,
+// send pending deletes, and age tombstones out after CALENDAR_HOST_RETAIN_MS.
+let calOutlookTickAt = 0;
+function calendarOutlookTick(now = Date.now(), force = false) {
+  if (!force && now - calOutlookTickAt < CALENDAR_WRITE_TICK_MS) return 0;
+  calOutlookTickAt = now;
+  let n = 0;
+  for (const t of Object.keys(calendarTurmaEvents)) n += calOutlookReconcileTenant(t, now);
+  let aged = false;
+  for (const [k, list] of Object.entries(calendarOutlookTombstones)) {
+    const keep = list.filter((x) => now - x.at < CALENDAR_HOST_RETAIN_MS);
+    if (keep.length !== list.length) aged = true;
+    if (keep.length) calendarOutlookTombstones[k] = keep;
+    else delete calendarOutlookTombstones[k];
+    if (keep.length) calOutlookFlushHost(k, now);
+  }
+  if (aged) persistCalendarOutlookTombstones();
+  return n;
+}
+// The host's `calendarWriteResults` outbox. A row counts only from the host the
+// entry (or tombstone) names, for that org; one older than the entry's version
+// keeps only its outlookId (the copy exists; a newer upsert is already owed).
+function ingestCalendarWriteResults(key, rows, now = Date.now()) {
+  if (!Array.isArray(rows) || !rows.length) return false;
+  const t = tenantOfKey(key);
+  const bucket = calendarTurmaEvents[t];
+  const touched = new Set();
+  let tombs = false;
+  for (const r of rows.slice(0, CALENDAR_WRITE_ROWS_MAX)) {
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    const turmaId = typeof r.turmaId === "string" && CAL_TURMA_ID_RE.test(r.turmaId) ? r.turmaId : "";
+    if (!turmaId || typeof r.org !== "string" || !r.org || (r.op !== "upsert" && r.op !== "delete")) continue;
+    const org = scopeSite(r.org, t);   // the agent names its org plain
+    const ok = r.ok === true;
+    const error = ok ? "" : meetingText(r.error, 300) || "Outlook did not say why the write failed";
+    const sk = `${key}\u0000${turmaId}`;
+    if (r.op === "delete") {
+      const list = calendarOutlookTombstones[key] || [];
+      const i = list.findIndex((x) => x.turmaId === turmaId && x.org === org);
+      if (i < 0) continue;
+      if (ok || /not found/i.test(error)) {
+        list.splice(i, 1);
+        if (!list.length) delete calendarOutlookTombstones[key];
+        calWriteSent.delete(sk);
+        tombs = true;
+      } else {
+        calMemoSet(calWriteSent, sk, { at: now, version: 0, op: "delete", failed: true });
+      }
+      continue;
+    }
+    const rec = bucket && Object.hasOwn(bucket, turmaId) ? bucket[turmaId] : null;
+    const e = rec && Object.hasOwn(rec.outlook, org) ? rec.outlook[org] : null;
+    if (!e || e.host !== key) continue;
+    const version = Number.isSafeInteger(r.version) ? r.version : -1;
+    const outlookId = ok ? meetingText(r.outlookId, 300) : "";
+    if (version < e.version) {
+      if (outlookId && outlookId !== e.outlookId) { e.outlookId = outlookId; touched.add(rec); }
+      continue;
+    }
+    if (version > e.version) continue;
+    calWriteSent.delete(sk);
+    if (ok) {
+      Object.assign(e, { outlookId: outlookId || e.outlookId, state: "written", at: now });
+      delete e.error;
+      const lm = calIso(r.lastModified);
+      if (lm) e.lastModified = lm;
+    } else {
+      Object.assign(e, { state: "failed", error, at: now });
+    }
+    touched.add(rec);
+  }
+  if (tombs) persistCalendarOutlookTombstones();
+  if (!touched.size) return tombs;
+  for (const rec of touched) rec.outlook = calOutlookSanitize(rec.outlook, rec.orgs, t);
+  persistCalendarTurmaEvents();
+  broadcastCalendarSoon(calTurmaFrameKey(t));
+  return true;
+}
+// Turma wins (on a GOOD sync row of host `key` for [from, until)): a copy this host
+// holds as written that drifted from what the record maps to, or that is missing from
+// the window, is re-written — at most once per copy per CALENDAR_WRITE_REPAIR_MIN_MS.
+function calOutlookCheckSync(key, from, until, events, now) {
+  const t = tenantOfKey(key);
+  const bucket = calendarTurmaEvents[t];
+  if (!bucket) return false;
+  const stamped = new Map();
+  for (const ev of events) if (ev.turmaId) (stamped.get(ev.turmaId) || stamped.set(ev.turmaId, []).get(ev.turmaId)).push(ev);
+  let n = 0;
+  for (const rec of Object.values(bucket)) {
+    let repaired = false;
+    for (const [org, e] of Object.entries(rec.outlook)) {
+      if (e.host !== key || e.state !== "written" || e.version !== rec.version) continue;
+      const rk = `${t}\u0000${rec.id}\u0000${org}`;
+      if (now - (calWriteRepairAt.get(rk) || 0) < CALENDAR_WRITE_REPAIR_MIN_MS) continue;
+      const copies = stamped.get(rec.id) || [];
+      let missing = false;
+      let drift = false;
+      if (copies.length) {
+        // A series' occurrences are compared by XERK-2986; a single copy here.
+        drift = !rec.recurrence && copies.some((c) => calOutlookDrifted(rec, e, c));
+      } else if (!rec.recurrence) {
+        missing = rec.startMs >= from && rec.startMs < until;
+      } else {
+        eachTurmaOccurrence(rec, from, until, (o) => {
+          const s = turmaOccurrenceRecord(rec, o, rec.exceptions[o.key]).startMs;
+          if (s >= from && s < until) { missing = true; return false; }
+          return true;
+        });
+      }
+      if (!missing && !drift) continue;
+      calMemoSet(calWriteRepairAt, rk, now);
+      calWriteSent.delete(`${key}\u0000${rec.id}`);
+      Object.assign(e, { state: "pending", at: now });
+      if (missing) Object.assign(e, { outlookId: "", recreatedAt: now });
+      repaired = true;
+    }
+    if (repaired) { calOutlookReconcile(t, rec, now); n++; }
+  }
+  if (n) {
+    persistCalendarTurmaEvents();
+    broadcastCalendarSoon(calTurmaFrameKey(t));
+  }
+  return n > 0;
+}
+// A stored copy `c` no longer reads as record `rec` maps to (withheld when private):
+// edited in Outlook after our write, or one of the compared fields moved.
+function calOutlookDrifted(rec, e, c) {
+  if (e.lastModified && c.lastModified && Date.parse(c.lastModified) > Date.parse(e.lastModified)) return true;
+  const hidden = CAL_TURMA_HIDDEN.has(rec.sensitivity);
+  return c.subject !== (hidden ? CAL_WRITE_WITHHELD.subject : rec.subject) || c.startMs !== rec.startMs ||
+    c.endMs !== rec.endMs || c.allDay !== rec.allDay || c.location !== (hidden ? "" : rec.location) ||
+    c.busy !== rec.busy || c.sensitivity !== rec.sensitivity;
+}
+// The per-org write state a client is served (only for the served orgs; never the host or outlookId).
+function calOutlookWire(outlook, served) {
+  const out = {};
+  for (const org of served) {
+    const e = outlook && Object.hasOwn(outlook, org) ? outlook[org] : null;
+    if (!e) continue;
+    const w = { state: e.state };
+    if (e.error) w.error = e.error;
+    if (e.recreatedAt) w.recreatedAt = e.recreatedAt;
+    w.at = e.at;
+    out[org] = w;
+  }
+  return out;
 }
 
 // A host gone from the registry keeps its calendar CALENDAR_HOST_RETAIN_MS past
@@ -7142,6 +7582,7 @@ function calendarTick(now = Date.now()) {
   // An auto link to an event that just went has nothing to hold (XERK-2896).
   for (const t of tenants) scheduleCalendarRelink(t);
   calendarTurmaTick(now);
+  calendarOutlookTick(now);
   return n;
 }
 
@@ -7219,11 +7660,12 @@ function calendarLinkCandidate(ev) {
 // sorted by start, plus the lookup.
 function calendarCandidateIndex(t, captures = []) {
   const list = [];
+  const stamps = calTurmaStampSet(t);   // a Turma event's own Outlook copy is not a second candidate (XERK-2985)
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t) continue;
     const org = calendarEventOrg(key);
     for (const ev of h.events) {
-      if (calendarLinkCandidate(ev)) list.push({ key, ev, org });
+      if (calendarLinkCandidate(ev) && !(ev.turmaId && stamps.has(ev.turmaId))) list.push({ key, ev, org });
     }
   }
   // A Turma event is a candidate for each of its orgs (XERK-2970); calendarBestMatch
@@ -10168,6 +10610,11 @@ registerTenantPurge("calendarTurmaEvents", (t) => {
   persistCalendarTurmaEvents();
   return n;
 });
+registerTenantPurge("calendarOutlookTombstones", (t) => {
+  const n = dropTenantKeys(calendarOutlookTombstones, t);
+  if (n) persistCalendarOutlookTombstones();
+  return n;
+});
 registerTenantPurge("calendarHostSettings", (t) => {
   const n = dropTenantKeys(calendarHostSettings, t);
   if (n) persistCalendarHostSettings();
@@ -10471,6 +10918,23 @@ for (const [name, read, persist] of [
     },
   });
 }
+// A plain host's Outlook tombstones (XERK-2985) move with the host, their orgs re-keyed.
+registerTenantMigration({
+  name: "calendarOutlookTombstones",
+  count: (t, scope) => Object.keys(calendarOutlookTombstones).filter((k) => hostMovable(k, scope)).length,
+  apply: (t, scope) => {
+    const moving = Object.keys(calendarOutlookTombstones).filter((k) => hostMovable(k, scope));
+    for (const k of moving) {
+      const nk = tenantHostKey(k, t);
+      if (!Object.hasOwn(calendarOutlookTombstones, nk)) {
+        calendarOutlookTombstones[nk] = calendarOutlookTombstones[k].map((x) => ({ ...x, org: migrateSiteKey(x.org, t) }));
+      }
+      delete calendarOutlookTombstones[k];
+    }
+    if (moving.length) persistCalendarOutlookTombstones();
+    return moving.length;
+  },
+});
 // An untenanted Turma event (XERK-2968) moves into the tenant when every org on
 // it does, its orgs re-keyed; one also in an org staying behind stays too.
 const calTurmaMovable = (scope) => Object.values(calendarTurmaEvents[""] || {})
@@ -10484,7 +10948,12 @@ registerTenantMigration({
     const src = calendarTurmaEvents[""];
     const dst = calendarTurmaEvents[t] || (calendarTurmaEvents[t] = Object.create(null));
     for (const r of moving) {
-      if (!Object.hasOwn(dst, r.id)) dst[r.id] = { ...r, orgs: r.orgs.map((o) => migrateSiteKey(o, t)) };
+      // Its Outlook copies (XERK-2985) move with it: org and host keys re-keyed.
+      const outlook = Object.fromEntries(Object.entries(r.outlook || {}).map(([o, e]) =>
+        [migrateSiteKey(o, t), { ...e, host: e.host ? tenantHostKey(e.host, t) : "" }]));
+      if (!Object.hasOwn(dst, r.id)) {
+        dst[r.id] = sanitizeTurmaEvent({ ...r, orgs: r.orgs.map((o) => migrateSiteKey(o, t)), outlook }, t) || dst[r.id];
+      }
       delete src[r.id];
     }
     if (!Object.keys(src).length) delete calendarTurmaEvents[""];
@@ -15099,7 +15568,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   // Meetings (XERK-2508): the capability block and the results outbox.
   "meetings", "meetingResults",
   // The Calendar (XERK-2891): the capability block and the sync outbox.
-  "calendar", "calendarSync",
+  "calendar", "calendarSync", "calendarWriteResults",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -23039,10 +23508,12 @@ function dailyBriefCalendar(siteKey, from, meetingAt, timeZone) {
     picked.set(ev.id, { startMs: ev.startMs, endMs: ev.endMs, title,
       with: people.filter(Boolean).slice(0, DAILY_BRIEF_CALENDAR_WITH_MAX) });
   };
+  const stamps = calTurmaStampSet(t);   // listed once, as the Turma event (XERK-2985)
   for (const [key, h] of Object.entries(calendarEvents)) {
     if (tenantOfKey(key) !== t || calendarEventOrg(key) !== siteKey) continue;
     const hs = calendarHostSettings[key];
     for (const ev of h.events) {
+      if (ev.turmaId && stamps.has(ev.turmaId)) continue;
       const w = calendarEventWire(key, ev, hs);
       take(ev, w.subject, w.attendees.filter((p) => p.role !== "organizer" && p.role !== "resource")
         .map((p) => p.name || p.email));
@@ -26840,6 +27311,9 @@ const server = http.createServer(async (req, res) => {
       // Calendar syncs (XERK-2891): folded into the calendar store below.
       const calendarSync = payload.calendarSync;
       delete payload.calendarSync;
+      // Its Outlook writes' answers (XERK-2985): folded into the Turma events below.
+      const calendarWriteResults = payload.calendarWriteResults;
+      delete payload.calendarWriteResults;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -27186,7 +27660,7 @@ const server = http.createServer(async (req, res) => {
       // The host's Outlook calendar (XERK-2891): fold its sync outbox, and queue
       // the default window on a reconnect. Never worth the beat.
       try {
-        calendarOnBeat(key, prev, next, calendarSync, next.lastSeen || Date.now());
+        calendarOnBeat(key, prev, next, calendarSync, next.lastSeen || Date.now(), calendarWriteResults);
       } catch (e) {
         console.error(`calendar beat failed: ${e && e.message}`);
       }
@@ -31200,6 +31674,9 @@ if (process.env.TURMA_TEST) {
     __setCalendarRelinkMinMs: (ms) => { calendarRelinkMinMs = ms; },
     getCalendarEvents: () => calendarEvents, getCalendarHostSettings: () => calendarHostSettings,
     // XERK-2968: Turma-created events.
+    getCalendarOutlookTombstones: () => calendarOutlookTombstones, calOutlookTombstonesCoerce, calendarOutlookTick,
+    ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
+    CALENDAR_WRITE_REPAIR_MIN_MS, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calOutlookTickAt = 0; },
     sanitizeTurmaEvent, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,

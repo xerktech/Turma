@@ -97,10 +97,10 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 
 - `outlook: {<org>: {host, outlookId, version, state, error?, lastModified?, recreatedAt?, at}}`,
   after `version` in `sanitizeTurmaEvent`'s field order, so the coerce stays a FIXED POINT.
-  - `state`: `pending` (queued/sent, no answer for this version) | `written` (an ok row for the
-    record's version) | `failed` (`error` set) | `deleting` (the org was dropped; its delete is
-    in flight, then the entry goes).
-  - An org the record does not name keeps an entry only while `deleting`.
+  - `state`: `pending` (owed or sent, no answer for this version) | `written` (an ok row for the
+    record's version) | `failed` (`error` set).
+  - An org the record does not name keeps NO entry: dropping it turns its copy into a tombstone
+    at once (served state is per served org, so a `deleting` state would never be shown).
   - `at` = the last state change; `recreatedAt` = the last repair that re-created a missing copy.
 - Hub-owned: route bodies cannot set it (dropped like `createdBy`), and a PATCH keeps it.
 - **Served** on `GET /api/calendar` per Turma event as `outlook: {<org>: {state, error?,
@@ -159,6 +159,24 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   that org, not the event's owner, so writing the real fields would leak them.
 - Times round-trip: the reader's `start`/`end` of the copy must equal the record's instants (the
   drift check above relies on it).
+
+## Hub mechanics (XERK-2985, `server.js` "Turma events written to Outlook")
+
+- **One reconcile, `calOutlookReconcile`**, run at every record write (`calTurmaStore`, series
+  DELETE, `calendarTurmaTick`'s org loss, via `calOutlookAfterWrite`), on a writer's reconnect
+  beat (its tenant) and on the leader's `calendarOutlookTick` (≤ once a minute). Never add a
+  second path that queues writes on its own.
+- **Sent/repair/org-loss times are in memory** (`calWriteSent`, bounded): a restart re-sends every
+  pending write once — safe only because the agent's upsert finds before it creates.
+- At most `CALENDAR_WRITE_INFLIGHT_MAX` (50) undelivered writes per host; the rest wait a pass, so
+  a reconnect with 1500 owed copies never floods `queueCommand` (it re-measures the record each call).
+- Queued only to an ONLINE writer; an offline holder keeps its entry `pending` until it beats.
+- Re-picking a host that holds a tombstone for the event takes the tombstone back and reuses its
+  `outlookId`, so (host, turmaId) never has both a delete and an upsert owed.
+- The command's `org` and a result's `org` are converted by hand (`baseOfSite` / `scopeSite`):
+  the beat's `scopeSiteKeys` walk only rewrites fields named `siteKey`.
+- Drift is compared for single events only; a series is checked for a MISSING occurrence
+  (XERK-2986 owns writing series and comparing their occurrences).
 
 ## Tests
 
