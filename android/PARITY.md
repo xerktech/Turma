@@ -233,7 +233,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   → `POST|PATCH|DELETE /api/calendar/events`.
   - A touch that moved is never a create, as on the web (its 10px pointerup check). Platform
     difference: Android also ignores a long press on an empty slot, and its grid scrolls the last
-    hour clear of the FAB (the web's New event is a toolbar button that covers nothing).
+    hour clear of the FAB (the web's New event is a toolbar button that covers nothing); a phone
+    in landscape shows New event in the toolbar, as the web does.
   - Repeat (XERK-2973) is the web's control: the same presets, custom interval / unit / days /
     month mode, end never / on date / after N, and summary (`core/CalendarRepeat.kt`, both clients
     read `turma/tests/fixtures/calendar-repeat-vectors.json`). An occurrence's Edit / Delete asks

@@ -297,6 +297,11 @@ private fun CalendarBody(
     var detailKey by rememberSaveable { mutableStateOf("") }
     var detailLast by remember { mutableStateOf<CalendarEvent?>(null) }
     var scrollTo by remember { mutableStateOf(-1.0) }
+    // The minute at the grid's top, held HERE (rollup XERK-2953): on a phone the detail and the
+    // editor replace the grid, so a scroll remembered inside it came back at 8 AM on every close.
+    // A minute, not pixels: the zoom or the pane can differ when the grid comes back. Negative
+    // until the operator first sees the grid (it then opens at 8 AM). Saveable: a rotation too.
+    var topMin by rememberSaveable { mutableStateOf(-1.0) }
     var picker by rememberSaveable { mutableStateOf(false) }
     var hostSetOpen by rememberSaveable { mutableStateOf(false) }
     // The Turma-event editor (XERK-2972), full screen while open; its state is the view model's.
@@ -370,7 +375,12 @@ private fun CalendarBody(
     }
 
     val grid: @Composable (Modifier) -> Unit = { m ->
-        Box(m) {
+        BoxWithConstraints(m) {
+        // A short, wide pane (a phone in landscape) has room for an hour or two of grid, and a
+        // FAB there covers a column's corner at every scroll (rollup XERK-2953): New event moves
+        // into the toolbar instead.
+        val fabless = maxHeight < maxWidth && maxHeight < CAL_FAB_MIN_HEIGHT
+        val newHere = { newEvent(anchor, calDefaultStart(anchor, cvm.now(), zone)) }
         Column(Modifier.fillMaxSize()) {
             CalToolbar(
                 weekly, mode, days, anchor, cvm.today(), locale,
@@ -381,21 +391,22 @@ private fun CalendarBody(
                 onDay = { go(it) },
                 settingsOpen = hostSetOpen,
                 onSettings = { hostSetOpen = !hostSetOpen },
+                onNew = newHere.takeIf { fabless },
             )
             if (hostSetOpen) HostSettings(range.hostRows, names, cvm)
             CalNotices(range, now, zone, locale)
             WeekGrid(
                 Modifier.weight(1f), weekly, days, before, after, stripRange, now, zone, locale, fleet, keys, names, colors,
                 detailKey = detail?.key, scrollTo = scrollTo, onScrolled = { scrollTo = -1.0 },
+                topMin = topMin, onTopMin = { topMin = it },
                 zoomHours = zoom, onZoom = { h, end -> cvm.setZoom(h, save = end) },
                 onOpen = ::openDetail,
                 onSwipe = { dir -> go(calSwipeStep(anchor, mode, dir)) },
                 onSlot = { d, min -> newEvent(d, calSlotStart(min)) },
             )
         }
-            FloatingActionButton(
-                { newEvent(anchor, calDefaultStart(anchor, cvm.now(), zone)) },
-                Modifier.align(Alignment.BottomEnd).padding(16.dp).testTag("cal-new-event"),
+            if (!fabless) FloatingActionButton(
+                newHere, Modifier.align(Alignment.BottomEnd).padding(16.dp).testTag("cal-new-event"),
             ) { Icon(Icons.Filled.Add, "New event") }
         }
     }
@@ -423,6 +434,8 @@ private fun CalendarBody(
     }
 }
 
+private val CAL_FAB_MIN_HEIGHT = 480.dp
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CalToolbar(
@@ -439,9 +452,12 @@ private fun CalToolbar(
     onDay: (LocalDate) -> Unit,
     settingsOpen: Boolean,
     onSettings: () -> Unit,
+    onNew: (() -> Unit)? = null,
 ) {
-    // The per-host calendar settings toggle (XERK-2929, the web's ⚙).
+    // The per-host calendar settings toggle (XERK-2929, the web's ⚙), after New event when the
+    // pane is too short for the FAB.
     val gear: @Composable () -> Unit = {
+        if (onNew != null) IconButton(onNew, Modifier.testTag("cal-new-event")) { Icon(Icons.Filled.Add, "New event") }
         IconButton(onSettings, Modifier.testTag("cal-settings").semantics { selected = settingsOpen }) {
             Icon(Icons.Outlined.Settings, "Calendar settings")
         }
@@ -584,6 +600,8 @@ private fun WeekGrid(
     detailKey: String?,
     scrollTo: Double,
     onScrolled: () -> Unit,
+    topMin: Double,
+    onTopMin: (Double) -> Unit,
     zoomHours: Float,
     onZoom: (hours: Float, end: Boolean) -> Unit,
     onOpen: (CalendarEvent) -> Unit,
@@ -772,7 +790,15 @@ private fun WeekGrid(
             val slot = calSlotDp(paneDp, zoomHours).dp
             val hourDp = slot * 2
             // The grid opens with 8 AM at the top (its label clear); a reveal scrolls to its event.
-            LaunchedEffect(Unit) { scroll.scrollTo(with(density) { (hourDp * CAL_OPEN_AT_H - 8.dp).roundToPx() }) }
+            // Back from a detail or the editor (or a rotation) it reopens where the operator left it.
+            val slotPxNow by rememberUpdatedState(with(density) { slot.toPx() })
+            LaunchedEffect(Unit) {
+                scroll.scrollTo(
+                    if (topMin >= 0) (slotPxNow * topMin / 30).roundToInt()
+                    else with(density) { (hourDp * CAL_OPEN_AT_H - 8.dp).roundToPx() },
+                )
+                androidx.compose.runtime.snapshotFlow { scroll.value / slotPxNow * 30.0 }.collect { onTopMin(it) }
+            }
             LaunchedEffect(scrollTo) {
                 if (scrollTo >= 0) {
                     scroll.animateScrollTo(with(density) { ((slot * (scrollTo / 30).toFloat()) - hourDp).roundToPx().coerceAtLeast(0) })
