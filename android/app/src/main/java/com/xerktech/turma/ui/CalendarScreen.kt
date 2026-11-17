@@ -336,8 +336,8 @@ private fun CalendarBody(
     val orgOptions = remember(names) {
         names.keys.sorted().map { it to com.xerktech.turma.core.orgName(it, names[it].orEmpty()) }
     }
-    fun newEvent(day: LocalDate, start: java.time.LocalTime) {
-        cvm.openEditor(calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys)))
+    fun newEvent(day: LocalDate, start: java.time.LocalTime, offset: java.time.ZoneOffset? = null) {
+        cvm.openEditor(calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys), offset))
     }
 
     fun go(d: LocalDate) { anchorDay = d.toEpochDay() }
@@ -429,7 +429,8 @@ private fun CalendarBody(
                 zoomHours = zoom, onZoom = { h, end -> cvm.setZoom(h, save = end) },
                 onOpen = ::openDetail,
                 onSwipe = { dir -> go(calSwipeStep(anchor, mode, dir)) },
-                onSlot = { d, t -> newEvent(d, t) },
+                // The tapped instant's offset keeps the second "1 AM" row's pass (XERK-3039).
+                onSlot = { d, t -> newEvent(d, t.toLocalTime(), t.offset) },
             )
         }
             if (!fabless) FloatingActionButton(
@@ -648,7 +649,7 @@ private fun WeekGrid(
     onZoom: (hours: Float, end: Boolean) -> Unit,
     onOpen: (CalendarEvent) -> Unit,
     onSwipe: (Int) -> Unit,
-    onSlot: (LocalDate, java.time.LocalTime) -> Unit,
+    onSlot: (LocalDate, java.time.ZonedDateTime) -> Unit,
 ) {
     val today = calDay(now, zone)
     val gutter = if (wide) 56.dp else 44.dp
@@ -979,7 +980,7 @@ private fun WeekGrid(
                                         if (up != null) {
                                             up.consume()
                                             val m = ((down.position.y / slot.toPx()).toInt() * 30).coerceIn(0, axis.total - 30)
-                                            onSlot(d, java.time.Instant.ofEpochMilli(calGridMs(m, d, zone, axis)).atZone(zone).toLocalTime())
+                                            onSlot(d, java.time.Instant.ofEpochMilli(calGridMs(m, d, zone, axis)).atZone(zone))
                                         }
                                     }
                                 }

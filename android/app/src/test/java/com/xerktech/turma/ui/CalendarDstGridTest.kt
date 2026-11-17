@@ -9,6 +9,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.click
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
 import com.xerktech.turma.harness.HubHarness
@@ -80,6 +82,22 @@ class CalendarDstGridTest {
         compose.onNodeWithTag("cal-scroll").performTouchInput { swipeRight() }; rec("swipe -> Oct 31")
         compose.onNodeWithTag("cal-scroll").performTouchInput { swipeLeft() }; rec("swipe -> Nov 1")
         assertTrue("9 AM drifted from $at: $seen", seen.all { kotlin.math.abs(it.second - at) < 3f })
+    }
+
+    @Test fun `XERK-2932 a tap on the second 1 AM row opens New event in that hour's second pass`() {
+        showDay("America/New_York", LocalDate.of(2026, 11, 1))
+        compose.onNodeWithTag("cal-scroll").performSemanticsAction(SemanticsActions.ScrollBy) { it(0f, -100_000f) }
+        settle()
+        val labels = compose.onAllNodesWithText("1 AM").fetchSemanticsNodes().map { it.positionInRoot.y }.sorted()
+        assertEquals(2, labels.size)
+        val row = labels[1] - labels[0]                       // an hour of grid, the two labels' distance
+        val col = compose.onNodeWithTag("cal-col-2026-11-01").fetchSemanticsNode()
+        val y = labels[1] + row * 0.6f - col.positionInRoot.y // into the EST 1 AM row, below its label
+        compose.onNodeWithTag("cal-col-2026-11-01").performTouchInput { click(Offset(width / 2f, y)) }
+        settle()
+        val d = hub.app.container.calendarEditor.value!!.draft
+        assertEquals(java.time.LocalTime.of(1, 0), d.startTime)
+        assertEquals(java.time.ZoneOffset.ofHours(-5), d.startOffset)
     }
 
     @Test fun `XERK-2932 a day whose midnight is skipped labels its 1 AM top row`() {
