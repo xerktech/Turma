@@ -34,7 +34,6 @@ import com.xerktech.turma.core.calDefaultStart
 import com.xerktech.turma.core.calDraftOf
 import com.xerktech.turma.core.calNewEventDraft
 import com.xerktech.turma.core.calOrgsOf
-import com.xerktech.turma.core.calSlotStart
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -170,7 +169,15 @@ import com.xerktech.turma.core.calStyle
 import com.xerktech.turma.core.calTime
 import com.xerktech.turma.core.calTitle
 import com.xerktech.turma.core.calVisibleDays
-import com.xerktech.turma.core.calWallMinutes
+import androidx.compose.ui.graphics.drawscope.clipRect
+import com.xerktech.turma.core.CalAxis
+import com.xerktech.turma.core.calAxisAt
+import com.xerktech.turma.core.calAxisRemap
+import com.xerktech.turma.core.calGridAxis
+import com.xerktech.turma.core.calGridGaps
+import com.xerktech.turma.core.calGridHours
+import com.xerktech.turma.core.calGridMin
+import com.xerktech.turma.core.calGridMs
 import com.xerktech.turma.core.calWeekStart
 import com.xerktech.turma.core.calWeekdayLabel
 import com.xerktech.turma.core.calWhenText
@@ -305,6 +312,8 @@ private fun CalendarBody(
     val days = calVisibleDays(anchor, mode)
     // Every org, whatever the header's site-wide pick (XERK-3031): the read sends no org filter.
     val keys = emptyList<String>()
+    // The rows the grid draws (XERK-2932): 25 on a fall-back day, 23 on a spring-forward one alone.
+    val axis = remember(days, zone) { calGridAxis(days, zone) }
     LaunchedEffect(days, keys) { cvm.show(days, keys) }
     val range = calCollect(days, zone) { weeks[cvm.weekKey(it, keys)] }
     // The days a swipe slides in, drawn off-screen either side (XERK-2980); they are in the
@@ -327,8 +336,8 @@ private fun CalendarBody(
     val orgOptions = remember(names) {
         names.keys.sorted().map { it to com.xerktech.turma.core.orgName(it, names[it].orEmpty()) }
     }
-    fun newEvent(day: LocalDate, start: java.time.LocalTime) {
-        cvm.openEditor(calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys)))
+    fun newEvent(day: LocalDate, start: java.time.LocalTime, offset: java.time.ZoneOffset? = null) {
+        cvm.openEditor(calNewEventDraft(day, start, zone, calDefaultOrgs(keys, names.keys), offset))
     }
 
     fun go(d: LocalDate) { anchorDay = d.toEpochDay() }
@@ -354,7 +363,7 @@ private fun CalendarBody(
         LaunchedEffect(hit?.key, range.have, range.loading) {
             if (hit != null) {
                 openDetail(hit)
-                if (!calInBand(hit)) scrollTo = calWallMinutes(hit.startMs ?: 0, calDay(hit.startMs ?: 0, zone), zone)
+                if (!calInBand(hit)) scrollTo = calGridMin(hit.startMs ?: 0, calDay(hit.startMs ?: 0, zone), zone, axis)
                 onRevealed()
             } else if (range.have && !range.loading) onRevealed()   // read, and not there: stay on its week
         }
@@ -414,13 +423,14 @@ private fun CalendarBody(
             if (hostSetOpen) HostSettings(range.hostRows, names, cvm)
             CalNotices(range, now, zone, locale)
             WeekGrid(
-                Modifier.weight(1f), weekly, days, before, after, stripRange, now, zone, locale, fleet, keys, names, colors,
+                Modifier.weight(1f), weekly, days, axis, before, after, stripRange, now, zone, locale, fleet, keys, names, colors,
                 detailKey = detail?.key, scrollTo = scrollTo, onScrolled = { scrollTo = -1.0 },
                 topMin = topMin, onTopMin = { topMin = it },
                 zoomHours = zoom, onZoom = { h, end -> cvm.setZoom(h, save = end) },
                 onOpen = ::openDetail,
                 onSwipe = { dir -> go(calSwipeStep(anchor, mode, dir)) },
-                onSlot = { d, min -> newEvent(d, calSlotStart(min)) },
+                // The tapped instant's offset keeps the second "1 AM" row's pass (XERK-3039).
+                onSlot = { d, t -> newEvent(d, t.toLocalTime(), t.offset) },
             )
         }
             if (!fabless) FloatingActionButton(
@@ -600,11 +610,26 @@ private fun Modifier.hatch(color: Color): Modifier = this.clipToBounds().drawBeh
     }
 }
 
+/** Diagonal stripes over the band [y]..[y]+[h] (a stretch of the axis the day lacks, XERK-2932). */
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawHatch(color: Color, y: Float, h: Float) {
+    if (h <= 0f) return
+    clipRect(top = y, bottom = y + h) {
+        drawRect(color.copy(alpha = color.alpha / 3), Offset(0f, y), androidx.compose.ui.geometry.Size(size.width, h))
+        val step = 6.dp.toPx()
+        var x = -h
+        while (x < size.width) {
+            drawLine(color, Offset(x, y + h), Offset(x + h, y), strokeWidth = 1.dp.toPx())
+            x += step
+        }
+    }
+}
+
 @Composable
 private fun WeekGrid(
     modifier: Modifier,
     wide: Boolean,
     days: List<LocalDate>,
+    axis: CalAxis,
     before: List<LocalDate>,
     after: List<LocalDate>,
     range: CalRange,
@@ -624,12 +649,14 @@ private fun WeekGrid(
     onZoom: (hours: Float, end: Boolean) -> Unit,
     onOpen: (CalendarEvent) -> Unit,
     onSwipe: (Int) -> Unit,
-    onSlot: (LocalDate, Int) -> Unit,
+    onSlot: (LocalDate, java.time.ZonedDateTime) -> Unit,
 ) {
     val today = calDay(now, zone)
     val gutter = if (wide) 56.dp else 44.dp
     val outline = MaterialTheme.colorScheme.outlineVariant
     val offShade = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+    val gapShade = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.16f)
+    val hourRows = remember(axis, zone, locale) { calGridHours(axis, zone, locale) }
     val density = LocalDensity.current
     val scroll = rememberScrollState()
     val series = TurmaColors.series()
@@ -813,7 +840,7 @@ private fun WeekGrid(
             LaunchedEffect(Unit) {
                 scroll.scrollTo(
                     if (topMin >= 0) (slotPxNow * topMin / 30).roundToInt()
-                    else with(density) { (hourDp * CAL_OPEN_AT_H - 8.dp).roundToPx() },
+                    else with(density) { (slot * (maxOf(0.0, calAxisAt(axis, CAL_OPEN_AT_H * 60.0, 0)) / 30).toFloat() - 8.dp).roundToPx() },
                 )
                 androidx.compose.runtime.snapshotFlow { scroll.value / slotPxNow * 30.0 }.collect { onTopMin(it) }
             }
@@ -845,6 +872,18 @@ private fun WeekGrid(
                 // frame (one per frame on a 120 Hz panel) and set the next step's hold, which
                 // clearing it here dropped to the top-hold fallback (rollup XERK-2953, measured).
                 if (hold === held) hold = null
+            }
+            // A step that brings a 25- or 23-row day into view (or takes it away) keeps the same wall
+            // time at the top (the web's gridRemap): the scroll is in grid minutes of the old axis.
+            var lastAxis by remember { mutableStateOf(axis) }
+            LaunchedEffect(axis) {
+                val was = lastAxis
+                if (was == axis) return@LaunchedEffect
+                lastAxis = axis
+                val px = with(density) { slot.toPx() }
+                val to = calAxisRemap(was, axis, scroll.value / px * 30.0)
+                withFrameNanos { }
+                scroll.dispatchRawDelta(((px * to / 30).roundToInt().coerceAtLeast(0) - scroll.value).toFloat())
             }
             val hours by rememberUpdatedState(zoomHours)
             fun zoomTo(h: Float, y: Float, end: Boolean) {
@@ -890,14 +929,22 @@ private fun WeekGrid(
             ) {
                 // Room below midnight for the New event FAB (16dp margin + 56dp + 16dp): the last
                 // hours scroll clear of it, so a late block's corner is never under it (XERK-2953).
-                Row(Modifier.fillMaxWidth().padding(bottom = 88.dp).height(hourDp * 24)) {
+                Row(Modifier.fillMaxWidth().padding(bottom = 88.dp).height(slot * (axis.total / 30f))) {
+                    // The hour labels follow the axis: a repeated hour is labelled twice, each with its zone.
                     Box(Modifier.width(gutter).fillMaxHeight()) {
-                        for (h in 1 until 24) {
-                            Text(
-                                DateTimeFormatter.ofPattern("h a", locale).format(java.time.LocalTime.of(h, 0)),
-                                Modifier.offset(y = hourDp * h - 7.dp).padding(start = 4.dp),
-                                fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                        for (r in hourRows) {
+                            // The top row is labelled only when it is not midnight (a day whose midnight is skipped).
+                            if (r.top == 0 && r.h == 0) continue
+                            Column(Modifier.offset(y = if (r.top == 0) 0.dp else slot * (r.top / 30f) - 7.dp).padding(start = 4.dp)) {
+                                Text(
+                                    DateTimeFormatter.ofPattern("h a", locale).format(java.time.LocalTime.of(r.h, 0)),
+                                    fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                if (r.zone.isNotEmpty()) Text(
+                                    r.zone, fontSize = 8.sp, lineHeight = 9.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.testTag("cal-hour-zone"),
+                                )
+                            }
                         }
                     }
                     DayStrip(Modifier.weight(1f).fillMaxHeight(), strip, before.size, days.size, { shiftNow() }) { d ->
@@ -908,10 +955,14 @@ private fun WeekGrid(
                             Modifier.fillMaxHeight()
                                 .drawBehind {
                                     drawRect(offShade)
-                                    val hp = hourDp.toPx()
-                                    drawRect(surface, Offset(0f, hp * CAL_WORK_FROM_H),
-                                        androidx.compose.ui.geometry.Size(size.width, hp * (CAL_WORK_UNTIL_H - CAL_WORK_FROM_H)))
-                                    for (h in 0 until 24) drawLine(outline, Offset(0f, hp * h), Offset(size.width, hp * h), 0.5.dp.toPx())
+                                    val mp = slot.toPx() / 30f
+                                    val wa = maxOf(0.0, calAxisAt(axis, CAL_WORK_FROM_H * 60.0, 0)).toFloat()
+                                    val wb = maxOf(0.0, calAxisAt(axis, CAL_WORK_UNTIL_H * 60.0, 0)).toFloat()
+                                    drawRect(surface, Offset(0f, mp * wa), androidx.compose.ui.geometry.Size(size.width, mp * (wb - wa)))
+                                    for (r in hourRows) drawLine(outline, Offset(0f, mp * r.top), Offset(size.width, mp * r.top), 0.5.dp.toPx())
+                                    // A stretch of the axis this day lacks (another day's repeated hour,
+                                    // the hour its clocks skipped) is hatched, never free time.
+                                    for (g in calGridGaps(d, zone, axis)) drawHatch(gapShade, mp * g.top, mp * g.len)
                                     drawLine(outline, Offset(0f, 0f), Offset(0f, size.height), 0.5.dp.toPx())
                                 }
                                 .then(if (off) Modifier.hatch(offShade) else Modifier)
@@ -928,7 +979,8 @@ private fun WeekGrid(
                                         }
                                         if (up != null) {
                                             up.consume()
-                                            onSlot(d, (down.position.y / slot.toPx() * 30).toInt())
+                                            val m = ((down.position.y / slot.toPx()).toInt() * 30).coerceIn(0, axis.total - 30)
+                                            onSlot(d, java.time.Instant.ofEpochMilli(calGridMs(m, d, zone, axis)).atZone(zone))
                                         }
                                     }
                                 }
@@ -937,7 +989,7 @@ private fun WeekGrid(
                             val w = maxWidth
                             val floor = with(density) { blockFloor() }
                             val minMin = calMinLayoutMin(slot.value, floor.value)
-                            for (seg in calDaySegments(range.events, d, zone, minMin)) {
+                            for (seg in calDaySegments(range.events, d, zone, minMin, axis)) {
                                 val ev = seg.ev
                                 val badge = calBadge(ev, fleet.meetingProposals)
                                 // A 640dp phone's 10 hours give a 15-minute meeting less than its title
@@ -952,7 +1004,7 @@ private fun WeekGrid(
                                 ) { onOpen(ev) }
                             }
                             if (isToday) {
-                                val y = slot * (calWallMinutes(now, d, zone) / 30).toFloat()
+                                val y = slot * (calGridMin(now, d, zone, axis) / 30).toFloat()
                                 val red = TurmaColors.critical
                                 Box(
                                     Modifier.fillMaxWidth().height(2.dp).offset(y = y - 1.dp)

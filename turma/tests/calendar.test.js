@@ -103,24 +103,63 @@ test("XERK-2897: an event spanning midnight is clipped to each day; a 24h+ one r
   assert.equal(cal.daySegments([{ allDay: true, startMs: at(2026, 11, 10), endMs: at(2026, 11, 11) }], at(2026, 11, 10)).length, 0);
 });
 
-test("XERK-2930: an event in the repeated fall-back hour lays out by its length and names both zones", () => {
+test("XERK-2932: a fall-back day draws 25 rows, its repeated hour twice; events sit in real time", () => {
+  const day = at(2026, 11, 1);
+  const axis = cal.gridAxis([day]);
+  assert.equal(axis.total, 1500);
+  // Rows: 0:00–2:00 EDT, then 1:00–2:00 again (EST), then 2:00 EST on.
+  assert.deepEqual(axis.segs.map((s) => [s.from, s.to, s.pass, s.top]), [[0, 120, 0, 0], [60, 120, 1, 120], [120, 1440, 0, 180]]);
+  const hrs = cal.gridHours(axis);
+  assert.deepEqual(hrs.slice(1, 4).map((h) => [h.top, h.h, h.zone]), [[60, 1, "EDT"], [120, 1, "EST"], [180, 2, ""]]);
   // 2026-11-01 05:30Z is 1:30 EDT; 06:00Z is 1:00 EST — the clock runs backwards.
   const ev = { startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T06:00:00Z") };
-  const [s] = cal.daySegments([ev], at(2026, 11, 1));
+  const [s] = cal.daySegments([ev], day);
   assert.deepEqual([s.top, s.end, s.bottom], [90, 120, 120]);
-  // An hour from 1:30 EDT to 1:30 EST (wall end == start) and 1:30 EDT – 1:40 EST are full length;
-  // 0:30 EDT – 1:30 EST is two hours; a spring-forward hour keeps its wall rows.
-  const len = (a, b, d) => { const [x] = cal.daySegments([{ startMs: Date.parse(a), endMs: Date.parse(b) }], d); return x.end - x.top; };
-  assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 60);
-  assert.equal(len("2026-11-01T05:30:00Z", "2026-11-01T06:40:00Z", at(2026, 11, 1)), 70);
-  assert.equal(len("2026-11-01T04:30:00Z", "2026-11-01T06:30:00Z", at(2026, 11, 1)), 120);
-  assert.equal(len("2026-03-08T06:30:00Z", "2026-03-08T07:30:00Z", at(2026, 3, 8)), 120);
-  // An end PAST the repeated hour keeps its wall row: 1:30 EDT – 9:00 EST ends at 9:00, and
-  // an overnight 10 pm EDT – 3:00 EST ends at 3:00 on Nov 1.
-  const [lg] = cal.daySegments([{ startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T14:00:00Z") }], at(2026, 11, 1));
-  assert.equal(lg.end, 540);
-  const [ov] = cal.daySegments([{ startMs: Date.parse("2026-11-01T02:00:00Z"), endMs: Date.parse("2026-11-01T08:00:00Z") }], at(2026, 11, 1));
-  assert.deepEqual([ov.top, ov.end], [0, 180]);
+  const span = (a, b, d = day, ax) => { const [x] = cal.daySegments([{ startMs: Date.parse(a), endMs: Date.parse(b) }], d, ax); return [x.top, x.end]; };
+  // The ticket's repro: 1:30 EDT – 1:30 EST and a 2:00–2:30 EST meeting no longer touch.
+  assert.deepEqual(span("2026-11-01T05:30:00Z", "2026-11-01T06:30:00Z"), [90, 150]);
+  assert.deepEqual(span("2026-11-01T07:00:00Z", "2026-11-01T07:30:00Z"), [180, 210]);
+  assert.equal(cal.layoutDay(cal.daySegments([
+    { startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T06:30:00Z") },
+    { startMs: Date.parse("2026-11-01T07:00:00Z"), endMs: Date.parse("2026-11-01T07:30:00Z") }], day))[0].cols, 1);
+  // …and a longer event is drawn longer: 1:30 EDT – 1:50 EST < 1:30 EDT – 2:00 EST.
+  assert.deepEqual(span("2026-11-01T05:30:00Z", "2026-11-01T06:50:00Z"), [90, 170]);
+  assert.deepEqual(span("2026-11-01T05:30:00Z", "2026-11-01T07:00:00Z"), [90, 180]);
+  // 9:00 EST sits on the 9:00 row of this axis (an hour lower), overnight ones clip at midnight.
+  assert.equal(cal.gridMin(at(2026, 11, 1, 9), day, axis), 600);
+  assert.deepEqual(span("2026-11-01T02:00:00Z", "2026-11-01T08:00:00Z"), [0, 240]);
+  // The repeated hour's second row creates in its second pass.
+  assert.equal(new Date(cal.gridMs(150, day, axis)).toISOString(), "2026-11-01T06:30:00.000Z");
+  assert.equal(new Date(cal.gridMs(90, day, axis)).toISOString(), "2026-11-01T05:30:00.000Z");
+  // A week holding it shares the 25 rows: the other days shade the extra hour, so 9:00 lines up.
+  const week = cal.visibleDays(at(2026, 11, 4), "week");
+  const wa = cal.gridAxis(week);
+  assert.equal(wa.total, 1500);
+  assert.deepEqual(cal.gridGaps(week[0], wa), []);
+  assert.deepEqual(cal.gridGaps(week[3], wa), [{ top: 120, len: 60, pass: 1 }]);
+  assert.equal(cal.gridMin(at(2026, 11, 4, 9), week[3], wa), cal.gridMin(at(2026, 11, 1, 9), week[0], wa));
+  // A week with no switch keeps the plain 24 rows.
+  assert.equal(cal.gridAxis(cal.visibleDays(at(2026, 11, 11), "week")).total, 1440);
+});
+
+test("XERK-2932: a spring-forward day alone draws 23 rows; in a week its skipped hour is shaded", () => {
+  const day = at(2026, 3, 8);
+  const axis = cal.gridAxis([day]);
+  assert.equal(axis.total, 1380);
+  assert.equal(cal.gridMin(at(2026, 3, 8, 9), day, axis), 480);
+  assert.deepEqual(cal.gridHours(axis).slice(0, 3).map((h) => [h.top, h.h]), [[0, 0], [60, 1], [120, 3]]);
+  // 1:30 EST – 3:30 EDT is one real hour.
+  const [x] = cal.daySegments([{ startMs: Date.parse("2026-03-08T06:30:00Z"), endMs: Date.parse("2026-03-08T07:30:00Z") }], day);
+  assert.deepEqual([x.top, x.end], [90, 150]);
+  const week = cal.visibleDays(day, "week");
+  const wa = cal.gridAxis(week);
+  assert.equal(wa.total, 1440);
+  assert.deepEqual(cal.gridGaps(day, wa), [{ top: 120, len: 60, pass: 0 }]);
+  assert.deepEqual(cal.gridGaps(week[1], wa), []);
+  // A press on the shaded hour creates at the next time the day has (3:00 EDT).
+  assert.equal(cal.gridMs(150, day, wa), at(2026, 3, 8, 3));
+  // A span across the fall-back switch names both zones.
+  const ev = { startMs: Date.parse("2026-11-01T05:30:00Z"), endMs: Date.parse("2026-11-01T06:00:00Z") };
   const label = cal.fmtSpan(ev.startMs, ev.endMs);
   assert.match(label, /EDT/);
   assert.match(label, /EST/);
@@ -213,6 +252,66 @@ test("XERK-2937: grid geometry is in --slot rows, so a tall pane stretches the d
   assert.ok(html.includes(`class="cal-hr" style="top:${slot(20)}"`), "10 AM label on row 20");
   assert.ok(html.includes(`;height:${slot(48)}">`), "the day is 48 rows tall");
   assert.ok(!/top:\d+px/.test(html), "no fixed-px row geometry left");
+});
+
+test("XERK-2932: a fall-back week paints 25 rows: labels, shading, now-line, gaps and slot presses follow the axis", async () => {
+  const was = NOW;
+  NOW = Date.parse("2026-11-01T08:00:00Z");             // 3:00 EST on the 25-hour Sunday
+  try {
+    replies = {
+      "/api/calendar": () => ({ hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+        events: [{ host: "h1", id: "b1", org: "", subject: "Late", startMs: Date.parse("2026-11-01T07:00:00Z"), endMs: Date.parse("2026-11-01T07:30:00Z") }] }),
+    };
+    cal.refetch();
+    cal.setMode("week");
+    const html = await show(at(2026, 11, 1));
+    const slot = (n) => `calc(var(--slot, 24px) * ${n})`;
+    assert.ok(html.includes(`;height:${slot(50)}">`), "the week is 50 rows tall");
+    assert.match(html, /--wa:20;--wb:36;/, "working hours 9–17 in this axis' rows");
+    assert.ok(html.includes(`class="cal-hr z" style="top:${slot(2)}">1 AM<span>EDT</span>`));
+    assert.ok(html.includes(`class="cal-hr z" style="top:${slot(4)}">1 AM<span>EST</span>`));
+    assert.ok(html.includes(`class="cal-now" style="top:${slot(8)}"`), "now-line at 3:00 EST = grid 240");
+    assert.ok(html.includes(`top:${slot(6)};height:calc(var(--slot, 24px) * 1 - 2px);`), "2:00 EST at grid 180");
+    assert.equal((html.match(/class="cal-gap"/g) || []).length, 6, "the six other days hatch the repeat");
+    assert.doesNotMatch(html, /cal-odd|cal-hl/, "whole-hour axis keeps the column's own lines");
+    // A press on Sunday's second 1 AM row is that hour's second pass; on Monday's hatch, 2:00.
+    const col = (d) => ({ dataset: { col: String(d) }, getBoundingClientRect: () => ({ top: 0, height: 1500 }) });
+    assert.equal(cal.slotMinAt(col(at(2026, 11, 1)), 1499), 1470);
+    assert.equal(cal.slotMs(at(2026, 11, 1), cal.slotMinAt(col(at(2026, 11, 1)), 150)), Date.parse("2026-11-01T06:30:00Z"));
+    assert.equal(cal.slotMs(at(2026, 11, 2), cal.slotMinAt(col(at(2026, 11, 2)), 130)), at(2026, 11, 2, 2));
+  } finally { NOW = was; cal.setMode("work"); }
+});
+
+test("XERK-2932: a step into a 25-row week moves the held top to the same wall time", async () => {
+  replies = { "/api/calendar": () => ({ events: [], hosts: [] }) };
+  cal.setMode("week");
+  try {
+    await show(at(2026, 10, 28));                       // Oct 25 – 31: 24 rows
+    cal._topMin(540);                                   // 9:00 at the top
+    await show(at(2026, 11, 4));                        // Nov 1 – 7: 25 rows
+    assert.equal(cal._topMin(), 600, "still 9:00, one row lower on this axis");
+    await show(at(2026, 10, 28));
+    assert.equal(cal._topMin(), 540);
+  } finally { cal._topMin(-1); cal.setMode("work"); }
+});
+
+test("XERK-2932: the gutter labels a repeated hour twice and never the midnight top row", () => {
+  const html = cal.hoursHtml(cal.gridAxis([at(2026, 11, 1)]));
+  assert.match(html, /^<div class="cal-hr top" style="top:calc\(var\(--slot, 24px\) \* 0\)"><\/div>/);
+  assert.match(html, />1 AM<span>EDT<\/span>/);
+  assert.match(html, />1 AM<span>EST<\/span>/);
+});
+
+test("XERK-2932: a held scroll keeps its wall time across a 24 ⇄ 25 row step", () => {
+  const plain = cal.gridAxis(cal.visibleDays(at(2026, 10, 28), "week"));
+  const fall = cal.gridAxis(cal.visibleDays(at(2026, 11, 4), "week"));
+  assert.equal(cal.gridRemap(plain, fall, 540), 600);      // 9:00 stays 9:00
+  assert.equal(cal.gridRemap(fall, plain, 600), 540);
+  assert.equal(cal.gridRemap(fall, plain, 150), 90);       // the repeat's 1:30 EST reads 1:30
+  assert.equal(cal.gridRemap(plain, fall, 30), 30);        // before the repeat, unmoved
+  const spring = cal.gridAxis([at(2026, 3, 8)]);           // 23 rows, no 2:00–3:00
+  assert.equal(cal.gridRemap(cal.gridAxis([at(2026, 3, 7)]), spring, 150), 120, "a skipped time is the next one");
+  assert.equal(cal.gridRemap(cal.gridAxis([at(2026, 3, 7)]), spring, 540), 480);
 });
 
 test("XERK-2897: holidays fill the all-day band; a day off shades for every org, whatever the header pick (XERK-3031)", async () => {

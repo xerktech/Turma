@@ -131,6 +131,9 @@ A pure-core/adapter-shell split:
   `core/Calendar.kt` (pure ports of calendar.js: week math, `layoutDay`, badges, notices) +
   `vm/CalendarViewModel.kt` (the week cache; `/api/calendar` is not on the snapshot).
   - Week math is `LocalDate` (java.time's calendar), never `+ 86_400_000`: a DST day is 23/25h.
+  - **DST days draw 25 / 23 rows** (XERK-2932, web `gridAxis`): `calGridAxis(days)` is the one
+    axis every column, label, hour line, now-line and slot tap reads; never `hourDp * 24`.
+    Tests: `CalendarTest` (`XERK-2932` cases).
   - Re-reads on `FleetRepository.calendarFrames` (`calendar`, `holidaySettings`,
     `meetingProposals` frames, an `agent` frame that flips `online` (XERK-2921), every stream
     open), coalesced 1s; a 60s poll while `streamUp` is

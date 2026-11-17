@@ -114,12 +114,181 @@ fun calDay(ms: Long, zone: ZoneId): LocalDate = Instant.ofEpochMilli(ms).atZone(
 
 fun calDayStartMs(d: LocalDate, zone: ZoneId): Long = d.atStartOfDay(zone).toInstant().toEpochMilli()
 
-/** Minutes past [day]'s local midnight on the wall clock (9:00 sits at 540 on a DST day too). */
-fun calWallMinutes(ms: Long, day: LocalDate, zone: ZoneId): Double {
-    if (ms <= calDayStartMs(day, zone)) return 0.0
-    if (ms >= calDayStartMs(day.plusDays(1), zone)) return 1440.0
-    val t = Instant.ofEpochMilli(ms).atZone(zone)
-    return t.hour * 60 + t.minute + t.second / 60.0
+// ---- the day grid's rows (XERK-2932, the web's gridAxis) ------------------------------------
+// The grid shows the hours the shown days really have: a fall-back day draws its repeated hour
+// twice (25 rows), a spring-forward day shown alone drops the hour it skipped (23). Every column
+// of a several-day view shares one axis, so 9:00 stays on one row; a day lacking a stretch
+// another day has gets it shaded.
+
+/** A stretch of [day]'s clock: elapsed minutes [e0]..[e1) read wall minute [w0].. on [pass] (1 = the repeat). */
+data class CalPiece(val e0: Int, val e1: Int, val w0: Int, val pass: Int)
+
+/** A stretch of the shared axis: wall [from]..[to) on [pass], drawn from grid minute [top]; [at] = the repeat's first instant. */
+data class CalAxisSeg(val from: Int, val to: Int, val pass: Int, val top: Int, val at: Long = 0)
+
+data class CalAxis(val segs: List<CalAxisSeg>, val total: Int)
+
+val CAL_DAY_AXIS = CalAxis(listOf(CalAxisSeg(0, 1440, 0, 0)), 1440)
+
+private fun calOffMin(ms: Long, zone: ZoneId): Int = zone.rules.getOffset(Instant.ofEpochMilli(ms)).totalSeconds / 60
+
+/** [day]'s stretches of wall clock in the order they happen (one offset change a day at most). */
+fun calDayPieces(day: LocalDate, zone: ZoneId): List<CalPiece> {
+    val ds = calDayStartMs(day, zone)
+    val next = calDayStartMs(day.plusDays(1), zone)
+    val len = ((next - ds) / 60000).toInt()
+    val st = Instant.ofEpochMilli(ds).atZone(zone)
+    val w0 = st.hour * 60 + st.minute
+    val a = calOffMin(ds, zone)
+    val b = calOffMin(next - 1, zone)
+    if (a == b) return listOf(CalPiece(0, len, w0, 0))
+    var lo = 0
+    var hi = len - 1
+    while (hi - lo > 1) {
+        val mid = (lo + hi) ushr 1
+        if (calOffMin(ds + mid * 60000L, zone) == a) lo = mid else hi = mid
+    }
+    val t = hi
+    val wT0 = w0 + t
+    val wT1 = wT0 + (b - a)
+    val out = ArrayList<CalPiece>()
+    out += CalPiece(0, t, w0, 0)
+    if (wT1 < wT0) {
+        out += CalPiece(t, t + (wT0 - wT1), wT1, 1)
+        out += CalPiece(t + (wT0 - wT1), len, wT0, 0)
+    } else out += CalPiece(t, len, wT1, 0)
+    return out.filter { it.e1 > it.e0 }
+}
+
+/** The shared axis of [days]: pass-0 wall time any day has, cut where a repeated stretch goes in after its first pass. */
+fun calGridAxis(days: List<LocalDate>, zone: ZoneId): CalAxis {
+    val cover = ArrayList<IntArray>()
+    val reps = LinkedHashMap<String, CalAxisSeg>()
+    for (d in days) for (p in calDayPieces(d, zone)) {
+        val to = p.w0 + p.e1 - p.e0
+        if (p.pass == 1) reps.getOrPut("${p.w0}|$to") { CalAxisSeg(p.w0, to, 1, 0, calDayStartMs(d, zone) + p.e0 * 60000L) }
+        else cover += intArrayOf(p.w0, to)
+    }
+    cover.sortBy { it[0] }
+    val merged = ArrayList<IntArray>()
+    for (c in cover) {
+        val last = merged.lastOrNull()
+        if (last != null && c[0] <= last[1]) last[1] = maxOf(last[1], c[1]) else merged += intArrayOf(c[0], c[1])
+    }
+    val cuts = reps.values.map { it.to }
+    val segs = ArrayList<CalAxisSeg>()
+    for (m in merged) {
+        val pts = listOf(m[0]) + cuts.filter { it > m[0] && it < m[1] }.sorted() + listOf(m[1])
+        for (i in 0 until pts.size - 1) segs += CalAxisSeg(pts[i], pts[i + 1], 0, 0)
+    }
+    for (r in reps.values.sortedBy { it.to }) {
+        val i = segs.indexOfFirst { it.pass == 0 && it.from >= r.to }
+        segs.add(if (i < 0) segs.size else i, r)
+    }
+    var top = 0
+    val placed = segs.map { s -> s.copy(top = top).also { top += s.to - s.from } }
+    return CalAxis(placed, if (top > 0) top else 1440)
+}
+
+/** Grid minute of wall minute [w] on [pass] (-1 when the axis lacks it); an [end] takes the stretch it closes. */
+fun calAxisAt(axis: CalAxis, w: Double, pass: Int, end: Boolean = false): Double {
+    for (s in axis.segs) {
+        if (s.pass == pass && (if (end) w > s.from && w <= s.to else w >= s.from && w < s.to)) return s.top + (w - s.from)
+    }
+    return -1.0
+}
+
+/** Grid minute of instant [ms] in [day]'s column, clipped to the day. */
+fun calGridMin(ms: Long, day: LocalDate, zone: ZoneId, axis: CalAxis, end: Boolean = false): Double {
+    val ds = calDayStartMs(day, zone)
+    val len = (calDayStartMs(day.plusDays(1), zone) - ds) / 60000.0
+    val e = (ms - ds) / 60000.0
+    val ps = calDayPieces(day, zone)
+    // Before the day: its first minute, which is not row 0 on a day whose midnight the clocks skip.
+    if (e <= 0 && !(end && e == 0.0)) return maxOf(0.0, calAxisAt(axis, ps[0].w0.toDouble(), ps[0].pass))
+    if (e >= len) return axis.total.toDouble()
+    val p = ps.firstOrNull { if (end) e > it.e0 && e <= it.e1 else e >= it.e0 && e < it.e1 } ?: ps.last()
+    val w = p.w0 + (e - p.e0)
+    // A neighbour day drawn on another day's axis (the swipe) may repeat an hour the axis lacks.
+    val m = calAxisAt(axis, w, p.pass, end).takeIf { it >= 0 } ?: calAxisAt(axis, w, 0, end)
+    return maxOf(0.0, m)
+}
+
+/**
+ * Grid minute [m] of axis [from] moved onto [to] at the same wall time (the web's gridRemap), so a
+ * held scroll stays on 9:00 when a step brings a 25- or 23-row day into view or takes it away.
+ */
+fun calAxisRemap(from: CalAxis, to: CalAxis, m: Double): Double {
+    val s = from.segs.firstOrNull { m >= it.top && m < it.top + it.to - it.from } ?: from.segs.last()
+    val w = s.from + minOf(m - s.top, (s.to - s.from).toDouble())
+    var r = calAxisAt(to, w, s.pass)
+    if (r < 0 && s.pass == 1) r = calAxisAt(to, w, 0)
+    if (r < 0) r = to.segs.firstOrNull { it.pass == 0 && it.from > w }?.top?.toDouble() ?: to.total.toDouble()
+    return r
+}
+
+/** The instant grid minute [m] of [day]'s column stands for; a minute the day lacks is the next one it has. */
+fun calGridMs(m: Int, day: LocalDate, zone: ZoneId, axis: CalAxis): Long {
+    val ds = calDayStartMs(day, zone)
+    val ps = calDayPieces(day, zone)
+    var mm = m
+    for (s in axis.segs) {
+        val segEnd = s.top + s.to - s.from
+        if (mm >= segEnd) continue
+        val w = s.from + maxOf(0, mm - s.top)
+        val p = ps.firstOrNull { it.pass == s.pass && w >= it.w0 && w < it.w0 + it.e1 - it.e0 }
+        if (p != null) return ds + (p.e0 + w - p.w0) * 60000L
+        val later = ps.filter { it.pass == s.pass && it.w0 > w && it.w0 < s.to }.minByOrNull { it.w0 }
+        if (later != null) return ds + later.e0 * 60000L
+        mm = segEnd
+    }
+    return calDayStartMs(day.plusDays(1), zone)
+}
+
+/** A shaded stretch: grid minutes [top]..[top]+[len] that [day] does not have. */
+data class CalGap(val top: Int, val len: Int, val pass: Int)
+
+fun calGridGaps(day: LocalDate, zone: ZoneId, axis: CalAxis): List<CalGap> {
+    val ps = calDayPieces(day, zone)
+    val out = ArrayList<CalGap>()
+    for (s in axis.segs) {
+        var w = s.from
+        while (w < s.to) {
+            val p = ps.firstOrNull { it.pass == s.pass && w >= it.w0 && w < it.w0 + it.e1 - it.e0 }
+            if (p != null) { w = minOf(s.to, p.w0 + p.e1 - p.e0); continue }
+            val stop = (ps.filter { it.pass == s.pass && it.w0 > w }.map { it.w0 } + s.to).min()
+            val top = s.top + (w - s.from)
+            val last = out.lastOrNull()
+            if (last != null && last.top + last.len == top) out[out.size - 1] = last.copy(len = last.len + stop - w)
+            else out += CalGap(top, stop - w, s.pass)
+            w = stop
+        }
+    }
+    return out
+}
+
+/** An hour label: at grid minute [top], hour [h]; [zone] ("EDT"/"EST") only on a repeated hour's two passes. */
+data class CalHourRow(val top: Int, val h: Int, val zone: String)
+
+fun calGridHours(axis: CalAxis, zone: ZoneId, locale: Locale): List<CalHourRow> {
+    val fmt = DateTimeFormatter.ofPattern("zzz", locale)
+    val zoneOf = { ms: Long -> fmt.format(Instant.ofEpochMilli(ms).atZone(zone)) }
+    val reps = axis.segs.filter { it.pass == 1 }
+    val out = ArrayList<CalHourRow>()
+    for (s in axis.segs) {
+        var w = ((s.from + 59) / 60) * 60
+        while (w < s.to) {
+            val r = reps.firstOrNull { w >= it.from && w < it.to }
+            val z = when {
+                r == null -> ""
+                s.pass == 1 -> zoneOf(r.at + (w - r.from) * 60000L)
+                else -> zoneOf(r.at + (w - r.from - (r.to - r.from)) * 60000L)
+            }
+            out += CalHourRow(s.top + (w - s.from), (w / 60) % 24, z)
+            w += 60
+        }
+    }
+    return out
 }
 
 private fun CalendarEvent.s(): Long = startMs ?: 0
@@ -280,25 +449,21 @@ fun calMinLayoutMin(slotDp: Float, floorDp: Float): Double =
     if (slotDp <= 0f) CAL_MIN_LAYOUT_MIN.toDouble()
     else maxOf(CAL_MIN_LAYOUT_MIN.toDouble(), floorDp.toDouble() / slotDp * 30.0)
 
-/** The timed events of [day] as laid-out segments; a short one lays out as [minLayoutMin]. */
+/**
+ * The timed events of [day] as laid-out segments in grid minutes of [axis] (default: the day's own),
+ * in real time, so a repeated or skipped hour is drawn as long as it is; a short one lays out as [minLayoutMin].
+ */
 fun calDaySegments(
     events: List<CalendarEvent>,
     day: LocalDate,
     zone: ZoneId,
     minLayoutMin: Double = CAL_MIN_LAYOUT_MIN.toDouble(),
+    axis: CalAxis = calGridAxis(listOf(day), zone),
 ): List<CalSeg> {
     val segs = events.filter { calDrawable(it) && !calInBand(it) && calOnDay(it, day, zone) }.map { ev ->
-        val top = calWallMinutes(ev.s(), day, zone)
-        var end = if (ev.e() > ev.s()) calWallMinutes(ev.e(), day, zone) else top
-        // The grid is wall-clock, so an end in the SECOND pass of the repeated fall-back hour
-        // reads an hour early (1:30 EDT – 1:30 EST is zero long): push it down by the hour the
-        // clock repeated. An end past the repeated hour (9:00 EST) already sits on its row.
-        val from = maxOf(ev.s(), calDayStartMs(day, zone))
-        val back = calOffsetSec(from, zone) - calOffsetSec(ev.e(), zone)
-        if (ev.e() > from && ev.e() < calDayStartMs(day.plusDays(1), zone) && back > 0 &&
-            calOffsetSec(ev.e() - back * 1000L, zone) != calOffsetSec(ev.e(), zone)
-        ) end = minOf(1440.0, end + back / 60.0)
-        CalSeg(ev, top, end, minOf(1440.0, maxOf(end, top + minLayoutMin)))
+        val top = calGridMin(ev.s(), day, zone, axis)
+        val end = if (ev.e() > ev.s()) maxOf(top, calGridMin(ev.e(), day, zone, axis, end = true)) else top
+        CalSeg(ev, top, end, minOf(axis.total.toDouble(), maxOf(end, top + minLayoutMin)))
     }
     return calLayoutDay(segs)
 }
@@ -413,9 +578,6 @@ fun calTime(ms: Long, zone: ZoneId, locale: Locale): String =
     timeFmt(locale).format(Instant.ofEpochMilli(ms).atZone(zone))
 
 /** "9:00 – 9:30 AM"-style span; the end alone on another day reads as the start only (the web's fmtSpan). */
-private fun calOffsetSec(ms: Long, zone: ZoneId): Int =
-    zone.rules.getOffset(Instant.ofEpochMilli(ms)).totalSeconds
-
 fun calSpan(s: Long, e: Long, zone: ZoneId, locale: Locale): String {
     if (e <= s) return calTime(s, zone, locale)
     val a = Instant.ofEpochMilli(s).atZone(zone)
