@@ -62,4 +62,6 @@ test("XERK-2932: Lord Howe — a 30-minute shift draws hour lines from the label
   assert.match(r.html, /class="cal-row cal-body cal-odd"/);
   assert.match(r.html, /class="cal-hl" style="top:calc\(var\(--slot, 24px\) \* 5\)"/);
   assert.match(r.html, /class="cal-hl half" style="top:calc\(var\(--slot, 24px\) \* 6\)"/, "half-hour lines too");
+  // The repeated 1:30–2:00 starts its own stretch at grid 120: a line there splits 1:30 from its repeat.
+  assert.match(r.html, /class="cal-hl" style="top:calc\(var\(--slot, 24px\) \* 4\)"/, "a line where the repeat starts");
 });

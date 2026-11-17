@@ -1267,8 +1267,15 @@ function calendarHtml() {
   // The hour labels follow the axis: a repeated hour is labelled twice, each with its zone.
   const hours = hoursHtml(axis);
   const offRhythm = offRhythmOf(axis);
-  const hourLines = offRhythm ? gridHours(axis).map((r) => `<div class="cal-hl" style="top:${slots(r.top / 30)}" aria-hidden="true"></div>`
-    + (r.top + 30 < axis.total ? `<div class="cal-hl half" style="top:${slots(r.top / 30 + 1)}" aria-hidden="true"></div>` : "")).join("") : "";
+  // Lines: each hour (solid), its half hour (light), and where each stretch of the axis starts, so
+  // the cell around a 30-minute switch is split too (QA).
+  const lineAt = new Map();
+  if (offRhythm) {
+    for (const r of gridHours(axis)) { lineAt.set(r.top, ""); if (!lineAt.has(r.top + 30)) lineAt.set(r.top + 30, " half"); }
+    for (const x of axis.segs) if (x.top > 0) lineAt.set(x.top, "");
+  }
+  const hourLines = [...lineAt].filter(([t]) => t < axis.total).sort((x, y) => x[0] - y[0])
+    .map(([t, c]) => `<div class="cal-hl${c}" style="top:${slots(t / 30)}" aria-hidden="true"></div>`).join("");
   const body = days.map((d) => {
     const isToday = dayKey(d) === today;
     const segs = daySegments(got.events, d, axis);
