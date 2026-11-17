@@ -142,6 +142,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
 - **Expanded at SERVE time, over the requested range only, in the event's IANA `timeZone`** (Intl,
   no dependency): every occurrence keeps the anchor's WALL start and length, so DST never moves a
   9:00. A time a spring-forward skips reads an hour later (old offset), a repeated one is its first.
+  - **Except the anchor itself** (XERK-3041): the first occurrence is the stored start/end, so a
+    series started at the SECOND 1:30 of a fall-back day keeps that instant and its own key resolves.
   - **An anchor in or across a spring-forward gap keeps the wall time it was GIVEN** (XERK-3040):
     its instants cannot carry it (02:30 there IS 03:30; 01:00-02:30 reads 01:00-03:30), so the
     record stores a hub-internal `wall: {tod, len}` (ms; never served, absent when the instants

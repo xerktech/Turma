@@ -6170,7 +6170,8 @@ function sanitizeTurmaEvent(v, t) {
   // the key is still an occurrence of the rule, so editing the rule (or moving
   // the series) drops the ones it no longer lands on. Sorted: a fixed point.
   const series = calTurmaSeries(out);
-  const raw = series && v.exceptions && typeof v.exceptions === "object" && !Array.isArray(v.exceptions) ? v.exceptions : {};
+  const raw = calTurmaRemapLegacyAnchorKey(series,
+    series && v.exceptions && typeof v.exceptions === "object" && !Array.isArray(v.exceptions) ? v.exceptions : {});
   let kept = 0;
   for (const key of Object.keys(raw).sort()) {
     if (kept >= CALENDAR_TURMA_EXCEPTIONS_MAX) break;
@@ -6179,6 +6180,22 @@ function sanitizeTurmaEvent(v, t) {
     const ov = ex.deleted === true ? { deleted: true } : turmaOverride(out, ex, t);
     if (ov) { out.exceptions[key] = ov; kept++; }
   }
+  return out;
+}
+// A series anchored at the SECOND instance of a fall-back's repeated hour had its first
+// occurrence keyed at the FIRST instance before XERK-3041 (recurrence.instantOf picks the
+// first). Its own instant is the key now, so an exception stored under the old key moves
+// to it instead of being dropped as "no longer an occurrence" on load.
+function calTurmaRemapLegacyAnchorKey(series, raw) {
+  if (!series) return raw;
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const anchorKey = iso(series.startMs);
+  const oldMs = recurrence.instantOf(recurrence.wallOf(series.startMs, series.timeZone), series.timeZone);
+  const oldKey = iso(oldMs);
+  if (oldKey === anchorKey || !Object.hasOwn(raw, oldKey) || Object.hasOwn(raw, anchorKey) ||
+      recurrence.occurrenceAt(series, oldKey) || !recurrence.occurrenceAt(series, anchorKey)) return raw;
+  const out = { ...raw, [anchorKey]: raw[oldKey] };
+  delete out[oldKey];
   return out;
 }
 // One occurrence's override, re-derived through the record whitelist so each

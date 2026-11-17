@@ -264,7 +264,7 @@ const setErr = new Map();         // host key -> the hub's refusal
 let sidePress = false, sidePending = false;
 let shown = [];                   // the events of the last paint, indexed by data-ev
 let scrolled = false;             // the grid opened at working hours once
-const weeks = new Map();          // `${orgKey}|${weekMs}` -> {cal, hol, loading, again, err, retry}
+const weeks = new Map();          // weekMs -> {cal, hol, loading, again, err, retry}
 let nowFn = () => Date.now();
 let onData = null;                // the page's callback once a read lands (the notes review's upcoming list)
 let openNotes = null;             // the page's "Open in notes review" (XERK-2899)
@@ -320,8 +320,8 @@ function setMode(m) {
   saveStore(MODE_KEY, modes);
 }
 
-function orgKeys() { return typeof TurmaOrg !== "undefined" && TurmaOrg.getKeys ? TurmaOrg.getKeys() : []; }
-const orgKeyOf = () => orgKeys().slice().sort().join(",");
+// The calendar always shows every org (XERK-3031): the header's site-wide org pick
+// never filters it, so nothing here reads TurmaOrg.getKeys().
 function sites() {
   return typeof TurmaBoard !== "undefined" && TurmaBoard.mergeSites && data ? TurmaBoard.mergeSites(data.agents || []) : [];
 }
@@ -338,10 +338,9 @@ function orgLabel(site) {
 }
 
 // ---- data ---------------------------------------------------------------------
-function weekEntry(ws, org = orgKeyOf()) {
-  const k = `${org}|${ws}`;
-  let w = weeks.get(k);
-  if (!w) { w = { cal: null, hol: null, loading: false, again: false, err: "" }; weeks.set(k, w); }
+function weekEntry(ws) {
+  let w = weeks.get(ws);
+  if (!w) { w = { cal: null, hol: null, loading: false, again: false, err: "" }; weeks.set(ws, w); }
   return w;
 }
 async function getJson(url) {
@@ -358,21 +357,16 @@ async function getJson(url) {
 }
 // Read one week (Sunday–Saturday) of events + holidays. A read already in flight
 // is asked again once it lands, so a frame mid-read is never lost.
-// The read keeps the org pick it started with (its cache key), so a pick changed
-// mid-read never leaves that entry loading or fills it with another pick's events.
-async function loadWeek(ws, keys = orgKeys()) {
-  keys = keys.slice().sort();
-  const org = keys.join(",");
-  const w = weekEntry(ws, org);
+async function loadWeek(ws) {
+  const w = weekEntry(ws);
   if (w.loading) { w.again = true; return; }
   w.loading = true;
   w.again = false;
   clearTimeout(w.retry);
   w.retry = 0;
-  const q = keys.length ? `&org=${encodeURIComponent(keys.join(","))}` : "";
   try {
     const [cal, hol] = await Promise.all([
-      getJson(`/api/calendar?from=${ws}&until=${addDays(ws, 7)}${q}`),
+      getJson(`/api/calendar?from=${ws}&until=${addDays(ws, 7)}`),
       getJson(`/api/holidays?from=${dayKey(ws)}&until=${dayKey(addDays(ws, 6))}`),
     ]);
     w.cal = cal && Array.isArray(cal.events) ? cal : { events: [], hosts: [] };
@@ -384,14 +378,14 @@ async function loadWeek(ws, keys = orgKeys()) {
     w.fails = (w.fails || 0) + 1;
   }
   w.loading = false;
-  if (weeks.get(`${org}|${ws}`) !== w) return;           // dropped by refetch() meanwhile
-  if (w.again) return void loadWeek(ws, keys);
+  if (weeks.get(ws) !== w) return;           // dropped by refetch() meanwhile
+  if (w.again) return void loadWeek(ws);
   // A failed read (a hub rollout, a 503) and a host still syncing are both read
   // again later; while hidden the timer only clears, and showing re-asks. Failures
   // back off (20s doubling to 5 min): an older hub's 404 is no reason to hammer it.
   if (w.err || (w.cal && hostNotices(w.cal, ws).some((n) => n.syncing))) {
     const wait = w.err ? Math.min(RETRY_PENDING_MS * 2 ** (w.fails - 1), RETRY_ERROR_MAX_MS) : RETRY_PENDING_MS;
-    w.retry = setTimeout(() => { w.retry = 0; if (active || upcomingWanted) loadWeek(ws, keys); }, wait);
+    w.retry = setTimeout(() => { w.retry = 0; if (active || upcomingWanted) loadWeek(ws); }, wait);
     if (w.retry && w.retry.unref) w.retry.unref();
   }
   if (active) paint();
@@ -415,15 +409,14 @@ function ensureLoaded(days) {
 // their copy on screen until the new one lands.
 // The notes review's upcoming weeks are kept and re-read too, shown or not (XERK-2899).
 function refetch() {
-  const org = orgKeyOf();
-  const keep = new Set(active ? wantedWeeks(visibleDays(anchor, mode())).map((ws) => `${org}|${ws}`) : []);
-  if (upcomingWanted) for (const ws of upcomingWeeks()) keep.add(`${org}|${ws}`);
+  const keep = new Set(active ? wantedWeeks(visibleDays(anchor, mode())) : []);
+  if (upcomingWanted) for (const ws of upcomingWeeks()) keep.add(ws);
   for (const [k, w] of [...weeks]) {
     if (keep.has(k)) continue;
     clearTimeout(w.retry);
     weeks.delete(k);
   }
-  for (const k of keep) loadWeek(Number(k.slice(org.length + 1)));
+  for (const ws of keep) loadWeek(ws);
 }
 // The weeks the next UPCOMING_MS touch.
 function upcomingWeeks() {
@@ -656,14 +649,13 @@ function bandHtml(day, events, holidays, colors, now) {
   }
   return bits.join("");
 }
-// The orgs in view a holiday is a day off for (the header pick, else every org).
+// The orgs a holiday is a day off for.
 function offOrgs(day, holidays) {
   const key = dayKey(day);
-  const keys = orgKeys();
   const out = new Set();
   for (const h of holidays) {
     if (h.date !== key || !Array.isArray(h.offFor)) continue;
-    for (const s of h.offFor) if (typeof s === "string" && (!keys.length || keys.includes(s))) out.add(s);
+    for (const s of h.offFor) if (typeof s === "string" && s) out.add(s);
   }
   return [...out];
 }
@@ -1103,7 +1095,7 @@ function calendarHtml() {
     const wd = dt.toLocaleDateString([], { weekday: narrow && days.length > 1 ? "short" : "long" });
     return `<div class="cal-dh${dayKey(d) === today ? " today" : ""}${off.length ? " off" : ""}"${dayKey(d) === today ? ' aria-current="date"' : ""}>`
       + `<span class="n">${dt.getDate()}</span><span class="w">${esc(wd)}</span>`
-      + (off.length ? `<span class="offnote" title="${esc(`Day off: ${off.map(orgLabel).join(", ")}`)}">Day off${orgKeys().length === 1 ? "" : ` · ${esc(off.map(orgLabel).join(", "))}`}</span>` : "")
+      + (off.length ? `<span class="offnote" title="${esc(`Day off: ${off.map(orgLabel).join(", ")}`)}">Day off${sites().length === 1 ? "" : ` · ${esc(off.map(orgLabel).join(", "))}`}</span>` : "")
       + `</div>`;
   }).join("");
   const band = days.map((d) => `<div class="cal-band-day${offOrgs(d, got.holidays).length ? " off" : ""}">${bandHtml(d, got.events, got.holidays, colors, now)}</div>`).join("");
@@ -1792,8 +1784,7 @@ function openEditor(opts = {}) {
     }
     const e = num(opts.endMs) && opts.endMs > s ? opts.endMs : s + 30 * 60000;
     const pick = pickableOrgs();
-    const filt = orgKeys().filter((o) => pick.includes(o));
-    f = blankForm(s, e, filt.length ? filt : pick.length === 1 ? pick : []);
+    f = blankForm(s, e, pick.length === 1 ? pick : []);
     if (opts.allDay) f.allDay = true;
     ed = { mode: "new", f, errors: {}, err: "", busy: false, tried: false };
   }
@@ -2042,12 +2033,8 @@ async function saveEditor() {
   }
   const saved = r.out && r.out.event && typeof r.out.event === "object" ? r.out.event : null;
   closeEditor();
-  // The event left every org the header filters to: it no longer shows here.
-  const keys = orgKeys();
   if (saved && detail && detail.source === "turma" && String(detail.id) === String(saved.id)) {
-    const orgs = Array.isArray(saved.orgs) ? saved.orgs : [];
-    if (keys.length && !orgs.some((o) => keys.includes(o))) closeDetail();
-    else { detail = { ...detail, ...saved, source: "turma", host: "" }; paintDetail(true); }
+    detail = { ...detail, ...saved, source: "turma", host: "" }; paintDetail(true);
   }
   refetch();
 }

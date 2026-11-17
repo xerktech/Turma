@@ -131,7 +131,8 @@ function wallOf(ms, tz) {
 // The instant whose wall clock in `tz` reads `w`. A time skipped by a
 // spring-forward reads at the old offset (the clock then shows an hour later); a
 // time repeated by a fall-back is its FIRST instant — so each wall time is ONE
-// instant, as the Daily Brief scheduler maps them. Offsets are probed 36h either
+// instant, as the Daily Brief scheduler maps them. (Expansion keeps the anchor's
+// own instant for the first occurrence instead.) Offsets are probed 36h either
 // side so a zone east of +12 still sees its pre-transition offset.
 function instantOf(w, tz) {
   const before = wallOf(w - 1.5 * DAY_MS, tz) - (w - 1.5 * DAY_MS);
@@ -265,13 +266,17 @@ function eachOccurrence(series, lo, hi, max, each) {
       if (dn < day0 || dn > untilDay || seen >= count) continue;
       seen++;
       const w = dn * DAY_MS + tod;
-      const startMs = instantOf(w, tz);
+      // The anchor is its own first occurrence: a start in a fall-back's repeated
+      // hour (the SECOND 1:30) must not map to the first one, or the series' own
+      // start would never be an occurrence and its key would 404 (XERK-3041).
+      const anchor = dn === day0;
+      const startMs = anchor ? series.startMs : instantOf(w, tz);
       if (startMs >= hi) return yielded;
       if (startMs < lo) continue;
       const key = new Date(startMs).toISOString().replace(/\.\d{3}Z$/, "Z");
       // A start in a spring-forward gap reads an hour later, which can put the
       // wall end before it: keep the anchor's length then.
-      let endMs = instantOf(w + wallLen, tz);
+      let endMs = anchor ? series.endMs : instantOf(w + wallLen, tz);
       if (endMs < startMs || (endMs === startMs && wallLen > 0)) endMs = startMs + (series.endMs - series.startMs);
       yielded++;
       if (each({ key, startMs, endMs }) === false || yielded >= max) return yielded;
