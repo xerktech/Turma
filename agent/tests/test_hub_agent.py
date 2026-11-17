@@ -43495,14 +43495,22 @@ class TestTicketUpdateEvents(unittest.TestCase):
         with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
             self.assertIsNone(ha.ticket_update_events("ENG-1"))
 
-    def test_status_categories_failing_degrades_not_fails(self):
+    def test_status_categories_failing_with_none_cached_fails_the_read(self):
+        # XERK-3036: judged with no map, a backward move was marked seen and lost.
         pages = {"total": 1, "isLast": True, "values": [
             {"id": "5", "items": [{"fieldId": "status", "to": "3", "toString": "Done"}]}]}
         get, _ = self._jira(pages=pages, fail="/rest/api/3/status")
         with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            self.assertIsNone(ha.ticket_update_events("ENG-1"))
+
+    def test_status_categories_failing_keeps_the_cached_map(self):
+        pages = {"total": 1, "isLast": True, "values": [
+            {"id": "5", "items": [{"fieldId": "status", "to": "3", "toString": "Done"}]}]}
+        ha._JIRA_STATUS_CATS.update(at=0.0, map={"3": "done"})
+        get, _ = self._jira(pages=pages, fail="/rest/api/3/status")
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
             ev = ha.ticket_update_events("ENG-1")
-        self.assertIsNone(ev[0]["toCategory"])
-        self.assertIsNone(ev[0]["toColumn"])
+        self.assertEqual(ev[0]["toCategory"], "done")
 
     def test_bad_key_or_unconfigured_is_none_with_no_http(self):
         def get(*a):
@@ -60979,7 +60987,7 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         sm = self._mgr(sess)
         self._run(sm, [self._comment("1"), self._field("2", "description", "a", "b")])
         sm.notify_session.assert_not_called()
-        self.assertEqual(sess["ticketUpdateBase"], {"key": self.KEY, "seen": ["c:1", "h:2:description"]})
+        self.assertEqual(sess["ticketUpdateBase"]["seen"], ["c:1", "h:2:description"])
 
     def test_a_new_comment_is_delivered_once(self):
         sess = self._sess(base=["c:1"])
@@ -61137,6 +61145,58 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         sm._fetch_ticket_updates.assert_not_called()
         sm._deliver_ticket_updates.side_effect = RuntimeError("boom")
         sm.build_payload(0)                          # never raises onto the beat
+
+    def test_delivery_runs_on_every_full_beat_not_only_the_cadence(self):
+        # XERK-3036: delivering only on the cadence beat made an update wait two cadences.
+        sm = self.make_manager()
+        sm._stage_ticket_update_fetch = mock.Mock()
+        sm._deliver_ticket_updates = mock.Mock()
+        sm.build_payload(1)
+        sm._stage_ticket_update_fetch.assert_not_called()
+        sm._deliver_ticket_updates.assert_called_once_with()
+
+    def test_an_older_comment_sliding_into_the_window_is_not_news(self):
+        # XERK-3036: deleting the newest comment pulled an older, never-seen one into
+        # the newest-N window, and it was delivered as new.
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._run(sm, [self._comment("5", at="2026-11-16T12:00:00.000+0000")])
+        sm.notify_session.reset_mock()
+        self._run(sm, [self._comment("5", at="2026-11-16T12:00:00.000+0000"),
+                       self._comment("1", body="old", at="2026-11-16T09:00:00.000+0000")])
+        sm.notify_session.assert_not_called()
+        self._run(sm, [self._comment("6", at="2026-11-16T12:30:00.000+0000")])
+        self.assertEqual(len(self._delivered(sm)), 1)
+
+    def test_a_failed_delivery_keeps_the_mark_for_its_retry(self):
+        # QA: a newer self-authored/unwanted event advanced the mark past the event
+        # whose delivery failed, so the retry dropped it as history.
+        sess = self._sess(base=[])
+        sess["ticketUpdateBase"]["mark"] = ha._ts_ms("2026-11-16T11:00:00Z")
+        sm = self._mgr(sess)
+        events = [self._comment("1", body="please add X", at="2026-11-16T11:05:00.000+0000"),
+                  self._field("2", "assignee", "a", "b", at="2026-11-16T11:09:00.000+0000")]
+        sm.notify_session.side_effect = RuntimeError("inbox down")
+        self._run(sm, events)
+        sm.notify_session.side_effect = None
+        sm.notify_session.reset_mock()
+        self._run(sm, events)
+        self.assertEqual(len(self._delivered(sm)), 1)
+        self.assertIn("please add X", self._delivered(sm)[0])
+
+    def test_a_summary_change_renames_the_message_header(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._run(sm, [self._field("7", "summary", "Fix it", "Fix it properly")])
+        self.assertIn("Fix it properly", self._delivered(sm)[0].splitlines()[0])
+        self.assertEqual(sess["ticket"]["summary"], "Fix it properly")
+
+    def test_a_deep_description_edit_shows_where_it_changed(self):
+        head = "x" * 400
+        line = ha._ticket_update_line(self._field("8", "description", head + " old tail",
+                                                  head + " new tail"))
+        self.assertIn("old tail", line)
+        self.assertIn("new tail", line)
 
     def test_staging_never_raises(self):
         sm = self._mgr(self._sess(base=[]))
