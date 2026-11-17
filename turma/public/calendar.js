@@ -127,6 +127,148 @@ function wallMinutes(ms, day) {
   return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60;
 }
 
+// ---- the day grid's rows (XERK-2932) --------------------------------------------
+// The grid shows the hours the shown days really have: a fall-back day draws its
+// repeated hour twice (25 rows), a spring-forward day shown alone drops the hour it
+// skipped (23). In a several-day view every column shares one axis, so 9:00 stays on
+// one row across the week: a day lacking a stretch another day has gets it shaded.
+// A day's stretches of wall clock in the order they happen, in minutes after its
+// midnight: [{e0, e1, w0, pass}] — elapsed [e0, e1) reads wall w0.. on its pass (1 =
+// the repeated hour's second pass). One offset change a day at most (every zone today).
+const piecesCache = new Map();
+function dayPieces(day) {
+  const hit = piecesCache.get(day);
+  if (hit) return hit;
+  const next = addDays(day, 1), len = Math.round((next - day) / 60000);
+  const d0 = new Date(day), w0 = d0.getHours() * 60 + d0.getMinutes();
+  const a = offsetAt(day), b = offsetAt(next - 1);
+  let out;
+  if (a === b) out = [{ e0: 0, e1: len, w0, pass: 0 }];
+  else {
+    let lo = 0, hi = len - 1;   // offset a at lo, b at hi: the switch is the first minute of b
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (offsetAt(day + mid * 60000) === a) lo = mid; else hi = mid; }
+    const t = hi, wT0 = w0 + t, wT1 = wT0 + (b - a);
+    out = [{ e0: 0, e1: t, w0, pass: 0 }];
+    if (wT1 < wT0) out.push({ e0: t, e1: t + (wT0 - wT1), w0: wT1, pass: 1 }, { e0: t + (wT0 - wT1), e1: len, w0: wT0, pass: 0 });
+    else out.push({ e0: t, e1: len, w0: wT1, pass: 0 });
+    out = out.filter((p) => p.e1 > p.e0);
+  }
+  if (piecesCache.size > 400) piecesCache.clear();
+  piecesCache.set(day, out);
+  return out;
+}
+// The shared axis of `days`: segs [{from, to, pass, top}] in grid order, `total` minutes.
+// Pass-0 wall time any day has, cut where a repeated stretch goes in after its first pass.
+function gridAxis(days) {
+  const cover = [], reps = new Map();
+  for (const d of days) {
+    for (const p of dayPieces(d)) {
+      const to = p.w0 + p.e1 - p.e0;
+      if (p.pass) {
+        const k = `${p.w0}|${to}`;
+        // The zone names of the two passes, for the hour labels.
+        if (!reps.has(k)) reps.set(k, { from: p.w0, to, pass: 1, at: d + p.e0 * 60000 });
+      } else cover.push([p.w0, to]);
+    }
+  }
+  cover.sort((x, y) => x[0] - y[0]);
+  const merged = [];
+  for (const [f, t] of cover) {
+    const last = merged[merged.length - 1];
+    if (last && f <= last[1]) last[1] = Math.max(last[1], t); else merged.push([f, t]);
+  }
+  const cuts = [...reps.values()].map((r) => r.to);
+  let segs = [];
+  for (const [f, t] of merged) {
+    const pts = [f, ...cuts.filter((c) => c > f && c < t).sort((x, y) => x - y), t];
+    for (let i = 0; i + 1 < pts.length; i++) segs.push({ from: pts[i], to: pts[i + 1], pass: 0 });
+  }
+  for (const r of [...reps.values()].sort((x, y) => x.to - y.to)) {
+    const i = segs.findIndex((s) => s.pass === 0 && s.from >= r.to);
+    segs.splice(i < 0 ? segs.length : i, 0, r);
+  }
+  let top = 0;
+  segs = segs.map((s) => { const o = { ...s, top }; top += s.to - s.from; return o; });
+  return { segs, total: top || 1440 };
+}
+const DAY_AXIS = { segs: [{ from: 0, to: 1440, pass: 0, top: 0 }], total: 1440 };
+// Grid minute of wall minute `w` on pass `pass`; an END takes the stretch it closes.
+function axisAt(axis, w, pass, end = false) {
+  for (const s of axis.segs) {
+    if (s.pass === pass && (end ? w > s.from && w <= s.to : w >= s.from && w < s.to)) return s.top + (w - s.from);
+  }
+  return -1;
+}
+// Grid minute of the instant `ms` in `day`'s column (clipped to the day).
+function gridMin(ms, day, axis, end = false) {
+  const len = (addDays(day, 1) - day) / 60000;
+  const e = (ms - day) / 60000;
+  if (e <= 0 && !(end && e === 0)) return 0;
+  if (e >= len) return axis.total;
+  const ps = dayPieces(day);
+  const p = ps.find((x) => (end ? e > x.e0 && e <= x.e1 : e >= x.e0 && e < x.e1)) || ps[ps.length - 1];
+  const w = p.w0 + (e - p.e0);
+  // A day drawn on an axis that lacks its repeated hour reads that hour's first-pass rows.
+  let m = axisAt(axis, w, p.pass, end);
+  if (m < 0 && p.pass) m = axisAt(axis, w, 0, end);
+  return m < 0 ? 0 : m;
+}
+// The instant at grid minute `m` of `day`'s column; a minute the day does not have
+// (a shaded stretch) is the next one it does.
+function gridMs(m, day, axis) {
+  const ps = dayPieces(day);
+  for (const s of axis.segs) {
+    if (m >= s.to - s.from + s.top) continue;
+    const w = s.from + Math.max(0, m - s.top);
+    const p = ps.find((x) => x.pass === s.pass && w >= x.w0 && w < x.w0 + x.e1 - x.e0);
+    if (p) return day + (p.e0 + w - p.w0) * 60000;
+    // Not on this day: the next time it has, later in this stretch or in the next one.
+    const later = ps.filter((x) => x.pass === s.pass && x.w0 > w && x.w0 < s.to).sort((x, y) => x.w0 - y.w0)[0];
+    if (later) return day + later.e0 * 60000;
+    m = s.to - s.from + s.top;
+  }
+  return addDays(day, 1);
+}
+// The stretches of the axis `day` does not have, as [{top, len, pass}] (shaded).
+function gridGaps(day, axis) {
+  const ps = dayPieces(day), out = [];
+  for (const s of axis.segs) {
+    let w = s.from;
+    while (w < s.to) {
+      const p = ps.find((x) => x.pass === s.pass && w >= x.w0 && w < x.w0 + x.e1 - x.e0);
+      if (p) { w = Math.min(s.to, p.w0 + p.e1 - p.e0); continue; }
+      const nx = ps.filter((x) => x.pass === s.pass && x.w0 > w).map((x) => x.w0);
+      const stop = Math.min(s.to, ...nx);
+      const last = out[out.length - 1];
+      const top = s.top + (w - s.from);
+      if (last && last.top + last.len === top) last.len += stop - w; else out.push({ top, len: stop - w, pass: s.pass });
+      w = stop;
+    }
+  }
+  return out;
+}
+// The hour labels of an axis: [{top, h, zone}] — `zone` (EDT / EST) only on the two
+// passes of a repeated hour, so "1 AM" twice reads which is which.
+function gridHours(axis) {
+  const out = [];
+  const zoneOf = (ms) => {
+    try {
+      const p = new Intl.DateTimeFormat([], { timeZoneName: "short" }).formatToParts(ms).find((x) => x.type === "timeZoneName");
+      return p ? p.value : "";
+    } catch { return ""; }
+  };
+  const reps = axis.segs.filter((s) => s.pass === 1);
+  for (const s of axis.segs) {
+    for (let w = Math.ceil(s.from / 60) * 60; w < s.to; w += 60) {
+      const r = reps.find((x) => w >= x.from && w < x.to);
+      let zone = "";
+      if (r) zone = zoneOf(s.pass ? r.at + (w - r.from) * 60000 : r.at + (w - r.from - (r.to - r.from)) * 60000);
+      out.push({ top: s.top + (w - s.from), h: Math.floor(w / 60) % 24, zone });
+    }
+  }
+  return out;
+}
+
 // ---- events -------------------------------------------------------------------
 // An all-day event, or one lasting a day or more, rides the all-day band (as Teams draws it).
 const inBand = (ev) => ev.allDay === true || ev.endMs - ev.startMs >= DAY_MS;
@@ -220,23 +362,15 @@ function layoutDay(segs) {
   if (cluster.length) finish();
   return list;
 }
-// The timed events of one day as laid-out segments.
-function daySegments(events, day) {
+// The timed events of one day as laid-out segments, in grid minutes of `axis`
+// (default: the day's own). Real time, so a repeated or skipped hour is drawn as long as it is.
+function daySegments(events, day, axis = gridAxis([day])) {
   const segs = [];
   for (const ev of events) {
     if (inBand(ev) || !onDay(ev, day)) continue;
-    const top = wallMinutes(ev.startMs, day);
-    let end = ev.endMs > ev.startMs ? wallMinutes(ev.endMs, day) : top;
-    // The grid is wall-clock, so an end in the SECOND pass of the repeated fall-back hour
-    // reads an hour early (1:30 EDT – 1:30 EST is zero long): push it down by the hour the
-    // clock repeated. An end past the repeated hour (9:00 EST) already sits on its row.
-    const from = Math.max(ev.startMs, day);
-    const back = offsetAt(from) - offsetAt(ev.endMs);
-    if (ev.endMs > from && ev.endMs < addDays(day, 1) && back > 0
-      && offsetAt(ev.endMs - back * 60000) !== offsetAt(ev.endMs)) {
-      end = Math.min(1440, end + back);
-    }
-    segs.push({ ev, top, end, bottom: Math.min(1440, Math.max(end, top + MIN_LAYOUT_MIN)) });
+    const top = gridMin(ev.startMs, day, axis);
+    const end = ev.endMs > ev.startMs ? Math.max(top, gridMin(ev.endMs, day, axis, true)) : top;
+    segs.push({ ev, top, end, bottom: Math.min(axis.total, Math.max(end, top + MIN_LAYOUT_MIN)) });
   }
   return layoutDay(segs);
 }
@@ -274,10 +408,11 @@ let revealFocus = false;          // the revealed event's panel takes focus on t
 let scrollToMin = -1;             // the grid scrolls to this wall minute on the next paint
 let zoomHours = ((z) => (ZOOMS.includes(z) ? z : ZOOM_DEFAULT))(loadStore(ZOOM_KEY, ZOOM_DEFAULT));
 let zoomAnchor = -1;              // the wall minute held at the pane's middle across a zoom
-// Rendered px per minute: the body is 24h tall. A fake scroller (tests) has no height.
-const pxPerMin = (sc) => (sc.scrollHeight > 0 ? sc.scrollHeight / 1440 : SLOT_PX / 30);
+let curAxis = DAY_AXIS;            // the rows the last paint drew (gridAxis of its days, XERK-2932)
+// Rendered px per grid minute: the body is the axis tall (23-25h). A fake scroller (tests) has no height.
+const pxPerMin = (sc) => (sc.scrollHeight > 0 ? sc.scrollHeight / curAxis.total : SLOT_PX / 30);
 // 8:00 at the top, its label clear of the edge (in minutes, so a pane resize keeps it).
-const openMin = (sc) => Math.max(0, OPEN_AT_H * 60 - 8 / pxPerMin(sc));
+const openMin = (sc) => Math.max(0, Math.max(0, axisAt(curAxis, OPEN_AT_H * 60, 0)) - 8 / pxPerMin(sc));
 // The rows follow the pane's height, so a height change (the loading notice going, a
 // host notice, a window resize) would slide the view to another time: the wall minute
 // at the pane's top is held instead (QA XERK-2954). The operator's scroll moves it.
@@ -1050,6 +1185,7 @@ function headerHtml(days) {
 function calendarHtml() {
   const now = nowFn();
   const days = visibleDays(anchor, mode());
+  const axis = curAxis = gridAxis(days);
   ensureLoaded(days);
   const got = collect(days);
   if (revealing) {
@@ -1060,7 +1196,7 @@ function calendarHtml() {
       detail = hit;
       const day = dayStart(hit.startMs);
       detailFrom = { ev: `${hit.host}\u0000${hit.id}`, day: String(day) };
-      if (!inBand(hit)) scrollToMin = wallMinutes(hit.startMs, day);
+      if (!inBand(hit)) scrollToMin = days.includes(day) ? gridMin(hit.startMs, day, axis) : Math.max(0, axisAt(axis, wallMinutes(hit.startMs, day), 0));
       revealing = null;
       revealFocus = true;
     } else if (got.have && !got.loading) revealing = null;    // read, and not there: stay on its week
@@ -1099,22 +1235,30 @@ function calendarHtml() {
       + `</div>`;
   }).join("");
   const band = days.map((d) => `<div class="cal-band-day${offOrgs(d, got.holidays).length ? " off" : ""}">${bandHtml(d, got.events, got.holidays, colors, now)}</div>`).join("");
-  const hours = Array.from({ length: 24 }, (_, h) => `<div class="cal-hr" style="top:${slots(h * 2)}">${h ? esc(new Date(2000, 0, 1, h).toLocaleTimeString([], { hour: "numeric" })) : ""}</div>`).join("");
+  // The hour labels follow the axis: a repeated hour is labelled twice, each with its zone.
+  const hours = gridHours(axis).map((r) => `<div class="cal-hr${r.zone ? " z" : ""}" style="top:${slots(r.top / 30)}">${r.top
+    ? esc(new Date(2000, 0, 1, r.h).toLocaleTimeString([], { hour: "numeric" })) + (r.zone ? `<span>${esc(r.zone)}</span>` : "") : ""}</div>`).join("");
   const body = days.map((d) => {
     const isToday = dayKey(d) === today;
-    const segs = daySegments(got.events, d);
-    const nowLine = isToday ? `<div class="cal-now" style="top:${slots(wallMinutes(now, d) / 30)}" aria-hidden="true"></div>` : "";
+    const segs = daySegments(got.events, d, axis);
+    const nowLine = isToday ? `<div class="cal-now" style="top:${slots(gridMin(now, d, axis) / 30)}" aria-hidden="true"></div>` : "";
+    // A stretch of the axis this day does not have (another day's repeated hour, the hour
+    // its own clocks skipped) is shaded, so no one reads it as free time.
+    const gaps = gridGaps(d, axis).map((g) => `<div class="cal-gap" style="top:${slots(g.top / 30)};height:${slots(g.len / 30)}"`
+      + ` title="${g.pass ? "This hour repeats on another day" : "The clocks skip this time on this day"}" aria-hidden="true"></div>`).join("");
     return `<div class="cal-col${isToday ? " today" : ""}${offOrgs(d, got.holidays).length ? " off" : ""}" data-col="${d}">`
-      + segs.map((s) => timedHtml(s, d, colors, now)).join("") + nowLine + `</div>`;
+      + gaps + segs.map((s) => timedHtml(s, d, colors, now)).join("") + nowLine + `</div>`;
   }).join("");
   const label = `Calendar, ${rangeLabel(days)}`;
+  // The shaded working hours (9–17) in rows of this axis (brief.html .cal-col).
+  const work = (h) => Math.max(0, axisAt(axis, h * 60, 0)) / 30;
   return headerHtml(days)
     + (hostSetOpen ? hostSettingsHtml(got.hostRows) + feedSettingsHtml() : "")
     + (notes.length ? `<div class="cal-notes" aria-live="polite">${notes.join("")}</div>` : "")
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
-    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};--hours:${zoomHours};height:${slots(48)}">`
+    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};--hours:${zoomHours};--wa:${work(9)};--wb:${work(17)};height:${slots(axis.total / 30)}">`
     + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 
@@ -2054,14 +2198,17 @@ async function saveEditor() {
   }
   refetch();
 }
-// A pointer press on an empty slot of the grid → its 30-minute row (wall minutes).
+// A pointer press on an empty slot of the grid → its 30-minute row (grid minutes of the drawn axis).
 function slotMinAt(col, y) {
   const r = col && col.getBoundingClientRect ? col.getBoundingClientRect() : null;
   if (!r || !(r.height > 0)) return -1;
-  const m = Math.floor(((y - r.top) / r.height) * 48) * 30;
-  return Math.max(0, Math.min(1410, m));
+  const rows = curAxis.total / 30;
+  const m = Math.floor(((y - r.top) / r.height) * rows) * 30;
+  return Math.max(0, Math.min(curAxis.total - 30, m));
 }
-function slotMs(day, min) { const d = new Date(day); d.setHours(Math.floor(min / 60), min % 60, 0, 0); return d.getTime(); }
+// The instant a grid minute of `day`'s column stands for: a repeated hour's second row is its
+// second pass, a shaded stretch the next time the day has.
+const slotMs = (day, min) => gridMs(min, day, curAxis);
 let slotPress = null;
 function mountEditor() {
   if (typeof document === "undefined" || !document.createElement) return;
@@ -2415,7 +2562,7 @@ const api = {
   mount, update, setActive, refetch, upcoming, reveal,
   // pure helpers, for tests
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
-  wallMinutes, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
+  wallMinutes, gridAxis, gridMin, gridMs, gridGaps, gridHours, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
   detailHtml, invitesText, invitesRowHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),

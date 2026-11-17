@@ -166,13 +166,19 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   - `lastError` is quoted as is, never labelled "Outlook" (the hub's budget errors ride it too),
     and an offline host shows it as well.
 - **Week math is local wall time via `Date` setters** (`addDays`, `weekStart`), never `+ 86400000`:
-  a DST week has a 23/25h day. Event rows use wall minutes (`wallMinutes`). Tests pin both DST
+  a DST week has a 23/25h day. Event rows use grid minutes (below). Tests pin both DST
   edges and the year boundary.
-- **An end in the SECOND pass of the repeated fall-back hour moves down by that hour** (XERK-2930):
-  on the wall clock 1:30 EDT – 1:30 EST reads zero long. Only an end inside the repeated hour moves
-  (offset an hour earlier differs); an end past it (9:00 EST) keeps its row, and `end < top` alone
-  misses equal/later wall ends. The grid stays wall-clock so 9:00 is row 18. Labels name both
-  zones (`calendar.js`/`meetings.js` `fmtSpan`, Android `calSpan`/`calSpanLong`).
+- **The grid's rows are the hours the shown days really have** (XERK-2932, operator's pick):
+  `gridAxis(days)` — a fall-back day draws its repeated hour twice (25 rows, both labelled with their
+  zone), a spring-forward day shown ALONE drops its skipped hour (23 rows).
+  - Every column of a view shares ONE axis, so 9:00 is one row across the week; a day lacking a
+    stretch another day has (the repeat, its own skipped hour) gets it hatched (`gridGaps`).
+  - Events sit in real time (`gridMin`), so a 24-row wall-clock grid's false clashes, inverted
+    lengths and midnight clipping (Santiago) cannot return. Never go back to wall minutes.
+  - Everything reads the axis: hour labels, working-hours shading (`--wa`/`--wb`), now-line,
+    `pxPerMin`, open-at-8, a slot press (`gridMs`: a hatched stretch is the next real time).
+  - Android ports it in `core/Calendar.kt` (`calGridAxis` & co.). Labels name both zones
+    (`fmtSpan`, Android `calSpan`/`calSpanLong`).
 - **Teams decisions** (researched on Microsoft's "Manage your calendar in Teams" / new-calendar
   docs; recorded so a later change doesn't drift):
   - Work week (Mon–Fri) is the default; Week is Mon–Sun; ‹ › move a week; Today; the range label
@@ -188,7 +194,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     - **Any other pane-height change holds the TOP minute** (`holdTop`/`topMin`, run by `refit`
       after every paint and on resize; the operator's scroll moves it): rows follow the pane, so
       the loading notice leaving opened the day at 7:34, not 8:00 (QA). Android does the same.
-    - **Scroll math reads the drawn row height back** (`pxPerMin` = `scrollHeight / 1440`), never
+    - **Scroll math reads the drawn row height back** (`pxPerMin` = `scrollHeight / curAxis.total`), never
       `SLOT_PX` — that is only the no-cqh fallback (10h). A fake scroller in tests has no height.
   - 30-min rows, working hours 9–17 shaded white, the grid opens with 8:00 at the top, a red
     now-line with a dot on today, today's header in the accent with a top bar.
