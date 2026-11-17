@@ -119,10 +119,13 @@ data class TurmaEventDraft(
     val startTime: LocalTime,
     val endDate: LocalDate,
     val endTime: LocalTime,
-    // The offsets the start and end were read at (the tapped slot's, the served event's): a
-    // repeated fall-back wall time keeps that pass on save, not its first (XERK-3039).
+    // The offsets the start and end were read at (the tapped slot's, the served event's), and the
+    // wall times they were read at: a repeated fall-back wall time keeps that pass on save while
+    // its field still reads it (XERK-3039, `calKeptOffset`); a typed time is its first pass.
     val startOffset: ZoneOffset? = null,
+    val startOffsetAt: java.time.LocalDateTime? = null,
     val endOffset: ZoneOffset? = null,
+    val endOffsetAt: java.time.LocalDateTime? = null,
     val allDay: Boolean = false,
     val timeZone: String,
     val location: String = "",
@@ -187,7 +190,7 @@ fun calNewEventDraft(
     val end = s.plusMinutes(CAL_NEW_EVENT_MIN.toLong())
     return TurmaEventDraft(
         startDate = day, startTime = start, endDate = end.toLocalDate(), endTime = end.toLocalTime(),
-        startOffset = s.offset, endOffset = end.offset,
+        startOffset = s.offset, startOffsetAt = s.toLocalDateTime(), endOffset = end.offset, endOffsetAt = end.toLocalDateTime(),
         timeZone = zone.id, orgs = orgs, reminder = CAL_REMINDER_DEFAULT,
     )
 }
@@ -226,7 +229,8 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
         required = names("required"), optional = names("optional"),
         startDate = s.toLocalDate(), startTime = s.toLocalTime().withSecond(0).withNano(0),
         endDate = e.toLocalDate(), endTime = e.toLocalTime().withSecond(0).withNano(0),
-        startOffset = s.offset, endOffset = e.offset,
+        startOffset = s.offset, startOffsetAt = s.toLocalDateTime().withSecond(0).withNano(0),
+        endOffset = e.offset, endOffsetAt = e.toLocalDateTime().withSecond(0).withNano(0),
         allDay = ev.allDay, timeZone = zone.id, location = ev.location,
         online = ev.isOnlineMeeting, joinUrl = ev.joinUrl, body = ev.body,
         busy = ev.busy.takeIf { b -> CAL_SHOW_AS.any { it.first == b } } ?: "busy",
@@ -440,29 +444,32 @@ private fun calCleanSubject(s: String): String = jsTrim(com.xerktech.turma.model
 
 /** The start moved to [day] [time], keeping the event's length (Teams does). */
 fun calMoveStart(d: TurmaEventDraft, day: LocalDate, time: LocalTime): TurmaEventDraft {
-    if (day == d.startDate && time == d.startTime) return d   // re-picked as it was: its pass stays
     val repeat = if (day != d.startDate) d.repeat.copy(monthDay = null, nth = null) else d.repeat
-    // A typed start is its first pass (XERK-3039); the length is kept in real time, and the end
-    // keeps the offset it lands in, as the web's start handler does: a wall-clock length
-    // stretched a fall-back-day event by the repeated hour.
-    val moved = d.copy(startDate = day, startTime = time, startOffset = null, repeat = repeat)
+    // The length is kept in real time, and the end keeps the offset it lands in, as the web's
+    // start handler does: a wall-clock length stretched a fall-back-day event by the repeated
+    // hour (XERK-3039). The start's own pass follows `calKeptOffset`.
+    val moved = d.copy(startDate = day, startTime = time, repeat = repeat)
     val was = calDraftSpan(d)
     val now = calDraftSpan(moved.copy(endDate = day, endTime = time))
     // All-day keeps its wall days (its span is midnight to the midnight after the last day).
     if (d.allDay || was == null || now == null) {
         val len = java.time.Duration.between(d.startDate.atTime(d.startTime), d.endDate.atTime(d.endTime))
         val end = day.atTime(time).plus(if (len.isNegative) java.time.Duration.ZERO else len)
-        return moved.copy(endDate = end.toLocalDate(), endTime = end.toLocalTime(), endOffset = null)
+        return moved.copy(endDate = end.toLocalDate(), endTime = end.toLocalTime())
     }
     val len = java.time.Duration.between(was.first, was.second).let { if (it.isNegative) java.time.Duration.ZERO else it }
     val zone = calZoneOrNull(d.timeZone) ?: return moved
     val end = now.first.plus(len).atZoneSameInstant(zone)
-    return moved.copy(endDate = end.toLocalDate(), endTime = end.toLocalTime(), endOffset = end.offset)
+    return moved.copy(endDate = end.toLocalDate(), endTime = end.toLocalTime(), endOffset = end.offset, endOffsetAt = end.toLocalDateTime())
 }
 
-/** The end typed as [day] [time]: a typed time is its first pass (XERK-3039). */
-fun calSetEnd(d: TurmaEventDraft, day: LocalDate, time: LocalTime): TurmaEventDraft =
-    if (day == d.endDate && time == d.endTime) d else d.copy(endDate = day, endTime = time, endOffset = null)
+/** The end typed as [day] [time]; its pass follows `calKeptOffset` (XERK-3039). */
+fun calSetEnd(d: TurmaEventDraft, day: LocalDate, time: LocalTime): TurmaEventDraft = d.copy(endDate = day, endTime = time)
+
+/** The offset kept for the start (or end), only while its field still reads the wall time it was read at. */
+fun calKeptOffset(d: TurmaEventDraft, start: Boolean): ZoneOffset? =
+    if (start) d.startOffset.takeIf { d.startOffsetAt == d.startDate.atTime(d.startTime) }
+    else d.endOffset.takeIf { d.endOffsetAt == d.endDate.atTime(d.endTime) }
 
 /** Another zone: its repeated hour has passes of its own, so the kept offsets go (XERK-3039). */
 fun calSetZone(d: TurmaEventDraft, zone: String): TurmaEventDraft = d.copy(timeZone = zone, startOffset = null, endOffset = null)
@@ -471,10 +478,10 @@ fun calSetZone(d: TurmaEventDraft, zone: String): TurmaEventDraft = d.copy(timeZ
 fun calDraftSpan(d: TurmaEventDraft): Pair<OffsetDateTime, OffsetDateTime>? {
     val zone = calZoneOrNull(d.timeZone) ?: return null
     // ofLocal keeps a repeated wall time's pass when the offset is one it can have, else its first.
-    val s = if (d.allDay) d.startDate.atStartOfDay(zone) else java.time.ZonedDateTime.ofLocal(d.startDate.atTime(d.startTime), zone, d.startOffset)
-    var e = if (d.allDay) d.endDate.plusDays(1).atStartOfDay(zone) else java.time.ZonedDateTime.ofLocal(d.endDate.atTime(d.endTime), zone, d.endOffset)
+    val s = if (d.allDay) d.startDate.atStartOfDay(zone) else java.time.ZonedDateTime.ofLocal(d.startDate.atTime(d.startTime), zone, calKeptOffset(d, true))
+    var e = if (d.allDay) d.endDate.plusDays(1).atStartOfDay(zone) else java.time.ZonedDateTime.ofLocal(d.endDate.atTime(d.endTime), zone, calKeptOffset(d, false))
     // A typed end (no kept offset) is the first pass not before the start (web wallToIso notBefore).
-    if (!d.allDay && d.endOffset == null && e.isBefore(s)) e.withLaterOffsetAtOverlap().takeIf { !it.isBefore(s) }?.let { e = it }
+    if (!d.allDay && calKeptOffset(d, false) == null && e.isBefore(s)) e.withLaterOffsetAtOverlap().takeIf { !it.isBefore(s) }?.let { e = it }
     return s.toOffsetDateTime() to e.toOffsetDateTime()
 }
 

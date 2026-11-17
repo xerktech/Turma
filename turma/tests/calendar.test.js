@@ -1687,6 +1687,11 @@ test("XERK-3039 QA: editing the times keeps the length in real time; a typed tim
     set("startTime", "00:50");
     assert.deepEqual([body().start, body().end], ["2026-11-01T00:50:00-04:00", "2026-11-01T01:05:00-04:00"]);
     cal.closeEditor();
+    // Retyping the opened start segment by segment (01:30, 01:03, 01:30) keeps its pass.
+    set = mk();
+    set("startTime", "01:03"); set("startTime", "01:30");
+    assert.deepEqual([body().start, body().end], ["2026-11-01T01:30:00-05:00", "2026-11-01T01:45:00-05:00"]);
+    cal.closeEditor();
     // A start typed into the repeated hour is its first pass, wherever the form opened.
     set = mk();
     set("startTime", "01:00");
@@ -1703,12 +1708,17 @@ test("XERK-3039 QA: editing the times keeps the length in real time; a typed tim
     set("endTime", "01:20");
     assert.equal(body().end, "2026-11-01T01:20:00-04:00");
     cal.closeEditor();
-    // Another zone drops the kept offsets: Halifax's 01:10 is its first pass (-03:00), never
+    // Another zone drops the kept offsets: Halifax's 01:30 is its first pass (-03:00), never
     // the -04:00 a form opened at 01:30 EDT kept (Halifax's second pass).
     set = mk(Date.parse("2026-11-01T01:30:00-04:00"));
-    cal._ed().f.startTime = "01:10"; cal._ed().f.endTime = "01:20";
     set("timeZone", "America/Halifax");
-    assert.equal(body().start, "2026-11-01T01:10:00-03:00");
+    assert.equal(body().start, "2026-11-01T01:30:00-03:00");
+    cal.closeEditor();
+    // A start moved so the end lands in the second pass keeps the length: 00:30 EDT +60 to 01:00
+    // ends 01:00 EST (an end left on its first pass would make it zero long).
+    set = mk(Date.parse("2026-11-01T00:30:00-04:00"), 60);
+    set("startTime", "01:00");
+    assert.deepEqual([body().start, body().end], ["2026-11-01T01:00:00-04:00", "2026-11-01T01:00:00-05:00"]);
   } finally { cal.closeEditor(); }
 }));
 

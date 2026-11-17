@@ -210,7 +210,7 @@ class CalendarEventsTest {
             val s = java.time.ZonedDateTime.ofLocal(fb.atTime(t), ny, off)
             val e = s.plusMinutes(len)
             return calNewEventDraft(fb, t, ny, setOf("o"), startOffset = off)
-                .copy(subject = "x", endDate = e.toLocalDate(), endTime = e.toLocalTime(), endOffset = e.offset)
+                .copy(subject = "x", endDate = e.toLocalDate(), endTime = e.toLocalTime(), endOffset = e.offset, endOffsetAt = e.toLocalDateTime())
         }
         fun span(d: TurmaEventDraft) = calDraftPayload(d).let { it["start"]!!.jsonPrimitive.content to it["end"]!!.jsonPrimitive.content }
         val second = open(LocalTime.of(1, 30), est)
@@ -218,8 +218,18 @@ class CalendarEventsTest {
         assertEquals("2026-11-01T00:50:00-04:00" to "2026-11-01T01:05:00-04:00", span(calMoveStart(second, fb, LocalTime.of(0, 50))))
         // A start typed into the repeated hour is its first pass, wherever the form opened.
         assertEquals("2026-11-01T01:00:00-04:00" to "2026-11-01T01:15:00-04:00", span(calMoveStart(second, fb, LocalTime.of(1, 0))))
-        // Re-picking the same start keeps its pass.
+        // Re-picking the same start keeps its pass, even through another time first.
         assertEquals("2026-11-01T01:30:00-05:00", span(calMoveStart(second, fb, LocalTime.of(1, 30))).first)
+        assertEquals("2026-11-01T01:30:00-05:00",
+            span(calMoveStart(calMoveStart(second, fb, LocalTime.of(1, 3)), fb, LocalTime.of(1, 30))).first)
+        // A start moved so the end lands in the second pass keeps the length: 00:30 EDT +60 to 01:00
+        // ends 01:00 EST (an end left on its first pass would make it zero long).
+        assertEquals("2026-11-01T01:00:00-04:00" to "2026-11-01T01:00:00-05:00",
+            span(calMoveStart(open(LocalTime.of(0, 30), edt, 60), fb, LocalTime.of(1, 0))))
+        // The length is real time, not wall: 5h from Oct 31 23:00 EDT (4h on the wall) moved to Nov 2 23:00.
+        val long = calMoveStart(calNewEventDraft(fb.minusDays(1), LocalTime.of(23, 0), ny, setOf("o")).copy(
+            endDate = fb, endTime = LocalTime.of(3, 0)), fb.plusDays(1), LocalTime.of(23, 0))
+        assertEquals("2026-11-03T04:00:00-05:00", span(long).second)
         // A typed end is the first pass not before the start.
         assertEquals("2026-11-01T01:30:00-05:00" to "2026-11-01T01:40:00-05:00", span(calSetEnd(second, fb, LocalTime.of(1, 40))))
         assertEquals("2026-11-01T01:20:00-04:00", span(calSetEnd(open(LocalTime.of(1, 0), edt, 75), fb, LocalTime.of(1, 20))).second)

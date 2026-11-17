@@ -1428,10 +1428,17 @@ function zoneList(cur) {
   try { all = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : []; } catch { all = []; }
   return [...new Set([cur, browserZone(), "UTC", ...all].filter((z) => typeof z === "string" && z))];
 }
-// The offsets a form's wall times were read at, so a repeated hour keeps its pass on save.
-function passOf(startMs, endMs, tz) {
-  try { return { startOff: zoneOffsetMin(startMs, tz), endOff: zoneOffsetMin(endMs, tz) }; } catch { return {}; }
+// The offsets a form's wall times were read at (`startOff` at `startAt`), so a repeated hour
+// keeps its pass on save. Only while the field still reads that wall time: a typed time is its
+// first pass, and retyping the opened one (a time input's change fires per segment) gets it back.
+function passOf(startMs, endMs, tz, only) {
+  try {
+    const wall = (ms) => { const p = zoneParts(ms, tz); return `${ymdOf(p)}T${pad(p.h)}:${pad(p.mi)}`; };
+    const o = { startOff: zoneOffsetMin(startMs, tz), startAt: wall(startMs), endOff: zoneOffsetMin(endMs, tz), endAt: wall(endMs) };
+    return only === "end" ? { endOff: o.endOff, endAt: o.endAt } : o;
+  } catch { return {}; }
 }
+const keptOff = (f, k) => (f[`${k}At`] === `${f[`${k}Date`]}T${f[`${k}Time`]}` ? f[`${k}Off`] : undefined);
 // A fresh form: [startMs, endMs) on the browser's wall clock, in `orgs`.
 function blankForm(startMs, endMs, orgs = []) {
   const tz = browserZone();
@@ -1469,10 +1476,10 @@ function formFromEvent(ev) {
 function formTimes(f) {
   const tz = f.timeZone;
   if (!zoneKnown(tz)) return { error: { timeZone: "Pick a time zone." } };
-  const s = f.allDay ? wallToIso(f.startDate, "00:00", tz) : wallToIso(f.startDate, f.startTime, tz, f.startOff);
+  const s = f.allDay ? wallToIso(f.startDate, "00:00", tz) : wallToIso(f.startDate, f.startTime, tz, keptOff(f, "start"));
   if (!s) return { error: { start: "Pick a start date and time." } };
   if (keepsLmt(s.ms, tz)) return { error: { start: LMT_ERROR } };
-  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz, f.endOff, s.ms);
+  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz, keptOff(f, "end"), s.ms);
   if (!e) return { error: { end: "Pick an end date and time." } };
   if (keepsLmt(e.ms, tz)) return { error: { end: LMT_ERROR } };
   if (e.ms < s.ms || (f.allDay && e.ms <= s.ms)) return { error: { end: "The end is before the start." } };
@@ -2151,9 +2158,6 @@ function mountEditor() {
       ed.f[d.edField] = String(t.value ?? "");
       // Another zone's repeated hour has passes of its own: its first pass, as typed (XERK-3039).
       if (d.edField === "timeZone") { delete ed.f.startOff; delete ed.f.endOff; }
-      // A typed time is its first pass: only the time the form opened on keeps its own.
-      if (d.edField === "startDate" || d.edField === "startTime") delete ed.f.startOff;
-      if (d.edField === "endDate" || d.edField === "endTime") delete ed.f.endOff;
       // A new start day names a new "day N" / "nth weekday" for the repeat (XERK-2973).
       if (d.edField === "startDate" && ed.f.repeat) {
         ed.f.repeat = { ...ed.f.repeat, monthDay: null, nth: null };
@@ -2167,7 +2171,7 @@ function mountEditor() {
           const p = zoneParts(now.startMs + len, ed.f.timeZone);
           ed.f.endDate = ymdOf(p);
           if (!ed.f.allDay) ed.f.endTime = `${pad(p.h)}:${pad(p.mi)}`;
-          ed.f.endOff = zoneOffsetMin(now.startMs + len, ed.f.timeZone);
+          Object.assign(ed.f, passOf(now.startMs + len, now.startMs + len, ed.f.timeZone, "end"));
           // Set in place: a date/time picker's change also lands on blur (see above).
           for (const k of ["endDate", "endTime"]) {
             const x = $edPanel.querySelector && $edPanel.querySelector(`[data-ed-field="${k}"]`);
@@ -2178,17 +2182,17 @@ function mountEditor() {
       // Remember only a start that parses: Chrome fires change with "" while a time is
       // half typed, and remembering that lost the length on the next digit (QA).
       if (!formTimes({ ...ed.f, endDate: ed.f.startDate, endTime: ed.f.startTime }).error) {
-        ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime, startOff: ed.f.startOff };
+        ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
       }
       if (ed.tried) clearFixedErrors();
       return;
     } else return;
     // A checkbox's change follows its own click, so a repaint here loses nothing.
-    ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime, startOff: ed.f.startOff };
+    ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
     if (ed.tried) ed.errors = validateForm(ed.f);
     paintEditor();
   });
-  $edPanel.addEventListener("focusin", () => { if (ed) ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime, startOff: ed.f.startOff }; });
+  $edPanel.addEventListener("focusin", () => { if (ed) ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime }; });
   $edPanel.addEventListener("click", (e) => {
     if (!ed) return;
     const b = e.target && e.target.closest ? e.target.closest("[data-ed-close],[data-ed-cancel],[data-ed-save],[data-ed-unchip]") : null;
