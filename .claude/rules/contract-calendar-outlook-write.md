@@ -130,6 +130,11 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   rewrite that copy forever. IANA → Windows is `windows_zone`: CLDR windowsZones + the tzdata
   `backward` links CLDR can place (Intl may say `Asia/Kolkata`, CLDR keeps `Asia/Calcutta`). A zone
   it lacks (a few links, `Factory`) is a failed row.
+- **The zone table is CLDR 49** (XERK-2996): Vancouver, Edmonton and Winnipeg have their own
+  Windows zones (British Columbia / Alberta / Manitoba Standard Time), which a host with older tz
+  data lacks. The command carries `zoneFallback` (CLDR 46's zone, `_WINDOWS_ZONE_FALLBACK`), tried
+  when Outlook has no `zone`: else every such write would fail on those hosts. A series' pattern
+  uses the zone Outlook took (`$tz.ID`), never `zone` blindly.
 - An `outlookId` hit outside the default calendar (the user deleted it to Deleted Items) is no copy.
 - **A command the CLI refuses never started PowerShell**, so it says nothing about Outlook: it
   never sets `calendar.write`, and one unreadable command never fails the rest of its batch.
@@ -261,7 +266,7 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
 | Turma | Outlook |
 |-------|---------|
 | `subject` | `Subject` |
-| `start`/`end` + `timeZone` | `StartTimeZone`/`EndTimeZone` = the IANA zone's Windows zone, then `StartInStartTimeZone`/`EndInEndTimeZone` = the wall times. A zone with no Windows id is a failed row in words. |
+| `start`/`end` + `timeZone` | `StartTimeZone`/`EndTimeZone` = the IANA zone's Windows zone (or its fallback), then `StartUTC`/`EndUTC` = the instants. A zone with no Windows id is a failed row in words. |
 | `allDay` | `AllDayEvent` (end = the midnight after the last day, as stored) |
 | `location` | `Location` |
 | `body` | `Body` (plain text); a `joinUrl` is appended as its own last line `Join: <url>` |

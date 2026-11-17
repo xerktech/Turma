@@ -370,7 +370,9 @@ __ATTACH__
       } else {
         $e = $c.event
         $tz = $null
-        try { $tz = $ol.TimeZones.Item([string]$e.zone) } catch {}
+        foreach ($z in @($e.zone, $e.zoneFallback)) {
+          if (-not $tz -and $z) { try { $tz = $ol.TimeZones.Item([string]$z) } catch {} }
+        }
         if (-not $tz) { throw ('Outlook has no time zone ' + $e.zone) }
         # Invitations turned off (or moved to another org's copy): the attendees get
         # a cancellation and a plain appointment replaces the sent copy.
@@ -434,7 +436,7 @@ __ATTACH__
         if ($rec) {
           # The anchor's WALL start and length in the event's zone: Outlook's
           # pattern, like turma/recurrence.js, keeps the wall time across DST.
-          $z = [TimeZoneInfo]::FindSystemTimeZoneById([string]$e.zone)
+          $z = [TimeZoneInfo]::FindSystemTimeZoneById([string]$tz.ID)
           $ws = [TimeZoneInfo]::ConvertTimeFromUtc((Utc $e.startMs), $z)
           $we = [TimeZoneInfo]::ConvertTimeFromUtc((Utc $e.endMs), $z)
           $pat = $it.GetRecurrencePattern()
@@ -534,7 +536,7 @@ __ATTACH__
 """.replace("__ATTACH__", _OUTLOOK_ATTACH_PS)
 
 # IANA zone -> the Windows zone id Outlook's TimeZones and .NET Framework take
-# (PowerShell 5.1 has no IANA lookup): CLDR windowsZones (release 46) plus every
+# (PowerShell 5.1 has no IANA lookup): CLDR windowsZones (release 49) plus every
 # tzdata `backward` link either way (Intl may spell Asia/Kolkata where CLDR keeps
 # Asia/Calcutta), plus bare "UTC" and "GMT" (UTC+0, never London). One line per Windows id; an indented line continues
 # the one above. A zone missing here is a failed write in words, never a guess.
@@ -543,6 +545,7 @@ AUS Central Standard Time=Australia/Darwin Australia/North
 AUS Eastern Standard Time=Australia/ACT Australia/Canberra Australia/Melbourne Australia/NSW
   Australia/Sydney Australia/Victoria
 Afghanistan Standard Time=Asia/Kabul
+Alberta Standard Time=America/Edmonton America/Inuvik America/Yellowknife Canada/Mountain
 Alaskan Standard Time=America/Anchorage America/Juneau America/Metlakatla America/Nome
   America/Sitka America/Yakutat US/Alaska
 Aleutian Standard Time=America/Adak America/Atka US/Aleutian
@@ -566,6 +569,7 @@ Azores Standard Time=America/Scoresbysund Atlantic/Azores
 Bahia Standard Time=America/Bahia
 Bangladesh Standard Time=Asia/Dacca Asia/Dhaka Asia/Thimbu Asia/Thimphu
 Belarus Standard Time=Europe/Minsk
+British Columbia Standard Time=America/Vancouver Canada/Pacific
 Bougainville Standard Time=Pacific/Bougainville
 Canada Central Standard Time=America/Regina America/Swift_Current Canada/Saskatchewan
 Cape Verde Standard Time=Atlantic/Cape_Verde Etc/GMT+1
@@ -586,9 +590,9 @@ Central Pacific Standard Time=Antarctica/Casey Etc/GMT-11 Pacific/Efate Pacific/
 Central Standard Time=America/Chicago America/Indiana/Knox America/Indiana/Tell_City
   America/Knox_IN America/Matamoros America/Menominee
   America/North_Dakota/Beulah America/North_Dakota/Center
-  America/North_Dakota/New_Salem America/Ojinaga America/Rainy_River
-  America/Rankin_Inlet America/Resolute America/Winnipeg CST6CDT
-  Canada/Central US/Central US/Indiana-Starke
+  America/North_Dakota/New_Salem America/Ojinaga
+  America/Rankin_Inlet America/Resolute CST6CDT
+  US/Central US/Indiana-Starke
 Central Standard Time (Mexico)=America/Bahia_Banderas America/Chihuahua America/Merida
   America/Mexico_City America/Monterrey Mexico/General
 Chatham Islands Standard Time=NZ-CHAT Pacific/Chatham
@@ -639,15 +643,15 @@ Libya Standard Time=Africa/Tripoli Libya
 Line Islands Standard Time=Etc/GMT-14 Pacific/Kiritimati
 Lord Howe Standard Time=Australia/LHI Australia/Lord_Howe
 Magadan Standard Time=Asia/Magadan
-Magallanes Standard Time=America/Punta_Arenas
+Magallanes Standard Time=America/Coyhaique America/Punta_Arenas
+Manitoba Standard Time=America/Rainy_River America/Winnipeg Canada/Central
 Marquesas Standard Time=Pacific/Marquesas
 Mauritius Standard Time=Indian/Mahe Indian/Mauritius Indian/Reunion
 Middle East Standard Time=Asia/Beirut
 Montevideo Standard Time=America/Montevideo
 Morocco Standard Time=Africa/Casablanca Africa/El_Aaiun
 Mountain Standard Time=America/Boise America/Cambridge_Bay America/Ciudad_Juarez America/Denver
-  America/Edmonton America/Inuvik America/Shiprock America/Yellowknife
-  Canada/Mountain MST7MDT Navajo US/Mountain
+  America/Shiprock MST7MDT Navajo US/Mountain
 Mountain Standard Time (Mexico)=America/Mazatlan Mexico/BajaSur
 Myanmar Standard Time=Asia/Rangoon Asia/Yangon Indian/Cocos
 N. Central Asia Standard Time=Asia/Novosibirsk
@@ -661,7 +665,7 @@ North Asia Standard Time=Asia/Krasnoyarsk Asia/Novokuznetsk
 North Korea Standard Time=Asia/Pyongyang
 Omsk Standard Time=Asia/Omsk
 Pacific SA Standard Time=America/Santiago Chile/Continental
-Pacific Standard Time=America/Los_Angeles America/Vancouver Canada/Pacific PST8PDT US/Pacific
+Pacific Standard Time=America/Los_Angeles PST8PDT US/Pacific
 Pacific Standard Time (Mexico)=America/Ensenada America/Santa_Isabel America/Tijuana
   Mexico/BajaNorte
 Pakistan Standard Time=Asia/Karachi
@@ -753,6 +757,14 @@ Yakutsk Standard Time=Asia/Khandyga Asia/Yakutsk
 Yukon Standard Time=America/Dawson America/Whitehorse Canada/Yukon
 """
 _WINDOWS_ZONES = None
+# Windows zones newer than many hosts' tz data (CLDR 49, XERK-2996) -> the zone CLDR mapped
+# them to before. The writer tries the new id first and this one when Outlook lacks it: the
+# instants are StartUTC either way, only the zone Outlook shows differs.
+_WINDOWS_ZONE_FALLBACK = {
+    "Alberta Standard Time": "Mountain Standard Time",
+    "British Columbia Standard Time": "Pacific Standard Time",
+    "Manitoba Standard Time": "Central Standard Time",
+}
 
 
 class Refused(Exception):
@@ -1319,7 +1331,8 @@ def prepare_calendar_write(cmd) -> dict:
     sens = ev.get("sensitivity")
     sens = sens if isinstance(sens, str) and sens in _SENSITIVITY_CODE else "normal"
     fields = _write_fields(ev, sens, whole=True)
-    fields.update({"startMs": start, "endMs": end, "zone": zone, "allDay": ev.get("allDay") is True,
+    fields.update({"startMs": start, "endMs": end, "zone": zone,
+                   "zoneFallback": _WINDOWS_ZONE_FALLBACK.get(zone, ""), "allDay": ev.get("allDay") is True,
                    "reminder": _reminder_minutes(ev.get("reminderMinutes"))})
     rule = ev.get("recurrence")
     if rule is not None:
