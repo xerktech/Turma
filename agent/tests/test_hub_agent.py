@@ -61262,6 +61262,80 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         sm._deliver_ticket_updates()
         self.assertIn("a human note", self._delivered(sm)[0])
 
+    def test_xerk3052_an_empty_beat_mid_call_keeps_it_held(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        st = self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
+        self._run(sm, [self._now_ev("9", "Fixed in PR 5")])
+        for _ in range(3):
+            sm._deliver_ticket_updates()   # the call is still running
+        sm.notify_session.assert_not_called()
+        self.assertIn("ticketUpdateHeld", sess)
+        self._land(sm, sess, st)
+        sm._deliver_ticket_updates()
+        sm.notify_session.assert_not_called()
+
+    def test_xerk3052_two_hold_rounds_accumulate(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        self._run(sm, [self._now_ev("8", "first")])
+        self._run(sm, [self._now_ev("8", "first"), self._now_ev("9", "second")])
+        self.assertEqual([e["key"] for e in sess["ticketUpdateHeld"]["events"]], ["c:8", "c:9"])
+
+    def test_xerk3052_past_the_cap_the_overflow_is_delivered(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        n = ha.TICKET_UPDATES_HELD_MAX
+        self._run(sm, [self._now_ev(str(i), f"note {i}") for i in range(n + 2)])
+        self.assertEqual(len(sess["ticketUpdateHeld"]["events"]), n)
+        self.assertEqual(len(self._delivered(sm)), 1)
+        self.assertIn(f"note {n + 1}", self._delivered(sm)[0])
+
+    def test_xerk3052_a_new_ticket_drops_the_old_tickets_held_updates(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        self._run(sm, [self._now_ev("9", "old ticket note")])
+        sess["ticket"] = {"key": "XERK-2", "siteKey": self.SITE, "summary": "Other"}
+        sm.sess_state.clear()
+        sm._deliver_ticket_updates()
+        sm.notify_session.assert_not_called()
+        self.assertNotIn("ticketUpdateHeld", sess)
+
+    def test_xerk3052_a_malformed_held_value_is_dropped(self):
+        for bad in ("x", 3, [1], True, {"key": self.KEY}, {"events": []}):
+            with self.subTest(bad=bad):
+                sess = self._sess(base=[], ticketUpdateHeld=bad)
+                sm = self._mgr(sess)
+                with mock.patch.object(ha, "log") as lg:
+                    sm._deliver_ticket_updates()
+                self.assertNotIn("ticketUpdateHeld", sess)
+                lg.assert_not_called()
+                sm.notify_session.assert_not_called()
+
+    def test_xerk3052_held_updates_ride_a_real_kill_and_resume(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
+                mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sess = sm.registry[-1]
+            sess["ticket"] = {"key": self.KEY, "siteKey": self.SITE}
+            sess["ticketUpdateHeld"] = {"key": self.KEY,
+                                        "events": [self._now_ev("9", "held through the kill")]}
+            sid = sess["id"]
+            sm.kill(sid)
+            sm.resume(sid)
+        rec = sm._find(sid)
+        self.assertEqual(rec["ticketUpdateHeld"]["events"][0]["key"], "c:9")
+        rec["status"] = "running"
+        sm.registry = [rec]
+        sm.notify_session = mock.Mock()
+        sm._deliver_ticket_updates()
+        self.assertIn("held through the kill", sm.notify_session.call_args.args[1])
+
     def test_xerk3052_a_failed_release_stays_held(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)

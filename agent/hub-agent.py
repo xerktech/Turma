@@ -49074,7 +49074,7 @@ class SessionManager:
             try:
                 key = self._ticket_update_key(sess, running=False)
                 events = held.get("events") if isinstance(held, dict) else None
-                if not key or held.get("key") != key or not isinstance(events, list):
+                if not key or not isinstance(events, list) or held.get("key") != key:
                     sess.pop("ticketUpdateHeld", None)  # its ticket is no longer this one
                     changed = True
                     continue
