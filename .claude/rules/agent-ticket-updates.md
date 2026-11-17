@@ -21,7 +21,8 @@ New comments and edits on a running session's ticket reach that session via `not
   - Kill + resume CARRIES the base (`_remember_closed` → `resume()`), so the resumed session gets
     exactly what it never read: the unread tail before the kill and what landed while down.
     Never anchor a resume on a time instead: reads are a cadence apart, so any anchor drops
-    that tail (QA). A closed record with no base anchors at its `closedAt`.
+    that tail (QA). `ticketUpdateSince` is carried too, so a run killed before its first read
+    keeps its own anchor; only a record predating both keys anchors at its `closedAt`.
   - Migration and resume-any build a record without the base (the hub carries none), so they
     anchor at their own `createdAt`; a clear-context restart keeps the record and its base.
   - First sight baselines only events created at or before `ticketUpdateSince` (adoption, or a

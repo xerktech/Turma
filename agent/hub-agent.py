@@ -36975,7 +36975,7 @@ class SessionManager:
             # What the run already saw of its ticket's updates (XERK-3035), so a
             # resume delivers exactly the rest: the unread tail before the kill
             # AND what landed while the session was down.
-            "ticketUpdateBase",
+            "ticketUpdateBase", "ticketUpdateSince",
             # The model that actually answered and its QA runs (XERK-1845): the
             # outcome ledger credits a session it first sees already closed by
             # these, so a kill must not forget them.
@@ -37198,11 +37198,16 @@ class SessionManager:
             "localModelContext": rec.get("localModelContext"),
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
-            # The previous run's seen-set carries over (XERK-3035). A record
-            # without one (an older agent's) anchors first sight at the kill.
+            # The previous run's seen-set and first-sight anchor carry over
+            # (XERK-3035): a run killed before its first read keeps its own
+            # anchor (adoption time, else the original createdAt), so nothing
+            # it never read is lost. A record from an agent that predates them
+            # (no key at all) anchors at the kill.
             "ticketUpdateBase": (rec.get("ticketUpdateBase")
                                  if isinstance(rec.get("ticketUpdateBase"), dict) else None),
-            "ticketUpdateSince": rec.get("closedAt") or now_iso(),
+            "ticketUpdateSince": (rec.get("ticketUpdateSince")
+                                  if "ticketUpdateBase" in rec
+                                  else rec.get("closedAt") or now_iso()),
             "stoppedAt": None,
             "errorMsg": None,
         }

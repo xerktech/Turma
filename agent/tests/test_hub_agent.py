@@ -60869,8 +60869,7 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
             sm.kill(sid)
             sm.resume(sid)
         rec = sm._find(sid)
-        self.assertGreater(ha._ts_ms(rec["ticketUpdateSince"]), ha._ts_ms(rec["createdAt"]))
-        self.assertIsNone(rec.get("ticketUpdateBase"))   # none to carry: anchored
+        self.assertIsNone(rec.get("ticketUpdateBase"))   # never read: nothing to carry
         rec["status"] = "running"
         sm.registry = [rec]
         sm.notify_session = mock.Mock()
@@ -60884,7 +60883,7 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         self.assertIn("while down", msgs[0])
         self.assertNotIn("seen before", msgs[0])
 
-    def test_resume_anchors_at_the_kill(self):
+    def test_a_legacy_record_resumes_anchored_at_the_kill(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
         with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
@@ -60894,8 +60893,36 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
             sm.kill(sid)
             closed = next(c for c in sm.closed if c.get("id") == sid)
             closed["closedAt"] = "2026-11-14T08:00:00Z"
+            # An older agent's record carries neither ticket-update field.
+            closed.pop("ticketUpdateBase", None)
+            closed.pop("ticketUpdateSince", None)
             sm.resume(sid)
         self.assertEqual(sm._find(sid)["ticketUpdateSince"], "2026-11-14T08:00:00Z")
+
+    def test_a_session_killed_before_its_first_read_keeps_its_own_anchor(self):
+        # Nothing was read yet: the resumed run must still get a comment written
+        # right after the original spawn (QA D3).
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
+                mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sess = sm.registry[-1]
+            sess["createdAt"] = "2026-11-10T00:00:00Z"
+            sess["ticket"] = {"key": self.KEY, "siteKey": self.SITE}
+            sid = sess["id"]
+            sm.kill(sid)
+            sm.resume(sid)
+        rec = sm._find(sid)
+        rec["status"] = "running"
+        sm.registry = [rec]
+        sm.notify_session = mock.Mock()
+        self._run(sm, [self._comment("1", body="before spawn", at="2026-11-09T00:00:00.000+0000"),
+                       self._comment("2", body="also handle X", at="2026-11-10T00:05:00.000+0000")])
+        msgs = [c.args[1] for c in sm.notify_session.call_args_list]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("also handle X", msgs[0])
+        self.assertNotIn("before spawn", msgs[0])
 
     def test_resume_carries_what_the_previous_run_saw(self):
         # An update written before the kill that the previous run never read
