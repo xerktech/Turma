@@ -60699,6 +60699,62 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
             self.assertFalse(sa(sess, bad), bad)
         self.assertFalse(sa({}, {"kind": "comment", "key": "XERK-1", "id": "9", "at": 1}))
 
+    def test_xerk3051_a_write_inside_a_long_command_matches_its_whole_span(self):
+        # `jira transition … && <three minutes of work>`: Jira changed at the
+        # START, the tool_result lands at the end. Stamped at the result alone,
+        # the session was told of its own move.
+        call = _tw_call("lc", "Bash", {"command": 'jira transition XERK-9 "To Do" && make check'})
+        state, report = {}, {"prUrls": [], "modelActual": None}
+        ha._scan_entry_line(json.dumps(call), state, report)
+        ha._scan_entry_line(json.dumps(_tw_result("lc", "ok", ts="2026-11-16T10:03:00Z")),
+                            state, report)
+        [w] = report["ticketWrites"]
+        start = ha._ts_ms("2026-11-16T10:00:00Z")
+        self.assertEqual((w["t0"], w["t"]), (start, start + 180_000))
+        sess = {"ticketWrites": [w]}
+        sa = ha._ticket_self_authored
+        for at in (start + 2_000, start + 90_000, start - ha.TICKET_SELF_EDIT_WINDOW_MS,
+                   start + 180_000 + ha.TICKET_SELF_EDIT_WINDOW_MS):
+            self.assertTrue(sa(sess, {"kind": "transition", "key": "XERK-9", "at": at,
+                                      "to": "To Do"}), at)
+        # Outside the span + slack, or to another status, is still someone else's.
+        for ev in ({"at": start - ha.TICKET_SELF_EDIT_WINDOW_MS - 1, "to": "To Do"},
+                   {"at": start + 180_001 + ha.TICKET_SELF_EDIT_WINDOW_MS, "to": "To Do"},
+                   {"at": start + 2_000, "to": "Backlog"}):
+            self.assertFalse(sa(sess, {"kind": "transition", "key": "XERK-9", **ev}), ev)
+        # A hand-edited or inverted `t0` widens nothing.
+        end = w["t"]
+        for t0 in (True, "x", start + 999_999):
+            bad = {"ticketWrites": [dict(w, t0=t0)]}
+            self.assertFalse(sa(bad, {"kind": "transition", "key": "XERK-9",
+                                      "at": start + 2_000, "to": "To Do"}), t0)
+        bad = {"ticketWrites": [dict(w, t0=end + 500_000)]}
+        self.assertFalse(sa(bad, {"kind": "transition", "key": "XERK-9", "to": "To Do",
+                                  "at": end + 499_999}))
+        # An ancient `t0` (hand edit, an hour-long permission wait) spans at most
+        # TICKET_SELF_SPAN_MAX_MS back from the result.
+        floor = end - ha.TICKET_SELF_SPAN_MAX_MS - ha.TICKET_SELF_EDIT_WINDOW_MS
+        for t0 in (0, -10**30, end - 86_400_000):
+            old = {"ticketWrites": [dict(w, t0=t0)]}
+            self.assertTrue(sa(old, {"kind": "transition", "key": "XERK-9", "to": "To Do",
+                                     "at": floor}), t0)
+            self.assertFalse(sa(old, {"kind": "transition", "key": "XERK-9", "to": "To Do",
+                                      "at": floor - 1}), t0)
+        # A comment's fingerprint window spans the call too.
+        c = {"u": "cm", "t": end, "t0": start, "kind": "comment", "key": "XERK-9",
+             "fp": ha.ticket_body_fingerprint("started")}
+        far = start - ha.TICKET_SELF_COMMENT_WINDOW_MS
+        self.assertTrue(sa({"ticketWrites": [c]},
+                           {"kind": "comment", "key": "XERK-9", "body": "started", "at": far}))
+        self.assertFalse(sa({"ticketWrites": [c]},
+                            {"kind": "comment", "key": "XERK-9", "body": "started", "at": far - 1}))
+        # A quick call keeps no span: the stamp is the result's, as before.
+        ha._scan_entry_line(json.dumps(_tw_call("q", "Bash", {"command": "jira transition X-1 Done"})),
+                            state, report)
+        ha._scan_entry_line(json.dumps(_tw_result("q", "ok", ts="2026-11-16T10:00:00Z")),
+                            state, report)
+        self.assertNotIn("t0", report["ticketWrites"][-1])
+
     def test_a_fieldless_edit_hides_nothing(self):
         sess = {"ticketWrites": [{"u": "e", "t": 1_000, "kind": "edit", "key": "X-1"}]}
         for ev in ({"kind": "transition", "key": "X-1", "at": 1_000},

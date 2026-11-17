@@ -12092,8 +12092,9 @@ def _scan_context_entry(entry, report):
 #     PAIRED with its own successful tool_result. Quoted prose, tool OUTPUT that
 #     merely prints such a command and an assistant echo never count.
 #
-# An entry: {u, t, kind, key, id?, fp?, fields?}. `u` dedups a re-scan (the
-# tool_use id, or "mgr:<…>"); `t` epoch ms; kind comment|edit|transition; `id`
+# An entry: {u, t, t0?, kind, key, id?, fp?, fields?}. `u` dedups a re-scan (the
+# tool_use id, or "mgr:<…>"); `t` epoch ms the call finished, `t0` when it
+# started (the write landed between them); kind comment|edit|transition; `id`
 # the tracker's comment id when the result carried one; `fp` the comment body's
 # fingerprint (`ticket_body_fingerprint`); `fields` the normalized field names
 # an edit/transition touched. Bounded (TICKET_WRITES_MAX, newest kept) and
@@ -12102,6 +12103,10 @@ TICKET_WRITES_MAX = 50
 # How far apart a session's edit/transition and the tracker's change of the same
 # field may be and still be the same write (transcript and tracker clocks differ).
 TICKET_SELF_EDIT_WINDOW_MS = 120_000
+# The most of a call's run [t0, t] a match may span (a foreground Bash call's
+# own timeout): a call that waited on a permission prompt, or a hand-edited
+# `t0`, never widens the window further back than this (XERK-3051).
+TICKET_SELF_SPAN_MAX_MS = 600_000
 # Pending tool calls held across beats (a call and its result land apart).
 TICKET_WRITE_CALLS_MAX = 32
 # A command longer than this is not parsed (bounded work on the beat).
@@ -12796,6 +12801,12 @@ def _scan_ticket_write_entry(entry, state, report):
             else:
                 writes = ticket_writes_from_mcp(name, inp)
             if writes:
+                t0 = _ts_ms(entry.get("timestamp"))
+                if t0:
+                    # When the command STARTED: a write inside a long command
+                    # lands anywhere between this and its tool_result (XERK-3051).
+                    for w in writes:
+                        w["t0"] = t0
                 calls[bid] = writes
                 while len(calls) > TICKET_WRITE_CALLS_MAX:
                     calls.pop(next(iter(calls)))
@@ -12830,7 +12841,9 @@ def _scan_ticket_write_entry(entry, state, report):
             cid = None if timed_out else _tw_result_id(text)
             out = report.setdefault("ticketWrites", [])
             for n, w in landed:
-                rec = {"u": f"{bid}:{n}", "t": t, **w}
+                rec = {"u": f"{bid}:{n}", **w, "t": t}
+                if not isinstance(rec.get("t0"), int) or rec["t0"] >= t:
+                    rec.pop("t0", None)  # no start time, or no span to widen by
                 if cid and w["kind"] == "comment" and len(writes) == 1:
                     rec["id"] = cid
                 out.append(rec)
@@ -12868,8 +12881,8 @@ def _ticket_self_authored(sess, event):
         different comment), else by body fingerprint within
         TICKET_SELF_COMMENT_WINDOW_MS;
       * an edit/transition by an OVERLAPPING field within
-        TICKET_SELF_EDIT_WINDOW_MS (a write that names no field matches
-        nothing), and a transition only to the same target status when both
+        TICKET_SELF_EDIT_WINDOW_MS of the call's [t0, t] span (a write that
+        names no field matches nothing), and a transition only to the same target status when both
         sides name one.
     False whenever unsure — a miss delivers the update, never hides one. Never
     raises (the ledger is a record field anyone may have hand-edited)."""
@@ -12883,6 +12896,19 @@ def _tw_names(value):
     if not isinstance(value, (list, tuple)):
         return set()
     return {_tw_field(f) for f in value if isinstance(f, str)} - {None}
+
+
+def _tw_gap(at, w):
+    """How far the tracker's change time `at` lies outside the window the write
+    was made in: [t0, t] when the entry carries the call's start `t0` (the write
+    landed somewhere inside the command, XERK-3051), else just `t`. The span
+    is at most TICKET_SELF_SPAN_MAX_MS."""
+    t = w["t"]
+    t0 = w.get("t0")
+    if not isinstance(t0, int) or isinstance(t0, bool) or not t0 < t:
+        t0 = t
+    t0 = max(t0, t - TICKET_SELF_SPAN_MAX_MS)
+    return t0 - at if at < t0 else max(0, at - t)
 
 
 def _ticket_self_authored_inner(sess, event):
@@ -12910,7 +12936,7 @@ def _ticket_self_authored_inner(sess, event):
                 if eid == wid:
                     return True
                 continue
-            if fp and w.get("fp") == fp and abs(at - w["t"]) <= TICKET_SELF_COMMENT_WINDOW_MS:
+            if fp and w.get("fp") == fp and _tw_gap(at, w) <= TICKET_SELF_COMMENT_WINDOW_MS:
                 return True
         return False
     if kind not in ("edit", "transition"):
@@ -12921,7 +12947,7 @@ def _ticket_self_authored_inner(sess, event):
     eto = _tw_status(event.get("to")) if isinstance(event.get("to"), str) else None
     for w in writes:
         if w.get("kind") not in ("edit", "transition") \
-                or abs(at - w["t"]) > TICKET_SELF_EDIT_WINDOW_MS:
+                or _tw_gap(at, w) > TICKET_SELF_EDIT_WINDOW_MS:
             continue
         shared = efields & _tw_names(w.get("fields"))
         if not shared:
