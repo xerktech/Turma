@@ -1385,9 +1385,23 @@ def _usage_slot(sid):
 # same instant contend on that shared state; staggering reduces the contention.
 LAUNCH_STAGGER = 1.0
 
+def _stdout_is_journal(env=None, fd=1):
+    """Is stdout journald's stream? systemd's own test: JOURNAL_STREAM names the
+    stream's "dev:ino", which must be fd 1's. The bare variable is not enough: every
+    session on a systemd host inherits it, so an agent started from one (the nohup
+    fallback) would read as journald while writing a plain file."""
+    want = (os.environ if env is None else env).get("JOURNAL_STREAM") or ""
+    try:
+        dev, ino = (int(x) for x in want.split(":"))
+        st = os.fstat(fd)
+    except (ValueError, OSError):
+        return False
+    return (st.st_dev, st.st_ino) == (dev, ino)
+
+
 # journald stamps every line itself; anywhere else (the nohup fallback's agent.log, a
 # container's stdout file) a line carries no time, so it is stamped here (XERK-3036).
-_LOG_STAMP = not os.environ.get("JOURNAL_STREAM")
+_LOG_STAMP = not _stdout_is_journal()
 
 
 def log(msg):
