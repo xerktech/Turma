@@ -40143,7 +40143,11 @@ class SessionManager:
         # STAGED for the input worker, never typed here: this runs on the beat,
         # and a typed message waits out its draw and submit deadlines (seconds;
         # on Windows each wait is a control-channel RPC).
-        self._stage_input(sid, text)
+        # The pane carries the same INBOX_PREFIX the inbox does (XERK-3043):
+        # typed bare, a manager-composed message reads in the pane exactly like
+        # the operator wrote it, and it may quote tracker or PR text anyone can
+        # write. The chat clients classify a turn as Turma's by this frame too.
+        self._stage_input(sid, f"{INBOX_PREFIX}\n\n{text}")
         return False
 
     def _poll_pending_inputs(self):

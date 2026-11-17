@@ -20925,6 +20925,8 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
     fall back to the pane whenever that would not actually deliver (XERK-340)."""
 
     SID = "11111111-1111-4111-8111-111111111111"
+    # The pane fallback carries the inbox's attribution frame (XERK-3043).
+    PANE_TEXT = f"{ha.INBOX_PREFIX}\n\nresolve the conflicts"
 
     def make_manager(self):
         sm = super().make_manager()
@@ -20977,8 +20979,8 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         # Staged for the input worker: nothing types on the beat.
         self.assertEqual(self.run_stdin_calls, [])
         self._deliver(sm)
-        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
-        self.assertEqual(sess["pendingInputs"][0]["text"], "resolve the conflicts")
+        self.assertEqual(self.run_stdin_calls[0][1], self.PANE_TEXT)
+        self.assertEqual(sess["pendingInputs"][0]["text"], self.PANE_TEXT)
 
     def test_a_failed_post_falls_back_to_the_pane(self):
         sm = self.make_manager()
@@ -20989,7 +20991,7 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         # Staged for the input worker: nothing types on the beat.
         self.assertEqual(self.run_stdin_calls, [])
         self._deliver(sm)
-        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(self.run_stdin_calls[0][1], self.PANE_TEXT)
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
     def test_a_session_that_refuses_peer_messages_stays_on_the_pane(self):
@@ -21008,7 +21010,7 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         # Staged for the input worker: nothing types on the beat.
         self.assertEqual(self.run_stdin_calls, [])
         self._deliver(sm)
-        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(self.run_stdin_calls[0][1], self.PANE_TEXT)
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
     def test_oversize_is_refused_once_by_send_input(self):

@@ -1451,8 +1451,8 @@
   //                Delivered via the session inbox (framed "[Relayed by Turma…]",
   //                which Claude Code wraps again as "Another Claude session sent
   //                a message:") OR, for a session with no inbox, typed into the
-  //                pane verbatim (no wrapper). Either way the "[Relayed by Turma"
-  //                frame is present.
+  //                pane with the same frame (no Claude wrapper). Either way the
+  //                "[Relayed by Turma" frame is present.
   //   "subagent" — a background agent handing its final report back to the
   //                session that spawned it ("<agent-message from=…>",
   //                "[Subagent hand-back]"). Claude Code wraps it "Another Claude
