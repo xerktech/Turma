@@ -7159,8 +7159,23 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   const fields = calPick(body);
   if (sc.scope === "series" && shown) {
     // Moving one occurrence "for the series" moves the series by the same amount.
-    if ("start" in body && calIso(body.start)) fields.start = calIsoZ(f.rec.startMs + Date.parse(body.start) - shown.startMs);
-    if ("end" in body && calIso(body.end)) fields.end = calIsoZ(f.rec.endMs + Date.parse(body.end) - shown.endMs);
+    // By WALL time in the event's zone (XERK-2991): a delta in ms read across a DST change
+    // left an all-day end at 23:00 and a moved 9:00 at 8:00.
+    // The end is built from the RESOLVED start + the wall length (a start in a spring-forward
+    // gap resolves an hour later, and a separately resolved end made the series 0 minutes);
+    // a start sent alone keeps the series' length.
+    const tz = f.rec.timeZone, W = (ms) => recurrence.wallOf(ms, tz);
+    const sD = "start" in body && calIso(body.start) ? W(Date.parse(body.start)) - W(shown.startMs) : null;
+    const eD = "end" in body && calIso(body.end) ? W(Date.parse(body.end)) - W(shown.endMs) : null;
+    if (sD || eD) {
+      const sW = W(f.rec.startMs) + (sD || 0);
+      const st = sD ? recurrence.instantOf(sW, tz) : f.rec.startMs;
+      fields.start = calIsoZ(st);
+      fields.end = calIsoZ(recurrence.instantOf(W(st) + W(f.rec.endMs) + (eD ?? sD) - sW, tz));
+    } else {
+      if (sD === 0) fields.start = f.rec.start;
+      if (eD === 0) fields.end = f.rec.end;
+    }
     // Moving a later occurrence back by its delta can take the FIRST one before 1970.
     if (!(Date.parse(fields.start || f.rec.start) > 0)) {
       return { status: 400, body: { error: "this would move the series' first occurrence before 1970-01-01T00:00:00Z" } };
@@ -7201,6 +7216,26 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   // it, carrying the edit and the exceptions from it on.
   const prev = calTurmaEndBefore(f.rec, f.occ, f.t, now);
   const { count } = f.rec.recurrence;
+  // A start resent as the occurrence DISPLAYS it (an edit form sends every field) is no
+  // re-time (XERK-2991): the new series keeps the cadence from the occurrence's ORIGINAL slot,
+  // and an occurrence moved on its own keeps that move as its exception. An end resent as
+  // displayed is unchanged too; a changed one (or one sent alone) is a new LENGTH, applied
+  // at the original slot. Only a start that differs from the displayed one re-times.
+  let ownEnd = null;
+  if (shown && ("start" in fields || "end" in fields) &&
+      (!("start" in fields) || Date.parse(fields.start) === shown.startMs)) {
+    const sentEnd = "end" in fields ? Date.parse(fields.end) : shown.endMs;
+    delete fields.start;
+    delete fields.end;
+    if (sentEnd !== shown.endMs) {
+      // A wall-clock length in the series' zone, as expansion keeps it: a ms length measured
+      // across a DST change ended an all-day series at 23:00.
+      const tz = f.rec.timeZone;
+      fields.end = calIsoZ(recurrence.instantOf(recurrence.wallOf(f.occ.startMs, tz) +
+        recurrence.wallOf(sentEnd, tz) - recurrence.wallOf(shown.startMs, tz), tz));
+      ownEnd = calIsoZ(sentEnd);
+    }
+  }
   // The rule the new series runs: the one sent, else the series' own. Either way it is the
   // series' rule RE-ANCHORED at this occurrence (XERK-2973: a client editing "this and
   // following" sends the series' rule as the person changed it):
@@ -7240,6 +7275,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     const own = { ...exceptions[f.key] };
     for (const k of Object.keys(fields)) delete own[k];
     if ("start" in fields || "end" in fields) { delete own.start; delete own.end; }
+    // A moved occurrence given a new length stays moved, at that length (XERK-2991).
+    if (ownEnd && exceptions[f.key].start) Object.assign(own, { start: exceptions[f.key].start, end: ownEnd });
     exceptions[f.key] = own;
   }
   const next = sanitizeTurmaEvent({ ...f.rec, start: calIsoZ(f.occ.startMs), end: calIsoZ(f.occ.endMs), ...fields,
