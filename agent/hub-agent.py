@@ -2880,6 +2880,14 @@ QWEN_STORE_MEMBER = "chat.jsonl"
 # old behaviour: a fresh worktree at the default branch.
 WORKTREE_STATE_ARCNAME = ".worktree"
 WORKTREE_STATE_MEMBERS = ("state.json", "commits.bundle", "changes.patch")
+# What the moved session already knows of its ticket's updates (XERK-3055): the
+# record fields `_migration_ticket_state` packs and `_carried_ticket_state`
+# re-validates. Under the `.worktree/` prefix because every target agent reads
+# that prefix into memory by name and never extracts it: an older target ignores
+# the member instead of unpacking it into the project-slug tree. Rides a
+# repos-root move too, with no `state.json` beside it.
+SESSION_STATE_MEMBER = "session.json"
+SESSION_STATE_MAX = 512 * 1024
 # qwen persists its per-server MCP connection-trust decisions here, keyed by the
 # workdir's realpath (XERK-507 D1). We PRE-AUTHORIZE our own registered servers
 # in it at launch so a session never wedges at the trust dialog. Same resolution
@@ -12888,6 +12896,77 @@ def merge_ticket_writes(writes, new):
         cur.sort(key=lambda w: w.get("t") if isinstance(w.get("t"), int) else 0)
         del cur[:-TICKET_WRITES_MAX]
     return cur, changed
+
+
+def _migration_ticket_state(sess):
+    """The ticket-update record a migration carries (XERK-3055), as JSON bytes,
+    or None for a session with no ticket. `since` is the source's own
+    first-sight anchor (adoption time, else its createdAt), so a session moved
+    before its first read loses nothing either. A snapshot: what the source
+    delivers between the export and its kill is delivered again on the target
+    (a duplicate, never a loss)."""
+    key = (sess.get("ticket") or {}).get("key") if isinstance(sess.get("ticket"), dict) else None
+    if not isinstance(key, str) or not key:
+        return None
+    return json.dumps({
+        "key": key,
+        "ticketUpdateBase": sess.get("ticketUpdateBase"),
+        "ticketUpdateSince": sess.get("ticketUpdateSince") or sess.get("createdAt"),
+        "ticketUpdateHeld": sess.get("ticketUpdateHeld"),
+        "ticketWrites": sess.get("ticketWrites"),
+    }, separators=(",", ":")).encode()
+
+
+def _carried_ticket_state(raw, ticket):
+    """Re-validate a migration's `_migration_ticket_state` bytes against the
+    importSession command's ticket (XERK-3055): the record fields to resume
+    with, or {} (first sight at the target's createdAt, as before) when absent,
+    unreadable or for another ticket. The bundle crossed a host boundary, so
+    each field is rebuilt from checked parts and capped like the live record,
+    the whole member is bounded (SESSION_STATE_MAX: a real record is far
+    smaller, and the target would re-save any bloat on every beat) and a time
+    must be plausible (a `mark` far in the future would mute every later
+    update). Never raises."""
+    try:
+        if isinstance(raw, bytes) and len(raw) > SESSION_STATE_MAX:
+            log(f"migration: the carried ticket-update record is {len(raw)} bytes, "
+                f"over {SESSION_STATE_MAX}; not carrying it")
+            return {}
+        key = ticket.get("key") if isinstance(ticket, dict) else None
+        latest = int(time.time() * 1000) + 3_600_000   # an hour of clock skew
+        data = json.loads(raw.decode()) if isinstance(raw, bytes) else None
+        if not isinstance(key, str) or not key or not isinstance(data, dict) \
+                or data.get("key") != key:
+            return {}
+        out = {}
+        base = data.get("ticketUpdateBase")
+        if isinstance(base, dict) and base.get("key") == key \
+                and isinstance(base.get("seen"), list):
+            nbase = {"key": key, "seen": [k for k in base["seen"]
+                                          if isinstance(k, str)][-TICKET_UPDATES_SEEN_MAX:]}
+            mark = base.get("mark")
+            if isinstance(mark, int) and not isinstance(mark, bool) and 0 < mark <= latest:
+                nbase["mark"] = mark
+            out["ticketUpdateBase"] = nbase
+        since = data.get("ticketUpdateSince")
+        since_ms = _ts_ms(since)
+        if since_ms is not None and since_ms <= latest:
+            out["ticketUpdateSince"] = since
+        held = data.get("ticketUpdateHeld")
+        if isinstance(held, dict) and held.get("key") == key \
+                and isinstance(held.get("events"), list):
+            events = [dict(e) for e in held["events"]
+                      if isinstance(e, dict) and isinstance(e.get("key"), str)]
+            if events:
+                out["ticketUpdateHeld"] = {"key": key,
+                                           "events": events[-TICKET_UPDATES_HELD_MAX:]}
+        writes, _ = merge_ticket_writes([], data.get("ticketWrites"))
+        if writes:
+            out["ticketWrites"] = writes
+        return out
+    except Exception as e:
+        log(f"migration: dropping the carried ticket-update record: {e}")
+        return {}
 
 
 TICKET_SELF_COMMENT_WINDOW_MS = 600_000
@@ -37868,6 +37947,12 @@ class SessionManager:
             "lastBranch": extra.get("lastBranch"),
             "ticketWrites": (extra.get("ticketWrites")
                              if isinstance(extra.get("ticketWrites"), list) else []),
+            # A migration's ticket-update record (XERK-3055), already
+            # re-validated (`_carried_ticket_state`). None = first sight at
+            # `ticketUpdateSince`, else this record's createdAt.
+            "ticketUpdateBase": extra.get("ticketUpdateBase"),
+            "ticketUpdateSince": extra.get("ticketUpdateSince"),
+            "ticketUpdateHeld": extra.get("ticketUpdateHeld"),
             # A session that was ALREADY named (XERK-815) must come back already
             # ANSWERING to that name, not to a launch slug the rc-name reconciler
             # then has to `/rename` away on the first idle beat. That `/rename`
@@ -38066,10 +38151,21 @@ class SessionManager:
             except Exception as e:
                 refuse(f"capturing the worktree's changes failed: {e}")
                 return
+        # The ticket-update record rides along (XERK-3055): without it the
+        # target baselines at its own createdAt and an update that landed before
+        # the move, unread, is history there.
+        members = dict(worktree or {})
+        try:
+            ticket_state = _migration_ticket_state(sess)
+        except Exception as e:   # never costs the move: the target anchors as before
+            log(f"exportSession: not carrying the ticket-update record: {e}")
+            ticket_state = None
+        if ticket_state:
+            members[SESSION_STATE_MEMBER] = ticket_state
         try:
             blob = self._pack_transcript(path, dsh_store=dsh_store,
                                          qwen_store=qwen_store,
-                                         worktree=worktree)
+                                         worktree=members or None)
         except Exception as e:
             refuse(f"packing the transcript failed: {e}")
             return
@@ -38192,6 +38288,8 @@ class SessionManager:
         except Exception as e:
             job["error"] = f"the moved worktree state is unreadable: {e}"
             return
+        # Re-validated against the command's ticket in `_finish_import`.
+        job["ticketState"] = state.pop(SESSION_STATE_MEMBER, None)
         try:
             self._stage_import(job, blob)
         except Exception as e:
@@ -38418,6 +38516,8 @@ class SessionManager:
             "localModelName": cmd.get("localModelName"),
             "localModelContext": cmd.get("localModelContext"),
             "migratedFrom": cmd.get("migratedFrom"),
+            # What the source already saw of the ticket's updates (XERK-3055).
+            **_carried_ticket_state(job.get("ticketState"), cmd.get("ticket")),
         }
         self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd.get("cmdId"),
                             extra=extra, migration_id=migration_id,
@@ -38928,7 +39028,8 @@ class SessionManager:
                 if not m.name.startswith(prefix):
                     continue
                 rel = m.name[len(prefix):]
-                if rel not in WORKTREE_STATE_MEMBERS or not m.isreg():
+                if rel not in WORKTREE_STATE_MEMBERS + (SESSION_STATE_MEMBER,) \
+                        or not m.isreg():
                     continue
                 if m.size > MIGRATION_BLOB_MAX - total:
                     raise ValueError(f"{rel} is over the migration size limit")

@@ -27,8 +27,18 @@ New comments and edits on a running session's ticket reach that session via `not
     Never anchor a resume on a time instead: reads are a cadence apart, so any anchor drops
     that tail (QA). `ticketUpdateSince` is carried too, so a run killed before its first read
     keeps its own anchor; only a record predating both keys anchors at its `closedAt`.
-  - Migration and resume-any build a record without the base (the hub carries none), so they
-    anchor at their own `createdAt`; a clear-context restart keeps the record and its base.
+  - Migration carries the base, anchor (`since`, else the source's `createdAt`), held updates and
+    `ticketWrites` in the bundle as `.worktree/session.json` (XERK-3055).
+    - It is never extracted: a target since #1213 ignores it; an older one leaves a stray copy
+      in the project-slug dir.
+    - The target re-validates it against the command's ticket key (`_carried_ticket_state`);
+      absent or mismatched = first sight at its own `createdAt`.
+    - Over `SESSION_STATE_MAX`, or a `mark`/`since` over an hour ahead, is dropped: a future
+      `mark` would mute the session's updates for good.
+    - It is a snapshot at export: what the source delivers before its kill is redelivered on
+      the target, a duplicate rather than a loss. Tests: `TestMigrationCarriesTicketUpdates`.
+  - Resume-any carries no ticket, so it gets no updates; a clear-context restart keeps the
+    record and its base.
   - First sight baselines only events created at or before `ticketUpdateSince` (adoption, or a
     base-less resume), else `createdAt`; later ones are delivered.
   - Why: the first read lands up to a cadence after the spawn, and an operator's "also handle X"
