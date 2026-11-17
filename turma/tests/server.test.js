@@ -35269,17 +35269,58 @@ test("XERK-3057: blocks have their own cap, never refuse a user's event, and say
     assert.ok(Date.now() - t0 < 3000, `one reconcile of ${half} blocks stays quick (${Date.now() - t0} ms)`);
     assert.equal((await block3057({ eventId: "GID-9:0", orgs: [S2985B] }, D2985A2)).status, 200);
     assert.equal(blockRecs3057().length, cap);
-    const served = (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events.filter((e) => e.blocks);
-    assert.equal(served.filter((e) => e.blocks.full === cap).length, 2 * half - cap, "the unwritten ones say why");
+    const fullOnes = async () => (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events
+      .filter((e) => e.blocks && e.blocks.full === cap).length;
+    assert.equal(await fullOnes(), 2 * half - cap, "the unwritten ones say why");
+    // Another host's reconcile never clears this host's note (QA: it flapped per tenant).
+    hub.calBlockReconcile(D2985A);
+    assert.equal(await fullOnes(), 2 * half - cap);
     // The user's own Turma event is never refused for hidden blocks.
     const c = await turma2968("POST", null, ev2968([S2985A]));
     assert.equal(c.status, 200, JSON.stringify(c.body));
     const stored = hub.getCalendarTurmaEvents()[""];
     assert.equal(Object.keys(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]).length,
       cap + 1, "the coerce keeps blocks beside the user's events");
+    // Clearing a host's whole series is one batch too (QA: per-tombstone persists were O(n²)).
+    const t1 = Date.now();
+    assert.equal((await block3057({ eventId: "GID-8:0", orgs: [] })).status, 200);
+    assert.ok(Date.now() - t1 < 3000, `clearing ${half} blocks stays quick (${Date.now() - t1} ms)`);
+    assert.equal(blockRecs3057().filter((r) => r.blockOf.host === D2985A).length, 0);
+    assert.equal(hub.getCalendarOutlookTombstones()[D2985B].length, half, "every copy is owed a delete");
   } finally {
     cleanup2985(D2985A, D2985A2, D2985B);
     forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3057: a block keeps its record id whatever its host key becomes; a stray second record goes", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    await beat2985(D2985A, S2985A, sync2985([src3057()]));
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: [S2985B] })).status, 200);
+    // The tenant migration keeps a block's id while its host key changes: stand that in by
+    // moving the record to an id that is not the (host, event) hash.
+    const bucket = hub.getCalendarTurmaEvents()[""];
+    const [rec] = blockRecs3057();
+    const kept = "turma:00000000000b3057";
+    delete bucket[rec.id];
+    bucket[kept] = hub.sanitizeTurmaEvent({ ...rec, id: kept }, "");
+    const before = writes2985(D2985B).length;
+    assert.equal(hub.calBlockReconcile(D2985A), 0, "nothing changed: no write");
+    assert.deepEqual(blockRecs3057().map((r) => r.id), [kept]);
+    await later2985();
+    await beat2985(D2985A, S2985A, sync2985([src3057({ start: iso2968(T2968 + 3.6e6), end: iso2968(T2968 + 7.2e6) })]));
+    assert.deepEqual(blockRecs3057().map((r) => [r.id, r.version]), [[kept, 2]], "moved in place, same id");
+    assert.ok(writes2985(D2985B).slice(before).every((w) => w.turmaId === kept));
+    // A second record for the same (host, event) is removed with its copies.
+    bucket[rec.id] = hub.sanitizeTurmaEvent({ ...bucket[kept], id: rec.id }, "");
+    hub.calBlockReconcile(D2985A);
+    assert.equal(blockRecs3057().length, 1);
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
   }
 });
 

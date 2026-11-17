@@ -7505,10 +7505,16 @@ const calBlockRules = (key) => (calendarHostSettings[key] && calendarHostSetting
 const calBlockRuleOf = (rules, ev) => (ev.seriesId && Object.hasOwn(rules, ev.seriesId) ? rules[ev.seriesId]
   : Object.hasOwn(rules, ev.id) ? rules[ev.id] : null);
 // Tenant `t`'s block records: `${host}\0${event}` -> record, and how many there are.
-function calBlockIndex(t) {
+// A second record for one (host, event) — which nothing should make — lands in `dups`,
+// so the reconcile removes it rather than leaving it, and its copies, for good.
+function calBlockIndex(t, dups = null) {
   const byEvent = new Map();
   for (const rec of Object.values(calendarTurmaEvents[t] || {})) {
-    if (rec.blockOf) byEvent.set(`${rec.blockOf.host}\u0000${rec.blockOf.event}`, rec);
+    if (!rec.blockOf) continue;
+    const k = `${rec.blockOf.host}\u0000${rec.blockOf.event}`;
+    const had = byEvent.get(k);
+    if (had && dups) dups.push(had.id < rec.id ? rec : had);
+    if (!had || rec.id < had.id) byEvent.set(k, rec);
   }
   return byEvent;
 }
@@ -7524,8 +7530,11 @@ function calBlockTimes(ev) {
 // host is in stays on a block while the record has it, so calendarTurmaTick's 24h
 // grace decides it. Only an event that has not ended gets a NEW block. Every write
 // lands in ONE persist/broadcast (per-record stores were O(n²): seconds at 1000).
-const calBlockFull = new Set();   // tenants whose last reconcile skipped a block for the cap
+const calBlockFull = new Set();   // hosts whose last reconcile skipped a block for the cap
 function calBlockReconcile(key, now = Date.now()) {
+  return calTombstoneBatch(() => calBlockReconcileNow(key, now), now);
+}
+function calBlockReconcileNow(key, now) {
   const t = tenantOfKey(key);
   const ownOrg = calendarEventOrg(key);
   const h = calendarEvents[key];
@@ -7533,7 +7542,8 @@ function calBlockReconcile(key, now = Date.now()) {
   const rules = calBlockRules(key);
   const decided = decidedOrgs();
   const stamps = calTurmaStampSet(t);
-  const index = calBlockIndex(t);
+  const dups = [];
+  const index = calBlockIndex(t, dups);
   let blocks = index.size;
   const want = new Map();   // event id -> {ev, orgs, rule, prev}
   for (const ev of h && ownOrg ? h.events : []) {
@@ -7547,6 +7557,12 @@ function calBlockReconcile(key, now = Date.now()) {
   }
   const bucket = calendarTurmaEvents[t] || (calendarTurmaEvents[t] = Object.create(null));
   let n = 0, full = false;
+  for (const rec of dups) {
+    if (rec.blockOf.host !== key) continue;
+    delete bucket[rec.id];
+    calOutlookAfterWrite(t, rec, null, now);
+    n++;
+  }
   for (const [k, rec] of index) {
     if (rec.blockOf.host !== key || want.has(rec.blockOf.event)) continue;
     delete bucket[rec.id];
@@ -7573,10 +7589,10 @@ function calBlockReconcile(key, now = Date.now()) {
     n++;
   }
   if (!Object.keys(bucket).length) delete calendarTurmaEvents[t];
-  if (full && !calBlockFull.has(t)) {
+  if (full && !calBlockFull.has(key)) {
     console.log(`calendar blocks of ${logName(key)} not all written: a tenant keeps at most ${CAL_BLOCK_RECORDS_MAX}`);
   }
-  if (full) calBlockFull.add(t); else calBlockFull.delete(t);
+  if (full) calBlockFull.add(key); else calBlockFull.delete(key);
   if (n) {
     persistCalendarTurmaEvents();
     broadcastCalendarSoon(calTurmaFrameKey(t));
@@ -7608,7 +7624,7 @@ function calBlockWire(key, ev, index, now = Date.now()) {
   const out = { orgs: rule.orgs.filter((o) => o !== calendarEventOrg(key)), alias: rule.alias, series: !!ev.seriesId };
   if (rec) out.outlook = calOutlookWire(rec.outlook, rec.orgs);
   // Not written for the tenant's block cap: said, never silent.
-  else if (ev.endMs > now && !ev.canceled && calBlockFull.has(tenantOfKey(key))) out.full = CAL_BLOCK_RECORDS_MAX;
+  else if (ev.endMs > now && !ev.canceled && calBlockFull.has(key)) out.full = CAL_BLOCK_RECORDS_MAX;
   return out;
 }
 // PUT /api/agents/<host>/calendar/blocks {eventId, orgs, alias?}: set (or, with
@@ -7862,6 +7878,23 @@ function calSendTombstoneSettled(t, turmaId, now) {
 // Orphan host `key`'s copy of `turmaId` (one per host: a host is in one org), and
 // send its delete now when the host can take it.
 // `sent`: the copy may have sent invitations (XERK-3014/3015), so its invitation may be live.
+// Inside calTombstoneBatch the per-tombstone persist + host flush wait for the batch's end:
+// a bulk block delete (XERK-3057) otherwise snapshotted the store per tombstone (O(n²)).
+let calTombstonePending = null;   // {hosts: Set, urgent} while a batch runs
+function calTombstoneBatch(fn, now) {
+  if (calTombstonePending) return fn();
+  calTombstonePending = { hosts: new Set(), urgent: false };
+  try {
+    return fn();
+  } finally {
+    const b = calTombstonePending;
+    calTombstonePending = null;
+    if (b.hosts.size) {
+      persistCalendarOutlookTombstones(b.urgent);
+      for (const k of b.hosts) calOutlookFlushHost(k, now);
+    }
+  }
+}
 function calTombstoneAdd(key, turmaId, org, outlookId, now, sent = false) {
   const old = calendarOutlookTombstones[key] || [];
   const list = old.filter((x) => x.turmaId !== turmaId);
@@ -7873,9 +7906,12 @@ function calTombstoneAdd(key, turmaId, org, outlookId, now, sent = false) {
   // A sent tombstone evicted by the cap (or replaced) gives up on its cancellation:
   // its event's first copy sends from now on (XERK-3015).
   const lost = old.filter((x) => x.sent && !kept.includes(x));
-  persistCalendarOutlookTombstones(sent || lost.length > 0);
+  if (calTombstonePending) {
+    calTombstonePending.hosts.add(key);
+    calTombstonePending.urgent = calTombstonePending.urgent || sent || lost.length > 0;
+  } else persistCalendarOutlookTombstones(sent || lost.length > 0);
   for (const x of lost) calSendTombstoneSettled(tenantOfKey(key), x.turmaId, now);
-  calOutlookFlushHost(key, now);
+  if (!calTombstonePending) calOutlookFlushHost(key, now);
 }
 // A copy being given back to its host (re-picked for the record): its tombstone
 // goes, and its outlookId is reused (the upsert then finds the copy).

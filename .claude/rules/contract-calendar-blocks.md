@@ -38,7 +38,8 @@ Built entirely on the Turma-event writer (`contract-calendar-outlook-write.md`);
   - Orgs = the rule's orgs of the host's tenant, never the source's own org; an org no host is in
     stays on the record while it has it, so `calendarTurmaTick`'s 24h grace decides it.
 - **The record follows its source**: re-timed/renamed in place (same id, next version); gone from
-  the host's store (deleted, moved out, aged out) → `calTurmaRemove`, which tombstones every copy.
+  the host's store (deleted, moved out, aged out) → removed, every copy tombstoned.
+  - A stray second record for one (host, event) is removed too (`calBlockIndex` dups).
   An event that has ENDED gets no NEW block (a past series must not flood the caps).
 - **A host in no decided org is left alone** (a brief drift must not delete every block).
 - Reconciled on: the rule route, every applied `calendarSync` row, a host's decided-org change
@@ -50,6 +51,9 @@ Built entirely on the Turma-event writer (`contract-calendar-outlook-write.md`);
     "Not written", never silent. Logged once per full run.
 - **One reconcile is ONE persist/broadcast/relink**: per-record `calTurmaStore` calls were O(n²)
   (seconds of event loop at 1000 blocks, QA). Writes go through `calOutlookAfterWrite` directly.
+  - Its tombstones are batched too (`calTombstoneBatch`: one persist, one flush per host): a
+    persist per tombstone made clearing 1500 blocks take seconds (QA).
+  - The "full" note is per HOST (`calBlockFull`): per tenant, any other host's reconcile cleared it.
 
 ## Hidden everywhere else
 
