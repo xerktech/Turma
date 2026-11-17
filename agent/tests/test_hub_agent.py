@@ -61369,6 +61369,9 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         ha.seed_ticket_write_calls(st2, pend)
         self.assertEqual(st2["twCalls"], st["twCalls"])
         self.assertIsInstance(st2["twCalls"]["t1"][0]["_file"], tuple)
+        # A timed-out call's rest is not persisted: its twBg job is in memory only.
+        st["twCalls"]["bg:task1"] = [{"kind": "comment", "key": "XERK-1", "tp": 9}]
+        self.assertNotIn("bg:task1", ha.ticket_write_calls_persisted(st))
 
     def test_xerk3053_seeding_retypes_the_record_and_runs_once(self):
         st = {}
@@ -61385,6 +61388,14 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
             "file": [{"kind": "comment", "key": "XERK-1"}]})
         ha.seed_ticket_write_calls(st, {"late": [{"kind": "comment", "key": "XERK-2"}]})
         self.assertNotIn("late", st["twCalls"])      # the scan's own map wins
+        st4 = {}
+        ha.seed_ticket_write_calls(st4, {
+            "times": [{"kind": "comment", "key": "XERK-1", "t0": 5, "tp": 9}],
+            "badtimes": [{"kind": "comment", "key": "XERK-1", "t0": True, "tp": 2 ** 53}],
+            "bg:task1": [{"kind": "comment", "key": "XERK-1", "tp": 9}]})
+        self.assertEqual(st4["twCalls"], {
+            "times": [{"kind": "comment", "key": "XERK-1", "t0": 5, "tp": 9}],
+            "badtimes": [{"kind": "comment", "key": "XERK-1"}]})
         st3 = {}
         ha.seed_ticket_write_calls(st3, "garbage")
         self.assertEqual(st3["twCalls"], {})

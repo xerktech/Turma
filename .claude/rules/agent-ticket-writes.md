@@ -90,6 +90,8 @@ The ticket-update poller must not hand a session back its own comment or status 
     re-learned on the process's first scan (`seed_ticket_write_calls`, re-typed: the file is
     outside the process). A live-agent snapshot's restart gap is folded into this scan as well.
     Every launch drops them (`_launch_tmux`): a relaunched claude never answers the old calls.
+    The re-typer keeps `t0`/`tp` (the hold and the match window need them); a timed-out call's
+    `bg:<task>` rest is NOT persisted, since its `twBg` job is in memory only and could never record.
     Residual: with no snapshot (back-scan path), a result written while the manager was down is lost.
   - Accepted residual: a MIGRATION re-seeds from the transcript only (the hub's `importSession`
     carries no ledger), so a manager close-ticket comment is forgotten on the target. Its miss

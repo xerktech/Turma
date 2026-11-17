@@ -12985,6 +12985,10 @@ def _tw_pending_write(w):
     for k in ("to", "fp"):
         if isinstance(w.get(k), str) and 0 < len(w[k]) <= 200:
             out[k] = w[k]
+    for k in ("t0", "tp"):  # the call's start / timeout (XERK-3051, XERK-3054)
+        v = w.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and 0 < v < 2 ** 53:
+            out[k] = v
     fields = w.get("fields")
     if isinstance(fields, list):
         names = [f for f in fields if isinstance(f, str) and 0 < len(f) <= 64][:16]
@@ -13004,13 +13008,16 @@ def ticket_write_calls_persisted(state):
     tool_result) in a JSON shape for the record (XERK-3053). In memory only, a
     command still running across a manager restart lost its call: the restart
     primes the scan to EOF, so its result alone arrived and nothing was
-    recorded. `_file`'s tuple goes as a list."""
+    recorded. `_file`'s tuple goes as a list. A timed-out call's `bg:<task>` rest
+    is left out: its `twBg` job is not persisted, so restored it could only hold
+    a matching update until it aged out, never be recorded."""
     calls = state.get("twCalls") if isinstance(state, dict) else None
     if not isinstance(calls, dict):
         return {}
     return {bid: [dict(w, _file=list(w["_file"])) if isinstance(w.get("_file"), tuple)
                   else dict(w) for w in writes]
-            for bid, writes in calls.items() if isinstance(writes, list)}
+            for bid, writes in calls.items()
+            if isinstance(writes, list) and not str(bid).startswith("bg:")}
 
 
 def seed_ticket_write_calls(state, pending):
@@ -13024,7 +13031,8 @@ def seed_ticket_write_calls(state, pending):
     if not isinstance(pending, dict):
         return
     for bid, writes in list(pending.items())[-TICKET_WRITE_CALLS_MAX:]:
-        if not isinstance(bid, str) or not 0 < len(bid) <= 200 or not isinstance(writes, list):
+        if not isinstance(bid, str) or not 0 < len(bid) <= 200 or not isinstance(writes, list) \
+                or bid.startswith("bg:"):
             continue
         kept = [w for w in (_tw_pending_write(x) for x in writes[:16]) if w]
         if kept:
