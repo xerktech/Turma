@@ -221,6 +221,14 @@ Events made IN Turma, owned by the hub. Every child of the epic
     TU,TH); byWeekday takes the new date's nth (a 5th = last). Why: kept as is, the new series'
     first instance was not one of its own occurrences. A day the client changed is kept as sent;
     one equal to the series' implicit day (`withAnchorDays`) counts as unchanged.
+  - **A `following` start equal to the occurrence's DISPLAYED start is no re-time** (XERK-2991):
+    the new series anchors on the ORIGINAL slot (cadence kept) and a moved occurrence keeps its
+    move. An end equal to the displayed one is unchanged; another end (or one sent alone) is a new
+    LENGTH at the original slot, the moved occurrence taking it too. Only a different start
+    re-times. Why: the web editor resends the start with a changed end, which shifted the cadence.
+  - **Moves and lengths carried onto another slot are WALL-clock deltas in the event's zone**
+    (`following` length, `series` move through an occurrence): a ms delta across DST ended an
+    all-day series at 23:00.
   - **A `series` move to another date re-anchors the same way** (`calTurmaMovedRule`): through an
     occurrence id, "following" from the first occurrence, or the series' own start.
   - **Every N > 1 weeks, a move carrying the days across different week boundaries is a 400**
@@ -229,6 +237,7 @@ Events made IN Turma, owned by the hub. Every child of the epic
     (`CAL_TURMA_ZONE_WEEK_REFUSAL`, XERK-2993): nothing was "moved".
   - `version` is the SERIES' (one version per series; every scope bumps it). Occurrence PATCH
     answers the occurrence, series PATCH the series record.
+- Tests: the `XERK-2991:` case in `server.test.js` (moved occurrence resent unchanged).
 - Tests: `recurrence.test.js` (DST both ways and east of +12, month-end, nth/last weekday,
   until/count, range cut, bounds); the `XERK-2969:` cases in `server.test.js` (ids, moved/deleted
   occurrences, rule edit dropping exceptions, the following split, the serve cap); the `XERK-2953:`
