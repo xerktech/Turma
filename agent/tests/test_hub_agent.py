@@ -43099,6 +43099,513 @@ class TestCreateBlocksLink(ManagerMixin, unittest.TestCase):
                          "the next-oldest unconfirmed entry is evicted")
 
 
+def _adf_doc(text):
+    return {"type": "doc", "content": [{"type": "paragraph",
+                                        "content": [{"type": "text", "text": text}]}]}
+
+
+class TestTicketUpdateEvents(unittest.TestCase):
+    """XERK-3033: a ticket's comments + field changes, one normalized list per
+    ticket, Jira and ADO, bounded, never raising (None on a hard failure)."""
+
+    JIRA = dict(JIRA_SITE="x.atlassian.net", JIRA_EMAIL="e", JIRA_TOKEN="t",
+                AZDO_URL="", AZDO_TOKEN="")
+    AZDO = dict(JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p")
+
+    def setUp(self):
+        p = mock.patch.object(ha, "_JIRA_STATUS_CATS", {"at": 0.0, "map": {}})
+        p.start()
+        self.addCleanup(p.stop)
+        p2 = mock.patch.object(ha, "log", lambda *a, **k: None)
+        p2.start()
+        self.addCleanup(p2.stop)
+
+    # --- Jira ------------------------------------------------------------
+    def _jira(self, comments=None, pages=None, statuses=None, fail=None):
+        calls = []
+
+        def get(path, params):
+            calls.append((path, dict(params)))
+            if fail and fail in path:
+                raise RuntimeError("boom")
+            if path.endswith("/comment"):
+                return comments if comments is not None else {"comments": []}
+            if path.endswith("/changelog"):
+                return pages(params) if callable(pages) else (pages or {"values": [], "total": 0, "isLast": True})
+            if path == "/rest/api/3/status":
+                return statuses or []
+            raise AssertionError(path)
+        return get, calls
+
+    def test_jira_comments_changelog_attachment_and_status_move(self):
+        comments = {"comments": [
+            {"id": "11", "author": {"displayName": "Ada", "accountId": "a1"},
+             "created": "2026-11-02T10:00:00.000+0000", "body": _adf_doc("newer ‮hi​")},
+            {"id": "10", "author": {"displayName": "Bo", "accountId": "b1"},
+             "created": "2026-11-01T10:00:00.000+0000", "body": _adf_doc("older")},
+        ]}
+        pages = {"total": 2, "isLast": True, "values": [
+            {"id": "500", "author": {"displayName": "Ada", "accountId": "a1"},
+             "created": "2026-11-01T12:00:00.000+0000", "items": [
+                 {"field": "status", "fieldId": "status", "from": "1", "fromString": "To Do",
+                  "to": "3", "toString": "In Review"},
+                 {"field": "Attachment", "fieldId": "attachment", "to": "77",
+                  "toString": "trace.log"},
+                 {"field": "Attachment", "fieldId": "attachment", "to": "78",
+                  "toString": "shot.png"}]},
+            {"id": "501", "author": {"displayName": "Bo"},
+             "created": "2026-11-01T13:00:00.000+0000", "items": [
+                 {"field": "Acceptance Criteria", "fieldId": "customfield_10050",
+                  "fromString": "", "toString": "must pass"},
+                 {"field": "description", "fieldId": "description",
+                  "fromString": "a", "toString": "b"}]},
+        ]}
+        statuses = [{"id": "1", "statusCategory": {"key": "new"}},
+                    {"id": "3", "statusCategory": {"key": "indeterminate"}}]
+        get, calls = self._jira(comments, pages, statuses)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        by = {e["key"]: e for e in ev}
+        self.assertEqual(set(by), {"c:10", "c:11", "h:500:status", "h:500:attachment",
+                                   "h:500:attachment:1", "h:501:acceptance criteria",
+                                   "h:501:description"})
+        self.assertEqual(by["c:11"]["body"], "newer hi")       # bidi/zero-width stripped
+        self.assertEqual(by["c:11"]["kind"], "comment")
+        self.assertEqual(by["c:11"]["authorId"], "a1")
+        st = by["h:500:status"]
+        self.assertEqual((st["fromText"], st["toText"]), ("To Do", "In Review"))
+        self.assertEqual(st["toCategory"], "inprogress")
+        self.assertEqual(st["toColumn"], "review")
+        self.assertEqual(st["fromColumn"], "todo")
+        self.assertEqual(by["h:500:attachment:1"]["toText"], "shot.png")
+        # Oldest first.
+        self.assertEqual(ev[0]["key"], "c:10")
+        cpath, cparams = calls[0]
+        self.assertEqual(cparams["orderBy"], "-created")
+        self.assertEqual(cparams["maxResults"], ha.TICKET_UPDATE_COMMENTS_MAX)
+
+    def test_jira_changelog_jumps_to_the_newest_window(self):
+        page = ha.TICKET_UPDATE_PAGE_SIZE
+        total = page * 10
+
+        def pages(params):
+            start = params["startAt"]
+            vals = [{"id": str(i), "created": "2026-11-01T00:00:00.000+0000",
+                     "items": [{"fieldId": "summary", "toString": f"s{i}"}]}
+                    for i in range(start, min(start + page, total))]
+            return {"total": total, "isLast": start + page >= total, "values": vals}
+        get, calls = self._jira(pages=pages)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        starts = [p["startAt"] for path, p in calls if path.endswith("/changelog")]
+        self.assertLessEqual(len(starts), ha.TICKET_UPDATE_HISTORY_PAGES)
+        ids = {int(e["key"].split(":")[1]) for e in ev}
+        self.assertIn(total - 1, ids)                  # the newest change is in
+        self.assertNotIn(0, ids)                       # the oldest page dropped
+        self.assertLessEqual(len(ev), ha.TICKET_UPDATE_EVENTS_MAX)
+
+    def test_jira_oversize_and_malformed_rows_are_bounded_not_fatal(self):
+        comments = {"comments": [
+            {"id": "1", "body": _adf_doc("x" * 50000), "created": "2026-11-01T00:00:00.000+0000"},
+            "junk", {"no": "id"}]}
+        pages = {"total": 1, "isLast": True, "values": [
+            "junk", {"id": "9", "items": ["junk", {"fieldId": "summary",
+                                                   "toString": "y" * 50000}]}]}
+        get, _ = self._jira(comments, pages)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        self.assertEqual(len(ev), 2)
+        self.assertLessEqual(len(ev[0]["body"] or ev[1]["body"]), ha.TICKET_UPDATE_BODY_MAX)
+        summ = next(e for e in ev if e["field"] == "summary")
+        self.assertLessEqual(len(summ["toText"]), ha.TICKET_UPDATE_FIELD_TEXT_MAX)
+
+    def test_jira_fetch_failure_or_malformed_reply_is_none(self):
+        for fail in ("/comment", "/changelog"):
+            get, _ = self._jira(fail=fail)
+            with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+                self.assertIsNone(ha.ticket_update_events("ENG-1"), fail)
+        get, _ = self._jira(comments=["not", "an", "object"])
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            self.assertIsNone(ha.ticket_update_events("ENG-1"))
+
+    def test_status_categories_failing_degrades_not_fails(self):
+        pages = {"total": 1, "isLast": True, "values": [
+            {"id": "5", "items": [{"fieldId": "status", "to": "3", "toString": "Done"}]}]}
+        get, _ = self._jira(pages=pages, fail="/rest/api/3/status")
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        self.assertIsNone(ev[0]["toCategory"])
+        self.assertIsNone(ev[0]["toColumn"])
+
+    def test_bad_key_or_unconfigured_is_none_with_no_http(self):
+        def get(*a):
+            raise AssertionError("no HTTP")
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            self.assertIsNone(ha.ticket_update_events("ENG-1/../x"))
+        with mock.patch.multiple(ha, JIRA_SITE="", JIRA_EMAIL="", JIRA_TOKEN="",
+                                 AZDO_URL="", AZDO_TOKEN=""), \
+             mock.patch.object(ha, "jira_get", get):
+            self.assertIsNone(ha.ticket_update_events("ENG-1"))
+
+    # --- Azure DevOps ----------------------------------------------------
+    def _azure(self, updates_pages, comments=None, rev=3, fail=None):
+        calls = []
+
+        def req(path, params, body=None, **kw):
+            calls.append((path, dict(params)))
+            if fail and fail in path:
+                raise RuntimeError("boom")
+            if path == "/_apis/wit/workitems/42":
+                return _azure_wi(42, "Active", **{"System.Rev": rev})
+            if path.endswith("/comments"):
+                self.assertTrue(path.startswith("/Proj/"))
+                return comments if comments is not None else {"comments": []}
+            if path.endswith("/updates"):
+                return updates_pages(params) if callable(updates_pages) else updates_pages
+            raise AssertionError(path)
+        return req, calls
+
+    def test_azure_comments_updates_attachment_and_status_move(self):
+        comments = {"comments": [
+            {"id": 7, "text": "<p>new <b>note</b></p>", "createdDate": "2026-11-02T00:00:00Z",
+             "createdBy": {"displayName": "Ada", "id": "g1"}},
+            {"id": 6, "text": "<p>gone</p>", "isDeleted": True,
+             "createdDate": "2026-11-01T00:00:00Z"}]}
+        updates = {"value": [
+            {"id": 1, "rev": 1, "fields": {"System.Title": {"newValue": "created"}}},
+            {"id": 2, "rev": 2, "revisedBy": {"displayName": "Bo", "id": "g2"},
+             "revisedDate": "9999-01-01T00:00:00Z",
+             "fields": {"System.State": {"oldValue": "New", "newValue": "Resolved"},
+                        "System.ChangedDate": {"newValue": "2026-11-01T05:00:00Z"},
+                        "System.Rev": {"oldValue": 1, "newValue": 2},
+                        "Microsoft.VSTS.Common.AcceptanceCriteria":
+                            {"newValue": "<div>must <i>work</i></div>"},
+                        "System.AssignedTo": {"newValue": {"displayName": "Cy"}}},
+             "relations": {"added": [
+                 {"rel": "AttachedFile", "attributes": {"name": "log.txt"}},
+                 {"rel": "System.LinkTypes.Related"}]}},
+        ]}
+        req, calls = self._azure(updates, comments)
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            ev = ha.ticket_update_events("42")
+        by = {e["key"]: e for e in ev}
+        self.assertEqual(set(by), {"c:7", "h:2:status", "h:2:acceptance criteria",
+                                   "h:2:assignee", "h:2:attachment"})
+        self.assertEqual(by["c:7"]["body"], "new note")
+        st = by["h:2:status"]
+        self.assertEqual((st["fromText"], st["toText"]), ("New", "Resolved"))
+        self.assertEqual(st["created"], "2026-11-01T05:00:00Z")   # never revisedDate
+        self.assertEqual(st["toColumn"], "review")
+        self.assertIn("must", by["h:2:acceptance criteria"]["toText"])
+        self.assertNotIn("<", by["h:2:acceptance criteria"]["toText"])
+        self.assertEqual(by["h:2:assignee"]["toText"], "Cy")
+        self.assertEqual(by["h:2:attachment"]["toText"], "log.txt")
+        self.assertEqual(by["h:2:status"]["authorId"], "g2")
+
+    def test_azure_updates_page_from_the_newest_window(self):
+        page = ha.TICKET_UPDATE_PAGE_SIZE
+        n = page * 10
+
+        def pages(params):
+            s, t = params["$skip"], params["$top"]
+            return {"value": [{"id": i, "rev": i,
+                               "fields": {"System.Title": {"newValue": f"t{i}"}}}
+                              for i in range(s + 1, min(s + t, n) + 1)]}
+        req, calls = self._azure(pages, rev=n)
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "azure_req", req):
+            ev = ha.ticket_update_events("42")
+        upd = [p for path, p in calls if path.endswith("/updates")]
+        self.assertLessEqual(len(upd), ha.TICKET_UPDATE_HISTORY_PAGES)
+        self.assertEqual(upd[0]["$skip"], n - ha.TICKET_UPDATE_HISTORY_PAGES * page)
+        self.assertIn(f"h:{n}:summary", {e["key"] for e in ev})
+
+    def test_azure_rev_overshoot_rereads_from_the_start(self):
+        def pages(params):
+            if params["$skip"]:
+                return {"value": []}
+            return {"value": [{"id": 2, "rev": 2,
+                               "fields": {"System.Title": {"newValue": "x"}}}]}
+        req, _ = self._azure(pages, rev=10 ** 6)
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "azure_req", req):
+            ev = ha.ticket_update_events("42")
+        self.assertEqual([e["key"] for e in ev], ["h:2:summary"])
+
+    def test_azure_fetch_failure_or_malformed_is_none(self):
+        for fail in ("/comments", "/updates", "/workitems/42"):
+            req, _ = self._azure({"value": []}, fail=fail)
+            with mock.patch.multiple(ha, **self.AZDO), mock.patch.object(ha, "azure_req", req):
+                self.assertIsNone(ha.ticket_update_events("42"), fail)
+        req, _ = self._azure({"value": "nope"})
+        with mock.patch.multiple(ha, **self.AZDO), mock.patch.object(ha, "azure_req", req):
+            self.assertIsNone(ha.ticket_update_events("42"))
+        with mock.patch.multiple(ha, **self.AZDO):
+            self.assertIsNone(ha.ticket_update_events("ENG-1"))   # not an ADO id
+
+    # --- field mapping + sanitising -----------------------------------------
+    def test_field_names_are_tracker_neutral(self):
+        cases = {"description": "description", "System.Description": "description",
+                 "Microsoft.VSTS.TCM.ReproSteps": "description",
+                 "summary": "summary", "System.Title": "summary",
+                 "Acceptance Criteria": "acceptance criteria",
+                 "Microsoft.VSTS.Common.AcceptanceCriteria": "acceptance criteria",
+                 "priority": "priority", "Microsoft.VSTS.Common.Priority": "priority",
+                 "attachment": "attachment", "status": "status", "System.State": "status",
+                 "customfield_99": "other", "": "other", None: "other"}
+        for raw, want in cases.items():
+            self.assertEqual(ha.ticket_field_name(raw), want, raw)
+
+    def test_tracker_text_strips_control_bidi_and_caps(self):
+        s = "a\x00b‮c⁦d​e﻿\nf g"
+        self.assertEqual(ha._tracker_text(s, 100), "abcde\nf\ng")
+        self.assertEqual(len(ha._tracker_text("z" * 10000, 50)), 50)
+        self.assertEqual(ha._tracker_text(None, 5), "")
+
+    # --- changed-since pre-check ---------------------------------------------
+    def test_jira_changed_since_is_one_relative_jql_and_filters(self):
+        seen = []
+        since = int(time.time() * 1000) - 10 * 60000
+
+        def fetch(jql, n, extra_fields=()):
+            seen.append(jql)
+            return ([{"key": "ENG-1", "updated": ha._ms_iso(since + 1000).replace("Z", "+0000")},
+                     {"key": "ENG-2", "updated": ha._ms_iso(since - 30000)},
+                     {"key": "OTHER-9", "updated": ha._ms_iso(since + 1)}], False)
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            got = ha.tickets_changed_since(["ENG-1", "ENG-2", "bad key)", "ENG-1"], since)
+        self.assertEqual(got, {"ENG-1"})
+        self.assertEqual(len(seen), 1)
+        self.assertIn('key in ("ENG-1", "ENG-2")', seen[0])
+        self.assertRegex(seen[0], r"updated >= -1[12]m$")
+
+    def test_jira_changed_since_chunks_and_fails_to_none(self):
+        keys = [f"ENG-{i}" for i in range(ha.TICKET_CHANGED_CHUNK + 1)]
+        seen = []
+
+        def fetch(jql, n, extra_fields=()):
+            seen.append(jql)
+            return [], False
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            self.assertEqual(ha.tickets_changed_since(keys, 0), set())
+        self.assertEqual(len(seen), 2)
+
+        def boom(*a, **k):
+            raise RuntimeError("x")
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", boom):
+            self.assertIsNone(ha.tickets_changed_since(["ENG-1"], 0))
+        with mock.patch.multiple(ha, **self.JIRA):
+            self.assertIsNone(ha.tickets_changed_since(["ENG-1"], "yesterday"))
+            self.assertEqual(ha.tickets_changed_since([], 0), set())
+
+    def test_azure_changed_since_reads_changed_date(self):
+        since = ha._ts_ms("2026-11-01T00:00:00Z")
+
+        def batch(ids, fields):
+            self.assertEqual(fields, ["System.ChangedDate"])
+            self.assertEqual(ids, [1, 2])
+            return [{"id": 1, "fields": {"System.ChangedDate": "2026-11-02T00:00:00.1234567Z"}},
+                    {"id": 2, "fields": {"System.ChangedDate": "2026-10-01T00:00:00Z"}}]
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "_azure_batch_get", batch):
+            self.assertEqual(ha.tickets_changed_since(["1", "2", "x"], since), {"1"})
+
+        def boom(*a):
+            raise RuntimeError("x")
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "_azure_batch_get", boom):
+            self.assertIsNone(ha.tickets_changed_since(["1"], since))
+
+    # --- QA pass 1 fixes -----------------------------------------------------
+    def test_jira_one_refused_key_drops_only_itself(self):
+        # Real Jira 400s the whole `key in (...)` when one key is gone or hidden.
+        seen = []
+
+        def fetch(jql, n, extra_fields=()):
+            seen.append(jql)
+            if '"ENG-9"' in jql:
+                raise ha.BoardHttpError("An issue with key 'ENG-9' does not exist", 400)
+            keys = re.findall(r'"([^"]+)"', jql)
+            return [{"key": k, "updated": None} for k in keys], False
+        keys = [f"ENG-{i}" for i in range(1, 11)]
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            got = ha.tickets_changed_since(keys, 0)
+        self.assertEqual(got, set(keys) - {"ENG-9"})
+        self.assertLess(len(seen), 12)
+
+        def down(*a, **k):
+            raise ha.BoardHttpError("unavailable", 503)
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", down):
+            self.assertIsNone(ha.tickets_changed_since(keys, 0))
+
+    def test_changed_keys_come_back_as_the_caller_spelled_them(self):
+        def fetch(jql, n, extra_fields=()):
+            return [{"key": "ABC-5", "updated": None}, {"key": "NEW-7", "updated": None}], False
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            self.assertEqual(ha.tickets_changed_since(["abc-5", "OLD-1"], 0), {"abc-5"})
+
+        def batch(ids, fields):
+            return [{"id": 7, "fields": {"System.ChangedDate": "garbage"}}]
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "_azure_batch_get", batch):
+            # Unparseable ChangedDate reads as changed, as on Jira.
+            self.assertEqual(ha.tickets_changed_since(["007"], 0), {"007"})
+
+    def test_jira_short_server_pages_still_reach_the_newest(self):
+        total, cap = 1000, 50
+
+        def pages(params):
+            st = params["startAt"]
+            vals = [{"id": str(i), "items": [{"fieldId": "summary", "toString": "x"}]}
+                    for i in range(st, min(st + cap, total))]
+            return {"total": total, "values": vals}
+        get, _ = self._jira(pages=pages)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        ids = {int(e["key"].split(":")[1]) for e in ev}
+        self.assertIn(total - 1, ids)
+        self.assertEqual(min(ids), total - (ha.TICKET_UPDATE_HISTORY_PAGES - 1) * cap)
+
+    def test_azure_short_server_pages_still_reach_the_newest(self):
+        n, cap = 1000, 50
+
+        def pages(params):
+            s0 = params["$skip"]
+            return {"value": [{"id": i, "rev": i,
+                               "fields": {"System.Title": {"newValue": "t"}}}
+                              for i in range(s0 + 1, min(s0 + cap, n) + 1)]}
+        req, calls = self._azure(pages, rev=n)
+        with mock.patch.multiple(ha, **self.AZDO), mock.patch.object(ha, "azure_req", req):
+            ev = ha.ticket_update_events("42")
+        keys = {e["key"] for e in ev}
+        self.assertIn(f"h:{n}:summary", keys)
+        self.assertLessEqual(len([c for c in calls if c[0].endswith("/updates")]),
+                             ha.TICKET_UPDATE_HISTORY_PAGES)
+
+    def test_created_is_cleaned_and_capped(self):
+        comments = {"comments": [{"id": "1", "body": _adf_doc("x"),
+                                  "created": "2026\u202e" + "9" * 200000}]}
+        get, _ = self._jira(comments)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        self.assertLessEqual(len(ev[0]["created"]), 64)
+        self.assertNotIn("\u202e", ev[0]["created"])
+
+    def test_malformed_status_list_degrades(self):
+        pages = {"total": 1, "isLast": True, "values": [
+            {"id": "5", "items": [{"fieldId": "status", "to": "3", "toString": "Done"}]}]}
+        for statuses in ([{"id": "3", "statusCategory": "done"}],
+                         [{"id": "3", "statusCategory": {"key": 3}}], {"x": 1}):
+            ha._JIRA_STATUS_CATS.update(at=0.0, map={})
+            get, _ = self._jira(pages=pages, statuses=statuses)
+            with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+                ev = ha.ticket_update_events("ENG-1")
+            self.assertIsNotNone(ev, statuses)
+            self.assertIsNone(ev[0]["toCategory"])
+
+    def test_events_are_capped_to_the_newest(self):
+        pages = {"total": 1, "isLast": True, "values": [
+            {"id": "1", "created": "2026-11-01T00:00:00.000+0000",
+             "items": [{"fieldId": "summary", "toString": str(i)}
+                       for i in range(ha.TICKET_UPDATE_EVENTS_MAX + 50)]}]}
+        get, _ = self._jira(pages=pages)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        self.assertEqual(len(ev), ha.TICKET_UPDATE_EVENTS_MAX)
+
+    def test_a_non_string_adf_text_does_not_fail_the_ticket(self):
+        comments = {"comments": [{"id": "1", "body": {"type": "doc", "content": [
+            {"type": "text", "text": 123}]}}]}
+        get, _ = self._jira(comments)
+        with mock.patch.multiple(ha, **self.JIRA), mock.patch.object(ha, "jira_get", get):
+            ev = ha.ticket_update_events("ENG-1")
+        self.assertEqual(ev[0]["body"], "123")
+    def test_azure_rev_overshoot_keeps_the_newest_it_found(self):
+        page = ha.TICKET_UPDATE_PAGE_SIZE
+        for n, rev, cap in ((150, 1000, page), (120, 400, page), (150, 1000, 50),
+                            (1000, 1500, None), (1000, 2400, None), (2000, 3000, None),
+                            (500, 600, 50), (500, 800, 50), (1000, 1100, 10),
+                            (50, 10 ** 15, None), (500, 10 ** 15, None)):
+            cap = cap or page
+            def pages(params, n=n, cap=cap):
+                s0 = params["$skip"]
+                return {"value": [{"id": i, "rev": i,
+                                   "fields": {"System.Title": {"newValue": "t"}}}
+                                  for i in range(s0 + 1, min(s0 + cap, n) + 1)]}
+            req, _ = self._azure(pages, rev=rev)
+            with mock.patch.multiple(ha, **self.AZDO), mock.patch.object(ha, "azure_req", req):
+                ev = ha.ticket_update_events("42")
+            self.assertIn(f"h:{n}:summary", {e["key"] for e in ev}, (n, rev, cap))
+            # Contiguous window ending at n, and a bounded number of reads.
+            ids = sorted(int(e["key"].split(":")[1]) for e in ev)
+            self.assertEqual(ids, list(range(ids[0], n + 1)), (n, rev, cap))
+            calls = [c for c in _ if c[0].endswith("/updates")]
+            self.assertLessEqual(len(calls), ha.TICKET_UPDATE_REV_PROBES
+                                 + 2 * ha.TICKET_UPDATE_HISTORY_PAGES + 3, (n, rev, cap))
+
+    def test_jira_every_key_refused_is_none_not_nothing_changed(self):
+        calls = []
+
+        def fetch(jql, n, extra_fields=()):
+            calls.append(jql)
+            raise ha.BoardHttpError("Date value is invalid", 400)
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            self.assertIsNone(ha.tickets_changed_since(["ENG-1", "ENG-2"], 0))
+            calls.clear()
+            self.assertIsNone(ha.tickets_changed_since([f"ENG-{i}" for i in range(120)], 0))
+        # Bounded: at most 2n-1 per chunk.
+        self.assertLessEqual(len(calls), 2 * 120)
+
+    def test_two_spellings_of_one_key_are_both_reported(self):
+        def fetch(jql, n, extra_fields=()):
+            return [{"key": "ABC-5", "updated": None}], False
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            self.assertEqual(ha.tickets_changed_since(["abc-5", "ABC-5"], 0), {"abc-5", "ABC-5"})
+
+        def batch(ids, fields):
+            return [{"id": 7, "fields": {"System.ChangedDate": "2030-01-01T00:00:00Z"}}]
+        with mock.patch.multiple(ha, **self.AZDO), \
+             mock.patch.object(ha, "_azure_batch_get", batch):
+            self.assertEqual(ha.tickets_changed_since(["007", "7"], 0), {"007", "7"})
+    def test_a_revoked_projects_keys_first_do_not_stop_the_check(self):
+        # Keys a user lost access to, listed first: bisection refuses them
+        # before any query answers. That is not a bad query.
+        def fetch(jql, n, extra_fields=()):
+            keys = re.findall(r'"([^"]+)"', jql)
+            if any(k.startswith("OLD-") for k in keys):
+                raise ha.BoardHttpError("does not exist", 400)
+            return [{"key": k, "updated": None} for k in keys], False
+        good = [f"ABC-{i}" for i in range(110)]
+        for bad_n in (8, 10, 20):
+            bad = [f"OLD-{i}" for i in range(bad_n)]
+            with mock.patch.multiple(ha, **self.JIRA), \
+                 mock.patch.object(ha, "fetch_jira_issues", fetch):
+                self.assertEqual(ha.tickets_changed_since(bad + good, 0), set(good), bad_n)
+        # Revoked projects at BOTH ends of the list.
+        both = [f"OLD-{i}" for i in range(15)] + good[:1] + [f"OLD-{i}" for i in range(20, 35)]
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            self.assertEqual(ha.tickets_changed_since(both, 0), set(good[:1]))
+            self.assertEqual(ha.tickets_changed_since(
+                ["ABC-1"] + [f"OLD-{i}" for i in range(20)], 0), {"ABC-1"})
+        # Answers first, then many refusals: never an abort either.
+        bad = [f"OLD-{i}" for i in range(12)]
+        with mock.patch.multiple(ha, **self.JIRA), \
+             mock.patch.object(ha, "fetch_jira_issues", fetch):
+            self.assertEqual(ha.tickets_changed_since(good[:5] + bad, 0), set(good[:5]))
+
 class TestBoardColumn(unittest.TestCase):
     """The status-column resolver behind drag-and-drop (XERK-141). Mirrors
     board.js categoryOf: review is carved out of inprogress by the status name."""

@@ -23814,6 +23814,8 @@ def adf_text(node):
 
     if t == "text":
         txt = node.get("text") or ""
+        if not isinstance(txt, str):
+            txt = str(txt)
         # A link's href is part of the detail an operator is reviewing, so keep
         # it alongside the anchor text unless the text already is the URL.
         for m in node.get("marks") or []:
@@ -27049,6 +27051,500 @@ def add_board_comment(key, text):
     else:
         jira_req(f"/rest/api/3/issue/{urllib.parse.quote(key)}/comment", {},
                  body={"body": _text_to_adf(text)})
+
+
+# --- Ticket update events (XERK-3033, epic XERK-3032) ---------------------------
+# Read primitives for delivering a ticket's NEW comments and field changes to the
+# session working it. One normalized event list per ticket, whatever the tracker,
+# with the `_pr_comment_events` contract: a list (possibly empty), or None on a
+# hard fetch failure so the caller keeps its seen-baseline untouched. No polling
+# and no delivery here. NETWORK: call these on a worker, never the beat (XERK-395).
+#
+# Every event: {key, kind: comment|field, author, authorId, body, field, rawField,
+# fromText, toText, created}, plus toCategory/toColumn (and fromColumn) on a status
+# change. `key` is stable across polls: `c:<commentId>` for a comment,
+# `h:<historyId>:<field>` for a change (`:<n>` appended when one history entry
+# carries the same field twice, e.g. two attachments). Tracker text is untrusted:
+# control, format (bidi, zero-width) and lone-surrogate characters are dropped and
+# every text is capped.
+TICKET_UPDATE_COMMENTS_MAX = _env_int("TURMA_TICKET_UPDATE_COMMENTS_MAX", 20, minimum=1, maximum=100)
+TICKET_UPDATE_BODY_MAX = 4000          # chars kept of one comment body
+TICKET_UPDATE_FIELD_TEXT_MAX = 1000    # chars kept of one from/to value
+TICKET_UPDATE_NAME_MAX = 200           # author / field-name chars kept
+TICKET_UPDATE_PAGE_SIZE = 100          # changelog / updates page
+TICKET_UPDATE_HISTORY_PAGES = 3        # hard bound on history pages per ticket
+TICKET_UPDATE_EVENTS_MAX = 300         # newest events kept per ticket
+TICKET_CHANGED_CHUNK = 50              # keys per pre-check query
+TICKET_STATUS_CAT_TTL_SEC = 3600       # Jira status-id -> category cache
+TICKET_UPDATE_REV_PROBES = 24          # ADO bisection steps when System.Rev overshoots
+TICKET_UPDATE_REV_CEILING = 1 << 20    # bisection range cap (24 steps cover it)
+
+# Tracker field -> tracker-neutral name, so a poller can allowlist without knowing
+# the tracker. Jira changelog items name a system field by id (`fieldId`) and a
+# custom one only by its display name (`field`); ADO by reference name.
+_TICKET_FIELD_NAMES = {
+    # Jira
+    "description": "description", "summary": "summary", "priority": "priority",
+    "status": "status", "attachment": "attachment", "labels": "labels",
+    "assignee": "assignee", "issuetype": "type", "duedate": "due",
+    "resolution": "resolution", "parent": "parent", "issuelinks": "link",
+    # Azure DevOps
+    "system.description": "description",
+    "microsoft.vsts.tcm.reprosteps": "description",
+    "system.title": "summary",
+    "microsoft.vsts.common.acceptancecriteria": "acceptance criteria",
+    "microsoft.vsts.common.priority": "priority",
+    "microsoft.vsts.common.severity": "priority",
+    "system.state": "status", "system.tags": "labels",
+    "system.assignedto": "assignee", "system.workitemtype": "type",
+    "microsoft.vsts.scheduling.duedate": "due",
+    "microsoft.vsts.scheduling.targetdate": "due",
+    "system.reason": "resolution", "system.parent": "parent",
+}
+_TICKET_ACCEPTANCE_RE = re.compile(r"acceptance[\s_-]*criteria", re.I)
+# ADO bookkeeping fields every update touches; they say nothing a session needs.
+_AZDO_NOISE_FIELDS = frozenset(s.lower() for s in (
+    "System.Rev", "System.ChangedDate", "System.ChangedBy", "System.AuthorizedDate",
+    "System.AuthorizedAs", "System.RevisedDate", "System.Watermark",
+    "System.PersonId", "System.CommentCount", "System.History",
+    "Microsoft.VSTS.Common.StateChangeDate", "Microsoft.VSTS.Common.ActivatedDate",
+    "Microsoft.VSTS.Common.ActivatedBy", "Microsoft.VSTS.Common.ClosedDate",
+    "Microsoft.VSTS.Common.ClosedBy", "Microsoft.VSTS.Common.ResolvedDate",
+    "Microsoft.VSTS.Common.ResolvedBy", "System.BoardColumn",
+    "System.BoardColumnDone", "System.BoardLane"))
+_JIRA_STATUS_CATS = {"at": 0.0, "map": {}}
+
+
+def ticket_field_name(raw):
+    """A tracker's field identifier -> its tracker-neutral name (description,
+    summary, acceptance criteria, priority, attachment, status, labels, assignee,
+    type, due, resolution, parent, link), else "other"."""
+    r = str(raw or "").strip().lower()
+    if not r:
+        return "other"
+    if r in _TICKET_FIELD_NAMES:
+        return _TICKET_FIELD_NAMES[r]
+    if _TICKET_ACCEPTANCE_RE.search(r):
+        return "acceptance criteria"
+    return "other"
+
+
+def _tracker_text(value, limit):
+    """Untrusted tracker text -> a plain string: control, format (bidi,
+    zero-width) and lone-surrogate characters dropped (newline and tab kept),
+    U+2028/9 as newlines, capped at `limit`. Never raises."""
+    if value is None:
+        return ""
+    s = value if isinstance(value, str) else str(value)
+    s = s[:limit * 2 + 64]   # bound the scan before cleaning
+    out = []
+    for ch in s:
+        if ch in "\n\t":
+            out.append(ch)
+            continue
+        if ch in "  ":
+            out.append("\n")
+            continue
+        if unicodedata.category(ch) in ("Cc", "Cf", "Cs", "Co", "Cn"):
+            continue
+        out.append(ch)
+    s = re.sub(r"\n{3,}", "\n\n", "".join(out)).strip()
+    return s[:limit].rstrip()
+
+
+def _tracker_person(v):
+    """(name, id) of a tracker person object (Jira user / ADO IdentityRef)."""
+    if not isinstance(v, dict):
+        return (_tracker_text(v, TICKET_UPDATE_NAME_MAX) or None) if isinstance(v, str) else None, None
+    name = v.get("displayName") or v.get("uniqueName") or v.get("name")
+    pid = v.get("accountId") or v.get("id") or v.get("uniqueName")
+    return (_tracker_text(name, TICKET_UPDATE_NAME_MAX) or None,
+            _tracker_text(pid, TICKET_UPDATE_NAME_MAX) or None)
+
+
+def _ticket_event(key, kind, author, created, body=None, field=None, raw_field=None,
+                  from_text=None, to_text=None):
+    name, pid = author
+    return {
+        "key": key, "kind": kind, "author": name, "authorId": pid,
+        "body": body, "field": field,
+        "rawField": _tracker_text(raw_field, TICKET_UPDATE_NAME_MAX) if raw_field else None,
+        "fromText": from_text, "toText": to_text,
+        "created": (_tracker_text(created, 64) or None) if isinstance(created, str) else None,
+    }
+
+
+def _finish_ticket_events(events):
+    """Unique keys (a repeat gets `:<n>`), oldest-first by `created`, newest
+    TICKET_UPDATE_EVENTS_MAX kept."""
+    seen, out = {}, []
+    for e in events:
+        k = e["key"]
+        n = seen.get(k, 0)
+        seen[k] = n + 1
+        if n:
+            e["key"] = f"{k}:{n}"
+        out.append(e)
+    out.sort(key=lambda e: (_ts_ms(_iso_z(e.get("created"))) or 0, e["key"]))
+    return out[-TICKET_UPDATE_EVENTS_MAX:]
+
+
+def _iso_z(ts):
+    """Jira's `+0000` offset -> `+00:00` so _ts_ms parses it."""
+    if not isinstance(ts, str):
+        return None
+    return re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", ts.strip())
+
+
+def _jira_status_categories():
+    """{status id: todo|inprogress|done} for the Jira site, cached for an hour.
+    Best-effort: a failed read keeps the last map (or {})."""
+    now = time.time()
+    if _JIRA_STATUS_CATS["map"] and now - _JIRA_STATUS_CATS["at"] < TICKET_STATUS_CAT_TTL_SEC:
+        return _JIRA_STATUS_CATS["map"]
+    try:
+        data = jira_get("/rest/api/3/status", {})
+    except Exception as e:
+        log(f"jira status categories read failed: {e}")
+        return _JIRA_STATUS_CATS["map"]
+    m = {}
+    for s in data if isinstance(data, list) else []:
+        if not isinstance(s, dict) or s.get("id") is None:
+            continue
+        sc = s.get("statusCategory")
+        cat = sc.get("key") if isinstance(sc, dict) else None
+        if isinstance(cat, str):
+            m[str(s["id"])] = _JIRA_CATEGORY.get(cat.lower(), "todo")
+    if m:
+        _JIRA_STATUS_CATS.update(at=now, map=m)
+    return m
+
+
+def _jira_ticket_comments(key):
+    data = jira_get(f"/rest/api/3/issue/{urllib.parse.quote(key)}/comment",
+                    {"orderBy": "-created", "maxResults": TICKET_UPDATE_COMMENTS_MAX})
+    if not isinstance(data, dict):
+        raise ValueError("comments reply is not an object")
+    out = []
+    for c in (data.get("comments") or [])[:TICKET_UPDATE_COMMENTS_MAX]:
+        if not isinstance(c, dict) or c.get("id") is None:
+            continue
+        body, _ = adf_plain(c.get("body"), TICKET_UPDATE_BODY_MAX * 2)
+        out.append(_ticket_event(
+            f"c:{_tracker_text(c['id'], 64)}", "comment", _tracker_person(c.get("author")),
+            c.get("created"), body=_tracker_text(body, TICKET_UPDATE_BODY_MAX)))
+    return out
+
+
+def _jira_ticket_histories(key):
+    """The newest TICKET_UPDATE_HISTORY_PAGES pages of the issue's changelog."""
+    path = f"/rest/api/3/issue/{urllib.parse.quote(key)}/changelog"
+    page = TICKET_UPDATE_PAGE_SIZE
+
+    def get(start):
+        d = jira_get(path, {"startAt": start, "maxResults": page})
+        if not isinstance(d, dict) or not isinstance(d.get("values", []), list):
+            raise ValueError("changelog reply is not a page")
+        return d
+
+    first = get(0)
+    values = list(first.get("values") or [])
+    total = first.get("total")
+    if not isinstance(total, int) or isinstance(total, bool) or first.get("isLast") \
+            or total <= len(values) or not values:
+        return values
+    # Older than the newest window: jump to it rather than walk every page,
+    # sized by the page the server actually SERVED (it may cap below ours).
+    served = len(values)
+    start = max(served, total - (TICKET_UPDATE_HISTORY_PAGES - 1) * served)
+    if start > len(values):
+        values = []
+    for _ in range(TICKET_UPDATE_HISTORY_PAGES - 1):
+        if start >= total:
+            break
+        got = get(start).get("values") or []
+        if not got:
+            break
+        values.extend(got)
+        start += len(got)
+    return values
+
+
+def _jira_ticket_update_events(key):
+    events = _jira_ticket_comments(key)
+    cats = None
+    for h in _jira_ticket_histories(key):
+        if not isinstance(h, dict) or h.get("id") is None:
+            continue
+        hid = _tracker_text(h["id"], 64)
+        who = _tracker_person(h.get("author"))
+        for it in h.get("items") or []:
+            if not isinstance(it, dict):
+                continue
+            raw = it.get("fieldId") or it.get("field")
+            field = ticket_field_name(raw)
+            if field == "other":
+                field = ticket_field_name(it.get("field"))
+            from_text = it.get("fromString") if it.get("fromString") is not None else None
+            to_text = it.get("toString") if it.get("toString") is not None else None
+            e = _ticket_event(
+                f"h:{hid}:{field}", "field", who, h.get("created"), field=field,
+                raw_field=it.get("field") or raw,
+                from_text=_tracker_text(from_text, TICKET_UPDATE_FIELD_TEXT_MAX) if from_text is not None else None,
+                to_text=_tracker_text(to_text, TICKET_UPDATE_FIELD_TEXT_MAX) if to_text is not None else None)
+            if field == "status":
+                if cats is None:
+                    cats = _jira_status_categories()
+                for side, sid, name in (("to", it.get("to"), e["toText"]),
+                                        ("from", it.get("from"), e["fromText"])):
+                    cat = cats.get(str(sid)) if sid is not None else None
+                    if side == "to":
+                        e["toCategory"] = cat
+                    e[f"{side}Column"] = _board_column(name, cat) if cat else None
+            events.append(e)
+    return _finish_ticket_events(events)
+
+
+def _azure_field_text(ref, value):
+    """One ADO field value -> text: an identity by name, HTML fields flattened."""
+    if isinstance(value, dict):
+        return _tracker_person(value)[0] or ""
+    if isinstance(value, str) and ref.lower() in (
+            "system.description", "microsoft.vsts.tcm.reprosteps",
+            "microsoft.vsts.common.acceptancecriteria", "system.history"):
+        value = azure_html_to_text(value[:TICKET_UPDATE_FIELD_TEXT_MAX * 8])
+    return _tracker_text(value, TICKET_UPDATE_FIELD_TEXT_MAX)
+
+
+def _azure_ticket_update_events(key):
+    q = urllib.parse.quote(key)
+    wi = azure_req(f"/_apis/wit/workitems/{q}",
+                   {"fields": "System.TeamProject,System.WorkItemType,System.Rev"})
+    if not isinstance(wi, dict):
+        raise ValueError("work item reply is not an object")
+    f = wi.get("fields") or {}
+    project, wtype = f.get("System.TeamProject"), f.get("System.WorkItemType")
+    if not project:
+        raise ValueError("the work item names no project")
+    events = []
+    cdata = azure_req(f"/{urllib.parse.quote(project)}/_apis/wit/workItems/{q}/comments",
+                      {"api-version": f"{AZDO_API_VERSION}-preview.3",
+                       "$top": TICKET_UPDATE_COMMENTS_MAX, "order": "desc"})
+    if not isinstance(cdata, dict):
+        raise ValueError("comments reply is not an object")
+    raw = [c for c in (cdata.get("comments") or [])
+           if isinstance(c, dict) and c.get("id") is not None and not c.get("isDeleted")]
+    raw.sort(key=lambda c: str(c.get("createdDate") or ""))
+    for c in raw[-TICKET_UPDATE_COMMENTS_MAX:]:
+        body = azure_html_to_text(str(c.get("text") or "")[:TICKET_UPDATE_BODY_MAX * 8])
+        events.append(_ticket_event(
+            f"c:{_tracker_text(c['id'], 64)}", "comment", _tracker_person(c.get("createdBy")),
+            c.get("createdDate"), body=_tracker_text(body, TICKET_UPDATE_BODY_MAX)))
+    # /updates pages oldest-first with no total; the item's rev count says where
+    # the newest window starts (one update per revision).
+    page, pages = TICKET_UPDATE_PAGE_SIZE, TICKET_UPDATE_HISTORY_PAGES
+    rev = f.get("System.Rev")
+    rev = rev if isinstance(rev, int) and not isinstance(rev, bool) and rev > 0 else 0
+    skip = max(0, rev - pages * page)
+
+    def get_updates(at):
+        d = azure_req(f"/_apis/wit/workItems/{q}/updates", {"$top": page, "$skip": at})
+        got = d.get("value") if isinstance(d, dict) else None
+        if not isinstance(got, list):
+            raise ValueError("updates reply is not a page")
+        return got
+
+    probes = [0]
+
+    def count_between(lo, hi):
+        """Rev overshot the list. A page at `k` is non-empty iff k < the update
+        count, so bisect for that count (`lo` known non-empty, `hi` empty)."""
+        hi = min(hi, lo + TICKET_UPDATE_REV_CEILING)
+        while hi - lo > 1 and probes[0] < TICKET_UPDATE_REV_PROBES:
+            mid = (lo + hi) // 2
+            probes[0] += 1
+            if get_updates(mid):
+                lo = mid
+            else:
+                hi = mid
+        return hi           # at worst an over-estimate, re-checked by the reads
+
+    got = get_updates(skip)
+    if not got and skip:
+        rev = count_between(0, skip)
+        skip = max(0, rev - pages * page)
+        got = get_updates(skip)
+        if not got and skip:
+            skip, rev = 0, 0    # still lost: read from the start
+            got = get_updates(0)
+    updates = list(got)
+    for i in range(1, pages):
+        if not got:
+            break
+        served = len(got)
+        nxt = skip + served
+        if rev and served < page:
+            # Short page with a trusted rev: the server caps pages below ours,
+            # so re-aim at the newest window. Keep what was read until the jump
+            # proves there is something past it.
+            jump = max(nxt, rev - (pages - i) * served)
+            if jump > nxt:
+                trial = get_updates(jump)
+                if not trial:
+                    # Landed past the end: rev overshot. Find the real count,
+                    # then aim once more at the window ending there.
+                    rev = count_between(nxt - 1, jump)
+                    jump = max(nxt, rev - (pages - i) * served)
+                    trial = get_updates(jump) if jump > nxt else None
+                if trial:
+                    skip, got, updates = jump, trial, list(trial)
+                    continue
+        if rev and nxt >= rev:
+            break
+        skip = nxt
+        got = get_updates(skip)
+        updates.extend(got)
+    site_key = normalize_azure_site(AZDO_URL)
+    seen_ids = set()
+    for u in updates:
+        if not isinstance(u, dict) or u.get("id") is None or u.get("rev") == 1:
+            continue   # rev 1 is the item's creation, not a change
+        uid = _tracker_text(u["id"], 64)
+        if uid in seen_ids:
+            continue   # a server that repeats a page must not mint `:1` twins
+        seen_ids.add(uid)
+        who = _tracker_person(u.get("revisedBy"))
+        fields = u.get("fields") if isinstance(u.get("fields"), dict) else {}
+        when = None
+        rd = fields.get("System.ChangedDate")
+        if isinstance(rd, dict):
+            when = rd.get("newValue")
+        # Never `revisedDate`: that is when this revision was SUPERSEDED.
+        for ref, ch in fields.items():
+            if not isinstance(ch, dict) or str(ref).lower() in _AZDO_NOISE_FIELDS:
+                continue
+            field = ticket_field_name(ref)
+            e = _ticket_event(
+                f"h:{uid}:{field}", "field", who, when, field=field, raw_field=ref,
+                from_text=_azure_field_text(ref, ch["oldValue"]) if "oldValue" in ch else None,
+                to_text=_azure_field_text(ref, ch["newValue"]) if "newValue" in ch else None)
+            if field == "status":
+                for side, name in (("to", e["toText"]), ("from", e["fromText"])):
+                    cat = _azure_category(site_key, project, wtype, name) if name else None
+                    if side == "to":
+                        e["toCategory"] = cat
+                    e[f"{side}Column"] = _board_column(name, cat) if cat else None
+            events.append(e)
+        rels = u.get("relations") if isinstance(u.get("relations"), dict) else {}
+        for side, rel_list in (("added", rels.get("added")), ("removed", rels.get("removed"))):
+            for r in rel_list if isinstance(rel_list, list) else []:
+                if not isinstance(r, dict) or r.get("rel") != "AttachedFile":
+                    continue
+                name = _tracker_text((r.get("attributes") or {}).get("name"),
+                                     TICKET_UPDATE_FIELD_TEXT_MAX) or None
+                events.append(_ticket_event(
+                    f"h:{uid}:attachment", "field", who, when, field="attachment",
+                    raw_field="AttachedFile",
+                    from_text=name if side == "removed" else None,
+                    to_text=name if side == "added" else None))
+    return _finish_ticket_events(events)
+
+
+def ticket_update_events(key):
+    """Every comment and field change on board ticket `key` the bounded windows
+    reach, normalized (see the section comment). None on a hard fetch failure,
+    an unconfigured board or a key the source rejects — the caller then keeps
+    its baseline. Never raises."""
+    try:
+        if not board_configured() or not valid_issue_key(key):
+            return None
+        k = str(key).strip()
+        if azure_configured():
+            return _azure_ticket_update_events(k)
+        return _jira_ticket_update_events(k)
+    except Exception as e:
+        log(f"ticket update fetch failed for {str(key)[:40]}: {e}")
+        return None
+
+
+def tickets_changed_since(keys, since_ms):
+    """The subset of `keys` whose tracker `updated` is at or after `since_ms`
+    (epoch ms) — the cheap pre-check so a pass fetches only tickets that moved.
+    Jira: one `key in (…) AND updated >= -Nm` JQL per chunk (relative minutes,
+    since an absolute JQL date reads in the Jira user's own zone), widened a
+    minute and then checked client-side. ADO: one batch read of
+    System.ChangedDate. None on any failure (caller fetches nothing / keeps its
+    baseline). Never raises."""
+    try:
+        if not board_configured() or not isinstance(since_ms, (int, float)) \
+                or isinstance(since_ms, bool):
+            return None
+        wanted = []
+        for k in keys or []:
+            k = str(k or "").strip()
+            if valid_issue_key(k) and k not in wanted:
+                wanted.append(k)
+        if not wanted:
+            return set()
+        changed = set()
+        if azure_configured():
+            by_id = {}
+            for k in wanted:
+                by_id.setdefault(int(k), []).append(k)   # "007" answers as id 7
+            for wi in _azure_batch_get(list(by_id), ["System.ChangedDate"]):
+                if not isinstance(wi, dict):
+                    continue
+                wid = wi.get("id")
+                if not isinstance(wid, int) or isinstance(wid, bool) or wid not in by_id:
+                    continue
+                when = _ts_ms((wi.get("fields") or {}).get("System.ChangedDate"))
+                # Unreadable = changed, as on Jira: fetching too much is the safe way.
+                if when is None or when >= since_ms:
+                    changed.update(by_id[wid])
+            return changed
+        minutes = max(1, int((time.time() * 1000 - since_ms) // 60000) + 2)
+        by_upper = {}
+        for k in wanted:
+            by_upper.setdefault(k.upper(), []).append(k)   # Jira answers `abc-5` as ABC-5
+        refused = []
+
+        def run(chunk):
+            # Keys are quoted (a project named like a JQL word) and validated.
+            keys = ", ".join(f'"{k}"' for k in chunk)
+            try:
+                tickets, _ = fetch_jira_issues(
+                    f"key in ({keys}) AND updated >= -{minutes}m", len(chunk))
+            except BoardHttpError as e:
+                # Jira refuses the WHOLE query when one key is gone or hidden:
+                # split until the bad key stands alone, then drop just it.
+                if getattr(e, "code", None) != 400:
+                    raise
+                if len(chunk) == 1:
+                    log(f"ticket change pre-check: {chunk[0]} refused: {e}")
+                    refused.append(chunk[0])
+                    return
+                mid = len(chunk) // 2
+                run(chunk[:mid])
+                run(chunk[mid:])
+                return
+            for t in tickets:
+                ks = by_upper.get(str(t.get("key") or "").upper())
+                if not ks:
+                    continue    # a moved issue answers under its new key: not ours
+                when = _ts_ms(_iso_z(t.get("updated")))
+                if when is None or when >= since_ms:
+                    changed.update(ks)
+
+        for i in range(0, len(wanted), TICKET_CHANGED_CHUNK):
+            run(wanted[i:i + TICKET_CHANGED_CHUNK])
+        if len(refused) == len(wanted):
+            # Every key refused: the QUERY was bad (a date Jira rejects), not
+            # the keys. "Nothing changed" would be a lie; can't tell is None.
+            return None
+        return changed
+    except Exception as e:
+        log(f"ticket change pre-check failed: {e}")
+        return None
 
 
 # A Done-category status a board names for "could not reproduce" (Jira's
