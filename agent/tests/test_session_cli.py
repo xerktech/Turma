@@ -937,7 +937,9 @@ _FAKE_WRITE_OUTLOOK = r"""
     $null }
   $tzs = [pscustomobject]@{}
   $tzs | Add-Member ScriptMethod Item { param($id)
-    if ($id -eq 'Russia Time Zone 11') { throw 'no such zone' }
+    # A host whose tz data predates CLDR 49's British Columbia/Alberta/Manitoba zones.
+    if ($id -in 'Russia Time Zone 11', 'British Columbia Standard Time', 'Alberta Standard Time',
+        'Manitoba Standard Time') { throw 'no such zone' }
     [pscustomobject]@{ ID = $id } }
   $ol = [pscustomobject]@{ Session = [pscustomobject]@{
     CurrentUser = [pscustomobject]@{ Address = 'Me@Example.com'; AddressEntry = $null } }; TimeZones = $tzs }
@@ -1054,6 +1056,20 @@ class CalendarWriteTest(unittest.TestCase):
         self.assertTrue(any(l.startswith("FIND @SQL=\"http://schemas.microsoft.com/mapi/string/"
                                          "{00020329-0000-0000-C000-000000000046}/TurmaId\" = '"
                                          + self.A + "'") for l in err))
+
+    def test_xerk2996_a_cldr49_zone_falls_back_where_outlook_lacks_it(self):
+        # This fake Outlook predates the CLDR 49 zones: the old zone is set instead.
+        got, err, _ = self.run_write([self.up(self.A, timeZone="America/Vancouver"),
+                                      self.up(self.B, timeZone="America/Winnipeg")])
+        self.assertEqual([r["ok"] for r in got], [True, True], got)
+        saves = [json.loads(l[5:]) for l in err if l.startswith("SAVE ")]
+        self.assertEqual([s["tz"] for s in saves], ["Pacific Standard Time", "Central Standard Time"])
+        # The instants are the record's either way.
+        self.assertEqual([s["startUtc"] for s in saves], ["2026-11-16T14:00:00"] * 2)
+        # A series sets its pattern in the zone Outlook took (FindSystemTimeZoneById of it).
+        got, err, _ = self.run_write([self.up(self.C, timeZone="America/Edmonton",
+                                              recurrence={"freq": "weekly", "interval": 1})])
+        self.assertTrue(got[0]["ok"], got)
 
     PEOPLE = [{"name": "Ann", "email": "ann@example.com", "role": "required"},
               {"name": "Bo", "email": "bo@example.com", "role": "optional"}]
@@ -1283,6 +1299,17 @@ class CalendarWriteTest(unittest.TestCase):
                                                     )["event"]["zone"], "UTC")
         self.assertEqual(cli.prepare_calendar_write(self.up(self.A, timeZone="Asia/Kolkata"))["event"]["zone"],
                          "India Standard Time")
+        # CLDR 49 (XERK-2996): the Canadian zones that diverged get their own Windows zone,
+        # each with the zone CLDR 46 named as the fallback for a host without it.
+        for iana, win, old in [("America/Vancouver", "British Columbia Standard Time", "Pacific Standard Time"),
+                               ("Canada/Pacific", "British Columbia Standard Time", "Pacific Standard Time"),
+                               ("America/Edmonton", "Alberta Standard Time", "Mountain Standard Time"),
+                               ("America/Yellowknife", "Alberta Standard Time", "Mountain Standard Time"),
+                               ("America/Winnipeg", "Manitoba Standard Time", "Central Standard Time"),
+                               ("America/Los_Angeles", "Pacific Standard Time", ""),
+                               ("America/Coyhaique", "Magallanes Standard Time", "")]:
+            e = cli.prepare_calendar_write(self.up(self.A, timeZone=iana))["event"]
+            self.assertEqual((e["zone"], e["zoneFallback"]), (win, old), iana)
         # Bare GMT is UTC+0 all year, never London's GMT Standard Time.
         self.assertEqual((cli.windows_zone("GMT"), cli.windows_zone("Europe/London")),
                          ("UTC", "GMT Standard Time"))
