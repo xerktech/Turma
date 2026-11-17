@@ -134,6 +134,10 @@ DevOps, and what gets typed back because of it.
   silently the first beat a PR is seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`), after that
   only NEW keys not the agent's own are typed in. Bounded `PR_COMMENTS_MAX` per beat; **a fetch
   failure leaves the baseline UNTOUCHED.**
+- **A batch is split, never sent past `INPUT_MAX_CHARS`** (`_pr_comment_messages`, XERK-3047): keys
+  are marked seen before delivery, and an oversized message is refused whole, so one big batch was
+  lost. Each part leaves room for `INBOX_PREFIX`. Tests: `TestPrCommentMessages`,
+  `test_a_batch_past_input_max_chars_is_split_not_lost`.
 - `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a rebase/force-
   push**) off the just-cached `mergeable`. `prConflicts` bounds nudging per PR; MERGEABLE/closed
   re-arms it, **UNKNOWN does neither** — that's what a just-pushed fix looks like, and clearing on it

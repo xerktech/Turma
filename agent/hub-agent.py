@@ -10365,7 +10365,8 @@ def _pr_comment_message(url, events):
     session (XERK-49). One flat paragraph — a header naming the PR and telling
     the agent to act on it in THIS session, then each comment as
     `@author (kind, loc): body`, each body collapsed to one line and capped so
-    one long comment can't crowd out the rest before INPUT_MAX_CHARS truncates."""
+    one long comment can't crowd out the rest. Callers delivering a batch use
+    _pr_comment_messages, which splits it to fit INPUT_MAX_CHARS."""
     if not events:
         return ""
     what, num = _pr_ref(url)
@@ -10379,6 +10380,29 @@ def _pr_comment_message(url, events):
         body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
         parts.append(f"[{who} — {tag}] {body}")
     return "  ".join(parts)
+
+
+def _pr_comment_messages(url, events, limit=None):
+    """_pr_comment_message split into as many messages as it takes for each to
+    fit `limit` (XERK-3047). Default limit: INPUT_MAX_CHARS less the
+    INBOX_PREFIX framing notify_session adds on the inbox and pane paths alike.
+
+    One message past INPUT_MAX_CHARS is REFUSED whole by send_input and skipped
+    by the inbox, while _deliver_pr_comments has already marked every key seen —
+    so an oversized batch was lost for good. Splitting keeps every comment.
+    Greedy, in order; a lone comment always fits (its body is capped at
+    PR_COMMENTS_BODY_CAP, far under the limit)."""
+    if limit is None:
+        limit = INPUT_MAX_CHARS - len(INBOX_PREFIX) - 2
+    out, chunk = [], []
+    for e in events:
+        if chunk and len(_pr_comment_message(url, chunk + [e])) > limit:
+            out.append(_pr_comment_message(url, chunk))
+            chunk = []
+        chunk.append(e)
+    if chunk:
+        out.append(_pr_comment_message(url, chunk))
+    return out
 
 
 def _pr_conflict_message(url, base, again=False):
@@ -48298,8 +48322,7 @@ class SessionManager:
                 changed = True
                 if first or not fresh:
                     continue
-                msg = _pr_comment_message(url, fresh)
-                if msg:
+                for msg in _pr_comment_messages(url, fresh):
                     self.notify_session(sess["id"], msg)
             if changed:
                 sess["prCommentBase"] = base
