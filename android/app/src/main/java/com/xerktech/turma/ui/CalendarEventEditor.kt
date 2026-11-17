@@ -1,6 +1,9 @@
 package com.xerktech.turma.ui
 
 import androidx.activity.compose.BackHandler
+import com.xerktech.turma.core.calMoveStart
+import com.xerktech.turma.core.calSetEnd
+import com.xerktech.turma.core.calSetZone
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -184,7 +187,7 @@ internal fun CalendarEventEditor(
             WhenRow("Starts", d.startDate, d.startTime, d.allDay, locale, "start", { picker = it })
             WhenRow("Ends", d.endDate, d.endTime, d.allDay, locale, "end", { picker = it })
             OutlinedTextField(
-                d.timeZone, { set(d.copy(timeZone = it, startOffset = null, endOffset = null)) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
+                d.timeZone, { set(calSetZone(d, it)) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
                 label = { Text("Time zone") }, singleLine = true, enabled = !d.oneOccurrence,
             )
             RepeatSection(d, ::set, { picker = it }, locale)
@@ -278,7 +281,7 @@ internal fun CalendarEventEditor(
                     TextButton({
                         state.selectedDateMillis?.let { ms ->
                             val day = Instant.ofEpochMilli(ms).atZone(ZoneOffset.UTC).toLocalDate()
-                            set(if (picker == "startDate") moveStart(d, day, d.startTime) else d.copy(endDate = day))
+                            set(if (picker == "startDate") calMoveStart(d, day, d.startTime) else calSetEnd(d, day, d.endTime))
                         }
                         picker = ""
                     }) { Text("OK") }
@@ -294,7 +297,7 @@ internal fun CalendarEventEditor(
                 confirmButton = {
                     TextButton({
                         val t = LocalTime.of(state.hour, state.minute)
-                        set(if (picker == "startTime") moveStart(d, d.startDate, t) else d.copy(endTime = t))
+                        set(if (picker == "startTime") calMoveStart(d, d.startDate, t) else calSetEnd(d, d.endDate, t))
                         picker = ""
                     }, Modifier.testTag("cal-ed-time-ok")) { Text("OK") }
                 },
@@ -309,12 +312,6 @@ internal fun CalendarEventEditor(
  * Moving the start keeps the event's length, as every calendar does; a new start day
  * names a new "day N" / "nth weekday" for its repeat (XERK-2973, the web's rule).
  */
-private fun moveStart(d: TurmaEventDraft, day: LocalDate, time: LocalTime): TurmaEventDraft {
-    val len = java.time.Duration.between(d.startDate.atTime(d.startTime), d.endDate.atTime(d.endTime))
-    val end = day.atTime(time).plus(if (len.isNegative) java.time.Duration.ZERO else len)
-    val repeat = if (day != d.startDate) d.repeat.copy(monthDay = null, nth = null) else d.repeat
-    return d.copy(startDate = day, startTime = time, endDate = end.toLocalDate(), endTime = end.toLocalTime(), repeat = repeat)
-}
 
 /**
  * The Repeat control (XERK-2973), the web's: a preset menu named for the start day,

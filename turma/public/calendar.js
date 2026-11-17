@@ -1397,7 +1397,8 @@ function addYmd(ymd, n) {
 // always that instant's own wall time + offset, so it parses back to itself.
 // `prefer` (offset minutes) picks the pass of a repeated wall time: the offset of the
 // slot or event the editor opened on, so a second-pass 1:30 stays EST (XERK-3039).
-function wallToIso(date, time, tz, prefer) {
+// Else `notBefore` (ms) takes the first pass not before it: an end typed after a second-pass start.
+function wallToIso(date, time, tz, prefer, notBefore) {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
   const t = /^(\d{2}):(\d{2})$/.exec(String(time || ""));
   if (!d || !t || +t[1] > 23 || +t[2] > 59) return null;
@@ -1413,7 +1414,8 @@ function wallToIso(date, time, tz, prefer) {
     const names = (off) => { const q = zoneParts(guess - off * 60000, tz); return Date.UTC(q.y, q.mo - 1, q.d, q.h, q.mi) === guess; };
     const fits = [...new Set([before, after])].filter(names).map((off) => guess - off * 60000);
     const own = fits.find((ms) => num(prefer) && zoneOffsetMin(ms, tz) === prefer);
-    const ms = own !== undefined ? own : fits.length ? Math.min(...fits) : guess - before * 60000;
+    const later = num(notBefore) ? fits.filter((ms) => ms >= notBefore) : [];
+    const ms = own !== undefined ? own : later.length ? Math.min(...later) : fits.length ? Math.min(...fits) : guess - before * 60000;
     const p = zoneParts(ms, tz), off = zoneOffsetMin(ms, tz);
     const sign = off < 0 ? "-" : "+", a = Math.abs(off);
     return { ms, iso: `${ymdOf(p)}T${pad(p.h)}:${pad(p.mi)}:00${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}` };
@@ -1470,7 +1472,7 @@ function formTimes(f) {
   const s = f.allDay ? wallToIso(f.startDate, "00:00", tz) : wallToIso(f.startDate, f.startTime, tz, f.startOff);
   if (!s) return { error: { start: "Pick a start date and time." } };
   if (keepsLmt(s.ms, tz)) return { error: { start: LMT_ERROR } };
-  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz, f.endOff);
+  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz, f.endOff, s.ms);
   if (!e) return { error: { end: "Pick an end date and time." } };
   if (keepsLmt(e.ms, tz)) return { error: { end: LMT_ERROR } };
   if (e.ms < s.ms || (f.allDay && e.ms <= s.ms)) return { error: { end: "The end is before the start." } };
@@ -2149,6 +2151,9 @@ function mountEditor() {
       ed.f[d.edField] = String(t.value ?? "");
       // Another zone's repeated hour has passes of its own: its first pass, as typed (XERK-3039).
       if (d.edField === "timeZone") { delete ed.f.startOff; delete ed.f.endOff; }
+      // A typed time is its first pass: only the time the form opened on keeps its own.
+      if (d.edField === "startDate" || d.edField === "startTime") delete ed.f.startOff;
+      if (d.edField === "endDate" || d.edField === "endTime") delete ed.f.endOff;
       // A new start day names a new "day N" / "nth weekday" for the repeat (XERK-2973).
       if (d.edField === "startDate" && ed.f.repeat) {
         ed.f.repeat = { ...ed.f.repeat, monthDay: null, nth: null };
@@ -2173,17 +2178,17 @@ function mountEditor() {
       // Remember only a start that parses: Chrome fires change with "" while a time is
       // half typed, and remembering that lost the length on the next digit (QA).
       if (!formTimes({ ...ed.f, endDate: ed.f.startDate, endTime: ed.f.startTime }).error) {
-        ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
+        ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime, startOff: ed.f.startOff };
       }
       if (ed.tried) clearFixedErrors();
       return;
     } else return;
     // A checkbox's change follows its own click, so a repaint here loses nothing.
-    ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime };
+    ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime, startOff: ed.f.startOff };
     if (ed.tried) ed.errors = validateForm(ed.f);
     paintEditor();
   });
-  $edPanel.addEventListener("focusin", () => { if (ed) ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime }; });
+  $edPanel.addEventListener("focusin", () => { if (ed) ed.prevStart = { startDate: ed.f.startDate, startTime: ed.f.startTime, startOff: ed.f.startOff }; });
   $edPanel.addEventListener("click", (e) => {
     if (!ed) return;
     const b = e.target && e.target.closest ? e.target.closest("[data-ed-close],[data-ed-cancel],[data-ed-save],[data-ed-unchip]") : null;
