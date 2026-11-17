@@ -12817,11 +12817,12 @@ def _scan_ticket_write_entry(entry, state, report):
                 # Moved to the background on its timeout (XERK-3052): the
                 # command is still running, so only a write whose success
                 # line is already in the output has happened.
+                # ONE source only: Claude Code's content already repeats the
+                # stdout, and joining both let one success line vouch for a
+                # second, not-yet-run write of the same kind and key.
                 timed_out = True
                 stdout = tur.get("stdout")
-                if isinstance(stdout, str):
-                    text = f"{text}\n{stdout}"
-                landed = _tw_landed(writes, text)
+                landed = _tw_landed(writes, stdout if isinstance(stdout, str) else text)
                 if not landed:
                     continue
             if _tw_result_failed(text):

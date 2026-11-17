@@ -27,6 +27,11 @@ The ticket-update poller must not hand a session back its own comment or status 
   only when its `jira` helper success line (`commented on K`, `K -> S`, `updated K`, `assigned K to`)
   is in the result's content or `toolUseResult.stdout`, each line claimed once, in command order
   (`_tw_landed`). curl/acli/az/MCP print no such line, so a timed-out one stays unrecorded.
+  - Read ONE source: `toolUseResult.stdout`, else the content. The content already repeats the
+    stdout, so joining both let one line vouch for a later, not-yet-run write of the same key.
+  - Accepted residual: `t` is the timeout moment, so an edit/transition that landed more than
+    `TICKET_SELF_EDIT_WINDOW_MS` earlier never self-matches (re-delivered, the harmless side).
+    Widening it to the call's span would hide a human's same-field edit made during the run.
 - **Matching errs toward DELIVERING** (a false match hides a human's update from the session):
   - key must be valid and equal, `at` finite — else False; never raises (`_ticket_self_authored`);
   - a comment: id when BOTH sides carry one (different ids = different comments), else the body

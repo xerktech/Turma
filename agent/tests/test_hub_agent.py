@@ -60535,7 +60535,12 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._scan([_tw_call("b1", "Bash", {"command": 'jira comment X-1 "a"'}),
                                      res]), [])
 
-    def _timed_out(self, tid, stdout, content="Command running in background with ID: bt1."):
+    def _timed_out(self, tid, stdout, content=None):
+        # The real shape: the content is the stdout so far, then the notice,
+        # and toolUseResult.stdout repeats the same stdout.
+        if content is None:
+            content = (f"{stdout}Command was moved to the background (ID: bt1) after "
+                       "running for 600s. Output is being written to: /tmp/bt1.output")
         res = _tw_result(tid, content)
         res["toolUseResult"] = {"stdout": stdout, "stderr": "", "interrupted": False,
                                 "backgroundTaskId": "bt1", "timedOutAfterMs": 600000}
@@ -60564,6 +60569,36 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
                                                "building...\n")])
         self.assertEqual([(w["u"], w["kind"]) for w in ws],
                          [("t1:0", "transition"), ("t1:1", "comment")])
+
+    def test_xerk3052_one_line_never_vouches_for_two_writes(self):
+        # QA: content + stdout joined counted the one printed line twice, so
+        # the later, not-yet-run write of the same kind and key was recorded.
+        for cmd, out in [
+                ('jira comment X-1 "first" && make long && jira comment X-1 "second"',
+                 "commented on X-1\n"),
+                ('jira transition X-1 "In Progress" && make long && jira transition X-1 "To Do"',
+                 "X-1 -> In Progress\n"),
+                ("jira edit X-1 -s a && make long && jira edit X-1 -s b",
+                 "updated X-1  https://x/browse/X-1\n")]:
+            with self.subTest(cmd=cmd):
+                ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                                 self._timed_out("t1", out)])
+                self.assertEqual([w["u"] for w in ws], ["t1:0"])
+        res = self._timed_out("t1", "", content="commented on X-1\nmoved to the background")
+        del res["toolUseResult"]["stdout"]  # no stdout field: the content is the source
+        [w] = self._scan([_tw_call("t1", "Bash", {"command": 'jira comment X-1 "a"'}), res])
+        self.assertEqual(w["u"], "t1:0")
+
+    def test_xerk3052_a_mid_line_mention_is_no_success_line(self):
+        cmd = 'jira comment X-1 "a"; sleep 900'
+        self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                                     self._timed_out("t1", "I commented on X-1 earlier\n")]), [])
+
+    def test_xerk3052_a_timed_out_comment_carries_no_result_id(self):
+        cmd = 'jira comment X-1 "a"; sleep 900'
+        [w] = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                          self._timed_out("t1", 'commented on X-1\n{"id": "10010"}\n')])
+        self.assertNotIn("id", w)
 
     def test_xerk3052_a_success_line_for_another_key_or_kind_does_not_count(self):
         cmd = 'jira comment XERK-1 "a"; jira edit XERK-2 -s t'
