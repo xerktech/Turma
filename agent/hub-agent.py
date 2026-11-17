@@ -12534,7 +12534,7 @@ def ticket_writes_from_bash(cmd, cwd=None, defer_files=False):
     stripped, heredocs = _tw_heredocs(cmd)
     out, moved = [], False
     for seg, docs in _tw_segments(stripped, heredocs)[:64]:
-        if any(wd in _TW_CD_WORDS for wd in seg):
+        if any(wd in _TW_CD_WORDS or _TW_CD_IN_WORD_RE.search(wd) for wd in seg):
             # A relative path may no longer resolve against `cwd` (`{ cd x;`,
             # `builtin cd`, `CDPATH= cd`…): any such word, anywhere, counts.
             moved = True
@@ -12559,6 +12559,8 @@ def ticket_writes_from_bash(cmd, cwd=None, defer_files=False):
 
 
 _TW_CD_WORDS = frozenset(("cd", "pushd", "popd"))
+# A quoted script that changes directory (`eval 'cd x'`, `sh -c "cd x; …"`).
+_TW_CD_IN_WORD_RE = re.compile(r"(?:\A|[\s;&|({])(?:cd|pushd|popd)(?:\s|\Z)")
 
 
 def resolve_ticket_write_files(writes):

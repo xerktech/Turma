@@ -42,7 +42,7 @@ The ticket-update poller must not hand a session back its own comment or status 
     holds the previous comment (whose fp would hide nothing real but miss this one).
   - `stat` says regular BEFORE any open (opening a FIFO releases its blocked writer), bounded read;
     a relative path resolves against the entry's own `cwd`, never through `$`, and never when ANY
-    `cd`/`pushd`/`popd` word appears before it (`{ cd x;`, `builtin cd`, `CDPATH= cd`).
+    `cd`/`pushd`/`popd` appears before it, quoted scripts too (`{ cd x;`, `eval 'cd x'`).
   - A file changed or gone before the scan (or a restart re-seed) just yields no match: delivered.
   - A segment's stdin is its LAST heredoc, here-string or fd-0 `<` redirect, as bash reads it.
 - **Beat cost**: a substring prefilter skips commands naming no tracker program; the heredoc scan

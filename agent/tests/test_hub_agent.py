@@ -60506,6 +60506,42 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
             [w] = ha.ticket_writes_from_bash(cmd, d)
             self.assertNotIn("fp", w, cmd)
 
+    def test_xerk3042_a_non_regular_file_is_never_opened(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.mkfifo(os.path.join(d, "p.md"))
+        with mock.patch.object(ha, "_read_regular_file_bounded") as read:
+            [w] = ha.ticket_writes_from_bash("jira comment X-1 - < p.md", d)
+        read.assert_not_called()  # opening a FIFO would release its blocked writer
+        self.assertNotIn("fp", w)
+
+    def test_xerk3042_a_refused_write_never_reads_its_file(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "c.json"), "w") as f:
+            f.write('{"body": "x"}')
+        call = _tw_call("f3", "Bash", {"command":
+                        "curl -X POST https://x/rest/api/3/issue/X-1/comment -d @c.json"})
+        call["cwd"] = d
+        with mock.patch.object(ha, "_tw_file_fingerprint", return_value=None) as fp:
+            self.assertEqual(self._scan([call, _tw_result("f3", "HTTP/1.1 403 Forbidden\n\n{}")]),
+                             [])
+        fp.assert_not_called()
+
+    def test_xerk3042_only_an_fd0_here_string_or_quoted_cd_counts(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.mkdir(os.path.join(d, "sub"))
+        for name in ("note.md", "sub/note.md"):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(name)
+        [w] = ha.ticket_writes_from_bash("jira comment X-1 - 3<<< words", d)
+        self.assertNotIn("fp", w)
+        for cmd in ("eval 'cd sub'; jira comment X-1 -F note.md",
+                    'sh -c "cd sub"; jira comment X-1 -F note.md'):
+            [w] = ha.ticket_writes_from_bash(cmd, d)
+            self.assertNotIn("fp", w, cmd)
+
     def test_redirections_are_not_arguments(self):
         for cmd in ('jira comment X-1 "text" 2>&1 | tail -3',
                     'jira comment X-1 "text" >/dev/null 2>&1',
