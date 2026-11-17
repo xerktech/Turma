@@ -1692,6 +1692,78 @@ test("XERK-2971 QA: join link case and DST edges match the hub", () => {
   assert.equal(cal.wallToIso("0050-06-01", "09:00", "UTC"), null, "no 19xx for a year under 100");
 });
 
+test("XERK-3039: the editor keeps the pass of a repeated hour it opened on", () => withOrgs(async () => {
+  const est = Date.parse("2026-11-01T01:30:00-05:00"), edt = Date.parse("2026-11-01T01:30:00-04:00");
+  // A press on the second "1 AM" row opens at 1:30 and saves at 1:30 EST, not an hour earlier.
+  const f = { ...cal.blankForm(est, est + 30 * 60000), orgs: ["acme"], subject: "x" };
+  assert.deepEqual([f.startTime, f.endTime], ["01:30", "02:00"]);
+  assert.deepEqual([cal.formPayload(f).start, cal.formPayload(f).end], ["2026-11-01T01:30:00-05:00", "2026-11-01T02:00:00-05:00"]);
+  // The first pass stays the first pass.
+  assert.equal(cal.formPayload({ ...cal.blankForm(edt, edt + 30 * 60000), orgs: ["acme"] }).start, "2026-11-01T01:30:00-04:00");
+  // An event served in the second pass saves where it is (an edit of its title must not move it).
+  const back = cal.formFromEvent(tev({ start: "2026-11-01T01:30:00-05:00", end: "2026-11-01T01:45:00-05:00", startMs: est, endMs: est + 15 * 60000 }));
+  assert.equal(cal.formPayload({ ...back, orgs: ["acme"] }).start, "2026-11-01T01:30:00-05:00");
+  // A wall time typed outside the repeated hour ignores the kept offset.
+  assert.equal(cal.formPayload({ ...f, startTime: "03:00", endTime: "03:30" }).start, "2026-11-01T03:00:00-05:00");
+  assert.equal(cal.wallToIso("2026-11-01", "01:30", "America/New_York", -300).iso, "2026-11-01T01:30:00-05:00");
+  assert.equal(cal.wallToIso("2026-11-01", "01:30", "America/New_York", 60).iso, "2026-11-01T01:30:00-04:00", "an offset the time cannot have is ignored");
+  cal.closeEditor();
+}));
+
+test("XERK-3039 QA: editing the times keeps the length in real time; a typed time or another zone is its first pass", () => withOrgs(async () => {
+  const est = Date.parse("2026-11-01T01:30:00-05:00");
+  const mk = (at = est, len = 15) => {
+    cal.openEditor({ startMs: at, endMs: at + len * 60000 });
+    const panel = cal._edEls().panel;
+    const inputs = { endDate: { value: "" }, endTime: { value: "" } };
+    panel.querySelector = (sel) => { const m = /data-ed-field="(\w+)"/.exec(sel); return m ? inputs[m[1]] || null : null; };
+    panel.querySelectorAll = () => [];
+    const fire = (kind, target) => { for (const f of panel.listeners[kind] || []) f({ target, preventDefault() {} }); };
+    fire("focusin", {});
+    return (field, value) => fire("change", { dataset: { edField: field }, value, tagName: "INPUT", type: "time" });
+  };
+  const body = () => cal.formPayload({ ...cal._ed().f, orgs: ["acme"] });
+  try {
+    // A 15-minute EST event moved to 00:50 stays 15 minutes: 00:50 EDT - 01:05 EDT.
+    let set = mk();
+    set("startTime", "00:50");
+    assert.deepEqual([body().start, body().end], ["2026-11-01T00:50:00-04:00", "2026-11-01T01:05:00-04:00"]);
+    cal.closeEditor();
+    // Retyping the opened start segment by segment (01:30, 01:03, 01:30) keeps its pass.
+    set = mk();
+    set("startTime", "01:03"); set("startTime", "01:30");
+    assert.deepEqual([body().start, body().end], ["2026-11-01T01:30:00-05:00", "2026-11-01T01:45:00-05:00"]);
+    cal.closeEditor();
+    // A start typed into the repeated hour is its first pass, wherever the form opened.
+    set = mk();
+    set("startTime", "01:00");
+    assert.deepEqual([body().start, body().end], ["2026-11-01T01:00:00-04:00", "2026-11-01T01:15:00-04:00"]);
+    cal.closeEditor();
+    // So is a typed end.
+    set = mk();
+    set("endTime", "01:40");
+    assert.equal(body().start, "2026-11-01T01:30:00-05:00", "the untouched start keeps its pass");
+    assert.equal(body().end, "2026-11-01T01:40:00-05:00", "an end typed after it is the first pass not before it");
+    cal.closeEditor();
+    // 01:00 EDT - 01:15 EST, end retyped 01:20: the first 01:20 after the start (EDT), not the opened EST.
+    set = mk(Date.parse("2026-11-01T01:00:00-04:00"), 75);
+    set("endTime", "01:20");
+    assert.equal(body().end, "2026-11-01T01:20:00-04:00");
+    cal.closeEditor();
+    // Another zone drops the kept offsets: Halifax's 01:30 is its first pass (-03:00), never
+    // the -04:00 a form opened at 01:30 EDT kept (Halifax's second pass).
+    set = mk(Date.parse("2026-11-01T01:30:00-04:00"));
+    set("timeZone", "America/Halifax");
+    assert.equal(body().start, "2026-11-01T01:30:00-03:00");
+    cal.closeEditor();
+    // A start moved so the end lands in the second pass keeps the length: 00:30 EDT +60 to 01:00
+    // ends 01:00 EST (an end left on its first pass would make it zero long).
+    set = mk(Date.parse("2026-11-01T00:30:00-04:00"), 60);
+    set("startTime", "01:00");
+    assert.deepEqual([body().start, body().end], ["2026-11-01T01:00:00-04:00", "2026-11-01T01:00:00-05:00"]);
+  } finally { cal.closeEditor(); }
+}));
+
 test("XERK-2971 QA: a half-typed start keeps the length; the shifted end is written into the inputs; a fixed field's error clears", () => withOrgs(async () => {
   cal.openEditor({ startMs: at(2027, 5, 5, 9), endMs: at(2027, 5, 5, 9, 30) });
   const panel = cal._edEls().panel;

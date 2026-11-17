@@ -1389,7 +1389,10 @@ function addYmd(ymd, n) {
 // the time as picked + that old offset (02:30-05:00, the same instant as 03:30-04:00):
 // the hub keeps it as the wall time a series repeats (XERK-3040). Every ISO parses
 // back to its instant.
-function wallToIso(date, time, tz) {
+// `prefer` (offset minutes) picks the pass of a repeated wall time: the offset of the
+// slot or event the editor opened on, so a second-pass 1:30 stays EST (XERK-3039).
+// Else `notBefore` (ms) takes the first pass not before it: an end typed after a second-pass start.
+function wallToIso(date, time, tz, prefer, notBefore) {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
   const t = /^(\d{2}):(\d{2})$/.exec(String(time || ""));
   if (!d || !t || +t[1] > 23 || +t[2] > 59) return null;
@@ -1404,7 +1407,9 @@ function wallToIso(date, time, tz) {
     const before = zoneOffsetMin(guess - DAY_MS, tz), after = zoneOffsetMin(guess + DAY_MS, tz);
     const names = (off) => { const q = zoneParts(guess - off * 60000, tz); return Date.UTC(q.y, q.mo - 1, q.d, q.h, q.mi) === guess; };
     const fits = [...new Set([before, after])].filter(names).map((off) => guess - off * 60000);
-    const ms = fits.length ? Math.min(...fits) : guess - before * 60000;
+    const own = fits.find((ms) => num(prefer) && zoneOffsetMin(ms, tz) === prefer);
+    const later = num(notBefore) ? fits.filter((ms) => ms >= notBefore) : [];
+    const ms = own !== undefined ? own : later.length ? Math.min(...later) : fits.length ? Math.min(...fits) : guess - before * 60000;
     const p = fits.length ? zoneParts(ms, tz) : { y, mo, d: dd, h: +t[1], mi: +t[2] };
     const off = fits.length ? zoneOffsetMin(ms, tz) : before;
     const sign = off < 0 ? "-" : "+", a = Math.abs(off);
@@ -1418,12 +1423,23 @@ function zoneList(cur) {
   try { all = typeof Intl.supportedValuesOf === "function" ? Intl.supportedValuesOf("timeZone") : []; } catch { all = []; }
   return [...new Set([cur, browserZone(), "UTC", ...all].filter((z) => typeof z === "string" && z))];
 }
+// The offsets a form's wall times were read at (`startOff` at `startAt`), so a repeated hour
+// keeps its pass on save. Only while the field still reads that wall time: a typed time is its
+// first pass, and retyping the opened one (a time input's change fires per segment) gets it back.
+function passOf(startMs, endMs, tz, only) {
+  try {
+    const wall = (ms) => { const p = zoneParts(ms, tz); return `${ymdOf(p)}T${pad(p.h)}:${pad(p.mi)}`; };
+    const o = { startOff: zoneOffsetMin(startMs, tz), startAt: wall(startMs), endOff: zoneOffsetMin(endMs, tz), endAt: wall(endMs) };
+    return only === "end" ? { endOff: o.endOff, endAt: o.endAt } : o;
+  } catch { return {}; }
+}
+const keptOff = (f, k) => (f[`${k}At`] === `${f[`${k}Date`]}T${f[`${k}Time`]}` ? f[`${k}Off`] : undefined);
 // A fresh form: [startMs, endMs) on the browser's wall clock, in `orgs`.
 function blankForm(startMs, endMs, orgs = []) {
   const tz = browserZone();
   const s = zoneParts(startMs, tz), e = zoneParts(endMs, tz);
   return { subject: "", startDate: ymdOf(s), startTime: `${pad(s.h)}:${pad(s.mi)}`, endDate: ymdOf(e),
-    endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay: false, timeZone: tz, location: "", online: false, joinUrl: "",
+    endTime: `${pad(e.h)}:${pad(e.mi)}`, ...passOf(startMs, endMs, tz), allDay: false, timeZone: tz, location: "", online: false, joinUrl: "",
     body: "", busy: "busy", reminder: REMINDER_DEFAULT, category: "", priv: false, sensitivity: "normal", orgs: orgs.slice(0, ORGS_MAX),
     invites: false, reqResp: true, allowFwd: true,
     required: [], optional: [], reqDraft: "", optDraft: "", repeat: blankRepeat() };
@@ -1439,7 +1455,7 @@ function formFromEvent(ev) {
   const sens = typeof ev.sensitivity === "string" ? ev.sensitivity : "normal";
   const join = safeHttps(ev.joinUrl);
   return { subject: typeof ev.subject === "string" ? ev.subject : "", startDate: ymdOf(s), startTime: `${pad(s.h)}:${pad(s.mi)}`,
-    endDate: ymdOf(e), endTime: `${pad(e.h)}:${pad(e.mi)}`, allDay, timeZone: tz,
+    endDate: ymdOf(e), endTime: `${pad(e.h)}:${pad(e.mi)}`, ...passOf(ev.startMs, ev.endMs, tz), allDay, timeZone: tz,
     location: typeof ev.location === "string" ? ev.location : "", online: ev.isOnlineMeeting === true || !!join, joinUrl: join,
     body: typeof ev.body === "string" ? ev.body : "", busy: Object.prototype.hasOwnProperty.call(SHOW_AS, ev.busy) ? ev.busy : "busy",
     reminder: reminderKey(ev.reminderMinutes),
@@ -1455,10 +1471,10 @@ function formFromEvent(ev) {
 function formTimes(f) {
   const tz = f.timeZone;
   if (!zoneKnown(tz)) return { error: { timeZone: "Pick a time zone." } };
-  const s = wallToIso(f.startDate, f.allDay ? "00:00" : f.startTime, tz);
+  const s = f.allDay ? wallToIso(f.startDate, "00:00", tz) : wallToIso(f.startDate, f.startTime, tz, keptOff(f, "start"));
   if (!s) return { error: { start: "Pick a start date and time." } };
   if (keepsLmt(s.ms, tz)) return { error: { start: LMT_ERROR } };
-  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz);
+  const e = f.allDay ? wallToIso(addYmd(f.endDate, 1), "00:00", tz) : wallToIso(f.endDate, f.endTime, tz, keptOff(f, "end"), s.ms);
   if (!e) return { error: { end: "Pick an end date and time." } };
   if (keepsLmt(e.ms, tz)) return { error: { end: LMT_ERROR } };
   if (e.ms < s.ms || (f.allDay && e.ms <= s.ms)) return { error: { end: "The end is before the start." } };
@@ -2130,6 +2146,8 @@ function mountEditor() {
         return;
       }
       ed.f[d.edField] = String(t.value ?? "");
+      // Another zone's repeated hour has passes of its own: its first pass, as typed (XERK-3039).
+      if (d.edField === "timeZone") { delete ed.f.startOff; delete ed.f.endOff; }
       // A new start day names a new "day N" / "nth weekday" for the repeat (XERK-2973).
       if (d.edField === "startDate" && ed.f.repeat) {
         ed.f.repeat = { ...ed.f.repeat, monthDay: null, nth: null };
@@ -2143,6 +2161,7 @@ function mountEditor() {
           const p = zoneParts(now.startMs + len, ed.f.timeZone);
           ed.f.endDate = ymdOf(p);
           if (!ed.f.allDay) ed.f.endTime = `${pad(p.h)}:${pad(p.mi)}`;
+          Object.assign(ed.f, passOf(now.startMs + len, now.startMs + len, ed.f.timeZone, "end"));
           // Set in place: a date/time picker's change also lands on blur (see above).
           for (const k of ["endDate", "endTime"]) {
             const x = $edPanel.querySelector && $edPanel.querySelector(`[data-ed-field="${k}"]`);
