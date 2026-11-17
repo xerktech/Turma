@@ -61150,6 +61150,96 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         self.assertIn('[@Ann — comment] "also handle nulls"', msgs[0])
         self.assertIn("continue in this session", msgs[0])
 
+    # --- XERK-3052: a still-running call's write is held, not delivered ----
+
+    @staticmethod
+    def _iso(ms, z=True):
+        t = time.gmtime(ms / 1000)
+        return time.strftime("%Y-%m-%dT%H:%M:%S", t) + (".000Z" if z else ".000+0000")
+
+    def _pending(self, sm, sid, cmd, ago_ms=5_000, tid="t1"):
+        now = int(time.time() * 1000)
+        st = sm.sess_state.setdefault(sid, {})
+        call = _tw_call(tid, "Bash", {"command": cmd})
+        call["timestamp"] = self._iso(now - ago_ms)
+        ha._scan_entry_line(json.dumps(call), st, {"prUrls": [], "modelActual": None})
+        return st
+
+    def _land(self, sm, sess, st, tid="t1", **kw):
+        res = _tw_result(tid, "commented on XERK-1", ts=self._iso(int(time.time() * 1000)), **kw)
+        report = {"prUrls": [], "modelActual": None}
+        ha._scan_entry_line(json.dumps(res), st, report)
+        sess["ticketWrites"], _ = ha.merge_ticket_writes(sess.get("ticketWrites") or [],
+                                                         report.get("ticketWrites"))
+
+    def test_xerk3052_a_running_calls_own_comment_is_held_then_filtered(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        st = self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
+        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [ev])
+        sm.notify_session.assert_not_called()
+        self.assertNotIn("c:9", sess["ticketUpdateBase"]["seen"])  # held, not seen
+        self._land(sm, sess, st)
+        self._run(sm, [ev])
+        sm.notify_session.assert_not_called()
+        self.assertIn("c:9", sess["ticketUpdateBase"]["seen"])
+
+    def test_xerk3052_a_humans_comment_during_the_call_is_delivered(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
+        ev = self._comment("9", body="please also cover nulls",
+                           at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [ev])
+        self.assertEqual(len(self._delivered(sm)), 1)
+
+    def test_xerk3052_a_failed_call_releases_the_held_comment(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        st = self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5"')
+        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [ev])
+        sm.notify_session.assert_not_called()
+        self._land(sm, sess, st, is_error=True)  # refused: nothing written by us
+        self._run(sm, [ev])
+        self.assertEqual(len(self._delivered(sm)), 1)
+
+    def test_xerk3052_a_lost_call_stops_holding(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5"',
+                      ago_ms=ha.TICKET_PENDING_HOLD_MAX_MS + 1_000)
+        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [ev])
+        self.assertEqual(len(self._delivered(sm)), 1)
+
+    def test_xerk3052_a_comment_body_from_a_file_holds_any_comment(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        ev = self._comment("9", body="anything", at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [ev])
+        sm.notify_session.assert_not_called()
+
+    def test_xerk3052_a_held_event_does_not_move_the_watermark(self):
+        sess = self._sess(base=["c:1"])
+        sess["ticketUpdateBase"]["mark"] = int(time.time() * 1000) - 60_000
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
+        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
+        mark = sess["ticketUpdateBase"]["mark"]
+        self._run(sm, [ev])
+        self.assertEqual(sess["ticketUpdateBase"]["mark"], mark)
+
+    def test_xerk3052_a_pending_write_on_another_ticket_holds_nothing(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", "jira comment XERK-2 -F /tmp/x.md && sleep 900")
+        ev = self._comment("9", body="anything", at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [ev])
+        self.assertEqual(len(self._delivered(sm)), 1)
+
     def test_a_ticket_key_change_rebaselines(self):
         # A base for another ticket (the session adopted a new one) is no base.
         sess = self._sess()

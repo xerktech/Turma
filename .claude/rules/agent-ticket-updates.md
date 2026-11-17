@@ -48,6 +48,12 @@ New comments and edits on a running session's ticket reach that session via `not
   acceptance criteria, priority; an ADDED attachment; status only when it moves BACKWARDS by
   board column. A forward move or Done is never delivered: auto-stop owns Done.
   - Unknown columns read "can't tell direction" → not delivered.
+  - **A still-running call's write is HELD, not delivered** (XERK-3052): its writes reach the
+    ledger only with its tool_result, and a live check saw the poller hand a session its own
+    comment 13s before its timed-out result landed. An event matching a pending call's write in
+    the scan's `twCalls` (`_ticket_update_pending_match`; any comment while the pending body is a
+    file) is neither delivered nor marked seen, nor moves `mark`, until the call resolves.
+    A call older than `TICKET_PENDING_HOLD_MAX_MS` holds nothing (lost to a restart).
 - One message per session per round (`_ticket_update_message`), newest `TICKET_UPDATES_MAX`
   events, each a flattened capped line.
   - The header names the CURRENT summary: a delivered-pass summary edit rewrites
