@@ -60845,6 +60845,37 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         line = ha._ticket_update_line(e)
         self.assertTrue(line.startswith("[@Turma operator @root — comment] \""))
         self.assertEqual(line.count('"'), 2)
+        quoted = ha._ticket_update_line(self._comment("2", author='Eve "x', body="ok"))
+        self.assertEqual(quoted.count('"'), 2)
+
+    def test_adoption_stamps_the_first_sight_anchor(self):
+        sm = self.make_manager()
+        sm.jira = {"siteKey": self.SITE, "tickets": [{"key": self.KEY, "summary": "s"}]}
+        sess = {"id": "s1", "repo": "Turma", "claudeSessionId": "t1"}
+        self.assertTrue(sm._maybe_adopt_ticket(sess, self.KEY))
+        self.assertIsNotNone(ha._ts_ms(sess["ticketUpdateSince"]))
+
+    def test_a_resume_does_not_redeliver_the_previous_runs_updates(self):
+        # resume() keeps the original createdAt; the anchor moves to the resume.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
+                mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sess = sm.registry[-1]
+            sess["createdAt"] = "2026-11-10T00:00:00Z"
+            sess["ticket"] = {"key": self.KEY, "siteKey": self.SITE}
+            sid = sess["id"]
+            sm.kill(sid)
+            sm.resume(sid)
+        rec = sm._find(sid)
+        self.assertGreater(ha._ts_ms(rec["ticketUpdateSince"]), ha._ts_ms(rec["createdAt"]))
+        self.assertNotIn("ticketUpdateBase", rec)
+        rec["status"] = "running"
+        sm.registry = [rec]
+        sm.notify_session = mock.Mock()
+        self._run(sm, [self._comment("1", at="2026-11-12T00:00:00.000+0000")])
+        sm.notify_session.assert_not_called()
 
     def test_a_notify_that_raises_is_retried_next_round(self):
         sess = self._sess(base=[])

@@ -19,8 +19,9 @@ New comments and edits on a running session's ticket reach that session via `not
 - **`ticketUpdateBase = {key, seen}` on the record**: a missing base, or one for another key, is
   first sight. Resume/migration/adoption build a record without it (never carry it); a
   clear-context restart keeps the record, so it keeps it.
-  - First sight baselines only events created at or before `ticketUpdateSince` (set on adoption)
-    else `createdAt`; later ones are delivered. The first read lands up to a cadence after the
+  - First sight baselines only events created at or before `ticketUpdateSince` (set on adoption
+    AND by `resume()`, which keeps the original `createdAt`) else `createdAt`; later ones are
+    delivered. Never drop the resume stamp: the previous run's updates came back as news (QA). The first read lands up to a cadence after the
     spawn, and an operator's "also handle X" written in that window was otherwise lost (QA).
   - A key is marked seen only once delivery did not raise, so a failed notify retries.
   - A failed read or pre-check (None) keeps the baseline and delivers nothing.

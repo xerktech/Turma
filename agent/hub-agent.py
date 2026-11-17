@@ -28333,7 +28333,8 @@ def _ticket_quote(text, limit):
 def _ticket_update_line(e):
     # A name is the tracker's, so it may not carry brackets that would let it
     # close the line's own [...] marker and forge another.
-    who = _ticket_flat(re.sub(r"[\[\]]", "", str(e.get("author") or "")) or "someone", 80)
+    who = _ticket_flat(re.sub(r"[\[\]]", "", str(e.get("author") or "")).replace('"', "”")
+                       or "someone", 80)
     if e.get("kind") == "comment":
         return f"[@{who} — comment] {_ticket_quote(e.get('body'), TICKET_UPDATE_LINE_MAX)}"
     field = e.get("field") or "field"
@@ -37193,6 +37194,10 @@ class SessionManager:
             "localModelContext": rec.get("localModelContext"),
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
+            # Resume keeps the original createdAt, so anchor the ticket-update
+            # first sight here: the previous run already saw what came before
+            # (XERK-3035), and the base is not carried.
+            "ticketUpdateSince": now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
         }
