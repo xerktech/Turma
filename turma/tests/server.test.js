@@ -35314,10 +35314,13 @@ test("XERK-3057: a block keeps its record id whatever its host key becomes; a st
     await beat2985(D2985A, S2985A, sync2985([src3057({ start: iso2968(T2968 + 3.6e6), end: iso2968(T2968 + 7.2e6) })]));
     assert.deepEqual(blockRecs3057().map((r) => [r.id, r.version]), [[kept, 2]], "moved in place, same id");
     assert.ok(writes2985(D2985B).slice(before).every((w) => w.turmaId === kept));
-    // A second record for the same (host, event) is removed with its copies.
+    // A second record for the same (host, event) is removed; a copy the kept one also names stays.
+    bucket[kept].outlook[S2985B] = { ...bucket[kept].outlook[S2985B], outlookId: "OID-KEEP", host: D2985B, state: "written" };
     bucket[rec.id] = hub.sanitizeTurmaEvent({ ...bucket[kept], id: rec.id }, "");
     hub.calBlockReconcile(D2985A);
     assert.equal(blockRecs3057().length, 1);
+    assert.ok(!(hub.getCalendarOutlookTombstones()[D2985B] || []).some((x) => x.outlookId === "OID-KEEP"),
+      "the kept record's copy is never deleted with a clone");
   } finally {
     cleanup2985(D2985A, D2985B);
     forget2533(D2985A, D2985B);

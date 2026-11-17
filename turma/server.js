@@ -7560,7 +7560,11 @@ function calBlockReconcileNow(key, now) {
   for (const rec of dups) {
     if (rec.blockOf.host !== key) continue;
     delete bucket[rec.id];
-    calOutlookAfterWrite(t, rec, null, now);
+    // A copy the kept record also names is the kept one's: never deleted with the stray.
+    const kept = index.get(`${key}\u0000${rec.blockOf.event}`);
+    const keptIds = new Set(Object.values((kept && kept.outlook) || {}).map((e) => e.outlookId).filter(Boolean));
+    const outlook = Object.fromEntries(Object.entries(rec.outlook || {}).filter(([, e]) => !keptIds.has(e.outlookId)));
+    calOutlookAfterWrite(t, { ...rec, outlook }, null, now);
     n++;
   }
   for (const [k, rec] of index) {
