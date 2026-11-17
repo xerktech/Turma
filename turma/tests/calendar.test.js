@@ -2299,3 +2299,36 @@ test("XERK-2987: the block wears the mark and says it aloud", () => withOrgs(asy
   assert.match(html, /<span class="cal-olk failed" aria-hidden="true"[^>]*>!<\/span>/);
   assert.match(html, /aria-label="Joint planning,[^"]*Turma event, an Outlook copy failed/);
 }));
+
+// ---- XERK-3057: an Outlook event blocks other orgs' calendars under an alias ----------
+test("XERK-3057: an Outlook panel offers the other orgs, saves the block, and the block wears a right bar", () => withOrgs(async () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  const src = { host: "h1", id: "S1", seriesId: "", org: "acme", source: "outlook", meetings: [], subject: "Board review",
+    startMs: at(2027, 6, 8, 10), endMs: at(2027, 6, 8, 11),
+    blocks: { orgs: ["globex"], alias: evil, series: false, outlook: { globex: { state: "failed", error: evil } } } };
+  replies = { "/api/calendar": () => ({ hosts: [], events: [src] }),
+    "/api/agents/h1/calendar/blocks": (u, init) => ({ ok: true, blocks: { orgs: JSON.parse(init.body).orgs, alias: "Away", series: false } }) };
+  cal.refetch();
+  const grid = await show(at(2027, 6, 8));
+  assert.match(grid, /class="cal-blkbar"[^>]*linear-gradient\(to bottom,var\(--s5\) 0\.00% 100\.00%\)/, "the right bar is the blocked org's color");
+  assert.match(grid, /aria-label="Board review[^"]*blocks globex/);
+  let html = await openEvent(at(2027, 6, 8), "Board review");
+  assert.match(html, /Block other calendars/);
+  assert.match(html, /data-blk-org="globex" checked/);
+  assert.ok(!html.includes('data-blk-org="acme"'), "never its own org");
+  assert.ok(!html.includes(evil), "the alias and the error are escaped");
+  assert.match(html, /Failed: &lt;img/);
+  // Uncheck globex: nothing is written until Save; Save PUTs the draft.
+  posts.length = 0;
+  change({ blkOrg: "globex" }, undefined);
+  assert.equal(posts.length, 0);
+  for (const f of root.listeners.input || []) f({ target: { dataset: { blkAlias: "" }, value: "Away" } });
+  click({ blkSave: "" });
+  for (let i = 0; i < 4; i++) await tick();
+  assert.deepEqual(posts.map((p) => [p.url, p.body]), [["/api/agents/h1/calendar/blocks", { eventId: "S1", orgs: [], alias: "Away" }]]);
+  // A Turma event, a Tenir entry and a private Outlook event offer no block.
+  assert.equal(cal.blocksHtml({ ...src, source: "turma" }), "");
+  assert.equal(cal.blocksHtml({ ...src, private: true }), "");
+  assert.equal(cal.blockBarHtml({ blocks: { orgs: ["globex"] } }, new Map([["globex", "red; x:y"]])).includes("red"), false,
+    "only palette slots are inlined");
+}));
