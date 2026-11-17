@@ -17,13 +17,17 @@ New comments and edits on a running session's ticket reach that session via `not
     `ticket_update_events` for the changed ones; `full` keys (a session with no baseline) skip
     the pre-check. Results REBOUND under `_ticket_upd_lock`.
 - **`ticketUpdateBase = {key, seen}` on the record**: a missing base, or one for another key, is
-  first sight. Resume/migration/adoption build a record without it (never carry it); a
-  clear-context restart keeps the record, so it keeps it.
-  - First sight baselines only events created at or before `ticketUpdateSince`, else
-    `createdAt`; later ones are delivered (news written while a session was down included).
-  - `ticketUpdateSince` is set on adoption (now) and by `resume()` (the kill's `closedAt`):
-    resume keeps the original `createdAt`, so without it the previous run's updates came back. The first read lands up to a cadence after the
-    spawn, and an operator's "also handle X" written in that window was otherwise lost (QA).
+  first sight.
+  - Kill + resume CARRIES the base (`_remember_closed` → `resume()`), so the resumed session gets
+    exactly what it never read: the unread tail before the kill and what landed while down.
+    Never anchor a resume on a time instead: reads are a cadence apart, so any anchor drops
+    that tail (QA). A closed record with no base anchors at its `closedAt`.
+  - Migration and resume-any build a record without the base (the hub carries none), so they
+    anchor at their own `createdAt`; a clear-context restart keeps the record and its base.
+  - First sight baselines only events created at or before `ticketUpdateSince` (adoption, or a
+    base-less resume), else `createdAt`; later ones are delivered.
+  - Why: the first read lands up to a cadence after the spawn, and an operator's "also handle X"
+    written in that window was otherwise lost (QA).
   - A key is marked seen only once delivery did not raise, so a failed notify retries.
   - A failed read or pre-check (None) keeps the baseline and delivers nothing.
 - **Filters, in order**: `_ticket_self_authored` (the record's `ticketWrites`, via

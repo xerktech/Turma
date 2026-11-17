@@ -60870,7 +60870,7 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
             sm.resume(sid)
         rec = sm._find(sid)
         self.assertGreater(ha._ts_ms(rec["ticketUpdateSince"]), ha._ts_ms(rec["createdAt"]))
-        self.assertNotIn("ticketUpdateBase", rec)
+        self.assertIsNone(rec.get("ticketUpdateBase"))   # none to carry: anchored
         rec["status"] = "running"
         sm.registry = [rec]
         sm.notify_session = mock.Mock()
@@ -60896,6 +60896,32 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
             closed["closedAt"] = "2026-11-14T08:00:00Z"
             sm.resume(sid)
         self.assertEqual(sm._find(sid)["ticketUpdateSince"], "2026-11-14T08:00:00Z")
+
+    def test_resume_carries_what_the_previous_run_saw(self):
+        # An update written before the kill that the previous run never read
+        # (reads are a cadence apart) still arrives after the resume.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
+                mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sess = sm.registry[-1]
+            sess["ticket"] = {"key": self.KEY, "siteKey": self.SITE}
+            sess["ticketUpdateBase"] = {"key": self.KEY, "seen": ["c:1"]}
+            sid = sess["id"]
+            sm.kill(sid)
+            sm.resume(sid)
+        rec = sm._find(sid)
+        self.assertEqual(rec["ticketUpdateBase"], {"key": self.KEY, "seen": ["c:1"]})
+        rec["status"] = "running"
+        sm.registry = [rec]
+        sm.notify_session = mock.Mock()
+        self._run(sm, [self._comment("1", body="seen", at="2026-11-01T00:00:00.000+0000"),
+                       self._comment("2", body="unread gap", at="2026-11-01T00:00:00.000+0000")])
+        msgs = [c.args[1] for c in sm.notify_session.call_args_list]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("unread gap", msgs[0])
+        self.assertNotIn('"seen"', msgs[0])
 
     def test_a_notify_that_raises_is_retried_next_round(self):
         sess = self._sess(base=[])

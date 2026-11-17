@@ -36972,6 +36972,10 @@ class SessionManager:
             # relaunched session already answers to — that keystroke would collide
             # with the operator's first message in the composer.
             "rcRenamedFor",
+            # What the run already saw of its ticket's updates (XERK-3035), so a
+            # resume delivers exactly the rest: the unread tail before the kill
+            # AND what landed while the session was down.
+            "ticketUpdateBase",
             # The model that actually answered and its QA runs (XERK-1845): the
             # outcome ledger credits a session it first sees already closed by
             # these, so a kill must not forget them.
@@ -37194,9 +37198,10 @@ class SessionManager:
             "localModelContext": rec.get("localModelContext"),
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
-            # Resume keeps the original createdAt, so anchor the ticket-update
-            # first sight at the KILL (XERK-3035): the previous run saw what came
-            # before it, and what landed while the session was down is news.
+            # The previous run's seen-set carries over (XERK-3035). A record
+            # without one (an older agent's) anchors first sight at the kill.
+            "ticketUpdateBase": (rec.get("ticketUpdateBase")
+                                 if isinstance(rec.get("ticketUpdateBase"), dict) else None),
             "ticketUpdateSince": rec.get("closedAt") or now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
