@@ -392,3 +392,29 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
 - **The app still creates no branch**: the worktree stays `--detach`. This decides the NAME only. A
   resume re-tells the persisted name rather than reserving a fresh one.
 - Tests: `TestNextTicketBranch`, `TestBranchNames`, `TestSpawnTicket`.
+
+## Ticket update events (XERK-3033, epic XERK-3032)
+
+- `ticket_update_events(key)` / `tickets_changed_since(keys, since_ms)`: read primitives for
+  delivering a ticket's new comments + field changes; no polling or delivery lives with them.
+- **Same contract as `_pr_comment_events`**: a list, or None on ANY hard fetch failure (comments,
+  history, the ADO item read, a malformed page) so the caller keeps its baseline. Never raise.
+- Keys are stable: `c:<commentId>`, `h:<historyId>:<field>` (`:<n>` for a repeat in one entry).
+  `field` is tracker-neutral (`ticket_field_name`); unknown fields read `other`.
+- **ADO times come from `System.ChangedDate`, never `revisedDate`** (when the revision was
+  superseded; `9999-…` for the latest). ADO rev 1 (creation) and bookkeeping fields are dropped.
+- ADO `/updates` has no total: the item's `System.Rev` places the newest window. An empty
+  page there means Rev overshot: BISECT for the real count (a page at k is non-empty iff k < n,
+  ≤`TICKET_UPDATE_REV_PROBES`), then read the window ending there — never page forward from a
+  halved skip (that returned a middle window). A jump never discards pages read until it has data.
+- Paging sizes jumps by the page the server SERVED (it may cap below ours), on both trackers.
+  Jira's changelog jumps to its newest pages via `total`.
+- **Real Jira 400s a whole `key in (…)` when ONE key is gone or hidden**: the pre-check bisects a
+  400 down to the refused key and drops only it; every key refused (a bad query) → None.
+  No early abort: every heuristic tried (N refusals, one canary) aborted on revoked-project keys
+  that happened to sort first/last. A full bisection is ≤2n-1 calls per chunk; keep it.
+  Keys are quoted and returned as the caller spelled them (Jira upper-cases them).
+- The Jira pre-check uses RELATIVE `updated >= -Nm` (an absolute JQL date reads in the Jira
+  user's zone), widened, then filtered client-side.
+- All tracker text goes through `_tracker_text` (Cc/Cf/Cs/Co/Cn dropped, capped).
+- Network: call on a worker, never the beat. Tests: `TestTicketUpdateEvents`.
