@@ -12140,6 +12140,11 @@ TICKET_SELF_EDIT_WINDOW_MS = 120_000
 TICKET_SELF_SPAN_MAX_MS = 600_000
 # Pending tool calls held across beats (a call and its result land apart).
 TICKET_WRITE_CALLS_MAX = 32
+# A Bash call moved to the background on its timeout keeps running for as long
+# as it likes (XERK-3054): its not-yet-landed writes are held, and a comment
+# recorded at its notification is matched, across this much time from the
+# timeout. Comments match by body, which a human's text does not share.
+TICKET_BG_MAX_MS = 3_600_000
 # A command longer than this is not parsed (bounded work on the beat).
 TICKET_WRITE_CMD_MAX = 64 * 1024
 # A tool_result longer than this is not searched for a comment id.
@@ -12804,6 +12809,67 @@ def _tw_landed(writes, text):
     return out
 
 
+def _tw_record(report, bid, writes, landed, t, cid=None):
+    """Append `landed` [(n, write)] of call `bid` to the report's ledger."""
+    resolve_ticket_write_files([w for _, w in landed])  # it has run: read its body file
+    out = report.setdefault("ticketWrites", [])
+    for n, w in landed:
+        rec = {"u": f"{bid}:{n}", **w, "t": t}
+        if not isinstance(rec.get("tp"), int) or isinstance(rec["tp"], bool) \
+                or rec["tp"] >= t or w["kind"] != "comment":
+            rec.pop("tp", None)  # only a post-timeout comment spans the task's life
+        if not isinstance(rec.get("t0"), int) or rec["t0"] >= t:
+            rec.pop("t0", None)  # no start time, or no span to widen by
+        if cid and w["kind"] == "comment" and len(writes) == 1:
+            rec["id"] = cid
+        out.append(rec)
+
+
+def _scan_ticket_write_bg(entry, state, report):
+    """A timed-out call's `<task-notification>` (XERK-3054): its command has
+    finished, so read the task's output file and record the comments whose
+    success line printed after the timeout. Only a `user`/`queue-operation`
+    entry carries a real one (an assistant quoting one retires nothing)."""
+    if entry.get("type") not in ("user", "queue-operation"):
+        return
+    bg = state.get("twBg")
+    if not bg:
+        return
+    for text in _entry_texts_for_scan(entry):
+        tn = _parse_task_notification(text)
+        if not tn:
+            continue
+        m = re.search(r"<output-file>(.*?)</output-file>", text, re.DOTALL)
+        named = m.group(1).strip() if m else ""
+        for tid in tn["taskIds"]:
+            job = bg.pop(tid, None)
+            if job is None:
+                continue
+            state.setdefault("twCalls", {}).pop(f"bg:{tid}", None)
+            # The file Claude Code names for that task, and no other: the
+            # notification's own, else the one the timeout result named.
+            raw = None
+            for path in (named, job.get("path") or ""):
+                if os.path.basename(path) == f"{tid}.output":
+                    raw = _read_regular_tail(path, TICKET_WRITE_RESULT_MAX)
+                    if raw:
+                        break
+            if not raw:
+                continue
+            # No refusal check over the whole output: a build's own `HTTP/1.1
+            # 404` or `{"errors": …}` line is not the helper's, and the helper's
+            # success line already says the comment was made.
+            out = raw.decode("utf-8", "replace")
+            done = set(job.get("landed") or [])
+            landed = [(n, w) for n, w in _tw_landed(job["writes"], out) if n not in done]
+            if landed:
+                t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
+                tp = job.get("tp")
+                _tw_record(report, job["bid"], job["writes"],
+                           [(n, {**w, "tp": tp} if isinstance(tp, int) else w)
+                            for n, w in landed], t)
+
+
 def _scan_ticket_write_entry(entry, state, report):
     """Fold one transcript entry into the session's own-ticket-write scan
     (XERK-3034). A tool_use is held only when it names a tracker write; it is
@@ -12811,7 +12877,11 @@ def _scan_ticket_write_entry(entry, state, report):
     error. An assistant entry's tool_result, or a user entry's tool_use, is
     never read (the role a real call/result rides). Appends to
     `report["ticketWrites"]`."""
-    msg = entry.get("message") if isinstance(entry, dict) else None
+    if not isinstance(entry, dict):
+        return
+    if state.get("twBg"):
+        _scan_ticket_write_bg(entry, state, report)
+    msg = entry.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
     if not isinstance(content, list):
         return
@@ -12863,21 +12933,40 @@ def _scan_ticket_write_entry(entry, state, report):
                 timed_out = True
                 stdout = tur.get("stdout")
                 landed = _tw_landed(writes, stdout if isinstance(stdout, str) else text)
+                t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
+                _tw_hold_bg(state, bid, tur["backgroundTaskId"], writes, landed, text, t)
                 if not landed:
                     continue
             if _tw_result_failed(text):
                 continue  # curl exits 0 on an HTTP 4xx: the tracker refused it
-            resolve_ticket_write_files([w for _, w in landed])  # it has run: read its body file
             t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
             cid = None if timed_out else _tw_result_id(text)
-            out = report.setdefault("ticketWrites", [])
-            for n, w in landed:
-                rec = {"u": f"{bid}:{n}", **w, "t": t}
-                if not isinstance(rec.get("t0"), int) or rec["t0"] >= t:
-                    rec.pop("t0", None)  # no start time, or no span to widen by
-                if cid and w["kind"] == "comment" and len(writes) == 1:
-                    rec["id"] = cid
-                out.append(rec)
+            _tw_record(report, bid, writes, landed, t, cid)
+
+
+def _tw_hold_bg(state, bid, tid, writes, landed, text, t):
+    """Keep a timed-out call's not-yet-landed writes pending (XERK-3054): the
+    command still runs, so they stay in `twCalls` (under `bg:<task id>`, so
+    the poller holds a matching update; `tp` = the timeout, which ages the
+    hold) and in `twBg` until the task's notification records them. Only a
+    comment can ever be recorded from it (`_tw_success_re`), but every write
+    is held: holding only delays an update, never drops one."""
+    if not isinstance(tid, str) or not tid:
+        return
+    done = [n for n, _ in landed]
+    rest = [{**w, "tp": t} for n, w in enumerate(writes) if n not in done]
+    if not rest:
+        return
+    m = PR_BG_OUTPUT_PATH_RE.search(text or "")
+    bg = state.setdefault("twBg", {})
+    bg[tid] = {"bid": bid, "writes": writes, "landed": done, "tp": t,
+               "path": m.group(1) if m else ""}
+    while len(bg) > TICKET_WRITE_CALLS_MAX:
+        bg.pop(next(iter(bg)))
+    calls = state.setdefault("twCalls", {})
+    calls[f"bg:{tid}"] = rest
+    while len(calls) > TICKET_WRITE_CALLS_MAX:
+        calls.pop(next(iter(calls)))
 
 
 def merge_ticket_writes(writes, new):
@@ -13028,6 +13117,10 @@ def _tw_gap(at, w):
     if not isinstance(t0, int) or isinstance(t0, bool) or not t0 < t:
         t0 = t
     t0 = max(t0, t - TICKET_SELF_SPAN_MAX_MS)
+    tp = w.get("tp")  # a comment made after its call's timeout (XERK-3054)
+    if isinstance(tp, int) and not isinstance(tp, bool) and tp < t \
+            and w.get("kind") == "comment":
+        t0 = min(t0, max(tp, t - TICKET_BG_MAX_MS))
     return t0 - at if at < t0 else max(0, at - t)
 
 
@@ -49246,6 +49339,14 @@ class SessionManager:
             for writes in list(calls.values()):
                 for w in writes if isinstance(writes, list) else []:
                     if not isinstance(w, dict) or w.get("key") != key:
+                        continue
+                    # A timed-out call's rest ages from its timeout (`tp`),
+                    # for as long as a backgrounded task may run.
+                    tp = w.get("tp")
+                    if isinstance(tp, int) and not isinstance(tp, bool):
+                        if now - tp > TICKET_BG_MAX_MS:
+                            continue
+                        out.append({**w, "t": now})
                         continue
                     t0 = w.get("t0")
                     if not isinstance(t0, int) or isinstance(t0, bool) \
