@@ -59719,6 +59719,100 @@ class TestMeetingWorker(ManagerMixin, unittest.TestCase):
         self.assertNotIn("daily standup", stdin_text)
         self.assertNotIn("End of the meeting data", stdin_text)
 
+    BOARD_3061 = {"tickets": [
+        {"key": "PROJ-7", "summary": "Add retry to the upload job", "status": "In Progress",
+         "statusCategory": "inprogress"},
+        {"key": "PROJ-3", "summary": "Fix login‮ bug", "status": "Done", "statusCategory": "done"},
+        {"key": "PROJ-1", "summary": "Platform epic", "statusCategory": "todo", "isEpic": True},
+        {"key": "bad key", "summary": "x"}, {"key": "PROJ-9", "summary": ""}, "junk"]}
+
+    def test_xerk3061_tracked_work_rides_the_prompt(self):
+        """The reader is told what is already tracked — this host's board tickets
+        (open first, an epic and malformed rows left out) and the org's Turma
+        sessions from the hub's pull — after the meeting data, as JSON."""
+        tm = TestMeetingItems()
+        tm.doc, tm.t = self.doc, ha.normalize_meeting_transcript(
+            dict(self.doc, runId="ab12"), "ab12", self.SITE)
+        self.sm.jira = self.BOARD_3061
+        self.doc = dict(self.doc, work={"sessions": [
+            {"ticket": "PROJ-12", "title": "Meeting recommendations", "branch": "PROJ-12",
+             "state": "running"},
+            {"title": "Spike on caching", "state": "ended"},
+            {"ticket": "not a key", "title": ""}, 5]})
+        self.replies = [tm.reply(tm.item(description="Continues PROJ-7 and PROJ-12."))]
+        self.sm.handle_commands([dict(self._cmd(), cmdId="c1")])
+        [row] = self._drain()
+        self.assertEqual(row["status"], "ok")
+        # Wired after the search: listed keys the item names lead its duplicateKeys.
+        self.assertEqual(row["items"][0]["duplicateKeys"], ["PROJ-7", "PROJ-12", "PROJ-9"])
+        [(_, stdin_text)] = self.calls
+        tail = stdin_text[stdin_text.index("End of the meeting data"):]
+        self.assertIn("Work already tracked", tail)
+        work = json.loads(tail[tail.index("{"):tail.index("}]}") + 3])
+        self.assertEqual([t["key"] for t in work["tickets"]], ["PROJ-7", "PROJ-3"])
+        self.assertEqual(work["tickets"][1], {"key": "PROJ-3", "title": "Fix login bug",
+                                              "status": "Done", "done": True})
+        self.assertEqual(work["sessions"], [
+            {"title": "Meeting recommendations", "state": "running", "ticket": "PROJ-12",
+             "branch": "PROJ-12"},
+            {"title": "Spike on caching", "state": "ended"}])
+        self.assertIn("status update is not new work", tail)
+
+    def test_xerk3061_one_closing_line_after_focus_and_daily(self):
+        tm = TestMeetingItems()
+        tm.doc, tm.t = self.doc, ha.normalize_meeting_transcript(
+            dict(self.doc, runId="ab12"), "ab12", self.SITE)
+        self.sm.jira = self.BOARD_3061
+        self.doc = dict(self.doc, daily={"day": "Shipped PROJ-3."})
+        self.replies = [tm.reply(tm.item())]
+        self.sm.handle_commands([dict(self._cmd(focus={"names": ["Ann"]}), cmdId="c1")])
+        self._drain()
+        [(_, text)] = self.calls
+        self.assertEqual(text.count("End of the meeting data"), 1)
+        self.assertLess(text.index("daily standup"), text.index("Work already tracked"))
+
+    def test_xerk3061_an_item_naming_tracked_work_links_it(self):
+        """An item whose text names a listed ticket gets that key first in its
+        duplicateKeys; a key not in the list (a model guess) is never added, and
+        a bare ADO number never matches a number in prose."""
+        work = ha.meeting_work_context(self.BOARD_3061, {"sessions": [
+            {"ticket": "PROJ-12", "title": "x"}, {"ticket": "42", "title": "y"}]})
+        items = [
+            {"kind": "task", "title": "Extend proj-12", "description": "", "duplicateKeys": ["PROJ-9"]},
+            {"kind": "task", "title": "Ship", "description": "continues PROJ-7; see PROJ-70",
+             "duplicateKeys": []},
+            {"kind": "task", "title": "Retry 42 times", "description": "PROJ-99", "duplicateKeys": []},
+            {"kind": "decision", "title": "PROJ-7 is fine", "description": "", "duplicateKeys": []},
+            {"kind": "task", "title": "XPROJ-7 and PROJ-7x", "description": "", "duplicateKeys": []},
+            {"kind": "task", "title": "Extend PROJ-12", "description": "", "duplicateKeys": ["PROJ-9"]}]
+        ha.meeting_link_known_keys(items, work)
+        # Case-sensitive ("proj-12" is prose), whole keys only, never a decision.
+        self.assertEqual([i["duplicateKeys"] for i in items],
+                         [["PROJ-9"], ["PROJ-7"], [], [], [], ["PROJ-12", "PROJ-9"]])
+        ha.meeting_link_known_keys(items, None)   # no work: nothing changes
+
+    def test_xerk3061_a_busy_open_list_keeps_recent_done(self):
+        rows = [{"key": f"OPEN-{i}", "summary": f"open {i}", "statusCategory": "todo"}
+                for i in range(100)]
+        rows += [{"key": f"DONE-{i}", "summary": f"done {i}", "statusCategory": "done"}
+                 for i in range(30)]
+        work = ha.meeting_work_context({"tickets": rows}, None)
+        keys = [t["key"] for t in work["tickets"]]
+        self.assertEqual(len(keys), ha.MEETING_WORK_TICKETS_MAX)
+        self.assertEqual(sum(k.startswith("DONE-") for k in keys), ha.MEETING_WORK_DONE_MAX)
+        self.assertEqual(keys[0], "OPEN-0")
+        self.assertFalse(ha._meeting_work_key("PROJ-1\n"))
+        many = ha.meeting_work_context(None, {"sessions": [
+            {"title": f"s{i}", "state": "running"} for i in range(50)]})
+        self.assertEqual([r["title"] for r in many["sessions"]],
+                         [f"s{i}" for i in range(ha.MEETING_WORK_SESSIONS_MAX)])
+
+    def test_xerk3061_no_tracked_work_keeps_the_old_prompt(self):
+        for board, raw in ((None, None), ({}, {}), ({"tickets": "x"}, {"sessions": {}}),
+                           ({"tickets": [{"key": "A-1", "summary": "  "}]}, {"sessions": [{}]})):
+            self.assertIsNone(ha.meeting_work_context(board, raw), (board, raw))
+        self.assertEqual(ha.meeting_work_instruction(None), "")
+
     def test_xerk2514_name_match_is_by_word_set(self):
         # Captions spell one person many ways; a clashing word is someone else.
         f = {"names": ["Malcolm Habeeb"], "role": ""}

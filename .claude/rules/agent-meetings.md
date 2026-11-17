@@ -47,6 +47,12 @@ Wire: `contract-meetings.md`. Model decision and eval: `docs/meeting-items-adr.m
     `_DAILY_BRIEF_PROJECT_RE`, ADO names are `'`-escaped.
   - Best-effort: a search error, or `MEETING_DUP_BUDGET_SEC` spent, leaves `[]`; the items ship.
   - A `decision` files nothing, so is not searched.
+- **The reader sees what is already tracked** (XERK-3061, `meeting_work_context`): this host's
+  `self.jira` tickets + the hub's `work.sessions`, as one JSON block after the meeting data
+  (`meeting_work_instruction`; one "End of the meeting data" line however many blocks follow).
+  - `meeting_link_known_keys` then puts a LISTED key the item's text names into `duplicateKeys`
+    (after the search, which overwrites the field). A bare ADO number never links: it would match
+    any number in prose.
 - **`assignee` maps the speaker to ONE tracker user** (XERK-2517, `meeting_assignee`), after the
   duplicate check, READ-ONLY and best-effort (`MEETING_ASSIGNEE_BUDGET_SEC`; an error leaves the
   rest unmapped). Never the model's: it names a caption spelling, the agent finds the identity.
