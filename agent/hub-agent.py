@@ -14741,8 +14741,9 @@ def _unwrap_paste(text):
     `<pasted_content id="X">` / the text / `</pasted_content id="X">`, each tag
     on a line of its own. Compared raw, it never equals the outbox record, so
     the message was never reaped and every later compaction typed it again.
-    Only a WHOLE turn framed by one matching id is unwrapped; anything else is
-    returned as it was."""
+    Only a WHOLE turn opened and closed by these tag lines (same id) is
+    unwrapped; anything else is returned as it was. The id is a shape check,
+    not a per-paste one: 2.1.326 reuses one id across a session's pastes."""
     lines = text.split("\n")
     if len(lines) < 3:
         return text
