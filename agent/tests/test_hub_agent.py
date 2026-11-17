@@ -61407,3 +61407,21 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         bare = self._sess()
         bare.pop("ticket")
         self.assertNotIn("do not poll the ticket", sm._session_directive(bare))
+
+
+class TestLogStamp(unittest.TestCase):
+    """A log line carries its time unless journald stamps it (XERK-3036)."""
+
+    def test_a_line_off_journald_is_stamped(self):
+        with mock.patch.object(ha, "_LOG_STAMP", True), \
+                mock.patch("builtins.print") as p:
+            ha.log("hello")
+        line = p.call_args.args[0]
+        self.assertRegex(line, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4} \[hub-agent\] hello$")
+
+    def test_a_line_under_journald_is_not(self):
+        with mock.patch.object(ha, "_LOG_STAMP", False), \
+                mock.patch("builtins.print") as p:
+            ha.log("hello")
+        self.assertEqual(p.call_args.args[0], "[hub-agent] hello")
+

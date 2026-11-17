@@ -1385,8 +1385,17 @@ def _usage_slot(sid):
 # same instant contend on that shared state; staggering reduces the contention.
 LAUNCH_STAGGER = 1.0
 
+# journald stamps every line itself; anywhere else (the nohup fallback's agent.log, a
+# container's stdout file) a line carries no time, so it is stamped here (XERK-3036).
+_LOG_STAMP = not os.environ.get("JOURNAL_STREAM")
+
+
 def log(msg):
-    print(f"[hub-agent] {msg}", flush=True)
+    if _LOG_STAMP:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        print(f"{stamp} [hub-agent] {msg}", flush=True)
+    else:
+        print(f"[hub-agent] {msg}", flush=True)
 
 
 def _start_poke_listener():
