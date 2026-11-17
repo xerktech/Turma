@@ -144,6 +144,16 @@ Events made IN Turma, owned by the hub. Every child of the epic
   9:00. A time a spring-forward skips reads an hour later (old offset), a repeated one is its first.
   - **Except the anchor itself** (XERK-3041): the first occurrence is the stored start/end, so a
     series started at the SECOND 1:30 of a fall-back day keeps that instant and its own key resolves.
+  - **An anchor in or across a spring-forward gap keeps the wall time it was GIVEN** (XERK-3040):
+    its instants cannot carry it (02:30 there IS 03:30; 01:00-02:30 reads 01:00-03:30), so the
+    record stores a hub-internal `wall: {tod, len}` (ms; never served, absent when the instants
+    carry it), which `recurrence.anchorWall` repeats. `recurrence.wallHint` derives it from a sent
+    string naming a gap time AS that instant (the web sends a picked 02:30 as `02:30-05:00`, the
+    old offset), else keeps the record's own hint while it still names the anchor's instants.
+  - A plain reading of the same instant (`03:30-04:00`, a Z stamp) never drops the hint: a form
+    resends what it shows. A re-time to other instants does. Android refuses a gap time outright.
+  - A series move through the FIRST occurrence keeps the sent string (`moved` in the series
+    PATCH) when it names the moved instant; a later occurrence's delta move writes a Z stamp.
   - Unbounded rules are fine: a call skips straight to the range and never walks more than
     `PERIODS_MAX` periods; the served range is already ≤100 days.
   - **A `count` series skips ahead too** (its occurrences before a period are counted in O(1)):
@@ -244,3 +254,4 @@ Events made IN Turma, owned by the hub. Every child of the epic
   until/count, range cut, bounds); the `XERK-2969:` cases in `server.test.js` (ids, moved/deleted
   occurrences, rule edit dropping exceptions, the following split, the serve cap); the `XERK-2953:`
   cases (dead old half, explicit-day re-anchor, the serve cap's early stop, one walk per span).
+  The `XERK-3040:` cases (`recurrence.test.js`, `server.test.js`) pin the DST-gap anchor.

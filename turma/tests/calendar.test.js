@@ -1681,10 +1681,11 @@ test("XERK-2971 QA: join link case and DST edges match the hub", () => {
   const f = { ...cal.blankForm(at(2027, 5, 4, 9), at(2027, 5, 4, 10)), orgs: ["acme"], online: true };
   assert.match(cal.validateForm({ ...f, joinUrl: "HTTPS://meet.example/x" }).joinUrl, /https/, "the hub's CAL_URL_RE is case-sensitive");
   assert.equal(cal.validateForm({ ...f, joinUrl: "https://meet.example/x" }).joinUrl, undefined);
-  // A skipped hour lands on the instant the OLD offset names, east of UTC as well as west.
-  assert.equal(cal.wallToIso("2027-03-28", "02:30", "Europe/Berlin").iso, "2027-03-28T03:30:00+02:00");
-  assert.equal(cal.wallToIso("2027-10-03", "02:15", "Australia/Lord_Howe").iso, "2027-10-03T02:45:00+11:00");
-  assert.equal(cal.wallToIso("2027-03-14", "02:30", "America/New_York").iso, "2027-03-14T03:30:00-04:00");
+  // A skipped hour lands on the instant the OLD offset names, east of UTC as well as west, and
+  // says the time as picked with that offset (XERK-3040: the hub repeats the picked wall time).
+  assert.equal(cal.wallToIso("2027-03-28", "02:30", "Europe/Berlin").iso, "2027-03-28T02:30:00+01:00");
+  assert.equal(cal.wallToIso("2027-10-03", "02:15", "Australia/Lord_Howe").iso, "2027-10-03T02:15:00+10:30");
+  assert.equal(cal.wallToIso("2027-03-14", "02:30", "America/New_York").iso, "2027-03-14T02:30:00-05:00");
   // A repeated hour is its first pass, east and west.
   assert.equal(cal.wallToIso("2027-10-31", "02:30", "Europe/Berlin").iso, "2027-10-31T02:30:00+02:00");
   assert.equal(cal.wallToIso("2027-04-04", "01:45", "Australia/Lord_Howe").iso, "2027-04-04T01:45:00+11:00");

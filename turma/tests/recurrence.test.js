@@ -214,6 +214,63 @@ test("XERK-2953: reanchorDays moves an explicit day with a moved anchor, so it i
   assert.equal(r.sameDays({ freq: "monthly", interval: 1 }, { freq: "monthly", interval: 1, byMonthDay: 3 }), false);
 });
 
+// XERK-3040: an anchor in or across a spring-forward gap keeps the wall time it was given.
+const lw = (iso) => Date.parse(iso.replace(/(?:Z|[+-]\d{2}:\d{2})$/, "") + "Z");
+const hinted = (start, end, rule, prev) => {
+  const s = series(start, end, rule);
+  return { ...s, wall: r.wallHint(s.startMs, s.endMs, NY, lw(start), lw(end), prev) };
+};
+
+test("XERK-3040: an anchor spanning the gap repeats its WALL length, not the length the gap stretched", () => {
+  // 01:00-02:30 EST on 2027-03-14: 02:30 does not exist, so the end is 07:30Z (03:30 EDT).
+  const s = hinted("2027-03-14T01:00:00-05:00", "2027-03-14T02:30:00-05:00", { freq: "weekly", interval: 1 });
+  assert.deepEqual(s.wall, { tod: 36e5, len: 54e5 });
+  const occ = r.occurrences(s, 0, Infinity, 3);
+  assert.deepEqual(occ.map((o) => o.key), ["2027-03-14T06:00:00Z", "2027-03-21T05:00:00Z", "2027-03-28T05:00:00Z"]);
+  assert.equal(occ[0].endMs, ms("2027-03-14T07:30:00Z"), "the anchor itself is unchanged");
+  assert.deepEqual(occ.slice(1).map((o) => o.endMs - o.startMs), [54e5, 54e5], "1.5h, not 2.5h");
+  // Without the hint: the bug as filed.
+  const bare = r.occurrences(series("2027-03-14T01:00:00-05:00", "2027-03-14T02:30:00-05:00", { freq: "weekly", interval: 1 }), 0, Infinity, 2);
+  assert.equal(bare[1].endMs - bare[1].startMs, 90e5);
+});
+
+test("XERK-3040: an anchor IN the gap keeps its 02:30 on every later day", () => {
+  const s = hinted("2026-03-08T02:30:00-05:00", "2026-03-08T03:30:00-04:00", { freq: "daily", interval: 1 });
+  assert.deepEqual(s.wall, { tod: 9e6, len: 36e5 });
+  const occ = r.occurrences(s, 0, Infinity, 3);
+  assert.equal(occ[0].key, "2026-03-08T07:30:00Z");
+  assert.deepEqual(occ.slice(1).map((o) => local(o)), ["2026-03-09T02:30", "2026-03-10T02:30"]);
+  assert.deepEqual(occ.slice(1).map((o) => o.endMs - o.startMs), [36e5, 36e5]);
+  // The occurrence id still resolves.
+  assert.ok(r.occurrenceAt(s, "2026-03-09T06:30:00Z"));
+});
+
+test("XERK-3040: the hint is kept only while it names the anchor, and never for an ordinary one", () => {
+  const plain = series("2026-03-09T09:00:00-04:00", "2026-03-09T10:00:00-04:00", { freq: "daily", interval: 1 });
+  assert.equal(r.wallHint(plain.startMs, plain.endMs, NY, lw("2026-03-09T09:00:00-04:00"), NaN, null), null);
+  // A UTC string names no wall time in New York: no hint.
+  assert.equal(r.wallHint(ms("2026-03-08T07:30:00Z"), ms("2026-03-08T08:30:00Z"), NY,
+    lw("2026-03-08T07:30:00Z"), lw("2026-03-08T08:30:00Z"), null), null);
+  // A carried hint survives Z strings at the same instants (a hub-built split)…
+  const prev = { tod: 9e6, len: 36e5 };
+  assert.deepEqual(r.wallHint(ms("2026-03-08T07:30:00Z"), ms("2026-03-08T08:30:00Z"), NY, NaN, NaN, prev), prev);
+  // …and on another date whose 02:30 lands on the same instant pattern (a later gap day).
+  assert.deepEqual(r.wallHint(ms("2027-03-14T07:30:00Z"), ms("2027-03-14T08:30:00Z"), NY, NaN, NaN, prev), prev);
+  // A series re-timed off the gap drops it.
+  assert.equal(r.wallHint(ms("2026-03-08T14:00:00Z"), ms("2026-03-08T15:00:00Z"), NY, NaN, NaN, prev), null);
+  // A plain reading of the same instants (a form resending 03:30-04:00) keeps it: same instant.
+  assert.deepEqual(r.wallHint(ms("2026-03-08T07:30:00Z"), ms("2026-03-08T08:30:00Z"), NY,
+    lw("2026-03-08T03:30:00-04:00"), lw("2026-03-08T04:30:00-04:00"), prev), prev);
+  // A new gap end replaces its length.
+  assert.deepEqual(r.wallHint(ms("2026-03-08T07:30:00Z"), ms("2026-03-08T07:30:00Z"), NY,
+    NaN, lw("2026-03-08T02:45:00-05:00"), prev), prev, "02:45-05:00 is 07:45Z, not this end: the old hint stands");
+  assert.deepEqual(r.wallHint(ms("2026-03-08T07:30:00Z"), ms("2026-03-08T07:45:00Z"), NY,
+    NaN, lw("2026-03-08T02:45:00-05:00"), prev), { tod: 9e6, len: 9e5 });
+  // A forged hint naming another instant is ignored by the expansion.
+  const forged = { ...plain, wall: { tod: 0, len: 1 } };
+  assert.deepEqual(r.occurrences(forged, 0, Infinity, 2).map((o) => o.endMs - o.startMs), [36e5, 36e5]);
+});
+
 test("XERK-3041: a series started at the SECOND 1:30 of a fall-back day keeps its own first instant", () => {
   const s = series("2027-11-07T06:30:00Z", "2027-11-07T07:30:00Z", { freq: "daily", interval: 1, count: 3 });
   const occ = r.occurrences(s, 0, Infinity, 5);

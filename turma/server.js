@@ -6094,7 +6094,9 @@ const CALENDAR_TURMA_EXCEPTIONS_MAX = 100;        // per series
 const CALENDAR_CANDIDATE_WORK_MAX = 20000;
 const calIsoZ = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 const calTurmaSeries = (rec) => (rec && rec.recurrence
-  ? { startMs: rec.startMs, endMs: rec.endMs, timeZone: rec.timeZone, rule: rec.recurrence } : null);
+  ? { startMs: rec.startMs, endMs: rec.endMs, timeZone: rec.timeZone, rule: rec.recurrence, wall: rec.wall } : null);
+// The wall time an ISO stamp's own fields name (read as UTC), offset dropped.
+const calLocalWall = (iso) => Date.parse(iso.replace(/(?:Z|[+-]\d{2}:\d{2})$/, "") + "Z");
 
 // An IANA zone the runtime knows, in its canonical spelling (so the coerce is a
 // fixed point), else "".
@@ -6150,6 +6152,13 @@ function sanitizeTurmaEvent(v, t) {
     version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
     outlook: calOutlookSanitize(v.outlook, orgs, t),
   };
+  // A series anchored in or across a spring-forward gap keeps the WALL start/length it
+  // was given (XERK-3040), which its instants cannot carry: `{tod, len}` ms, from the
+  // sent strings' own fields, else the hint it had. Hub-internal: never served.
+  if (out.recurrence) {
+    const wall = recurrence.wallHint(startMs, endMs, out.timeZone, calLocalWall(start), calLocalWall(end), v.wall);
+    if (wall) out.wall = wall;
+  }
   // Every series a chain of "following" splits made this one from, nearest first
   // (XERK-3014): an unsettled sent copy of any still covers these occurrences, and all
   // are kept so deleting a middle one cannot cut the chain. Hub-internal: never
@@ -6773,7 +6782,7 @@ function turmaEventWire(p, rec, served = rec.orgs, occKey = "") {
   // A series' exceptions ride its occurrences, never the wire; nor do its copies' hosts and ids.
   // Nor does `createdBy`: it names the creator's hub user id, which no client reads (`editable`
   // says who may change it), and a private event must not tell every org viewer who made it (XERK-2953).
-  const { exceptions, outlook, createdBy, splitFrom, ...fields } = rec;
+  const { exceptions, outlook, createdBy, splitFrom, wall, ...fields } = rec;
   const out = { source: "turma", host: "", ...fields, orgs: served, org: served[0] || "",
     outlook: calOutlookWire(outlook, served),
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
@@ -7184,11 +7193,14 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     const tz = f.rec.timeZone, W = (ms) => recurrence.wallOf(ms, tz);
     const sD = "start" in body && calIso(body.start) ? W(Date.parse(body.start)) - W(shown.startMs) : null;
     const eD = "end" in body && calIso(body.end) ? W(Date.parse(body.end)) - W(shown.endMs) : null;
+    // The sent string itself when it names the resolved instant (the first occurrence): its
+    // wall fields are the time picked, which a DST-gap anchor keeps (XERK-3040).
+    const iso = (k, ms) => (calIso(body[k]) && Date.parse(body[k]) === ms ? body[k] : calIsoZ(ms));
     if (sD || eD) {
       const sW = W(f.rec.startMs) + (sD || 0);
       const st = sD ? recurrence.instantOf(sW, tz) : f.rec.startMs;
-      fields.start = calIsoZ(st);
-      fields.end = calIsoZ(recurrence.instantOf(W(st) + W(f.rec.endMs) + (eD ?? sD) - sW, tz));
+      fields.start = iso("start", st);
+      fields.end = iso("end", recurrence.instantOf(W(st) + W(f.rec.endMs) + (eD ?? sD) - sW, tz));
     } else {
       if (sD === 0) fields.start = f.rec.start;
       if (eD === 0) fields.end = f.rec.end;
@@ -7248,8 +7260,10 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
       // A wall-clock length in the series' zone, as expansion keeps it: a ms length measured
       // across a DST change ended an all-day series at 23:00.
       const tz = f.rec.timeZone;
-      fields.end = calIsoZ(recurrence.instantOf(recurrence.wallOf(f.occ.startMs, tz) +
-        recurrence.wallOf(sentEnd, tz) - recurrence.wallOf(shown.startMs, tz), tz));
+      const endMs = recurrence.instantOf(recurrence.wallOf(f.occ.startMs, tz) +
+        recurrence.wallOf(sentEnd, tz) - recurrence.wallOf(shown.startMs, tz), tz);
+      // The sent string when it names that instant: a DST-gap end's wall time (XERK-3040).
+      fields.end = calIso(body.end) && Date.parse(body.end) === endMs ? body.end : calIsoZ(endMs);
       ownEnd = calIsoZ(sentEnd);
     }
   }
@@ -7520,6 +7534,7 @@ function calWriteEvent(rec, org) {
     exceptions[k] = !x.deleted && hide(x.sensitivity ?? rec.sensitivity) ? { ...x, ...CAL_WRITE_WITHHELD } : x;
   }
   const ev = { subject: rec.subject, start: rec.start, end: rec.end, timeZone: rec.timeZone, allDay: rec.allDay,
+    ...(rec.recurrence && rec.wall ? { wall: rec.wall } : {}),
     location: rec.location, body: rec.body, attendees: rec.attendees, joinUrl: rec.joinUrl, busy: rec.busy,
     categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions,
     sendInvites: calTurmaSends(rec, org),

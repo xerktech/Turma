@@ -141,15 +141,61 @@ function instantOf(w, tz) {
   return ok.length ? Math.min(...ok) : w - before;
 }
 
+// The anchor's WALL start (`w0`, a wallOf value) and WALL length in `tz`, which every
+// occurrence repeats. Read off the anchor's instants, except where `wall` ({tod, len},
+// ms) names them: an anchor in or across a spring-forward gap cannot carry its own
+// wall time (02:30 there IS 03:30, 01:00-02:30 reads 01:00-03:30), so the record keeps
+// the one it was given (XERK-3040). A hint counts only while it names the anchor's own
+// instants, so a series re-timed since (or a forged hint) falls back to the instants.
+function anchorWall(startMs, endMs, tz, wall) {
+  let w0 = wallOf(startMs, tz);
+  let w1 = wallOf(endMs, tz);
+  if (isObj(wall) && intIn(wall.tod, 0, DAY_MS - 1)) {
+    const s = Math.floor(w0 / DAY_MS) * DAY_MS + wall.tod;
+    if (instantOf(s, tz) === startMs) {
+      w0 = s;
+      w1 = Math.max(w1, s);
+      // The end must be the anchor's own, or one its instants cannot refute: a wall end
+      // at or before the start (the gap swallowed it) is how expansion's fallback ended
+      // the occurrence a "following" split re-anchors at.
+      if (intIn(wall.len, 0, DURATION_MAX_MS)) {
+        const e = instantOf(s + wall.len, tz);
+        if (e === endMs || (e <= startMs && endMs >= startMs)) w1 = s + wall.len;
+      }
+    }
+  }
+  return { w0, len: w1 - w0 };
+}
+// The `wall` hint a record stores for an anchor (startMs, endMs) in `tz`, or null when
+// its instants already carry it. `startWall`/`endWall` are the wall times its ISO
+// strings name (their local fields read as UTC; NaN = none), and count only when they
+// name a time the gap skips that IS that instant (a client sends 02:30-05:00 for a
+// picked 02:30). Else `prev`, the hint the record had, while it still names the anchor
+// — a plain reading (03:30-04:00, a Z stamp) never overrides it: it is the same instant.
+function wallHint(startMs, endMs, tz, startWall, endWall, prev) {
+  const plain0 = wallOf(startMs, tz);
+  const plain1 = wallOf(endMs, tz);
+  const day = Math.floor(plain0 / DAY_MS);
+  const gapStart = Number.isFinite(startWall) && Math.floor(startWall / DAY_MS) === day &&
+    startWall !== plain0 && instantOf(startWall, tz) === startMs;
+  const gapEnd = Number.isFinite(endWall) && endWall !== plain1 && instantOf(endWall, tz) === endMs;
+  const p = isObj(prev) ? prev : {};
+  const tod = gapStart ? startWall - day * DAY_MS : intIn(p.tod, 0, DAY_MS - 1) ? p.tod : plain0 - day * DAY_MS;
+  const { w0 } = anchorWall(startMs, endMs, tz, { tod, len: -1 });
+  const len = gapEnd ? endWall - w0 : p.len;
+  const got = anchorWall(startMs, endMs, tz, { tod, len });
+  if (got.w0 === plain0 && got.len === plain1 - plain0) return null;
+  return got.len >= 0 ? { tod: got.w0 - day * DAY_MS, len: got.len } : null;
+}
+
 // ---- expansion --------------------------------------------------------------------
-// `series` = {startMs, endMs, timeZone, rule}. Calls `each({key, startMs, endMs})`
+// `series` = {startMs, endMs, timeZone, rule, wall?}. Calls `each({key, startMs, endMs})`
 // for every occurrence whose ORIGINAL start lies in [lo, hi), earliest first,
 // until `max` were yielded or `each` returns false. Returns how many it yielded.
 function eachOccurrence(series, lo, hi, max, each) {
   if (!series || !series.rule || !(max > 0)) return 0;
   const { rule, timeZone: tz } = series;
-  const w0 = wallOf(series.startMs, tz);
-  const wallLen = wallOf(series.endMs, tz) - w0;
+  const { w0, len: wallLen } = anchorWall(series.startMs, series.endMs, tz, series.wall);
   const day0 = Math.floor(w0 / DAY_MS);
   const tod = w0 - day0 * DAY_MS;          // wall time of day, ms
   const d0 = new Date(day0 * DAY_MS);
@@ -309,5 +355,5 @@ const localDate = (ms, tz, days = 0) => dayDate(Math.floor(wallOf(ms, tz) / DAY_
 
 module.exports = {
   FREQS, DAYS, INTERVAL_MAX, COUNT_MAX, PERIODS_MAX, DURATION_MAX_MS, KEY_RE,
-  ruleError, sanitizeRule, eachOccurrence, occurrences, occurrenceAt, localDate, wallOf, instantOf, sameDays, withAnchorDays, reanchorDays,
+  ruleError, sanitizeRule, eachOccurrence, occurrences, occurrenceAt, localDate, wallOf, instantOf, anchorWall, wallHint, sameDays, withAnchorDays, reanchorDays,
 };
