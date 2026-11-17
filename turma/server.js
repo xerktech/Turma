@@ -6082,6 +6082,9 @@ const persistCalendarHostSettings = registerExternalStore({
 // belong to several orgs of that tenant. Contract: contract-calendar.md
 // ("Turma-created events").
 const CALENDAR_TURMA_EVENTS_MAX = 1500;           // per tenant (a host's Outlook cap)
+// Calendar blocks (XERK-3057) have their own cap per tenant: they are hidden, so
+// counting them in the one above refused a user's event with nothing to delete.
+const CAL_BLOCK_RECORDS_MAX = 1500;
 const CALENDAR_TURMA_BYTES_MAX = 2 << 20;         // per tenant, JSON bytes
 const CALENDAR_TURMA_ORGS_MAX = 20;
 const CALENDAR_TURMA_BODY_MAX = 64 << 10;         // a route's request body
@@ -6268,7 +6271,7 @@ function calendarTurmaEventsCoerce(raw) {
   for (const [t, bucket] of Object.entries(raw).slice(0, 2000)) {
     if (!CAL_TENANT_BUCKET_RE.test(t) || !bucket || typeof bucket !== "object" || Array.isArray(bucket)) continue;
     const b = Object.create(null);
-    for (const [id, rec] of Object.entries(bucket).slice(0, CALENDAR_TURMA_EVENTS_MAX)) {
+    for (const [id, rec] of Object.entries(bucket).slice(0, CALENDAR_TURMA_EVENTS_MAX + CAL_BLOCK_RECORDS_MAX)) {
       const ev = sanitizeTurmaEvent(rec, t);
       if (ev && ev.id === id) b[id] = ev;
     }
@@ -6570,6 +6573,8 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
   let events = [];
   const tenir = calendarTenirView(p, from, until, orgFilter);
   const stampHidden = calStampHidden();   // a Turma event's own copy is served as the Turma event (XERK-2985)
+  const blockIndexes = new Map();   // tenant -> calBlockIndex, built once per answer (XERK-3057)
+  const blockIndex = (t) => { if (!blockIndexes.has(t)) blockIndexes.set(t, calBlockIndex(t)); return blockIndexes.get(t); };
   for (const key of [...keys].sort()) {
     if (!principalMayDriveHost(p, key)) continue;
     const a = agents[key];
@@ -6605,7 +6610,7 @@ function calendarView(p, from, until, orgFilter, now = Date.now()) {
       // Clients relink by it.
       w.matchOrg = w.org;
       // Its calendar block (XERK-3057): which orgs it blocks, under what name.
-      const blocks = calBlockWire(key, ev);
+      const blocks = calBlockWire(key, ev, blockIndex(tenantOfKey(key)), now);
       if (blocks) w.blocks = blocks;
       tenir.linked.delete(lk);   // served: its captures ride on it
       events.push({ source: "outlook", ...w });
@@ -7012,7 +7017,8 @@ function turmaEventOrgsError(p, orgs) {
 // A 409 when putting `rec` (replacing its id) would take tenant `t` past its caps.
 // `gone`: the id of a record the same write deletes, which no longer counts.
 function turmaEventCapError(t, rec, gone = null) {
-  const bucket = calendarTurmaEvents[t] || {};
+  // Calendar blocks (XERK-3057) count against their own cap (calBlockReconcile), never this one.
+  const bucket = Object.fromEntries(Object.entries(calendarTurmaEvents[t] || {}).filter(([, r]) => !r.blockOf));
   const isNew = !Object.hasOwn(bucket, rec.id);
   const count = Object.keys(bucket).length + (isNew ? 1 : 0) - (gone && Object.hasOwn(bucket, gone) ? 1 : 0);
   if (isNew && count > CALENDAR_TURMA_EVENTS_MAX) {
@@ -7491,25 +7497,34 @@ function calendarTurmaTick(now = Date.now()) {
 // hidden on read like every Turma copy. Contract: contract-calendar-blocks.md.
 const CAL_BLOCK_ALIAS_DEFAULT = "Blocked";
 const CAL_BLOCK_RULES_MAX = 200;   // per host (sanitizeCalendarHostSettings' literal)
-// The record id of a source event's block: stable, so a re-sent sync re-finds it.
+// A NEW block's record id: stable for its (host, event). An existing block keeps its id
+// whatever its host key becomes (the tenant migration), since its copies carry the id.
 const calBlockId = (key, eventId) =>
   `turma:${crypto.createHash("sha256").update(`block\u0000${key}\u0000${eventId}`).digest("hex").slice(0, 16)}`;
 const calBlockRules = (key) => (calendarHostSettings[key] && calendarHostSettings[key].blocks) || {};
 const calBlockRuleOf = (rules, ev) => (ev.seriesId && Object.hasOwn(rules, ev.seriesId) ? rules[ev.seriesId]
   : Object.hasOwn(rules, ev.id) ? rules[ev.id] : null);
-// An all-day source's day must read the same in the block's zone: Outlook gives only
-// an offset, so a whole-hour one is its Etc/GMT zone (whose sign runs the other way).
-function calBlockZone(ev) {
-  if (!ev.allDay) return "UTC";
-  const m = /([+-])(\d{2}):(\d{2})$/.exec(ev.start);
-  if (!m || m[3] !== "00" || m[2] === "00") return "UTC";
-  return `Etc/GMT${m[1] === "+" ? "-" : "+"}${Number(m[2])}`;
+// Tenant `t`'s block records: `${host}\0${event}` -> record, and how many there are.
+function calBlockIndex(t) {
+  const byEvent = new Map();
+  for (const rec of Object.values(calendarTurmaEvents[t] || {})) {
+    if (rec.blockOf) byEvent.set(`${rec.blockOf.host}\u0000${rec.blockOf.event}`, rec);
+  }
+  return byEvent;
+}
+// The block's own start/end: an all-day source keeps its DATE, written as UTC midnights
+// in UTC (Outlook gives only an offset, which no IANA zone names for +05:30 & co.).
+function calBlockTimes(ev) {
+  if (!ev.allDay) return { start: ev.start, end: ev.end, timeZone: "UTC" };
+  const day = (iso) => `${iso.slice(0, 10)}T00:00:00Z`;
+  return { start: day(ev.start), end: day(ev.end), timeZone: "UTC" };
 }
 // Bring host `key`'s blocks in step with its rules and stored events. A host in no
 // decided org is left alone (a brief drift must not delete every block); an org no
 // host is in stays on a block while the record has it, so calendarTurmaTick's 24h
-// grace decides it. Only an event that has not ended gets a NEW block.
-const calBlockFullLogged = new Set();
+// grace decides it. Only an event that has not ended gets a NEW block. Every write
+// lands in ONE persist/broadcast (per-record stores were O(n²): seconds at 1000).
+const calBlockFull = new Set();   // tenants whose last reconcile skipped a block for the cap
 function calBlockReconcile(key, now = Date.now()) {
   const t = tenantOfKey(key);
   const ownOrg = calendarEventOrg(key);
@@ -7518,42 +7533,54 @@ function calBlockReconcile(key, now = Date.now()) {
   const rules = calBlockRules(key);
   const decided = decidedOrgs();
   const stamps = calTurmaStampSet(t);
-  const bucket = () => calendarTurmaEvents[t] || {};
-  const want = new Map();
+  const index = calBlockIndex(t);
+  let blocks = index.size;
+  const want = new Map();   // event id -> {ev, orgs, rule, prev}
   for (const ev of h && ownOrg ? h.events : []) {
     if (ev.canceled || (ev.turmaId && stamps.has(ev.turmaId))) continue;
     const rule = calBlockRuleOf(rules, ev);
     if (!rule) continue;
-    const id = calBlockId(key, ev.id);
-    const prev = Object.hasOwn(bucket(), id) ? bucket()[id] : null;
+    const prev = index.get(`${key}\u0000${ev.id}`) || null;
     const orgs = rule.orgs.filter((o) => o !== ownOrg && tenantOfSite(o) === t &&
       (decided.has(o) || (prev && prev.orgs.includes(o))));
-    if (orgs.length) want.set(id, { ev, orgs, rule, prev });
+    if (orgs.length) want.set(ev.id, { ev, orgs, rule, prev });
   }
-  let n = 0;
-  for (const [id, rec] of Object.entries(bucket())) {
-    if (rec.blockOf && rec.blockOf.host === key && !want.has(id)) { calTurmaRemove(t, id, now); n++; }
+  const bucket = calendarTurmaEvents[t] || (calendarTurmaEvents[t] = Object.create(null));
+  let n = 0, full = false;
+  for (const [k, rec] of index) {
+    if (rec.blockOf.host !== key || want.has(rec.blockOf.event)) continue;
+    delete bucket[rec.id];
+    calOutlookAfterWrite(t, rec, null, now);   // every copy is deleted (XERK-2985)
+    index.delete(k);
+    blocks--;
+    n++;
   }
-  for (const [id, w] of want) {
+  for (const w of want.values()) {
     const { ev, prev } = w;
     if (!prev && ev.endMs <= now) continue;
-    const rec = sanitizeTurmaEvent({ id, orgs: w.orgs, subject: w.rule.alias || CAL_BLOCK_ALIAS_DEFAULT,
-      start: ev.start, end: ev.end, timeZone: calBlockZone(ev), allDay: ev.allDay, busy: "outOfOffice",
+    if (!prev && blocks >= CAL_BLOCK_RECORDS_MAX) { full = true; continue; }
+    const rec = sanitizeTurmaEvent({ id: prev ? prev.id : calBlockId(key, ev.id), orgs: w.orgs,
+      subject: w.rule.alias || CAL_BLOCK_ALIAS_DEFAULT, ...calBlockTimes(ev), allDay: ev.allDay, busy: "outOfOffice",
       sendInvites: false, createdBy: w.rule.by, createdAt: prev ? prev.createdAt : now, updatedAt: now,
       version: prev ? prev.version + 1 : 1, outlook: prev ? prev.outlook : {}, blockOf: { host: key, event: ev.id } }, t);
     if (!rec) continue;
     if (prev && prev.subject === rec.subject && prev.startMs === rec.startMs && prev.endMs === rec.endMs &&
         prev.allDay === rec.allDay && prev.timeZone === rec.timeZone && prev.orgs.join("\u0000") === rec.orgs.join("\u0000")) continue;
-    const full = prev ? null : turmaEventCapError(t, rec);
-    if (full) {
-      if (!calBlockFullLogged.has(t)) {
-        calBlockFullLogged.add(t);
-        console.log(`calendar block not written for ${logName(key)}: ${full.body.error}`);
-      }
-      continue;
-    }
-    calTurmaStore(t, rec);
+    if (!prev && Object.hasOwn(bucket, rec.id)) continue;   // a user's event can never share an id; belt and braces
+    bucket[rec.id] = rec;
+    calOutlookAfterWrite(t, prev, rec, now);   // queue its Outlook copies (XERK-2985)
+    if (!prev) blocks++;
     n++;
+  }
+  if (!Object.keys(bucket).length) delete calendarTurmaEvents[t];
+  if (full && !calBlockFull.has(t)) {
+    console.log(`calendar blocks of ${logName(key)} not all written: a tenant keeps at most ${CAL_BLOCK_RECORDS_MAX}`);
+  }
+  if (full) calBlockFull.add(t); else calBlockFull.delete(t);
+  if (n) {
+    persistCalendarTurmaEvents();
+    broadcastCalendarSoon(calTurmaFrameKey(t));
+    scheduleCalendarRelink(t);
   }
   return n;
 }
@@ -7572,16 +7599,16 @@ function calBlockTick(now = Date.now()) {
   return n;
 }
 // What the source event's panel shows: the rule and each org's copy, for an Outlook
-// event a rule covers; null otherwise.
-function calBlockWire(key, ev) {
-  const rule = calBlockRuleOf(calBlockRules(key), ev);
+// event a rule covers; null otherwise. `index`: calBlockIndex of the host's tenant.
+function calBlockWire(key, ev, index, now = Date.now()) {
+  const rules = calBlockRules(key);
+  const rule = calBlockRuleOf(rules, ev);
   if (!rule) return null;
-  const t = tenantOfKey(key);
-  const id = calBlockId(key, ev.id);
-  const rec = calendarTurmaEvents[t] && Object.hasOwn(calendarTurmaEvents[t], id) ? calendarTurmaEvents[t][id] : null;
-  const out = { orgs: rule.orgs.filter((o) => o !== calendarEventOrg(key)), alias: rule.alias,
-    series: !!ev.seriesId };
+  const rec = index.get(`${key}\u0000${ev.id}`);
+  const out = { orgs: rule.orgs.filter((o) => o !== calendarEventOrg(key)), alias: rule.alias, series: !!ev.seriesId };
   if (rec) out.outlook = calOutlookWire(rec.outlook, rec.orgs);
+  // Not written for the tenant's block cap: said, never silent.
+  else if (ev.endMs > now && !ev.canceled && calBlockFull.has(tenantOfKey(key))) out.full = CAL_BLOCK_RECORDS_MAX;
   return out;
 }
 // PUT /api/agents/<host>/calendar/blocks {eventId, orgs, alias?}: set (or, with
@@ -7599,14 +7626,25 @@ function setCalendarBlock(p, key, body, now = Date.now()) {
   if (!ev || (ev.turmaId && calTurmaStampSet(t).has(ev.turmaId))) return { status: 404, body: { error: "no such Outlook event on this host" } };
   const ownOrg = calendarEventOrg(key);
   if (!ownOrg) return { status: 409, body: { error: "this event's host is in no org, so it has no org to block from" } };
-  if (body.orgs.length) {
-    const oe = turmaEventOrgsError(p, body.orgs);
-    if (oe) return oe;
-    if (tenantOfSite(body.orgs[0]) !== t) return { status: 404, body: { error: `no host is in org ${body.orgs[0]}` } };
-    if (body.orgs.includes(ownOrg)) return { status: 400, body: { error: "an event cannot block its own org's calendar" } };
-  }
   const k = ev.seriesId || ev.id;
   const cur = sanitizeCalendarHostSettings(calendarHostSettings[key] || {});
+  if (body.orgs.length) {
+    if (!body.orgs.every((o) => typeof o === "string" && o)) return { status: 400, body: { error: "orgs must be a list of org keys" } };
+    if (new Set(body.orgs).size !== body.orgs.length) return { status: 400, body: { error: "orgs must not repeat an org" } };
+    if (body.orgs.includes(ownOrg)) return { status: 400, body: { error: "an event cannot block its own org's calendar" } };
+    // An org the rule already has may be one no host is in right now: kept, so the
+    // operator can still edit the rest (calendarTurmaTick's grace decides it).
+    const kept = cur.blocks && Object.hasOwn(cur.blocks, k) ? cur.blocks[k].orgs : [];
+    const added = body.orgs.filter((o) => !kept.includes(o));
+    if (added.length) {
+      const oe = turmaEventOrgsError(p, added);
+      if (oe) return oe;
+      if (added.some((o) => tenantOfSite(o) !== t)) return { status: 404, body: { error: `no host is in org ${added.find((o) => tenantOfSite(o) !== t)}` } };
+    }
+    if (body.orgs.length > CALENDAR_TURMA_ORGS_MAX) {
+      return { status: 400, body: { error: `an event blocks at most ${CALENDAR_TURMA_ORGS_MAX} orgs` } };
+    }
+  }
   const blocks = { ...(cur.blocks || {}) };
   if (body.orgs.length) {
     if (!Object.hasOwn(blocks, k) && Object.keys(blocks).length >= CAL_BLOCK_RULES_MAX) {
@@ -7621,7 +7659,7 @@ function setCalendarBlock(p, key, body, now = Date.now()) {
   persistCalendarHostSettings();
   calBlockReconcile(key, now);
   broadcastCalendarSoon(key);
-  return { status: 200, body: { ok: true, blocks: calBlockWire(key, ev) } };
+  return { status: 200, body: { ok: true, blocks: calBlockWire(key, ev, calBlockIndex(t), now) } };
 }
 
 // ---- Turma events written to Outlook (XERK-2985) --------------------------------
@@ -11852,7 +11890,10 @@ registerTenantMigration({
       const outlook = Object.fromEntries(Object.entries(r.outlook || {}).map(([o, e]) =>
         [migrateSiteKey(o, t), { ...e, host: e.host ? tenantHostKey(e.host, t) : "" }]));
       if (!Object.hasOwn(dst, r.id)) {
-        dst[r.id] = sanitizeTurmaEvent({ ...r, orgs: r.orgs.map((o) => migrateSiteKey(o, t)), outlook }, t) || dst[r.id];
+        // A calendar block (XERK-3057) follows its source host into the tenant, keeping its id
+        // (its Outlook copies are stamped with it).
+        const blockOf = r.blockOf ? { ...r.blockOf, host: tenantHostKey(r.blockOf.host, t) } : undefined;
+        dst[r.id] = sanitizeTurmaEvent({ ...r, orgs: r.orgs.map((o) => migrateSiteKey(o, t)), outlook, blockOf }, t) || dst[r.id];
       }
       delete src[r.id];
     }
@@ -32778,7 +32819,7 @@ if (process.env.TURMA_TEST) {
     getCalendarOutlookTombstones: () => calendarOutlookTombstones, calTurmaBytes, calOutlookTombstonesCoerce, calendarOutlookTick,
     ingestCalendarWriteResults, normalizeCalendarCapability, CALENDAR_WRITE_REHOME_MS, CALENDAR_WRITE_RESULT_MS,
     CALENDAR_WRITE_REPAIR_MIN_MS, calHeldError, calOutlookSanitize, __calTombstoneAdd: calTombstoneAdd, __resetCalendarWriteMemo: () => { calWriteSent.clear(); calWriteRepairAt.clear(); calWriteOrgLostAt.clear(); calWriteDownAt.clear(); calOutlookTickAt = 0; },
-    sanitizeTurmaEvent, calTurmaResponses, calTurmaSends, __calTurmaStore: calTurmaStore, setCalendarBlock, calBlockReconcile, calBlockTick, calBlockId, calBlockZone, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
+    sanitizeTurmaEvent, calTurmaResponses, calTurmaSends, __calTurmaStore: calTurmaStore, setCalendarBlock, calBlockReconcile, CAL_BLOCK_RECORDS_MAX, calBlockTick, calBlockId, calBlockTimes, calBlockIndex, calendarTurmaEventsCoerce, createTurmaEvent, patchTurmaEvent, deleteTurmaEvent, calendarTurmaTick, getCalendarTurmaEvents: () => calendarTurmaEvents,
     CALENDAR_TURMA_EVENTS_MAX, CALENDAR_SERVE_MAX, CALENDAR_SERVE_UNTIL_MAX, CALENDAR_TURMA_EXCEPTIONS_MAX, CALENDAR_CANDIDATE_WORK_MAX, CALENDAR_TURMA_BYTES_MAX, CALENDAR_TURMA_ORG_GRACE_MS,
     CALENDAR_SYNC_EVENTS_MAX, CALENDAR_SYNC_BYTES_MAX, CALENDAR_PAST_MS, CALENDAR_FUTURE_MS,
     CALENDAR_HOST_EVENTS_MAX, CALENDAR_HOST_BYTES_MAX, CALENDAR_TENANT_BYTES_MAX,

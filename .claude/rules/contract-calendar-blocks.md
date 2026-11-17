@@ -23,14 +23,18 @@ Built entirely on the Turma-event writer (`contract-calendar-outlook-write.md`);
   - Keyed by the event's `seriesId` when it has one, so a recurring event's rule covers its whole
     series; else its `id`. Purge, retention and migration ride the settings store (the migration
     re-keys the rule's orgs).
-- **Each stored source occurrence gets ONE hidden Turma record** (`calBlockReconcile`), id
-  `calBlockId(host, eventId)` (a sha256 → `turma:<16 hex>`, stable), carrying hub-internal
-  `blockOf: {host, event}` (never served, never client-set).
+- **Each stored source occurrence gets ONE hidden Turma record** (`calBlockReconcile`), carrying
+  hub-internal `blockOf: {host, event}` (never served, never client-set), found by that pair
+  (`calBlockIndex`), never by id.
+  - A NEW block's id is `calBlockId(host, eventId)`; an existing one KEEPS its id when its host key
+    moves (the tenant migration re-keys `blockOf.host`): the Outlook copies are stamped with the
+    id, and a new id would orphan them and write a second copy.
   - subject = alias, `busy: outOfOffice`, no attendees/body/location, `sendInvites: false`:
     the writer's copy is a plain `Save()` with no recipients — **a block never mails anyone**.
     Never let a block record carry attendees or `sendInvites`.
-  - Timed: `timeZone` UTC (the instants are what count). All-day: the offset's `Etc/GMT±N` zone
-    (`calBlockZone`) so the day reads the same; a non-whole-hour offset falls back to UTC.
+  - Times in UTC (`calBlockTimes`). An all-day source keeps its DATE, written as UTC midnights:
+    Outlook gives only an offset, and no IANA zone names +05:30 & co. (an instant-based copy
+    landed a day early there, QA).
   - Orgs = the rule's orgs of the host's tenant, never the source's own org; an org no host is in
     stays on the record while it has it, so `calendarTurmaTick`'s 24h grace decides it.
 - **The record follows its source**: re-timed/renamed in place (same id, next version); gone from
@@ -39,7 +43,13 @@ Built entirely on the Turma-event writer (`contract-calendar-outlook-write.md`);
 - **A host in no decided org is left alone** (a brief drift must not delete every block).
 - Reconciled on: the rule route, every applied `calendarSync` row, a host's decided-org change
   (`calendarOnBeat`), and every `calendarTick` (`calBlockTick`: every host with a rule or a block).
-- Over the tenant's Turma caps a block is skipped and logged once, never a refusal of the sync.
+- **Blocks have their OWN cap** (`CAL_BLOCK_RECORDS_MAX`, 1500 a tenant) and never count toward
+  the user's Turma-event caps (`turmaEventCapError` skips them): hidden records that 409'd a
+  user's event left nothing visible to delete (QA). The store coerce slices at both caps together.
+  - Past the cap a NEW block is skipped, and the source is served `blocks.full` so its panel says
+    "Not written", never silent. Logged once per full run.
+- **One reconcile is ONE persist/broadcast/relink**: per-record `calTurmaStore` calls were O(n²)
+  (seconds of event loop at 1000 blocks, QA). Writes go through `calOutlookAfterWrite` directly.
 
 ## Hidden everywhere else
 
@@ -52,11 +62,12 @@ Built entirely on the Turma-event writer (`contract-calendar-outlook-write.md`);
 
 - `PUT /api/agents/<host>/calendar/blocks {eventId, orgs, alias?}` (`host` class): 404 a host the
   caller may not drive / an event the host does not hold (or a Turma copy); 409 a host in no org;
-  orgs checked by `turmaEventOrgsError` (decided, the caller's, one tenant) and never the source's
-  own (400). `orgs: []` clears the rule. Answers `{ok, blocks}`.
+  orgs ADDED to the rule are checked by `turmaEventOrgsError` (decided, the caller's, one tenant);
+  an org the rule already has may be one no host is in now, so the rest stays editable. Never the
+  source's own org (400). `orgs: []` clears the rule. Answers `{ok, blocks}`.
 - `GET /api/calendar` serves an Outlook event a rule covers with `blocks: {orgs, alias, series,
-  outlook?}`; `outlook` is `calOutlookWire` of the block record (absent before one exists).
+  outlook?, full?}`; `outlook` is `calOutlookWire` of the block record (absent before one exists).
 - Web: the panel's "Block other calendars" (`blocksHtml`, checkboxes + alias, Save); the source
   keeps its org tint and gains a right bar of the blocked orgs' colors (`blockBarHtml`, palette
   slots only). Android: a `PARITY-open.md` gap.
-- Tests: `XERK-3057:` in `server.test.js` and `calendar.test.js`.
+- Tests: `XERK-3057:` in `server.test.js`, `calendar.test.js`; the block case in `tenant-migration.test.js`.

@@ -1085,7 +1085,8 @@ function blocksHtml(ev) {
   const dis = d.busy ? ' aria-disabled="true"' : "";
   const rows = others.map((o) => {
     const c = safeColor(colors.get(o));
-    const st = blockOrgsOf(ev).includes(o) ? blockStateText(own(ol, o)) : "";
+    const full = num(ev.blocks && ev.blocks.full) ? `Not written: the hub keeps at most ${ev.blocks.full} calendar blocks` : "";
+    const st = blockOrgsOf(ev).includes(o) ? (own(ol, o) ? blockStateText(own(ol, o)) : full) : "";
     return `<label class="cal-blk-org"><input type="checkbox" data-blk-org="${esc(o)}"${d.orgs.has(o) ? " checked" : ""}${dis}>`
       + `<span class="cal-orgdot"${c ? ` style="--org:${c}"` : ""} aria-hidden="true"></span>${esc(orgLabel(o))}`
       + (st ? `<span class="cal-blk-st">${esc(st)}</span>` : "") + `</label>`;

@@ -140,10 +140,15 @@ test("XERK-2554: seed untenanted data in every partitioned store", async () => {
   assert.equal(archive.sessionRow("t2554").host, "gone2554");
   // XERK-2891: a host's calendar and its settings.
   hub.getCalendarEvents().gone2554 = { syncedAt: NOW, windowFrom: 1, windowUntil: 2, ranges: [], events: [] };
-  hub.getCalendarHostSettings().gone2554 = { showPrivate: true };
+  hub.getCalendarHostSettings().gone2554 = { showPrivate: true,
+    blocks: { E1: { orgs: [SITE], alias: "Blocked", by: "breakglass", at: NOW } } };
   // XERK-2968: a Turma event in a plain org.
   hub.getCalendarTurmaEvents()[""] = { "turma:00000000000a2554": hub.sanitizeTurmaEvent({ id: "turma:00000000000a2554",
-    orgs: [SITE], subject: "Plan", start: "2026-11-16T09:00:00Z", end: "2026-11-16T10:00:00Z", version: 1 }, "") };
+    orgs: [SITE], subject: "Plan", start: "2026-11-16T09:00:00Z", end: "2026-11-16T10:00:00Z", version: 1 }, ""),
+  // XERK-3057: a calendar block of that host's event.
+  "turma:00000000000b2554": hub.sanitizeTurmaEvent({ id: "turma:00000000000b2554", orgs: [SITE], subject: "Blocked",
+    start: "2026-11-16T09:00:00Z", end: "2026-11-16T10:00:00Z", busy: "outOfOffice", version: 1,
+    blockOf: { host: "gone2554", event: "E1" } }, "") };
 
   // Every sampled store is migrated too: one dropped from the list would keep
   // its rows under the old site key.
@@ -282,7 +287,10 @@ test("XERK-2554: the migration moves every store into the owner's tenant; hosts 
   assert.deepEqual(hub.outcomeLedger.hostKeys(), [tk("gone2554")]);
   assert.ok(!hub.getCalendarEvents().gone2554 && hub.getCalendarEvents()[tk("gone2554")]);
   const cs = hub.getCalendarHostSettings()[tk("gone2554")];
-  assert.deepEqual(cs, { showPrivate: true });
+  assert.deepEqual(cs, { showPrivate: true, blocks: { E1: { orgs: [tk(SITE)], alias: "Blocked", by: "breakglass", at: NOW } } },
+    "a block rule's orgs follow into the tenant (XERK-3057)");
+  // The block keeps its id (its Outlook copies carry it) and follows its host into the tenant.
+  assert.deepEqual(hub.getCalendarTurmaEvents()[T]["turma:00000000000b2554"].blockOf, { host: tk("gone2554"), event: "E1" });
   assert.ok(!hub.getCalendarTurmaEvents()[""], "the untenanted Turma event left");
   assert.deepEqual(hub.getCalendarTurmaEvents()[T]["turma:00000000000a2554"].orgs, [tk(SITE)]);
   assert.deepEqual(hub.outcomeLedger.siteKeys(), [tk(SITE)]);

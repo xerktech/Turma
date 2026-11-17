@@ -35237,10 +35237,75 @@ test("XERK-3057: a recurring source blocks its whole series; an ended event gets
     assert.deepEqual(Object.keys(hub.getCalendarHostSettings()[D2985A].blocks), ["GID-1"]);
     assert.equal((await block3057({ eventId: "PAST-1", orgs: [S2985B] })).status, 200);
     assert.equal(blockRecs3057().length, 2, "an event that has ended gets no new block");
-    // An all-day source keeps its day in an Etc zone.
-    assert.equal(hub.calBlockZone({ allDay: true, start: "2026-11-16T00:00:00-05:00" }), "Etc/GMT+5");
-    assert.equal(hub.calBlockZone({ allDay: true, start: "2026-11-16T00:00:00+05:30" }), "UTC");
-    assert.equal(hub.calBlockZone({ allDay: false, start: "2026-11-16T09:00:00-05:00" }), "UTC");
+    // An all-day source keeps its DATE, as UTC midnights, whatever its offset (QA D2).
+    assert.deepEqual(hub.calBlockTimes({ allDay: true, start: "2026-11-21T00:00:00+05:30", end: "2026-11-22T00:00:00+05:30" }),
+      { start: "2026-11-21T00:00:00Z", end: "2026-11-22T00:00:00Z", timeZone: "UTC" });
+    assert.equal(hub.calBlockTimes({ allDay: false, start: "2026-11-16T09:00:00-05:00", end: "x" }).timeZone, "UTC");
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-3057: blocks have their own cap, never refuse a user's event, and say when one was not written", async () => {
+  cleanup2985(D2985A, D2985A2, D2985B);
+  const cap = hub.CAL_BLOCK_RECORDS_MAX;
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    // Two org-A hosts, each with a series; together more stored occurrences than the block cap
+    // (a host's sync carries at most 1500 events).
+    await beat2985(D2985A2, S2985A);
+    const half = Math.ceil((cap + 3) / 2);
+    const occ = (g, i) => src3057({ id: `${g}:${i}`, seriesId: g, recurring: true, attendees: [],
+      location: "", start: iso2968(T2968 + i * 6e4), end: iso2968(T2968 + i * 6e4 + 3e4) });
+    for (const [d, g] of [[D2985A, "GID-8"], [D2985A2, "GID-9"]]) {
+      await beat2985(d, S2985A, { calendarSync: [{ windowFrom: T2968 - 864e5, windowUntil: T2968 + 864e5,
+        syncedAt: Date.now(), events: Array.from({ length: half }, (_, i) => occ(g, i)) }] });
+    }
+    const t0 = Date.now();
+    const r = await block3057({ eventId: "GID-8:0", orgs: [S2985B] });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.ok(Date.now() - t0 < 3000, `one reconcile of ${half} blocks stays quick (${Date.now() - t0} ms)`);
+    assert.equal((await block3057({ eventId: "GID-9:0", orgs: [S2985B] }, D2985A2)).status, 200);
+    assert.equal(blockRecs3057().length, cap);
+    const served = (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events.filter((e) => e.blocks);
+    assert.equal(served.filter((e) => e.blocks.full === cap).length, 2 * half - cap, "the unwritten ones say why");
+    // The user's own Turma event is never refused for hidden blocks.
+    const c = await turma2968("POST", null, ev2968([S2985A]));
+    assert.equal(c.status, 200, JSON.stringify(c.body));
+    const stored = hub.getCalendarTurmaEvents()[""];
+    assert.equal(Object.keys(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]).length,
+      cap + 1, "the coerce keeps blocks beside the user's events");
+  } finally {
+    cleanup2985(D2985A, D2985A2, D2985B);
+    forget2533(D2985A, D2985A2, D2985B);
+  }
+});
+
+test("XERK-3057: a block is never a capture candidate nor in the daily brief, and an org gone from the hub stays editable", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    await beat2985(D2985A, S2985A, sync2985([src3057()]));
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: [S2985B], alias: "Focus" })).status, 200);
+    // Even a block record that read as a real meeting is skipped by both readers.
+    const [rec] = blockRecs3057();
+    hub.getCalendarTurmaEvents()[""][rec.id] = { ...rec, busy: "busy", joinUrl: "https://x.example/j" };
+    const ix = hub.calendarCandidateIndex("", [{ site: S2985B, startedAt: T2968, endedAt: T2968 + 3.6e6 }]);
+    assert.ok(!ix.list.some((c) => c.ev.id === rec.id), "never a capture candidate");
+    assert.equal(ix.byId.get(rec.id), undefined, "never resolved as a linked event");
+    const brief = hub.dailyBriefCalendar(S2985B, T2968 - 3.6e6, T2968 - 7.2e6, "UTC");
+    assert.ok(!JSON.stringify(brief).includes("Focus"), "never in the daily brief");
+    hub.getCalendarTurmaEvents()[""][rec.id] = rec;
+    // Org B's only host leaves: B stays on the rule and the operator can still change the alias.
+    delete agents[D2985B];
+    const r = await block3057({ eventId: "SRC-3057", orgs: [S2985B], alias: "Away" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(blockRecs3057()[0].subject, "Away");
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: [S2985B, "c3057.atlassian.net"] })).status, 404,
+      "a NEW org must still be one a host is in");
   } finally {
     cleanup2985(D2985A, D2985B);
     forget2533(D2985A, D2985B);
