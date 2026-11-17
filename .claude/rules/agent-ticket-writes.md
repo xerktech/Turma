@@ -29,6 +29,12 @@ The ticket-update poller must not hand a session back its own comment or status 
   - an edit/transition: an OVERLAPPING field (`_tw_field` vocabulary) within
     `TICKET_SELF_EDIT_WINDOW_MS`; a fieldless write matches nothing; a transition to a different
     target status (`to`) is not ours.
+  - **Windows are measured from the call's whole span `[t0, t]`** (XERK-3051, `_tw_gap`): `t0` is
+    the tool_use time, `t` the tool_result's. A `jira transition … && <long step>` writes Jira at
+    the START; stamped at the result alone it was echoed back. Never widen the window instead —
+    that hides a human's move made in it.
+  - The span is capped at `TICKET_SELF_SPAN_MAX_MS` (Bash's own 600 s timeout): `t0` is when the
+    call was EMITTED, so a permission wait or a hand-edited `t0` would otherwise widen it unbounded.
 - **The Bash reader**: a `-`/stdin body is ITS OWN segment's heredoc (marker words, not
   `heredocs[0]`); redirections (`2>&1`, `> f`) are dropped with their target; `curl -G`, a write
   aimed at another board host or under a `JIRA_SITE=`/`AZDO_URL=` prefix, and a result that is a
