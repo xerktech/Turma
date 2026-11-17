@@ -61297,6 +61297,130 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         again = next(s for s in sm2.registry if s.get("id") == "abcde")
         self.assertEqual(again["ticketWrites"], [w])
 
+    def _transcript(self, sess):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        return os.path.join(proj, self.CID + ".jsonl")
+
+    def _append(self, path, *entries):
+        with open(path, "a") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def _beat(self, sm, sess):
+        with mock.patch.object(ha, "_pane_status", return_value=(None, None, None)), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            sm._session_payload(sess, refresh=False)
+
+    def test_xerk3053_a_write_finishing_across_a_restart_is_recorded(self):
+        """The ticket's repro: tool_use, beat, manager restart, tool_result,
+        beat. The held call rides the record, so the result is still read."""
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        sm.save()
+        path = self._transcript(sess)
+        self._append(path, {"type": "user", "message": {"role": "user", "content": "go"}})
+        self._beat(sm, sess)                         # primes to EOF
+        self._append(path, _tw_call("t1", "Bash", {"command": 'jira comment XERK-1 "long run"'}))
+        self._beat(sm, sess)
+        self.assertIn("t1", sess.get("ticketWritesPending", {}))
+        sm2 = self.make_manager()                    # restart mid-command
+        sess2 = next(s for s in sm2.registry if s.get("id") == "abcde")
+        self._beat(sm2, sess2)                       # primes again, to EOF
+        self._append(path, _tw_result("t1", '{"id": "9"}'))
+        self._beat(sm2, sess2)
+        self.assertEqual([(w["u"], w["key"], w.get("id")) for w in sess2["ticketWrites"]],
+                         [("t1:0", "XERK-1", "9")])
+        self.assertNotIn("ticketWritesPending", sess2)   # resolved: dropped
+
+    def test_xerk3053_a_held_call_saves_once_not_every_beat(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        path = self._transcript(sess)
+        self._append(path, {"type": "user", "message": {"role": "user", "content": "go"}})
+        self._beat(sm, sess)
+        self._append(path, _tw_call("t1", "Bash", {"command": 'jira comment XERK-1 "x"'}))
+        with mock.patch.object(sm, "save") as save:
+            for _ in range(4):
+                self._beat(sm, sess)
+        self.assertEqual(save.call_count, 1)
+
+    def test_xerk3053_a_launch_drops_held_calls(self):
+        """A relaunched claude never answers the old process's calls."""
+        sm = self.make_manager()
+        sess = self._sess()
+        sess["ticketWritesPending"] = {"t1": [{"kind": "comment", "key": "XERK-1"}]}
+        sm.sess_state["abcde"] = {"primed": True, "twCalls": {"t1": []}}
+        sess["agentType"] = "dsh"     # stop at the runtime dispatch, past the drop
+        with mock.patch.object(sm, "_launch_dsh", side_effect=RuntimeError("stop")):
+            with self.assertRaises(RuntimeError):
+                sm._launch_tmux(sess, resume=True)
+        self.assertNotIn("ticketWritesPending", sess)
+        self.assertNotIn("twCalls", sm.sess_state["abcde"])
+
+    def test_xerk3053_a_file_body_call_survives_the_record_round_trip(self):
+        st = {}
+        ha._scan_entry_line(json.dumps(_tw_call(
+            "t1", "Bash", {"command": "jira comment XERK-1 -F /w/note.md"})), st, {})
+        pend = json.loads(json.dumps(ha.ticket_write_calls_persisted(st)))
+        st2 = {}
+        ha.seed_ticket_write_calls(st2, pend)
+        self.assertEqual(st2["twCalls"], st["twCalls"])
+        self.assertIsInstance(st2["twCalls"]["t1"][0]["_file"], tuple)
+        # A timed-out call's rest is not persisted: its twBg job is in memory only.
+        st["twCalls"]["bg:task1"] = [{"kind": "comment", "key": "XERK-1", "tp": 9}]
+        self.assertNotIn("bg:task1", ha.ticket_write_calls_persisted(st))
+
+    def test_xerk3053_seeding_retypes_the_record_and_runs_once(self):
+        st = {}
+        ha.seed_ticket_write_calls(st, {
+            "ok": [{"kind": "comment", "key": "XERK-1", "fp": "f", "junk": 1}],
+            "badkind": [{"kind": "delete", "key": "XERK-1"}],
+            "badkey": [{"kind": "edit", "key": "not a key"}],
+            "notlist": {"kind": "comment", "key": "XERK-1"},
+            7: [{"kind": "comment", "key": "XERK-1"}],
+            "file": [{"kind": "comment", "key": "XERK-1", "_file": ["/a", 3]}],
+        })
+        self.assertEqual(st["twCalls"], {
+            "ok": [{"kind": "comment", "key": "XERK-1", "fp": "f"}],
+            "file": [{"kind": "comment", "key": "XERK-1"}]})
+        ha.seed_ticket_write_calls(st, {"late": [{"kind": "comment", "key": "XERK-2"}]})
+        self.assertNotIn("late", st["twCalls"])      # the scan's own map wins
+        st4 = {}
+        ha.seed_ticket_write_calls(st4, {
+            "times": [{"kind": "comment", "key": "XERK-1", "t0": 5, "tp": 9}],
+            "badtimes": [{"kind": "comment", "key": "XERK-1", "t0": True, "tp": 2 ** 53}],
+            "bg:task1": [{"kind": "comment", "key": "XERK-1", "tp": 9}]})
+        self.assertEqual(st4["twCalls"], {
+            "times": [{"kind": "comment", "key": "XERK-1", "t0": 5, "tp": 9}],
+            "badtimes": [{"kind": "comment", "key": "XERK-1"}]})
+        st3 = {}
+        ha.seed_ticket_write_calls(st3, "garbage")
+        self.assertEqual(st3["twCalls"], {})
+
+    def test_xerk3053_a_result_landing_while_the_manager_was_down_is_recorded(self):
+        """With a live-agent snapshot, the gap written while the manager was
+        down is folded into the ticket-write scan too."""
+        sess = self._sess()
+        path = self._transcript(sess)
+        self._append(path, {"type": "user", "message": {"role": "user", "content": "go"}})
+        offset = os.path.getsize(path)
+        ha.os.makedirs(ha.LIVE_AGENTS_DIR, exist_ok=True)
+        with open(ha._live_snapshot_path("abcde"), "w") as f:
+            json.dump({"v": 1, "transcript": os.path.basename(path), "offset": offset,
+                       "liveAgents": {}, "agentTasks": {}, "shellCalls": {},
+                       "stoppedAgents": []}, f)
+        self._append(path, _tw_call("t1", "Bash", {"command": 'jira comment XERK-1 "x"'}),
+                     _tw_result("t1", '{"id": "5"}'))
+        report = {}
+        st = {}
+        end = ha._restore_live_agents("abcde", path, st, report)
+        self.assertEqual(end, os.path.getsize(path))
+        self.assertEqual([(w["u"], w.get("id")) for w in report["ticketWrites"]],
+                         [("t1:0", "5")])
+
     def test_the_ledger_is_bounded_newest_kept(self):
         new = [{"u": f"u{i}", "t": i, "kind": "comment", "key": "X-1"}
                for i in range(ha.TICKET_WRITES_MAX + 7)]

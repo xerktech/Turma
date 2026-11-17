@@ -84,7 +84,16 @@ The ticket-update poller must not hand a session back its own comment or status 
   Bounded `TICKET_WRITES_MAX` (newest kept), carried on the closed record and into `resume()` /
   resume-any (the manager's entries are in no transcript), then re-seeded from the whole transcript
   (`_seed_ticket_writes`, beside `_seed_prs`). Never on the wire.
+  - **Calls still awaiting their result ride the record too** (`ticketWritesPending`, XERK-3053):
+    `twCalls` was in memory only, so a command running across a manager restart lost its call and
+    its result was never recorded. Written each beat it changes (`ticket_write_calls_persisted`),
+    re-learned on the process's first scan (`seed_ticket_write_calls`, re-typed: the file is
+    outside the process). A live-agent snapshot's restart gap is folded into this scan as well.
+    Every launch drops them (`_launch_tmux`): a relaunched claude never answers the old calls.
+    The re-typer keeps `t0`/`tp` (the hold and the match window need them); a timed-out call's
+    `bg:<task>` rest is NOT persisted, since its `twBg` job is in memory only and could never record.
+    Residual: with no snapshot (back-scan path), a result written while the manager was down is lost.
   - Accepted residual: a MIGRATION re-seeds from the transcript only (the hub's `importSession`
     carries no ledger), so a manager close-ticket comment is forgotten on the target. Its miss
     re-delivers that one comment — the harmless direction.
-- Tests: `TestTicketWrites`, `test_xerk3034_*` in `TestCloseTicketRequest`.
+- Tests: `TestTicketWrites` (incl. `test_xerk3053_*`), `test_xerk3034_*` in `TestCloseTicketRequest`.

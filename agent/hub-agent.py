@@ -12969,6 +12969,76 @@ def _tw_hold_bg(state, bid, tid, writes, landed, text, t):
         calls.pop(next(iter(calls)))
 
 
+_TW_KINDS = ("comment", "edit", "transition")
+
+
+def _tw_pending_write(w):
+    """One held write in the shape `_scan_ticket_write_entry` builds, or None.
+    The record it is restored from is a file outside this process, so every
+    field is re-typed rather than trusted."""
+    if not isinstance(w, dict) or w.get("kind") not in _TW_KINDS:
+        return None
+    key = w.get("key")
+    if not isinstance(key, str) or _tw_key(key) != key:
+        return None
+    out = {"kind": w["kind"], "key": key}
+    for k in ("to", "fp"):
+        if isinstance(w.get(k), str) and 0 < len(w[k]) <= 200:
+            out[k] = w[k]
+    for k in ("t0", "tp"):  # the call's start / timeout (XERK-3051, XERK-3054)
+        v = w.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and 0 < v < 2 ** 53:
+            out[k] = v
+    fields = w.get("fields")
+    if isinstance(fields, list):
+        names = [f for f in fields if isinstance(f, str) and 0 < len(f) <= 64][:16]
+        if names:
+            out["fields"] = names
+    f = w.get("_file")
+    if isinstance(f, (list, tuple)) and len(f) == 2 and isinstance(f[0], str) \
+            and 0 < len(f[0]) <= 4096 and (f[1] is None or isinstance(f[1], str)):
+        out["_file"] = (f[0], f[1])
+    elif isinstance(f, str) and 0 < len(f) <= 4096:
+        out["_file"] = f
+    return out
+
+
+def ticket_write_calls_persisted(state):
+    """The scan's held tracker-write calls (a tool_use still awaiting its
+    tool_result) in a JSON shape for the record (XERK-3053). In memory only, a
+    command still running across a manager restart lost its call: the restart
+    primes the scan to EOF, so its result alone arrived and nothing was
+    recorded. `_file`'s tuple goes as a list. A timed-out call's `bg:<task>` rest
+    is left out: its `twBg` job is not persisted, so restored it could only hold
+    a matching update until it aged out, never be recorded."""
+    calls = state.get("twCalls") if isinstance(state, dict) else None
+    if not isinstance(calls, dict):
+        return {}
+    return {bid: [dict(w, _file=list(w["_file"])) if isinstance(w.get("_file"), tuple)
+                  else dict(w) for w in writes]
+            for bid, writes in calls.items()
+            if isinstance(writes, list) and not str(bid).startswith("bg:")}
+
+
+def seed_ticket_write_calls(state, pending):
+    """Re-learn held tracker-write calls from the record on this process's
+    first scan of the session (`twCalls` not yet in `state`), so a result that
+    lands after a manager restart is still recorded. A no-op once the scan has
+    its own map."""
+    if not isinstance(state, dict) or "twCalls" in state:
+        return
+    calls = state["twCalls"] = {}
+    if not isinstance(pending, dict):
+        return
+    for bid, writes in list(pending.items())[-TICKET_WRITE_CALLS_MAX:]:
+        if not isinstance(bid, str) or not 0 < len(bid) <= 200 or not isinstance(writes, list) \
+                or bid.startswith("bg:"):
+            continue
+        kept = [w for w in (_tw_pending_write(x) for x in writes[:16]) if w]
+        if kept:
+            calls[bid] = kept
+
+
 def merge_ticket_writes(writes, new):
     """Fold new ledger entries onto a record's (deduped by `u`, oldest first,
     the newest TICKET_WRITES_MAX kept). Returns (writes, changed)."""
@@ -14497,6 +14567,11 @@ def _restore_live_agents(session_id, path, state, report=None):
             _scan_agent_entry(entry, state)
             if qa:
                 _scan_qa_entry(entry, state, report)
+            if report is not None:
+                # A tracker write whose result landed while the manager was
+                # down (XERK-3053); its call is in the gap or was seeded from
+                # the record. Re-recording one the old scan saw is deduped.
+                _scan_ticket_write_entry(entry, state, report)
     if qa:
         state["qaRestored"] = True
     return offset + end
@@ -35215,6 +35290,12 @@ class SessionManager:
         # path; the dsh LAUNCHER is XERK-466, which fills in _launch_dsh — the
         # swap is that method's body alone, this dispatch line stays.
         self._forget_live_agents(sess.get("id"))
+        # Tracker-write calls held for their result (XERK-3053) die with the
+        # process that ran them: a relaunched claude never answers them.
+        sess.pop("ticketWritesPending", None)
+        st = self.sess_state.get(sess.get("id")) if isinstance(sess.get("id"), str) else None
+        if isinstance(st, dict):
+            st.pop("twCalls", None)
         if sess.get("agentType") == "dsh":
             self._launch_dsh(sess, resume=resume, prompt=prompt, resume_id=resume_id)
             return
@@ -52819,6 +52900,7 @@ class SessionManager:
             try:
                 st = self.sess_state.setdefault(sid, {})
                 _seed_qa_scan(st, sess.get("qaRuns"))
+                seed_ticket_write_calls(st, sess.get("ticketWritesPending"))
                 signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
                                          session_id=sess.get("id"),
                                          claude_sid=sess.get("claudeSessionId"),
@@ -52847,6 +52929,15 @@ class SessionManager:
                     if grew:
                         sess["ticketWrites"] = writes
                         self.save()
+                # The calls still awaiting their result, so one that finishes
+                # across a manager restart is still recorded (XERK-3053).
+                tw_pending = ticket_write_calls_persisted(st)
+                if tw_pending != (sess.get("ticketWritesPending") or {}):
+                    if tw_pending:
+                        sess["ticketWritesPending"] = tw_pending
+                    else:
+                        sess.pop("ticketWritesPending", None)
+                    self.save()
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 pend.extend(u for u in self._take_discovered_prs(sid)
