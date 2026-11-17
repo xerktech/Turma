@@ -32,6 +32,22 @@ The ticket-update poller must not hand a session back its own comment or status 
     `TICKET_SELF_SPAN_MAX_MS`, so a field match there hides ANY human change to that field across
     the whole 10-minute run (QA, XERK-3052). Comments match by body, which a human's text lacks.
   - curl/acli/az/MCP print no such line, so a timed-out one stays unrecorded (delivered).
+- **A timed-out call's not-yet-landed writes stay PENDING until its task ends** (XERK-3054,
+  `_tw_hold_bg`): `twCalls["bg:<task id>"]` (so XERK-3052's hold covers them, aged from the
+  timeout via `tp`) + `twBg[<task id>]` (full writes, indices already recorded, output path).
+  - On the task's `<\task-notification>` (`user`/`queue-operation` only, `_scan_ticket_write_bg`)
+    both are dropped and `<task id>.output` is read (the notification's path, else the timeout
+    result's); `_tw_landed` over the whole output records only indices not recorded at the timeout.
+  - Same comment-only rule as above; edits are held but never recorded. Lost across a manager
+    restart (the scan primes to EOF): the miss delivers the update, the harmless direction.
+  - **Both the hold and the match span the task's life, not 10 min** (`TICKET_BG_MAX_MS`, 1h
+    from the timeout `tp`): the hold ages from `tp`, and a comment recorded at the notification
+    keeps `tp`, which `_tw_gap` widens its window back to (comments only, matched by body).
+    Tests: the `test_xerk3054_*` cases in `TestTicketWrites`/`TestTicketUpdates`.
+  - No refusal check over the task output: a build's own `HTTP/1.1 404`/`{"errors"…}` line is
+    not the helper's, and the success line already proves the comment ran.
+  - Residual: the output is read as a 256 KiB tail; an earlier success line cut off shifts
+    `_tw_landed`'s alignment, so a post-timeout comment may go unrecorded (delivered).
 - **Matching errs toward DELIVERING** (a false match hides a human's update from the session):
   - key must be valid and equal, `at` finite — else False; never raises (`_ticket_self_authored`);
   - a comment: id when BOTH sides carry one (different ids = different comments), else the body

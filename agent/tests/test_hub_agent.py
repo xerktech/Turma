@@ -60809,6 +60809,108 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._scan([_tw_call("b1", "Bash", {"command": 'jira comment X-1 "a"'}),
                                      res]), [])
 
+    # --- XERK-3054: a write after the timeout is recorded at the notification
+
+    def _bg_done(self, tid="bt1", output="", path=None, role="user"):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        f = path or os.path.join(d, f"{tid}.output")
+        if path is None:
+            with open(f, "w") as fh:
+                fh.write(output)
+        body = (f"<task-notification>\n<task-id>{tid}</task-id>\n<output-file>{f}</output-file>\n"
+                "<status>completed</status>\n<summary>done</summary>\n</task-notification>")
+        return {"type": role, "timestamp": "2026-11-16T10:11:05Z",
+                "message": {"role": role, "content": body}}
+
+    def test_xerk3054_a_write_after_the_timeout_is_recorded_when_the_task_ends(self):
+        # QA probe C: the comment lands 60 s after the 600 s timeout.
+        cmd = 'make long; jira comment XERK-1 "Fixed in PR 5"'
+        state = {}
+        self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                                     self._timed_out("t1", "building...\n")], state), [])
+        self.assertEqual([w["kind"] for w in state["twCalls"]["bg:bt1"]], ["comment"])
+        [w] = self._scan([self._bg_done(output="building...\ncommented on XERK-1\n")], state)
+        self.assertEqual((w["u"], w["key"]), ("t1:0", "XERK-1"))
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("Fixed in PR 5"))
+        self.assertEqual(w["tp"], ha._ts_ms("2026-11-16T10:00:05Z"))  # spans from the timeout
+        self.assertNotIn("bg:bt1", state["twCalls"])
+        self.assertEqual(state["twBg"], {})
+
+    def test_xerk3054_a_comment_recorded_at_the_timeout_is_not_counted_again(self):
+        cmd = 'jira comment X-1 "a" && make long && jira comment X-1 "b"'
+        state = {}
+        [w] = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                          self._timed_out("t1", "commented on X-1\n")], state)
+        self.assertEqual(w["u"], "t1:0")
+        report = {"prUrls": [], "modelActual": None}
+        ha._scan_entry_line(json.dumps(self._bg_done(
+            output="commented on X-1\nbuilt\ncommented on X-1\n")), state, report)
+        self.assertEqual([r["u"] for r in report["ticketWrites"]], ["t1:1"])
+        self.assertEqual(report["ticketWrites"][0]["fp"], ha.ticket_body_fingerprint("b"))
+
+    def test_xerk3054_a_write_that_never_printed_is_not_recorded(self):
+        cmd = 'make long && jira comment X-1 "a"'
+        state = {}
+        self._scan([_tw_call("t1", "Bash", {"command": cmd}), self._timed_out("t1", "")], state)
+        self.assertEqual(self._scan([self._bg_done(output="make: *** Error 2\n")], state), [])
+        self.assertNotIn("bg:bt1", state["twCalls"])  # the call is over: nothing held
+
+    def test_xerk3054_a_quoted_or_foreign_notification_records_nothing(self):
+        cmd = 'make long; jira comment X-1 "a"'
+        state = {}
+        self._scan([_tw_call("t1", "Bash", {"command": cmd}), self._timed_out("t1", "")], state)
+        # An assistant quoting one is the session talking, not the task ending.
+        self.assertEqual(self._scan([self._bg_done(output="commented on X-1\n",
+                                                   role="assistant")], state), [])
+        self.assertIn("bg:bt1", state["twCalls"])
+        # Another task's notification leaves this one pending.
+        self.assertEqual(self._scan([self._bg_done(tid="bt9", output="commented on X-1\n")],
+                                    state), [])
+        self.assertIn("bg:bt1", state["twCalls"])
+        # A file not named <task id>.output is never read.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        other = os.path.join(d, "notes.txt")
+        with open(other, "w") as fh:
+            fh.write("commented on X-1\n")
+        state["twBg"]["bt1"]["path"] = ""
+        self.assertEqual(self._scan([self._bg_done(path=other)], state), [])
+
+    def test_xerk3054_an_unrelated_error_line_does_not_drop_the_comment(self):
+        cmd = 'make long; jira comment X-1 "a"'
+        state = {}
+        self._scan([_tw_call("t1", "Bash", {"command": cmd}), self._timed_out("t1", "")], state)
+        [w] = self._scan([self._bg_done(output='HTTP/1.1 404 Not Found\n{"errors": ["lint"]}\n'
+                                               "commented on X-1\n")], state)
+        self.assertEqual(w["u"], "t1:0")
+        self.assertIsInstance(w["tp"], int)
+
+    def test_xerk3054_a_timed_out_edit_is_held_but_never_recorded(self):
+        cmd = "make long; jira edit X-1 -s t"
+        state = {}
+        self._scan([_tw_call("t1", "Bash", {"command": cmd}), self._timed_out("t1", "")], state)
+        self.assertEqual([w["kind"] for w in state["twCalls"]["bg:bt1"]], ["edit"])
+        self.assertEqual(self._scan([self._bg_done(output="updated X-1  https://x/browse/X-1\n")],
+                                    state), [])
+
+    def test_xerk3054_the_timed_out_result_names_the_output_file(self):
+        # The notification's own <output-file> is read first; the timeout
+        # result's "Output is being written to:" path is the fallback.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        f = os.path.join(d, "bt1.output")
+        with open(f, "w") as fh:
+            fh.write("commented on X-1\n")
+        state = {}
+        res = self._timed_out("t1", "", content=f"Moved to background. Output is being written to: {f}")
+        self._scan([_tw_call("t1", "Bash", {"command": 'sleep 900; jira comment X-1 "a"'}), res],
+                   state)
+        self.assertEqual(state["twBg"]["bt1"]["path"], f)
+        note = self._bg_done(path="/nonexistent/bt1.output")
+        [w] = self._scan([note], state)
+        self.assertEqual(w["u"], "t1:0")
+
     def test_a_call_and_its_result_in_different_beats(self):
         state = {}
         self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command":
@@ -61410,6 +61512,79 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
                       ago_ms=ha.TICKET_PENDING_HOLD_MAX_MS + 1_000)
         self._run(sm, [self._now_ev("9", "Fixed in PR 5")])
         self.assertEqual(len(self._delivered(sm)), 1)
+
+    def test_xerk3054_a_comment_after_the_timeout_is_held_then_filtered(self):
+        # QA probe C end to end: the call times out with only "building...",
+        # its comment lands later, and the poller must not hand it back.
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        st = self._pending(sm, "s1", 'make long; jira comment XERK-1 "Fixed in PR 5"',
+                           ago_ms=600_000)
+        res = _tw_result("t1", "building...", ts=self._iso(int(time.time() * 1000)))
+        res["toolUseResult"] = {"stdout": "building...\n", "backgroundTaskId": "bt1",
+                                "timedOutAfterMs": 600000}
+        report = {"prUrls": [], "modelActual": None}
+        ha._scan_entry_line(json.dumps(res), st, report)
+        self.assertNotIn("ticketWrites", report)
+        self._run(sm, [self._now_ev("9", "Fixed in PR 5")])
+        sm.notify_session.assert_not_called()
+        self.assertEqual([e["key"] for e in sess["ticketUpdateHeld"]["events"]], ["c:9"])
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        out = os.path.join(d, "bt1.output")
+        with open(out, "w") as fh:
+            fh.write("building...\ncommented on XERK-1\n")
+        note = {"type": "user", "timestamp": self._iso(int(time.time() * 1000)),
+                "message": {"role": "user", "content":
+                            f"<task-notification><task-id>bt1</task-id><output-file>{out}"
+                            "</output-file><status>completed</status></task-notification>"}}
+        report = {"prUrls": [], "modelActual": None}
+        ha._scan_entry_line(json.dumps(note), st, report)
+        sess["ticketWrites"], _ = ha.merge_ticket_writes(sess.get("ticketWrites") or [],
+                                                         report.get("ticketWrites"))
+        sm._deliver_ticket_updates()
+        sm.notify_session.assert_not_called()
+        self.assertNotIn("ticketUpdateHeld", sess)
+
+    def test_xerk3054_a_timed_out_calls_hold_ages_from_its_timeout(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        now = int(time.time() * 1000)
+        st = sm.sess_state.setdefault("s1", {})
+        w = {"kind": "comment", "key": "XERK-1",
+             "fp": ha.ticket_body_fingerprint("Fixed in PR 5"), "t0": now - 700_000}
+        st["twCalls"] = {"bg:bt1": [{**w, "tp": now - 100_000}]}
+        self.assertEqual(len(sm._ticket_pending_writes(sess, "XERK-1")), 1)
+        # QA D1: a task still running 13 min after its timeout still holds.
+        st["twCalls"] = {"bg:bt1": [{**w, "tp": now - 780_000}]}
+        self.assertEqual(len(sm._ticket_pending_writes(sess, "XERK-1")), 1)
+        st["twCalls"] = {"bg:bt1": [{**w, "tp": now - ha.TICKET_BG_MAX_MS - 1_000}]}
+        self.assertEqual(sm._ticket_pending_writes(sess, "XERK-1"), [])
+
+    def test_xerk3054_a_comment_long_before_the_task_ended_still_matches(self):
+        # QA D2: recorded at a notification 21 min after the comment landed.
+        now = int(time.time() * 1000)
+        fp = ha.ticket_body_fingerprint("Fixed in PR 5")
+        rec = {"u": "t1:0", "kind": "comment", "key": "XERK-1", "fp": fp,
+               "t0": now - 2_200_000, "tp": now - 1_400_000, "t": now}
+        ev = {"kind": "comment", "key": "XERK-1", "at": now - 1_260_000, "fp": fp,
+              "body": "Fixed in PR 5"}
+        self.assertTrue(ha._ticket_self_authored({"ticketWrites": [rec]}, ev))
+        # Before the timeout it is no post-timeout comment of this call.
+        ev["at"] = now - 2_200_000 - ha.TICKET_SELF_COMMENT_WINDOW_MS - 1_000
+        self.assertFalse(ha._ticket_self_authored({"ticketWrites": [rec]}, ev))
+        # The widening is bounded: a task ending 2h after its timeout spans 1h.
+        late = {**rec, "tp": now - 7_200_000, "t0": now - 7_800_000}
+        ev["at"] = now - 7_000_000
+        self.assertFalse(ha._ticket_self_authored({"ticketWrites": [late]}, ev))
+        ev["at"] = now - 3_000_000
+        self.assertTrue(ha._ticket_self_authored({"ticketWrites": [late]}, ev))
+        # Only a comment widens: an edit carrying tp keeps its span.
+        self.assertGreater(ha._tw_gap(now - 1_260_000, {**rec, "kind": "edit"}), 0)
+        # A non-bg write keeps the 10-minute span.
+        rec2 = {k: v for k, v in rec.items() if k != "tp"}
+        ev["at"] = now - 1_260_000
+        self.assertFalse(ha._ticket_self_authored({"ticketWrites": [rec2]}, ev))
 
     def test_xerk3052_a_comment_body_from_a_file_holds_any_comment(self):
         sess = self._sess(base=[])
