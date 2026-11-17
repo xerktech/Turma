@@ -282,6 +282,26 @@ test("XERK-2932: a fall-back week paints 25 rows: labels, shading, now-line, gap
   } finally { NOW = was; cal.setMode("work"); }
 });
 
+test("XERK-2932: a step into a 25-row week moves the held top to the same wall time", async () => {
+  replies = { "/api/calendar": () => ({ events: [], hosts: [] }) };
+  cal.setMode("week");
+  try {
+    await show(at(2026, 10, 28));                       // Oct 25 – 31: 24 rows
+    cal._topMin(540);                                   // 9:00 at the top
+    await show(at(2026, 11, 4));                        // Nov 1 – 7: 25 rows
+    assert.equal(cal._topMin(), 600, "still 9:00, one row lower on this axis");
+    await show(at(2026, 10, 28));
+    assert.equal(cal._topMin(), 540);
+  } finally { cal._topMin(-1); cal.setMode("work"); }
+});
+
+test("XERK-2932: the gutter labels a repeated hour twice and never the midnight top row", () => {
+  const html = cal.hoursHtml(cal.gridAxis([at(2026, 11, 1)]));
+  assert.match(html, /^<div class="cal-hr top" style="top:calc\(var\(--slot, 24px\) \* 0\)"><\/div>/);
+  assert.match(html, />1 AM<span>EDT<\/span>/);
+  assert.match(html, />1 AM<span>EST<\/span>/);
+});
+
 test("XERK-2932: a held scroll keeps its wall time across a 24 ⇄ 25 row step", () => {
   const plain = cal.gridAxis(cal.visibleDays(at(2026, 10, 28), "week"));
   const fall = cal.gridAxis(cal.visibleDays(at(2026, 11, 4), "week"));

@@ -27,7 +27,7 @@ test("XERK-2932: Santiago — the repeated 23:00 hour is drawn, a skipped midnig
     const [over] = cal.daySegments([{ startMs: Date.parse("2026-09-06T02:00:00Z"), endMs: Date.parse("2026-09-06T04:30:00Z") }], sun, wa);
     return { total: ax.total, late: [late.top, late.end], hours: cal.gridHours(ax).slice(-2),
       first: [first.top, first.end], over: [over.top, over.end], gaps: cal.gridGaps(sun, wa),
-      alone: cal.gridHours(cal.gridAxis([sun]))[0] };`);
+      alone: cal.gridHours(cal.gridAxis([sun]))[0], top: cal.hoursHtml(cal.gridAxis([sun])).split("</div>")[0] };`);
   assert.equal(r.total, 1500);
   assert.deepEqual(r.late, [1410, 1485], "23:30 -03 → 23:45 -04 is not clipped at midnight");
   assert.deepEqual(r.hours.map((h) => [h.top, h.h]), [[1380, 23], [1440, 23]]);
@@ -37,6 +37,7 @@ test("XERK-2932: Santiago — the repeated 23:00 hour is drawn, a skipped midnig
   assert.deepEqual(r.first, [60, 120]);
   assert.deepEqual(r.over, [60, 90]);
   assert.deepEqual([r.alone.top, r.alone.h], [0, 1], "a day shown alone starts with its 1 AM row");
+  assert.equal(r.top, '<div class="cal-hr top" style="top:calc(var(--slot, 24px) * 0)">1 AM', "and labels it at the top edge");
 });
 
 test("XERK-2932: Lord Howe — a 30-minute shift draws hour lines from the labels", () => {
@@ -60,4 +61,5 @@ test("XERK-2932: Lord Howe — a 30-minute shift draws hour lines from the label
   // So the week paints its hour lines from the labels, not the column's repeating gradient.
   assert.match(r.html, /class="cal-row cal-body cal-odd"/);
   assert.match(r.html, /class="cal-hl" style="top:calc\(var\(--slot, 24px\) \* 5\)"/);
+  assert.match(r.html, /class="cal-hl half" style="top:calc\(var\(--slot, 24px\) \* 6\)"/, "half-hour lines too");
 });

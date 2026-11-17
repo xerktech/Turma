@@ -1198,6 +1198,15 @@ function headerHtml(days) {
     + zoomBtn(1, "Zoom in", "+", zoomHours === ZOOMS[ZOOMS.length - 1])
     + `</span><button type="button" class="cal-ic" data-host-settings aria-expanded="${hostSetOpen}" aria-label="Calendar settings" title="Calendar settings">⚙</button></div>`;
 }
+// The gutter's hour labels (XERK-2932): a repeated hour twice, each with its zone; the top row is
+// labelled only when it is not midnight (a day starting at 1:00, its midnight skipped).
+function hoursHtml(axis) {
+  return gridHours(axis).map((r) => `<div class="cal-hr${r.zone ? " z" : ""}${r.top ? "" : " top"}" style="top:${slots(r.top / 30)}">${r.top || r.h
+    ? esc(new Date(2000, 0, 1, r.h).toLocaleTimeString([], { hour: "numeric" })) + (r.zone ? `<span>${esc(r.zone)}</span>` : "") : ""}</div>`).join("");
+}
+// An axis whose hours sit off the 60-minute rhythm (a 30-minute DST shift, Lord Howe) draws its
+// hour and half-hour lines from the labels; the column's repeating lines would cut through the hours.
+const offRhythmOf = (axis) => axis.segs.some((x) => ((x.top - x.from) % 60 + 60) % 60 !== 0);
 function calendarHtml() {
   const now = nowFn();
   const days = visibleDays(anchor, mode());
@@ -1256,14 +1265,10 @@ function calendarHtml() {
   }).join("");
   const band = days.map((d) => `<div class="cal-band-day${offOrgs(d, got.holidays).length ? " off" : ""}">${bandHtml(d, got.events, got.holidays, colors, now)}</div>`).join("");
   // The hour labels follow the axis: a repeated hour is labelled twice, each with its zone.
-  // The top row's label shows only when it is not midnight (a day starting at 1:00, its midnight skipped).
-  const hourRows = gridHours(axis);
-  const hours = hourRows.map((r) => `<div class="cal-hr${r.zone ? " z" : ""}${r.top ? "" : " top"}" style="top:${slots(r.top / 30)}">${r.top || r.h
-    ? esc(new Date(2000, 0, 1, r.h).toLocaleTimeString([], { hour: "numeric" })) + (r.zone ? `<span>${esc(r.zone)}</span>` : "") : ""}</div>`).join("");
-  // An axis whose hours sit off the 60-minute rhythm (a 30-minute DST shift, Lord Howe) draws
-  // its hour lines from the labels; the column's repeating lines would cut through the hours.
-  const offRhythm = axis.segs.some((x) => ((x.top - x.from) % 60 + 60) % 60 !== 0);
-  const hourLines = offRhythm ? hourRows.map((r) => `<div class="cal-hl" style="top:${slots(r.top / 30)}" aria-hidden="true"></div>`).join("") : "";
+  const hours = hoursHtml(axis);
+  const offRhythm = offRhythmOf(axis);
+  const hourLines = offRhythm ? gridHours(axis).map((r) => `<div class="cal-hl" style="top:${slots(r.top / 30)}" aria-hidden="true"></div>`
+    + (r.top + 30 < axis.total ? `<div class="cal-hl half" style="top:${slots(r.top / 30 + 1)}" aria-hidden="true"></div>` : "")).join("") : "";
   const body = days.map((d) => {
     const isToday = dayKey(d) === today;
     const segs = daySegments(got.events, d, axis);
@@ -2598,7 +2603,8 @@ const api = {
   _go: go,
   scopedBody, blankRepeat, repeatFromRule, ruleFromRepeat, repeatSummary, repeatError, repeatPresets, repeatPick, repeatPresetOf,
   validateForm, formPayload, formFromEvent, blankForm, wallToIso, parseAttendee, normEmail, evOrgs, openEditor, closeEditor,
-  saveEditor, slotMinAt, slotMs, setMode,
+  saveEditor, slotMinAt, slotMs, setMode, hoursHtml,
+  _topMin: (v) => (v === undefined ? topMin : (topMin = v)),
   _ed: () => ed, _edEls: () => ({ back: $edBack, panel: $edPanel }),
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
 };
