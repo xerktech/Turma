@@ -9069,11 +9069,6 @@ PR_COMMENTS_DELIVER = os.environ.get("TURMA_PR_COMMENTS", "1") != "0"
 PR_COMMENTS_REFRESH_EVERY = _env_int("TURMA_PR_COMMENTS_EVERY", 3)
 PR_COMMENTS_MAX = 20               # PRs polled per beat, like PR_STATUS_MAX
 PR_COMMENTS_SEEN_MAX = 500         # per-PR seen-key ceiling (newest kept)
-# Beats a PR's FIRST sighting waits for a full fetch (XERK-3047) before it
-# baselines a partial one: a baseline missing the inline channel delivers that
-# channel's whole history later, but an inline fetch that always fails (a PR too
-# big to page inside run()'s timeout, a rate limit) must not mean no delivery.
-PR_COMMENTS_PARTIAL_WAIT = 3
 PR_COMMENTS_BODY_CAP = 1200        # per-comment body chars folded into the message
 
 # Merge-conflict auto-resolution (XERK-223): a PR whose branch conflicts with
@@ -30772,8 +30767,6 @@ class SessionManager:
         self._pr_comments_wake = threading.Event()
         self._pr_comments_worker = None
         self._pr_comments_fetched = {}
-        # (sid, url) -> partial first sightings skipped so far (XERK-3047).
-        self._pr_partial_waits = {}
         # The permission ledger (XERK-1563). The hook-log TAIL is a worker's
         # (`_permission_cursors` is its alone); it stages parsed hook rows in
         # `_permission_rows_fetched`, REBOUND under `_permission_lock` like the
@@ -36842,6 +36835,7 @@ class SessionManager:
             if isinstance(c, dict) and "paused" in c:
                 c.pop("paused", None)
                 c.pop("prCommentBase", None)
+                c.pop("prCommentInlinePending", None)
                 log(f"closed session {c.get('id')}: dropped its sleeper pause; "
                     f"it is an ordinary ended session now")
                 tmux = c.get("tmuxName")
@@ -48344,6 +48338,11 @@ class SessionManager:
             base = sess.get("prCommentBase")
             if not isinstance(base, dict):
                 base = {}
+            # PRs first baselined from a PARTIAL fetch (inline channel failed):
+            # their inline history is not in `base` yet (XERK-3047).
+            pending = sess.get("prCommentInlinePending")
+            pending = [u for u in pending if isinstance(u, str)] \
+                if isinstance(pending, list) else []
             changed = False
             # Iterate the session's CURRENT urls so a PR dropped between fetch
             # and deliver is not delivered for; look each up in the staging.
@@ -48354,26 +48353,26 @@ class SessionManager:
                 if events is None:
                     continue                       # fetch failed — keep baseline
                 first = url not in base
-                wait_key = (sess["id"], url)
-                if first and isinstance(events, _PartialEvents):
-                    # A baseline missing a channel would deliver that channel's
-                    # whole history on the next full fetch: wait for a full one,
-                    # but only PR_COMMENTS_PARTIAL_WAIT beats.
-                    waited = self._pr_partial_waits.get(wait_key, 0) + 1
-                    if waited <= PR_COMMENTS_PARTIAL_WAIT:
-                        self._pr_partial_waits[wait_key] = waited
-                        log(f"PR comments: {url} for session {sess['id']}: "
-                            f"inline fetch failed on first sighting; waiting "
-                            f"for a full fetch ({waited}/"
-                            f"{PR_COMMENTS_PARTIAL_WAIT})")
-                        continue
-                    log(f"PR comments: {url} for session {sess['id']}: "
-                        f"baselining without inline comments after "
-                        f"{PR_COMMENTS_PARTIAL_WAIT} failed fetches")
-                self._pr_partial_waits.pop(wait_key, None)
+                partial = isinstance(events, _PartialEvents)
+                # A first sighting from a partial fetch baselines what it has,
+                # so conversation comments flow at once, and flags the PR: the
+                # first FULL fetch then folds the inline history in silently
+                # rather than delivering it as new. (Inline comments posted
+                # while the channel was failing are folded in too: they cannot
+                # be told from history.)
+                quiet_inline = False
+                if first and partial:
+                    pending.append(url)
+                    log(f"PR comments: {url} for session {sess['id']}: inline "
+                        f"fetch failed on first sighting; baselining without "
+                        f"it until a full fetch")
+                elif url in pending and not partial:
+                    pending = [u for u in pending if u != url]
+                    quiet_inline = True
                 seen = set(base.get(url) or [])
                 fresh = [e for e in events
-                         if e["key"] not in seen and not e["is_self"]]
+                         if e["key"] not in seen and not e["is_self"]
+                         and not (quiet_inline and e.get("kind") == "inline")]
                 # Fold EVERY current key (self-authored included) into the seen
                 # set — a first sighting baselines them all; later beats only add
                 # the newcomers, capped so a chatty PR can't grow it without bound.
@@ -48392,7 +48391,7 @@ class SessionManager:
                 prior = [k for k in old if k not in current]
                 merged = prior + list(dict.fromkeys(keys))
                 keep = max(PR_COMMENTS_SEEN_MAX, len(current))
-                if isinstance(events, _PartialEvents):
+                if partial:
                     keep = len(merged)
                 base[url] = merged[-keep:]
                 changed = True
@@ -48400,6 +48399,16 @@ class SessionManager:
                     continue
                 for msg in _pr_comment_messages(url, fresh):
                     self.notify_session(sess["id"], msg)
+            # Drop flags for PRs the session no longer has, so none outlives
+            # its PR.
+            live = set(self.session_pr_urls.get(sess["id"]) or [])
+            pending = [u for u in pending if u in live]
+            if pending != (sess.get("prCommentInlinePending") or []):
+                if pending:
+                    sess["prCommentInlinePending"] = pending
+                else:
+                    sess.pop("prCommentInlinePending", None)
+                changed = True
             if changed:
                 sess["prCommentBase"] = base
                 self.save()

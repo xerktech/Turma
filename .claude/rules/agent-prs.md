@@ -144,9 +144,11 @@ DevOps, and what gets typed back because of it.
 - **A partial fetch trims nothing from the seen set**: a failed GitHub inline channel returns
   `_PartialEvents`, not None, and the keys it lacks are still on the PR.
   Tests: `test_a_partial_fetch_past_the_seen_cap_does_not_resend_later`.
-- **A partial first sighting waits `PR_COMMENTS_PARTIAL_WAIT` beats for a full baseline, then
-  baselines anyway**: unbounded, a PR whose inline fetch always fails would get nothing.
-  Tests: `test_a_partial_first_sighting_waits_*`, `test_an_inline_channel_that_always_fails_*`.
+- **A partial first sighting baselines at once and flags the PR** (`prCommentInlinePending`): the
+  first full fetch folds the inline history in silently. Never wait for a full fetch instead: an
+  inline channel that always fails (too many pages for `run()`'s timeout) would deliver nothing.
+  Tests: `test_a_partial_first_sighting_*`, `test_the_inline_pending_flag_*`,
+  `test_an_inline_channel_that_always_fails_*`.
 - `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a rebase/force-
   push**) off the just-cached `mergeable`. `prConflicts` bounds nudging per PR; MERGEABLE/closed
   re-arms it, **UNKNOWN does neither** — that's what a just-pushed fix looks like, and clearing on it

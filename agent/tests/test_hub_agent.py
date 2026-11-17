@@ -21862,30 +21862,59 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.assertIn("new19", joined)
         self.assertNotIn("inline", joined)          # no old inline re-sent
 
-    def test_a_partial_first_sighting_waits_for_a_full_baseline(self):
+    def test_a_partial_first_sighting_does_not_deliver_inline_history(self):
+        # Baselined from a partial fetch, the first full fetch folds the inline
+        # history in silently (XERK-3047 QA); comments posted meanwhile on the
+        # conversation are delivered as usual.
         sm = self.make_manager()
         conv = [self._ev(f"c{i}") for i in range(5)]
-        inline = [self._ev(f"i{i}", kind="inline") for i in range(5)]
+        inline = [self._ev(f"i{i}", kind="inline", body=f"old{i}")
+                  for i in range(5)]
         sess = self._session(sm)
         with mock.patch.object(ha, "_pr_comment_events",
                                return_value=ha._PartialEvents(conv)):
             sm._poll_pr_comments()
-        self.assertNotIn(self.URL, sess.get("prCommentBase") or {})
-        with self._events(*conv, *inline):
-            sm._poll_pr_comments()                  # the real baseline
+        self.assertEqual(sess["prCommentInlinePending"], [self.URL])
+        conv.append(self._ev("cnew", body="during"))
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
             sm._poll_pr_comments()
-        self.assertEqual(self._typed(), [])
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()
+        self.assertNotIn("prCommentInlinePending", sess)
+        inline.append(self._ev("inew", kind="inline", body="later"))
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 2)
+        self.assertIn("during", typed[0])
+        self.assertIn("later", typed[1])
+        self.assertNotIn("old", "".join(typed))
+
+    def test_the_inline_pending_flag_is_per_session_and_dropped_with_its_pr(self):
+        sm = self.make_manager()
+        conv = [self._ev("c0")]
+        sess = self._session(sm)
+        other = dict(sess, id="s2", prCommentBase={self.URL: ["c0"]})
+        sm.registry.append(other)
+        sm.session_pr_urls["s2"] = [self.URL]
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()
+        self.assertEqual(sess["prCommentInlinePending"], [self.URL])
+        self.assertNotIn("prCommentInlinePending", other)
+        sm.session_pr_urls["s1"] = ["https://github.com/o/r/pull/8"]
+        with self._events(*conv):
+            sm._poll_pr_comments()
+        self.assertNotIn("prCommentInlinePending", sess)
 
     def test_an_inline_channel_that_always_fails_still_delivers(self):
-        # The wait for a full baseline is bounded: a PR whose inline fetch
-        # never succeeds still gets its conversation comments.
         sm = self.make_manager()
         conv = [self._ev(f"c{i}") for i in range(3)]
         sess = self._session(sm)
-        for _ in range(ha.PR_COMMENTS_PARTIAL_WAIT + 1):
-            with mock.patch.object(ha, "_pr_comment_events",
-                                   return_value=ha._PartialEvents(conv)):
-                sm._poll_pr_comments()
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()                  # baseline, at once
         self.assertEqual(len(sess["prCommentBase"][self.URL]), 3)
         conv.append(self._ev("cnew", body="reply"))
         with mock.patch.object(ha, "_pr_comment_events",
@@ -21894,7 +21923,6 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         typed = self._typed()
         self.assertEqual(len(typed), 1)
         self.assertIn("reply", typed[0])
-        self.assertEqual(sm._pr_partial_waits, {})
 
     def test_a_batch_past_input_max_chars_is_split_not_lost(self):
         # XERK-3047: ~90 near-cap comments compose past INPUT_MAX_CHARS; one
