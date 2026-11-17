@@ -151,21 +151,26 @@
   // `forbidden` = signed in, but not in a group with access; `oidc` = the SSO
   // flow itself failed. A denied SSO user can still use the break-glass local
   // credential below, so the message points them at it rather than dead-ending.
-  const OIDC_ERRORS = {
-    forbidden:
-      "You signed in, but your account isn’t in a group with access to this hub. " +
-      "Ask an administrator to be added, or use the local credential below.",
-    oidc: "Single sign-on failed. Please try again, or use the local credential below.",
-    // XERK-3038: the sign-in sat open past the hub's window (10 min) before the
-    // IdP sent the browser back, so the callback could not finish it.
-    expired: "Your single sign-on attempt timed out. Sign in again to continue.",
-  };
-  const errParam = new URLSearchParams(location.search).get("error");
-  if (errParam && Object.prototype.hasOwnProperty.call(OIDC_ERRORS, errParam)) {
-    showError(OIDC_ERRORS[errParam]);
-    // Only the callback sends these, so SSO is configured: offer a fresh attempt
-    // instead of leaving the local form as the only way forward.
-    if (errParam !== "forbidden") document.getElementById("ssoRetry").hidden = false;
+  // XERK-3038: `expired` = the sign-in sat open past the hub's window (10 min)
+  // before the IdP sent the browser back, so the callback could not finish it.
+  // Only the callback sends these, so SSO is configured: every outcome but a
+  // group refusal also offers a fresh SSO attempt (`sso`), since retrying cannot
+  // change a refusal. An unknown or inherited key is ignored.
+  function loginNotice(errParam) {
+    const OIDC_ERRORS = {
+      forbidden:
+        "You signed in, but your account isn’t in a group with access to this hub. " +
+        "Ask an administrator to be added, or use the local credential below.",
+      oidc: "Single sign-on failed. Please try again, or use the local credential below.",
+      expired: "Your single sign-on attempt timed out. Sign in again to continue.",
+    };
+    if (!errParam || !Object.prototype.hasOwnProperty.call(OIDC_ERRORS, errParam)) return null;
+    return { message: OIDC_ERRORS[errParam], sso: errParam !== "forbidden" };
+  }
+  const notice = loginNotice(new URLSearchParams(location.search).get("error"));
+  if (notice) {
+    showError(notice.message);
+    document.getElementById("ssoRetry").hidden = !notice.sso;
   }
 
   // XERK-2630: after an administrator reset the password, /api/login answers 403

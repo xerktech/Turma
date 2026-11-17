@@ -27285,7 +27285,8 @@ const server = http.createServer(async (req, res) => {
       // never the hub's HTML /login page — the app is waiting on the deep link,
       // and dropping it into a web page strands the user in the Custom Tab. Only
       // a flow whose tx we recognise is trusted to deep-link; a dead/forged tx
-      // falls to the plain outcome (the app times out and reports failure).
+      // falls to the plain outcome (the Custom Tab shows the web page; the app
+      // itself has no timeout and stays on its Login screen).
       const mobile = tx && tx.mobile ? tx.mobile : "";
       const failLocation = (kind) => (mobile ? oidcMobileRedirect({ error: kind }) : `/login?error=${kind}`);
       if (idpError) {
@@ -27303,7 +27304,8 @@ const server = http.createServer(async (req, res) => {
       // that drops the state cookie would loop. No session is issued on either
       // path, so the login-CSRF defence is unchanged. A mobile flow reaching here
       // has no trusted tx, so it never deep-links (an untrusted redirect must not
-      // carry a token); the app times out and reports the failure.
+      // carry a token): its Custom Tab lands on the same page, which the user
+      // closes to retry from the app's own SSO button.
       if (!state || !code || !tx || Date.now() - tx.at > OIDC_TX_TTL_MS || stateCookie !== state) {
         res.writeHead(302, {
           Location: userAuthorized(req) ? "/" : "/login?error=expired",
