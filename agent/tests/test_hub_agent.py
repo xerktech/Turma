@@ -60874,8 +60874,28 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         rec["status"] = "running"
         sm.registry = [rec]
         sm.notify_session = mock.Mock()
-        self._run(sm, [self._comment("1", at="2026-11-12T00:00:00.000+0000")])
-        sm.notify_session.assert_not_called()
+        # An update the previous run saw stays history; one that landed while
+        # the session was down (after the kill) is delivered.
+        rec["ticketUpdateSince"] = "2026-11-12T12:00:00Z"   # the kill, pinned
+        self._run(sm, [self._comment("1", body="seen before", at="2026-11-12T00:00:00.000+0000"),
+                       self._comment("2", body="while down", at="2026-11-13T00:00:00.000+0000")])
+        msgs = [c.args[1] for c in sm.notify_session.call_args_list]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("while down", msgs[0])
+        self.assertNotIn("seen before", msgs[0])
+
+    def test_resume_anchors_at_the_kill(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
+                mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sid = sm.registry[-1]["id"]
+            sm.kill(sid)
+            closed = next(c for c in sm.closed if c.get("id") == sid)
+            closed["closedAt"] = "2026-11-14T08:00:00Z"
+            sm.resume(sid)
+        self.assertEqual(sm._find(sid)["ticketUpdateSince"], "2026-11-14T08:00:00Z")
 
     def test_a_notify_that_raises_is_retried_next_round(self):
         sess = self._sess(base=[])

@@ -37195,9 +37195,9 @@ class SessionManager:
             "status": "running",
             "createdAt": rec.get("createdAt") or now_iso(),
             # Resume keeps the original createdAt, so anchor the ticket-update
-            # first sight here: the previous run already saw what came before
-            # (XERK-3035), and the base is not carried.
-            "ticketUpdateSince": now_iso(),
+            # first sight at the KILL (XERK-3035): the previous run saw what came
+            # before it, and what landed while the session was down is news.
+            "ticketUpdateSince": rec.get("closedAt") or now_iso(),
             "stoppedAt": None,
             "errorMsg": None,
         }
