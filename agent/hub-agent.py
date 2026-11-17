@@ -37205,9 +37205,11 @@ class SessionManager:
             # (no key at all) anchors at the kill.
             "ticketUpdateBase": (rec.get("ticketUpdateBase")
                                  if isinstance(rec.get("ticketUpdateBase"), dict) else None),
-            "ticketUpdateSince": (rec.get("ticketUpdateSince")
-                                  if "ticketUpdateBase" in rec
-                                  else rec.get("closedAt") or now_iso()),
+            "ticketUpdateSince": (
+                (rec.get("ticketUpdateSince")
+                 if _ts_ms(rec.get("ticketUpdateSince")) is not None else None)
+                if "ticketUpdateBase" in rec
+                else rec.get("closedAt") or now_iso()),
             "stoppedAt": None,
             "errorMsg": None,
         }

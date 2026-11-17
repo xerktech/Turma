@@ -60924,6 +60924,32 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         self.assertIn("also handle X", msgs[0])
         self.assertNotIn("before spawn", msgs[0])
 
+    def test_an_adopted_session_keeps_its_adoption_anchor_across_a_resume(self):
+        # Killed before its first read: pre-adoption history stays history.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "REPOS_ROOT", self.tmp), \
+                mock.patch.object(ha, "scan_repos", lambda: []):
+            sm.spawn(ha.ROOT_REPO_NAME)
+            sess = sm.registry[-1]
+            sess["createdAt"] = "2026-11-10T00:00:00Z"
+            sess["ticket"] = {"key": self.KEY, "siteKey": self.SITE}
+            sess["ticketUpdateSince"] = "2026-11-11T00:00:00Z"   # the adoption
+            sid = sess["id"]
+            sm.kill(sid)
+            sm.resume(sid)
+        rec = sm._find(sid)
+        self.assertEqual(rec["ticketUpdateSince"], "2026-11-11T00:00:00Z")
+        rec["status"] = "running"
+        sm.registry = [rec]
+        sm.notify_session = mock.Mock()
+        self._run(sm, [self._comment("1", body="pre adoption", at="2026-11-10T12:00:00.000+0000"),
+                       self._comment("2", body="after adoption", at="2026-11-11T12:00:00.000+0000")])
+        msgs = [c.args[1] for c in sm.notify_session.call_args_list]
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("after adoption", msgs[0])
+        self.assertNotIn("pre adoption", msgs[0])
+
     def test_resume_carries_what_the_previous_run_saw(self):
         # An update written before the kill that the previous run never read
         # (reads are a cadence apart) still arrives after the resume.
