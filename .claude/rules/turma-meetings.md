@@ -307,6 +307,15 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   repaint. Unit tests can't see this ordering: drive a real mouse (`fill()` hides it).
 - A skipped DST time takes the offset BEFORE the switch, a repeated one its first pass, east of UTC
   too (`wallToIso` tries the offsets a day either side).
+- **The form keeps the offset its times were opened at** (`startOff`/`endOff`, XERK-3039): a
+  repeated wall time saves in THAT pass. A press on the second "1 AM" row, or an edit of a
+  second-pass event, otherwise saved an hour earlier.
+  - Kept only while the field still reads the wall time it was read at (`startAt`, `keptOff`):
+    a time input's `change` fires per segment, so deleting it on change moved a retyped 01:30.
+  - Else a start is its first pass, an end the first pass not before the start; a zone change
+    drops both. A moved start keeps the length in real time (a wall length stretched it).
+  - Android: `startOffset`/`startOffsetAt` (`calKeptOffset`, `ZonedDateTime.ofLocal`), edits via
+    `calMoveStart`/`calSetEnd`/`calSetZone`. Tests: `XERK-3039` in `calendar.test.js`, `CalendarEventsTest`.
 - **Repeat (XERK-2973)**: a Teams-style preset menu named for the start day, Custom (interval +
   unit + days / month mode), Ends never / on date / after N, and a one-line summary.
   - Rule ⇄ control is calendar.js's repeat block; Android's `core/CalendarRepeat.kt` is its port.

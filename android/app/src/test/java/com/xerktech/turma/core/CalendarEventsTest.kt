@@ -179,6 +179,69 @@ class CalendarEventsTest {
         assertEquals(LocalTime.of(9, 0), calDefaultStart(day.plusDays(3), 0, ny))
     }
 
+    @Test fun `XERK-3039 a repeated hour's second pass is kept from the slot or event it opened on`() {
+        val fb = LocalDate.of(2026, 11, 1)
+        val est = java.time.ZoneOffset.ofHours(-5)
+        // A tap on the second "1 AM" row (EST) saves at 1:30 EST, not an hour earlier.
+        val d = calNewEventDraft(fb, LocalTime.of(1, 30), ny, setOf("o"), startOffset = est).copy(subject = "x")
+        val p = calDraftPayload(d)
+        assertEquals("2026-11-01T01:30:00-05:00", p["start"]!!.jsonPrimitive.content)
+        assertEquals("2026-11-01T02:00:00-05:00", p["end"]!!.jsonPrimitive.content)
+        // With no pass named, the first one, as before.
+        assertEquals("2026-11-01T01:30:00-04:00",
+            calDraftPayload(calNewEventDraft(fb, LocalTime.of(1, 30), ny, setOf("o")))["start"]!!.jsonPrimitive.content)
+        // An event served in the second pass saves where it is (a title edit must not move it).
+        val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:a", "orgs": ["o"], "org": "o", "editable": true, "version": 1,
+            "start": "2026-11-01T01:30:00-05:00", "end": "2026-11-01T01:45:00-05:00", "startMs": 1, "endMs": 2,
+            "timeZone": "America/New_York" } ]""").single()
+        val back = calDraftPayload(calDraftOf(ev, ny))
+        assertEquals("2026-11-01T01:30:00-05:00", back["start"]!!.jsonPrimitive.content)
+        assertEquals("2026-11-01T01:45:00-05:00", back["end"]!!.jsonPrimitive.content)
+        // A time moved out of the repeated hour ignores the kept offset.
+        assertEquals("2026-11-01T03:00:00-05:00",
+            calDraftPayload(d.copy(startTime = LocalTime.of(3, 0), endTime = LocalTime.of(3, 30)))["start"]!!.jsonPrimitive.content)
+    }
+
+    @Test fun `XERK-3039 QA editing the times keeps the length in real time, a typed time or another zone is its first pass`() {
+        val fb = LocalDate.of(2026, 11, 1)
+        val edt = java.time.ZoneOffset.ofHours(-4)
+        val est = java.time.ZoneOffset.ofHours(-5)
+        fun open(t: LocalTime, off: java.time.ZoneOffset, len: Long = 15): TurmaEventDraft {
+            val s = java.time.ZonedDateTime.ofLocal(fb.atTime(t), ny, off)
+            val e = s.plusMinutes(len)
+            return calNewEventDraft(fb, t, ny, setOf("o"), startOffset = off)
+                .copy(subject = "x", endDate = e.toLocalDate(), endTime = e.toLocalTime(), endOffset = e.offset, endOffsetAt = e.toLocalDateTime())
+        }
+        fun span(d: TurmaEventDraft) = calDraftPayload(d).let { it["start"]!!.jsonPrimitive.content to it["end"]!!.jsonPrimitive.content }
+        val second = open(LocalTime.of(1, 30), est)
+        // A 15-minute EST event moved to 00:50 stays 15 minutes (a wall-clock length made it 75).
+        assertEquals("2026-11-01T00:50:00-04:00" to "2026-11-01T01:05:00-04:00", span(calMoveStart(second, fb, LocalTime.of(0, 50))))
+        // A start typed into the repeated hour is its first pass, wherever the form opened.
+        assertEquals("2026-11-01T01:00:00-04:00" to "2026-11-01T01:15:00-04:00", span(calMoveStart(second, fb, LocalTime.of(1, 0))))
+        // Re-picking the same start keeps its pass, even through another time first.
+        assertEquals("2026-11-01T01:30:00-05:00", span(calMoveStart(second, fb, LocalTime.of(1, 30))).first)
+        assertEquals("2026-11-01T01:30:00-05:00",
+            span(calMoveStart(calMoveStart(second, fb, LocalTime.of(1, 3)), fb, LocalTime.of(1, 30))).first)
+        // A start moved so the end lands in the second pass keeps the length: 00:30 EDT +60 to 01:00
+        // ends 01:00 EST (an end left on its first pass would make it zero long).
+        assertEquals("2026-11-01T01:00:00-04:00" to "2026-11-01T01:00:00-05:00",
+            span(calMoveStart(open(LocalTime.of(0, 30), edt, 60), fb, LocalTime.of(1, 0))))
+        // The length is real time, not wall: 5h from Oct 31 23:00 EDT (4h on the wall) moved to Nov 2 23:00.
+        val long = calMoveStart(calNewEventDraft(fb.minusDays(1), LocalTime.of(23, 0), ny, setOf("o")).copy(
+            endDate = fb, endTime = LocalTime.of(3, 0)), fb.plusDays(1), LocalTime.of(23, 0))
+        assertEquals("2026-11-03T04:00:00-05:00", span(long).second)
+        // A typed end is the first pass not before the start.
+        assertEquals("2026-11-01T01:30:00-05:00" to "2026-11-01T01:40:00-05:00", span(calSetEnd(second, fb, LocalTime.of(1, 40))))
+        assertEquals("2026-11-01T01:20:00-04:00", span(calSetEnd(open(LocalTime.of(1, 0), edt, 75), fb, LocalTime.of(1, 20))).second)
+        // Another zone drops the kept offsets: Halifax's 01:10 is its first pass, not the kept -04:00.
+        val hal = calSetZone(open(LocalTime.of(1, 10), edt), "America/Halifax")
+        assertEquals("2026-11-01T01:10:00-03:00", span(hal).first)
+        // An all-day event keeps its days when its start moves.
+        val ad = draft("o").copy(allDay = true, endDate = day.plusDays(2))
+        val moved = calMoveStart(ad, day.plusDays(1), ad.startTime)
+        assertEquals(day.plusDays(3), moved.endDate)
+    }
+
     @Test fun `XERK-2972 QA a name with a comma survives an unchanged save, and quoted names parse`() {
         val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:a", "orgs": ["o"], "org": "o", "editable": true, "version": 1,
             "start": "2026-11-16T14:00:00Z", "end": "2026-11-16T15:00:00Z", "startMs": 1, "endMs": 2, "timeZone": "UTC",

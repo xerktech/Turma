@@ -116,7 +116,16 @@ class SessionsBackPositionTest {
         compose.waitForIdle()
 
         // Process death: the saved state comes back, but the new process's fleet has not
-        // loaded yet (the repository's initial state: loading, no hosts).
+        // loaded yet (the repository's initial state: loading, no hosts). The fleet answer is
+        // held until the test releases it, and the old poll stopped: the restored screen's own
+        // start() refreshes at once and the 6s poll runs on a real clock, so either could land
+        // the fleet before "Loading…" was read (a CI flake).
+        val gate = java.util.concurrent.CountDownLatch(1)
+        hub.route("/api/agents") {
+            gate.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            okhttp3.mockwebserver.MockResponse().setHeader("Content-Type", "application/json").setBody(fleetJson)
+        }
+        hub.container.fleet.stop()
         val state = FleetRepository::class.java.getDeclaredField("_state").apply { isAccessible = true }
             .get(hub.container.fleet) as MutableStateFlow<FleetState>
         state.value = FleetState()
@@ -125,6 +134,7 @@ class SessionsBackPositionTest {
         compose.onNodeWithText("Loading…").assertIsDisplayed()
 
         // The fleet lands: the list is where it was, not clamped to the top by the empty one.
+        gate.countDown()
         runBlocking { hub.container.fleet.refresh() }
         compose.waitForIdle()
         compose.onNodeWithText(target).assertIsDisplayed()
