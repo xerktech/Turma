@@ -418,3 +418,4 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   user's zone), widened, then filtered client-side.
 - All tracker text goes through `_tracker_text` (Cc/Cf/Cs/Co/Cn dropped, capped).
 - Network: call on a worker, never the beat. Tests: `TestTicketUpdateEvents`.
+- Delivered into the session working the ticket: `agent-ticket-updates.md` (XERK-3035).
