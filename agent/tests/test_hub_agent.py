@@ -26462,12 +26462,14 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         text = ha._close_ticket_comment({"kind": "not-reproducible",
                                          "note": "ran repro.sh on main: passes"})
         self.assertTrue(ha._ticket_self_authored(
-            sess, {"kind": "comment", "key": self.KEY, "id": "10077"}))
+            sess, {"kind": "comment", "key": self.KEY, "id": "10077", "at": 1_000_500}))
         # The read-back as ADF, no id: the fingerprint still matches.
         self.assertTrue(ha._ticket_self_authored(
-            sess, {"kind": "comment", "key": self.KEY, "body": ha._text_to_adf(text)}))
+            sess, {"kind": "comment", "key": self.KEY, "body": ha._text_to_adf(text),
+                   "at": 1_000_500}))
         self.assertFalse(ha._ticket_self_authored(
-            sess, {"kind": "comment", "key": self.KEY, "id": "1", "body": "a human reply"}))
+            sess, {"kind": "comment", "key": self.KEY, "id": "1", "body": "a human reply",
+                   "at": 1_000_500}))
         # An outcome-less retry pass records it once, never twice.
         sm._apply_closed_tickets()
         self.assertEqual(len(sess["ticketWrites"]), 1)
@@ -59821,22 +59823,115 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         sess = {"ticketWrites": [
             {"u": "a", "t": 1_000_000, "kind": "comment", "key": "XERK-1", "id": "9",
              "fp": ha.ticket_body_fingerprint("hello world")},
+            {"u": "c", "t": 1_000_000, "kind": "comment", "key": "XERK-1",
+             "fp": ha.ticket_body_fingerprint("no id here")},
             {"u": "b", "t": 2_000_000, "kind": "transition", "key": "XERK-1",
-             "fields": ["status"]}]}
+             "fields": ["status"], "to": "inreview"}]}
         sa = ha._ticket_self_authored
-        self.assertTrue(sa(sess, {"kind": "comment", "key": "XERK-1", "id": 9}))
-        self.assertTrue(sa(sess, {"kind": "comment", "key": "XERK-1", "body": "<p>Hello, world</p>"}))
-        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-2", "id": "9"}))
-        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-1", "body": "hello there"}))
-        self.assertTrue(sa(sess, {"kind": "transition", "key": "XERK-1", "at": 2_060_000}))
+        self.assertTrue(sa(sess, {"kind": "comment", "key": "xerk-1", "id": 9, "at": 1_000_000}))
+        # A different id on both sides is a different comment, same words or not.
+        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-1", "id": "20002",
+                                   "body": "Hello world.", "at": 1_000_000}))
+        self.assertTrue(sa(sess, {"kind": "comment", "key": "XERK-1",
+                                  "body": "<p>No, id here</p>", "at": 1_100_000}))
+        # The fingerprint only within its window: days later it is a human "done".
+        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-1", "body": "no id here",
+                                   "at": 1_000_000 + ha.TICKET_SELF_COMMENT_WINDOW_MS + 1}))
+        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-2", "id": "9", "at": 1_000_000}))
+        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-1", "body": "hello there",
+                                   "at": 1_000_000}))
+        self.assertTrue(sa(sess, {"kind": "transition", "key": "XERK-1", "at": 2_060_000,
+                                  "to": "In Review"}))
         self.assertTrue(sa(sess, {"kind": "edit", "key": "XERK-1", "at": 1_950_000,
                                   "fields": ["System.State"]}))
+        # A human moving it back inside the window is not ours.
+        self.assertFalse(sa(sess, {"kind": "transition", "key": "XERK-1", "at": 2_060_000,
+                                   "to": "To Do"}))
         self.assertFalse(sa(sess, {"kind": "edit", "key": "XERK-1", "at": 2_000_000,
                                    "fields": ["summary"]}))
         self.assertFalse(sa(sess, {"kind": "transition", "key": "XERK-1",
                                    "at": 2_000_000 + ha.TICKET_SELF_EDIT_WINDOW_MS + 1}))
-        self.assertFalse(sa(sess, {"kind": "transition", "key": "XERK-1"}))  # no time
-        self.assertFalse(sa({}, {"kind": "comment", "id": "9"}))
+        for bad in ({"kind": "transition", "key": "XERK-1"},                 # no time
+                    {"kind": "transition", "key": "XERK-1", "at": float("nan")},
+                    {"kind": "transition", "key": None, "at": 2_000_000},
+                    {"kind": "transition", "key": "XERK 1", "at": 2_000_000},
+                    {"kind": "comment", "id": "9", "at": 1_000_000}):
+            self.assertFalse(sa(sess, bad), bad)
+        self.assertFalse(sa({}, {"kind": "comment", "key": "XERK-1", "id": "9", "at": 1}))
+
+    def test_a_fieldless_edit_hides_nothing(self):
+        sess = {"ticketWrites": [{"u": "e", "t": 1_000, "kind": "edit", "key": "X-1"}]}
+        for ev in ({"kind": "transition", "key": "X-1", "at": 1_000},
+                   {"kind": "edit", "key": "X-1", "at": 1_000, "fields": ["summary"]},
+                   {"kind": "edit", "key": "X-1", "at": 1_000}):
+            self.assertFalse(ha._ticket_self_authored(sess, ev), ev)
+
+    def test_a_malformed_ledger_never_raises(self):
+        sess = {"ticketWrites": [
+            {"u": "x", "t": 5, "kind": "edit", "key": "X-1", "fields": 7},
+            {"u": "y", "t": 5, "kind": "edit", "key": "X-1", "fields": [["a"], {"b": 1}]},
+            {"u": "z", "t": True, "kind": "transition", "key": "X-1", "fields": ["status"]},
+            "junk", None]}
+        for ev in ({"kind": "edit", "key": "X-1", "at": 5, "fields": "summary"},
+                   {"kind": "edit", "key": "X-1", "at": 5, "fields": [["x"]]},
+                   {"kind": "transition", "key": "X-1", "at": 5, "to": 3}):
+            self.assertFalse(ha._ticket_self_authored(sess, ev), ev)
+
+    # --- shapes QA found ------------------------------------------------------
+
+    def test_the_stdin_body_is_its_own_segments_heredoc(self):
+        cmd = ("cat > pr.md <<'EOF'\nthe PR body\nEOF\ngh pr create -F pr.md && "
+               "jira comment XERK-1 - <<'EOF'\nthe real comment\nEOF")
+        [w] = ha.ticket_writes_from_bash(cmd)
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("the real comment"))
+        two = "jira comment X-1 - <<A && jira comment X-2 - <<B\nfirst\nA\nsecond\nB"
+        self.assertEqual([w["fp"] for w in ha.ticket_writes_from_bash(two)],
+                         [ha.ticket_body_fingerprint("first"), ha.ticket_body_fingerprint("second")])
+
+    def test_redirections_are_not_arguments(self):
+        for cmd in ('jira comment X-1 "text" 2>&1 | tail -3',
+                    'jira comment X-1 "text" >/dev/null 2>&1',
+                    'jira comment X-1 "text" &> log.txt'):
+            [w] = ha.ticket_writes_from_bash(cmd)
+            self.assertEqual(w["fp"], ha.ticket_body_fingerprint("text"), cmd)
+
+    def test_writes_that_did_not_happen_or_are_not_ours(self):
+        self.assertEqual(ha.ticket_writes_from_bash(
+            "curl -G -d q=1 https://x.atlassian.net/rest/api/3/issue/X-1/comment"), [])
+        self.assertEqual(ha.ticket_writes_from_bash('JIRA_SITE=other jira comment X-1 "a"'), [])
+        with mock.patch.object(ha, "JIRA_SITE", "mine.atlassian.net"):
+            self.assertEqual(ha.ticket_writes_from_bash(
+                "curl -X POST https://other.atlassian.net/rest/api/3/issue/X-1/comment "
+                "-d '{\"body\": \"a\"}'"), [])
+        put = "curl -X PUT https://x/rest/api/3/issue/X-1 -d '{\"fields\": {\"summary\": \"s\"}}'"
+        for refused in ('{"errorMessages": ["You do not have permission"], "errors": {}}',
+                        "HTTP/1.1 403 Forbidden\n\n{}",
+                        '{"$id": "1", "message": "VS402", "typeKey": "WorkItemUpdateException"}'):
+            self.assertEqual(self._one("Bash", {"command": put}, result=refused), [], refused)
+
+    def test_a_tool_use_on_a_user_entry_is_never_a_call(self):
+        call = _tw_call("u1", "Bash", {"command": 'jira comment X-1 "a"'})
+        call["type"] = "user"
+        self.assertEqual(self._scan([call, _tw_result("u1")]), [])
+
+    def test_the_jira_helpers_long_options_and_acli_priority(self):
+        [w] = ha.ticket_writes_from_bash('jira edit X-1 --summary "a" --file d.md')
+        self.assertEqual(w["fields"], ["summary", "description"])
+        [w] = ha.ticket_writes_from_bash("acli jira workitem edit --key X-1 --priority High")
+        self.assertEqual(w["fields"], ["priority"])
+
+    def test_pathological_commands_stay_fast(self):
+        for pat in ("<<" + "a" * 31 + " ", "cout<<v<<endl;", "<<<x ", "x<<a\na\n"):
+            cmd = ("jira comment X-1 " + pat * (ha.TICKET_WRITE_CMD_MAX // len(pat)))
+            cmd = cmd[:ha.TICKET_WRITE_CMD_MAX]
+            t = time.monotonic()
+            ha.ticket_writes_from_bash(cmd)
+            self.assertLess(time.monotonic() - t, 0.5, pat)
+
+    def test_azure_html_readback_of_a_bracketed_note_matches(self):
+        text = "Closed: see <unit> output"
+        self.assertEqual(ha.ticket_body_fingerprint(text),
+                         ha.ticket_body_fingerprint(ha.html.escape(text).replace("\n", "<br>")))
 
     # --- persistence ----------------------------------------------------------
 
@@ -59886,6 +59981,24 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["ticketWrites"][1]["id"], "77")
         sm._seed_ticket_writes(sess)                 # idempotent
         self.assertEqual(len(sess["ticketWrites"]), 2)
+
+    def test_a_closed_record_carries_the_ledger_into_resume(self):
+        """The manager's own entries are in no transcript: resume() and
+        resume-any must carry them from the closed record (QA D1)."""
+        sm = self.make_manager()
+        sess = self._sess()
+        w = {"u": "mgr:10077", "t": 1, "kind": "comment", "key": "X-1", "id": "10077"}
+        sess["ticketWrites"] = [w]
+        sm.registry = [sess]
+        sm._remember_closed(sess)
+        rec = next(c for c in sm.closed if c.get("id") == "abcde")
+        self.assertEqual(rec["ticketWrites"], [w])
+        src = inspect.getsource(ha.SessionManager.resume)
+        self.assertIn('"ticketWrites": (rec.get("ticketWrites")', src)
+        self.assertIn('"ticketWrites": closed.get("ticketWrites")',
+                      inspect.getsource(ha.SessionManager.resume_transcript))
+        self.assertIn('"ticketWrites": (extra.get("ticketWrites")',
+                      inspect.getsource(ha.SessionManager._resume_at_cwd))
 
     def test_resume_seed_never_raises(self):
         sm = self.make_manager()

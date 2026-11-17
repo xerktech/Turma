@@ -12112,18 +12112,26 @@ def ticket_body_fingerprint(value):
     text = _tw_text(value)
     if not isinstance(text, str):
         return None
-    text = html.unescape(_TW_MD_LINK_RE.sub("]", _TW_TAG_RE.sub(" ", text[:TICKET_WRITE_CMD_MAX])))
+    text = _TW_MD_LINK_RE.sub("]", _TW_TAG_RE.sub(" ", html.unescape(text[:TICKET_WRITE_CMD_MAX])))
     norm = "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold() if ch.isalnum())
     if not norm:
         return None
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:24]
 
 
-def _tw_write(kind, key, body=None, fields=None):
+def _tw_status(name):
+    """A target status normalized for comparison ("In Review" == "in-review")."""
+    n = "".join(ch for ch in str(name or "").casefold() if ch.isalnum())
+    return n[:64] or None
+
+
+def _tw_write(kind, key, body=None, fields=None, to=None):
     k = _tw_key(key)
     if not k:
         return None
     w = {"kind": kind, "key": k}
+    if kind == "transition" and _tw_status(to):
+        w["to"] = _tw_status(to)
     if kind == "comment" and body is not None:
         fp = ticket_body_fingerprint(body)
         if fp:
@@ -12141,45 +12149,103 @@ def _tw_write(kind, key, body=None, fields=None):
     return w
 
 
+_TW_HEREDOC_OP_RE = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]{0,31})\2")
+_TW_HEREDOC_MARK = "__twheredoc{}__"
+_TW_HEREDOC_MARK_RE = re.compile(r"\A__twheredoc([0-9]{1,3})__\Z")
+# Heredoc operators read per command; more is not a tracker write we can follow.
+_TW_HEREDOCS_MAX = 64
+
+
 def _tw_heredocs(cmd):
-    """(command with heredoc bodies cut out, [bodies]) — bodies are what a
-    `-`/stdin argument reads. An unterminated heredoc leaves the rest as body."""
+    """(command with each heredoc operator replaced by a marker word and its
+    body cut out, [bodies]) — so a `-`/stdin argument reads the body of ITS OWN
+    segment's heredoc (`_tw_segments`). Linear: each `<<` is matched at its own
+    position with a bounded pattern, and a line's bodies are read once, in order,
+    after its newline. A here-string (`<<<`) is not a heredoc; an unterminated
+    body runs to the end."""
     bodies, out, pos = [], [], 0
-    while True:
-        m = _TW_HEREDOC_RE.search(cmd, pos)
+    pending = []          # delimiters whose bodies follow the current line
+    nl = -2               # the current line's newline, found once per line
+    i = cmd.find("<<", pos)
+    while i >= 0 and len(bodies) + len(pending) < _TW_HEREDOCS_MAX:
+        if nl != -1 and nl < i:
+            nl = cmd.find("\n", i)
+        if cmd.startswith("<<<", i) or (i > 0 and cmd[i - 1] == "<"):
+            j = i + 3
+            while j < len(cmd) and cmd[j] == "<":
+                j += 1
+            i = cmd.find("<<", j)
+            continue
+        m = _TW_HEREDOC_OP_RE.match(cmd, i)
         if not m:
-            out.append(cmd[pos:])
+            i = cmd.find("<<", i + 2)
+            continue
+        out.append(cmd[pos:i])
+        out.append(" " + _TW_HEREDOC_MARK.format(len(bodies) + len(pending)) + " ")
+        pending.append((m.group(3), m.group(1) == "-"))
+        pos = m.end()
+        nxt = cmd.find("<<", pos)
+        if nl < 0:
             break
-        out.append(cmd[pos:m.end()])
-        delim = m.group(2)
-        end = re.compile(r"^[ \t]*" + re.escape(delim) + r"[ \t]*$", re.M).search(cmd, m.end())
-        if not end:
-            bodies.append(cmd[m.end():])
-            break
-        bodies.append(cmd[m.end():end.start()])
-        out.append("\n")
-        pos = end.end()
+        if nxt >= 0 and nxt < nl:
+            i = nxt
+            continue
+        # End of this line: read every queued body, in order.
+        out.append(cmd[pos:nl + 1])
+        pos = nl + 1
+        for delim, tabs in pending:
+            end = re.compile(r"^" + (r"\t*" if tabs else "") + re.escape(delim) + r"[ \t]*$",
+                             re.M).search(cmd, pos)
+            if not end:
+                bodies.append(cmd[pos:])
+                pos = len(cmd)
+                break
+            bodies.append(cmd[pos:end.start()])
+            pos = end.end()
+        pending = []
+        i = cmd.find("<<", pos)
+    out.append(cmd[pos:])
+    bodies.extend("" for _ in pending)
     return "".join(out), bodies
 
 
-def _tw_segments(cmd):
+def _tw_segments(cmd, heredocs=()):
+    """[(words, own heredoc bodies)] per simple command. Redirections (`2>&1`,
+    `> f`, `&>f`, `<f`) are dropped with their target, so they never pose as an
+    argument; the heredoc marker words are moved to the segment's own list."""
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|")
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|<>")
         lex.whitespace_split = True
         lex.commenters = ""
         toks = list(lex)
     except ValueError:
         return []
-    segs, cur = [], []
-    for t in toks:
-        if t and set(t) <= set(";&|"):
+    segs, cur, docs, i = [], [], [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t and set(t) <= set(";&|<>"):
+            if "<" in t or ">" in t:
+                # A redirection: a lone fd number right before it is part of it,
+                # and its target (or the `&N` fd) is the next word.
+                if cur and cur[-1].isdigit() and len(cur[-1]) <= 2:
+                    cur.pop()
+                i += 2 if i + 1 < len(toks) and not set(toks[i + 1]) <= set(";&|<>") else 1
+                continue
             if cur:
-                segs.append(cur)
-            cur = []
+                segs.append((cur, docs))
+            cur, docs = [], []
+            i += 1
+            continue
+        m = _TW_HEREDOC_MARK_RE.match(t)
+        if m:
+            n = int(m.group(1))
+            if n < len(heredocs):
+                docs.append(heredocs[n])
         else:
             cur.append(t)
+        i += 1
     if cur:
-        segs.append(cur)
+        segs.append((cur, docs))
     return segs
 
 
@@ -12212,24 +12278,26 @@ def _tw_jira_cli(args, heredocs):
         return []
     verb, rest = args[0], args[1:]
     pos, opts = _tw_opts(rest, {"-s", "-d", "-F", "--add-label", "--remove-label",
-                                "-p", "-t", "-l", "--priority"})
+                                "-p", "-t", "-l", "--priority", "--summary",
+                                "--description", "--file"})
     if not pos:
         return []
     key = pos[0]
     if verb == "comment":
-        body = None if "-F" in opts else _tw_stdin(pos[1] if len(pos) > 1 else None, heredocs)
+        body = None if ("-F" in opts or "--file" in opts) \
+            else _tw_stdin(pos[1] if len(pos) > 1 else None, heredocs)
         w = _tw_write("comment", key, body)
     elif verb == "edit":
         fields = []
-        if "-s" in opts:
+        if "-s" in opts or "--summary" in opts:
             fields.append("summary")
-        if "-d" in opts or "-F" in opts or "-" in pos[1:]:
+        if any(o in opts for o in ("-d", "-F", "--description", "--file")) or "-" in pos[1:]:
             fields.append("description")
         if "--add-label" in opts or "--remove-label" in opts:
             fields.append("labels")
         w = _tw_write("edit", key, fields=fields)
     elif verb == "transition" and len(pos) > 1:
-        w = _tw_write("transition", key)
+        w = _tw_write("transition", key, to=pos[1])
     elif verb == "assign":
         w = _tw_write("edit", key, fields=["assignee"])
     else:
@@ -12245,7 +12313,8 @@ def _tw_acli(args, heredocs):
     sub = words[3] if len(words) > 3 else ""
     _, opts = _tw_opts(args, {"--key", "-k", "--body", "-b", "--summary", "--description",
                               "--status", "-s", "--assignee", "-a", "--labels", "--type",
-                              "--body-file", "--from-file", "--jql", "--project"})
+                              "--body-file", "--from-file", "--jql", "--project",
+                              "--priority"})
     key = opts.get("--key") or opts.get("-k")
     if not isinstance(key, str):
         return []
@@ -12253,12 +12322,13 @@ def _tw_acli(args, heredocs):
         body = opts.get("--body", opts.get("-b"))
         w = _tw_write("comment", key, _tw_stdin(body, heredocs) if isinstance(body, str) else None)
     elif verb == "transition":
-        w = _tw_write("transition", key)
+        to = opts.get("--status", opts.get("-s"))
+        w = _tw_write("transition", key, to=to if isinstance(to, str) else None)
     elif verb == "assign":
         w = _tw_write("edit", key, fields=["assignee"])
     elif verb == "edit":
         w = _tw_write("edit", key, fields=[o for o in opts if o in (
-            "--summary", "--description", "--assignee", "--labels", "--type")])
+            "--summary", "--description", "--assignee", "--labels", "--type", "--priority")])
     else:
         w = None
     return [w] if w else []
@@ -12284,8 +12354,8 @@ def _tw_az(args, heredocs):
         fields += [p.split("=", 1)[0] for p in fv.split() if "=" in p]
     if fields:
         out.append(_tw_write("edit", key, fields=fields))
-    if "--state" in opts:
-        out.append(_tw_write("transition", key))
+    if isinstance(opts.get("--state"), str):
+        out.append(_tw_write("transition", key, to=opts["--state"]))
     return [w for w in out if w]
 
 
@@ -12293,6 +12363,8 @@ def _tw_curl(args, heredocs):
     _, opts = _tw_opts(args, {"-X", "--request", "-d", "--data", "--data-raw",
                               "--data-binary", "--json", "-H", "--header", "-u",
                               "--user", "-o", "--output", "-w", "--url"})
+    if "-G" in opts or "--get" in opts:
+        return []  # -d becomes the query string of a GET
     method = str(opts.get("-X") or opts.get("--request") or "").upper()
     data = next((opts[f] for f in ("--json", "-d", "--data", "--data-raw", "--data-binary")
                  if isinstance(opts.get(f), str)), None)
@@ -12309,6 +12381,8 @@ def _tw_curl(args, heredocs):
         urls.insert(0, opts["--url"])
     for url in urls:
         m = _TW_JIRA_URL_RE.search(url)
+        if m and not _tw_board_host(url, "jira"):
+            return []  # another site's ticket of the same key
         if m:
             key, tail = m.group(1), m.group(2)
             if tail == "comment" and method == "POST":
@@ -12321,6 +12395,8 @@ def _tw_curl(args, heredocs):
                 w = None
             return [w] if w else []
         m = _TW_AZDO_URL_RE.search(url)
+        if m and not _tw_board_host(url, "azure"):
+            return []
         if m:
             key, tail = m.group(1), m.group(2)
             if tail == "comments" and method == "POST":
@@ -12332,6 +12408,22 @@ def _tw_curl(args, heredocs):
                 w = None
             return [w] if w else []
     return []
+
+
+def _tw_board_host(url, kind):
+    """False when `url` plainly names another host than this host's board (an
+    unset board, or a URL with no host, says nothing)."""
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+        if not host:
+            return True
+        if kind == "jira":
+            site = normalize_jira_site(JIRA_SITE) if JIRA_SITE else ""
+            return not site or host == site.split("/")[0].split(":")[0].lower()
+        base = AZDO_URL and urllib.parse.urlsplit(AZDO_URL).hostname
+        return not base or host == base.lower()
+    except (ValueError, TypeError):
+        return True
 
 
 def _tw_payload_fields(body):
@@ -12353,6 +12445,7 @@ def _tw_payload_fields(body):
 
 
 _TW_PROGRAMS = {"jira": _tw_jira_cli, "acli": _tw_acli, "az": _tw_az, "curl": _tw_curl}
+_TW_PROGRAM_HINT_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:jira|acli|az|curl)(?![A-Za-z0-9_.-])")
 
 
 def ticket_writes_from_bash(cmd):
@@ -12363,18 +12456,23 @@ def ticket_writes_from_bash(cmd):
     COMMAND words (shlex), never its output. [] for anything else."""
     if not isinstance(cmd, str) or not cmd or len(cmd) > TICKET_WRITE_CMD_MAX:
         return []
+    if not _TW_PROGRAM_HINT_RE.search(cmd):
+        return []  # cheap prefilter: most commands name no tracker program
     stripped, heredocs = _tw_heredocs(cmd)
     out = []
-    for seg in _tw_segments(stripped)[:64]:
-        i = 0
-        while i < len(seg) and (re.match(r"\A[A-Za-z_][A-Za-z0-9_]*=", seg[i])
+    for seg, docs in _tw_segments(stripped, heredocs)[:64]:
+        i, other_board = 0, False
+        while i < len(seg) and (re.match(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}=", seg[i])
                                 or seg[i] in ("env", "command", "exec", "sudo", "time")):
+            # A write pointed at another board (`JIRA_SITE=x jira …`) is not ours.
+            if re.match(r"\A(?:JIRA_SITE|AZDO_URL|AZURE_DEVOPS_EXT_PAT)=", seg[i]):
+                other_board = True
             i += 1
-        if i >= len(seg):
+        if i >= len(seg) or other_board:
             continue
         fn = _TW_PROGRAMS.get(os.path.basename(seg[i]))
         if fn:
-            out += fn(seg[i + 1:], heredocs)
+            out += fn(seg[i + 1:], docs)
     return out[:8]
 
 
@@ -12401,8 +12499,10 @@ def ticket_writes_from_mcp(name, inp):
         fields = [u.get("path") for u in ups[:32] if isinstance(u, dict)] \
             if isinstance(ups, list) else []
         names = [_tw_field(f) for f in fields]
+        to = next((u.get("value") for u in ups if isinstance(u, dict)
+                   and _tw_field(u.get("path")) == "status"), None) if names == ["status"] else None
         w = _tw_write("transition" if names == ["status"] else "edit",
-                      inp.get("id"), fields=fields)
+                      inp.get("id"), fields=fields, to=to if isinstance(to, str) else None)
     else:
         w = None
     return [w] if w else []
@@ -12429,6 +12529,28 @@ def _tw_result_id(text):
             if isinstance(v, int) or (isinstance(v, str) and re.fullmatch(r"[0-9A-Za-z_-]{1,64}", v)):
                 return str(v)
     return None
+
+
+def _tw_result_failed(text):
+    """True when the tool's own output is a tracker REFUSAL body (Jira's
+    `errorMessages`/`errors`, ADO's `typeKey`+`message`) or an HTTP 4xx/5xx
+    status line: the command exited 0 but nothing was written."""
+    if not isinstance(text, str) or len(text) > TICKET_WRITE_RESULT_MAX:
+        return False
+    if re.search(r"^HTTP/[0-9.]{1,3} [45][0-9]{2}\b", text[:4096], re.M):
+        return True
+    s = text.strip()
+    for c in [s] + [ln.strip() for ln in s.splitlines()[-20:]]:
+        if not c.startswith("{"):
+            continue
+        try:
+            data = json.loads(c)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(data, dict) and (data.get("errorMessages") or data.get("errors")
+                                       or (data.get("typeKey") and data.get("message"))):
+            return True
+    return False
 
 
 def _scan_ticket_write_entry(entry, state, report):
@@ -12468,8 +12590,11 @@ def _scan_ticket_write_entry(entry, state, report):
             tur = entry.get("toolUseResult")
             if isinstance(tur, dict) and tur.get("backgroundTaskId"):
                 continue  # still running: its outcome is not known here
+            text = _tool_result_text(block.get("content"))
+            if _tw_result_failed(text):
+                continue  # curl exits 0 on an HTTP 4xx: the tracker refused it
             t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
-            cid = _tw_result_id(_tool_result_text(block.get("content")))
+            cid = _tw_result_id(text)
             out = report.setdefault("ticketWrites", [])
             for n, w in enumerate(writes):
                 rec = {"u": f"{bid}:{n}", "t": t, **w}
@@ -12496,46 +12621,81 @@ def merge_ticket_writes(writes, new):
     return cur, changed
 
 
+TICKET_SELF_COMMENT_WINDOW_MS = 600_000
+
+
 def _ticket_self_authored(sess, event):
     """Did this session (or its manager on its behalf) make this ticket change?
-    `event` = {kind: comment|edit|transition, key, id?, body?, fields?, at?}
-    (`at` epoch ms; `fields` in the `_tw_field` vocabulary: status, summary,
-    description, assignee, labels, priority, …). Matched against the record's
-    `ticketWrites`: the comment id first, then the body fingerprint, then an
-    edit/transition of an overlapping field within TICKET_SELF_EDIT_WINDOW_MS.
-    False when nothing matches — a miss delivers the update, never hides one."""
+    `event` = {kind: comment|edit|transition, key, at, id?, body?, fields?, to?}
+    (`at` epoch ms of the change; `fields` in the `_tw_field` vocabulary:
+    status, summary, description, assignee, labels, priority, …; `to` a
+    transition's target status). Matched against the record's `ticketWrites`,
+    same key only:
+      * a comment by id when both sides carry one (a different id is a
+        different comment), else by body fingerprint within
+        TICKET_SELF_COMMENT_WINDOW_MS;
+      * an edit/transition by an OVERLAPPING field within
+        TICKET_SELF_EDIT_WINDOW_MS (a write that names no field matches
+        nothing), and a transition only to the same target status when both
+        sides name one.
+    False whenever unsure — a miss delivers the update, never hides one. Never
+    raises (the ledger is a record field anyone may have hand-edited)."""
+    try:
+        return _ticket_self_authored_inner(sess, event)
+    except Exception:
+        return False
+
+
+def _tw_names(value):
+    if not isinstance(value, (list, tuple)):
+        return set()
+    return {_tw_field(f) for f in value if isinstance(f, str)} - {None}
+
+
+def _ticket_self_authored_inner(sess, event):
     if not isinstance(sess, dict) or not isinstance(event, dict):
         return False
     writes = sess.get("ticketWrites")
-    if not isinstance(writes, list) or not writes:
+    key = _tw_key(event.get("key"))
+    at = event.get("at")
+    if not isinstance(writes, list) or not key or isinstance(at, bool) \
+            or not isinstance(at, (int, float)) or not math.isfinite(at):
         return False
-    key = _tw_key(event.get("key")) if event.get("key") is not None else None
-    writes = [w for w in writes if isinstance(w, dict)
-              and (key is None or w.get("key") == key)]
+    writes = [w for w in writes if isinstance(w, dict) and w.get("key") == key
+              and isinstance(w.get("t"), int) and not isinstance(w.get("t"), bool)]
     kind = event.get("kind")
     if kind == "comment":
         eid = event.get("id")
-        if eid is not None and any(w.get("kind") == "comment" and w.get("id") == str(eid)
-                                   for w in writes):
-            return True
+        eid = str(eid) if isinstance(eid, (int, str)) and not isinstance(eid, bool) else None
         fp = ticket_body_fingerprint(event.get("body")) if event.get("body") is not None else None
-        return bool(fp) and any(w.get("kind") == "comment" and w.get("fp") == fp for w in writes)
-    if kind in ("edit", "transition"):
-        at = event.get("at")
-        if not isinstance(at, (int, float)) or isinstance(at, bool):
-            return False
-        efields = {_tw_field(f) for f in (event.get("fields") or [])} - {None}
-        if kind == "transition":
-            efields.add("status")
         for w in writes:
-            if w.get("kind") not in ("edit", "transition"):
+            if w.get("kind") != "comment":
                 continue
-            t = w.get("t")
-            if not isinstance(t, int) or abs(at - t) > TICKET_SELF_EDIT_WINDOW_MS:
+            wid = w.get("id") if isinstance(w.get("id"), str) else None
+            if eid and wid:
+                if eid == wid:
+                    return True
                 continue
-            wfields = set(w.get("fields") or [])
-            if not efields or not wfields or efields & wfields:
+            if fp and w.get("fp") == fp and abs(at - w["t"]) <= TICKET_SELF_COMMENT_WINDOW_MS:
                 return True
+        return False
+    if kind not in ("edit", "transition"):
+        return False
+    efields = _tw_names(event.get("fields"))
+    if kind == "transition":
+        efields.add("status")
+    eto = _tw_status(event.get("to")) if isinstance(event.get("to"), str) else None
+    for w in writes:
+        if w.get("kind") not in ("edit", "transition") \
+                or abs(at - w["t"]) > TICKET_SELF_EDIT_WINDOW_MS:
+            continue
+        shared = efields & _tw_names(w.get("fields"))
+        if not shared:
+            continue
+        wto = w.get("to") if isinstance(w.get("to"), str) else None
+        if shared == {"status"} and eto and wto and eto != wto:
+            continue
+        return True
     return False
 
 
@@ -36363,6 +36523,10 @@ class SessionManager:
             # transcript's end, so its QA history is partial from here on.
             "modelActual": rec.get("modelActual"),
             "qaRuns": rec.get("qaRuns") if isinstance(rec.get("qaRuns"), list) else [],
+            # The own-ticket-write ledger (XERK-3034): the manager's entries are
+            # in no transcript, so the re-seed below cannot bring them back.
+            "ticketWrites": (rec.get("ticketWrites")
+                             if isinstance(rec.get("ticketWrites"), list) else []),
             "qaPartial": True,
             # Re-gate the runtime on rebuild, like receive_migration does: a
             # persisted "dsh"/"qwen" falls back to claude when this host does not
@@ -36529,7 +36693,9 @@ class SessionManager:
                   "summary": closed.get("summary"),
                   "summaryManual": closed.get("summaryManual"),
                   # The branch its tree was on, for a re-created worktree (XERK-2482).
-                  "lastBranch": closed.get("lastBranch")}
+                  "lastBranch": closed.get("lastBranch"),
+                  # Own ticket writes the transcript cannot re-derive (XERK-3034).
+                  "ticketWrites": closed.get("ticketWrites")}
                  if closed else None)
         # No closed record (an older agent's, or one aged out of
         # CLOSED_PER_REPO) knows no lastBranch: take the branch the transcript
@@ -36688,6 +36854,8 @@ class SessionManager:
             "ticket": extra.get("ticket"),
             "migratedFrom": extra.get("migratedFrom"),
             "lastBranch": extra.get("lastBranch"),
+            "ticketWrites": (extra.get("ticketWrites")
+                             if isinstance(extra.get("ticketWrites"), list) else []),
             # A session that was ALREADY named (XERK-815) must come back already
             # ANSWERING to that name, not to a launch slug the rc-name reconciler
             # then has to `/rename` away on the first idle beat. That `/rename`
