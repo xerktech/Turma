@@ -213,3 +213,20 @@ test("XERK-2953: reanchorDays moves an explicit day with a moved anchor, so it i
   assert.equal(r.sameDays(r.sanitizeRule({ freq: "weekly", byDay: ["WE", "MO"] }), r.sanitizeRule({ freq: "weekly", byDay: ["MO", "WE"] })), true);
   assert.equal(r.sameDays({ freq: "monthly", interval: 1 }, { freq: "monthly", interval: 1, byMonthDay: 3 }), false);
 });
+
+test("XERK-3041: a series started at the SECOND 1:30 of a fall-back day keeps its own first instant", () => {
+  const s = series("2027-11-07T06:30:00Z", "2027-11-07T07:30:00Z", { freq: "daily", interval: 1, count: 3 });
+  const occ = r.occurrences(s, 0, Infinity, 5);
+  assert.deepEqual(occ.map((o) => o.key), ["2027-11-07T06:30:00Z", "2027-11-08T06:30:00Z", "2027-11-09T06:30:00Z"]);
+  assert.deepEqual(occ.map((o) => o.endMs - o.startMs), [36e5, 36e5, 36e5]);
+  assert.ok(r.occurrenceAt(s, "2027-11-07T06:30:00Z"), "the anchor's own key resolves");
+  assert.equal(r.occurrenceAt(s, "2027-11-07T05:30:00Z"), null, "the first 1:30 is not an occurrence");
+  // A range cut around the anchor still finds it.
+  assert.deepEqual(keys(s, ms("2027-11-07T06:00:00Z"), ms("2027-11-07T07:00:00Z")), ["2027-11-07T06:30:00Z"]);
+});
+
+test("XERK-3041: an anchor whose END falls in the repeated hour keeps its stored end", () => {
+  const s = series("2027-11-07T05:00:00Z", "2027-11-07T06:45:00Z", { freq: "daily", interval: 1, count: 2 });
+  const occ = r.occurrences(s, 0, Infinity, 5);
+  assert.equal(occ[0].endMs - occ[0].startMs, 105 * 60e3, "the anchor is exactly its stored instance");
+});
