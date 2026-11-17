@@ -33,6 +33,18 @@ The ticket-update poller must not hand a session back its own comment or status 
   `heredocs[0]`); redirections (`2>&1`, `> f`) are dropped with their target; `curl -G`, a write
   aimed at another board host or under a `JIRA_SITE=`/`AZDO_URL=` prefix, and a result that is a
   tracker refusal body or HTTP 4xx/5xx (curl exits 0) are not writes.
+- **A body read from a FILE is fingerprinted from the file** (XERK-3042, `_TwFile`,
+  `_tw_file_fingerprint`): `-F f`, `- < f`, `cat f |`, curl `-d @f`, acli `--body-file`, az
+  `--discussion @f`. The command text never holds those words, so without it the session's own
+  comment was echoed back as someone else's.
+  - **Read at the call's TOOL_RESULT, never its tool_use** (`resolve_ticket_write_files`): a session
+    writes the file and posts it in ONE command, so at tool_use time the file is absent or still
+    holds the previous comment (whose fp would hide nothing real but miss this one).
+  - `stat` says regular BEFORE any open (opening a FIFO releases its blocked writer), bounded read;
+    a relative path resolves against the entry's own `cwd`, never through `$`, and never when ANY
+    `cd`/`pushd`/`popd` appears before it, quoted scripts too (`{ cd x;`, `eval 'cd x'`).
+  - A file changed or gone before the scan (or a restart re-seed) just yields no match: delivered.
+  - A segment's stdin is its LAST heredoc, here-string or fd-0 `<` redirect, as bash reads it.
 - **Beat cost**: a substring prefilter skips commands naming no tracker program; the heredoc scan
   finds each line's newline once (the regex form was quadratic: 2s on a 64 KiB `<<` line).
 - **The ledger lives on the record, never re-derived per beat**: a restart primes the scan to EOF.
