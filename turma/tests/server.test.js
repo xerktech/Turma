@@ -34211,6 +34211,45 @@ test("XERK-2969: 'following' splits the series into two; a count is shared out; 
   }
 });
 
+test("XERK-3040: a series anchored on the spring-forward gap repeats the wall time and length it was given", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const NY = "America/New_York";
+    const span = async (id, from, until) => (await calGet2891(Date.parse(from), Date.parse(until))).body.events
+      .filter((e) => e.seriesId === id).map((e) => [e.start, (e.endMs - e.startMs) / 6e4]);
+    // Case 1: weekly Sunday 01:00-02:00; "this and following" from 03-14 ends at 02:30, a
+    // time that day skips (the web client sends 02:30 with the old offset).
+    const w = (await turma2968("POST", null, ev2968([S2968A], { timeZone: NY, start: "2027-03-07T01:00:00-05:00",
+      end: "2027-03-07T02:00:00-05:00", recurrence: { freq: "weekly" } }))).body.event;
+    const sp = await turma2968("PATCH", `${w.id}:2027-03-14T06:00:00Z`, { version: 1, scope: "following",
+      start: "2027-03-14T01:00:00-05:00", end: "2027-03-14T02:30:00-05:00" });
+    assert.equal(sp.status, 200, JSON.stringify(sp.body));
+    assert.equal(sp.body.event.wall, undefined, "the hint is never served");
+    assert.deepEqual(await span(sp.body.event.id, "2027-03-13T00:00:00Z", "2027-03-29T00:00:00Z"),
+      [["2027-03-14T06:00:00Z", 90], ["2027-03-21T05:00:00Z", 90], ["2027-03-28T05:00:00Z", 90]]);
+    // Case 2: a daily 02:30 series re-timed onto the gap day stays at 02:30 after it.
+    const d = (await turma2968("POST", null, ev2968([S2968A], { timeZone: NY, start: "2027-03-10T02:30:00-05:00",
+      end: "2027-03-10T03:00:00-05:00", recurrence: { freq: "daily" } }))).body.event;
+    const mv = await turma2968("PATCH", `${d.id}:2027-03-10T07:30:00Z`, { version: 1, scope: "following",
+      start: "2027-03-14T02:30:00-05:00", end: "2027-03-14T04:00:00-04:00" });
+    assert.equal(mv.status, 200, JSON.stringify(mv.body));
+    const after = await span(mv.body.event.id, "2027-03-14T00:00:00Z", "2027-03-17T00:00:00Z");
+    assert.deepEqual(after.map(([s]) => s), ["2027-03-14T07:30:00Z", "2027-03-15T06:30:00Z", "2027-03-16T06:30:00Z"]);
+    assert.deepEqual(after.map(([, m]) => m), [30, 90, 90], "02:30-04:00 on the wall; the gap day is 30 min real");
+    // An edit that keeps the instants (a subject) keeps the hint; the store echo is a fixed point.
+    const id = mv.body.event.id;
+    const rec = hub.getCalendarTurmaEvents()[""][id];
+    assert.deepEqual(rec.wall, { tod: 9e6, len: 54e5 });
+    const ed = await turma2968("PATCH", `${id}:2027-03-15T06:30:00Z`, { version: mv.body.event.version, scope: "series", subject: "x" });
+    assert.equal(ed.status, 200, JSON.stringify(ed.body));
+    assert.deepEqual(hub.getCalendarTurmaEvents()[""][id].wall, { tod: 9e6, len: 54e5 });
+    assert.deepEqual((await span(id, "2027-03-15T00:00:00Z", "2027-03-16T00:00:00Z")).map(([s]) => s), ["2027-03-15T06:30:00Z"]);
+  } finally {
+    cleanup2968(D2968A);
+  }
+});
+
 test("XERK-2969: expansion is bounded by CALENDAR_SERVE_MAX per request and says it was cut", async () => {
   cleanup2968(D2968A);
   try {

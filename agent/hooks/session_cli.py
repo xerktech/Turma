@@ -454,8 +454,14 @@ __ATTACH__
           if ([int]$rec.type -eq 3) { $pat.Instance = [int]$rec.instance }
           $pat.Interval = [int]$rec.interval
           $pat.PatternStartDate = $ws.Date
-          $pat.StartTime = $ws
-          $pat.Duration = [int][Math]::Round(($we - $ws).TotalMinutes)
+          if ($null -ne $rec.wallTod) {
+            # A gap anchor (XERK-3040): the wall time and length it was given.
+            $pat.StartTime = $ws.Date.AddMilliseconds([double]$rec.wallTod)
+            $pat.Duration = [int][Math]::Round([double]$rec.wallLen / 60000)
+          } else {
+            $pat.StartTime = $ws
+            $pat.Duration = [int][Math]::Round(($we - $ws).TotalMinutes)
+          }
           if ([int]$rec.count -gt 0) { $pat.Occurrences = [int]$rec.count }
           elseif ($rec.until) {
             $u = @($rec.until)
@@ -1337,6 +1343,13 @@ def prepare_calendar_write(cmd) -> dict:
     rule = ev.get("recurrence")
     if rule is not None:
         fields["recurrence"] = outlook_recurrence(rule)
+        # The anchor's wall start/length when its instants cannot carry it (a start in
+        # or across a spring-forward gap, XERK-3040): what turma/recurrence.js repeats.
+        wall = ev.get("wall")
+        if isinstance(wall, dict) and _rule_int(wall.get("tod"), 0, 86399999) \
+                and _rule_int(wall.get("len"), 0, 31 * 86400000):
+            fields["recurrence"]["wallTod"] = wall["tod"]
+            fields["recurrence"]["wallLen"] = wall["len"]
         # An occurrence's body merges the series' body as WRITTEN: a private
         # series' text never reaches an occurrence made public, even when the
         # hub sent it unwithheld.

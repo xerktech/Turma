@@ -6094,7 +6094,9 @@ const CALENDAR_TURMA_EXCEPTIONS_MAX = 100;        // per series
 const CALENDAR_CANDIDATE_WORK_MAX = 20000;
 const calIsoZ = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 const calTurmaSeries = (rec) => (rec && rec.recurrence
-  ? { startMs: rec.startMs, endMs: rec.endMs, timeZone: rec.timeZone, rule: rec.recurrence } : null);
+  ? { startMs: rec.startMs, endMs: rec.endMs, timeZone: rec.timeZone, rule: rec.recurrence, wall: rec.wall } : null);
+// The wall time an ISO stamp's own fields name (read as UTC), offset dropped.
+const calLocalWall = (iso) => Date.parse(iso.replace(/(?:Z|[+-]\d{2}:\d{2})$/, "") + "Z");
 
 // An IANA zone the runtime knows, in its canonical spelling (so the coerce is a
 // fixed point), else "".
@@ -6150,6 +6152,13 @@ function sanitizeTurmaEvent(v, t) {
     version: Number.isSafeInteger(v.version) && v.version >= 1 ? v.version : 1,
     outlook: calOutlookSanitize(v.outlook, orgs, t),
   };
+  // A series anchored in or across a spring-forward gap keeps the WALL start/length it
+  // was given (XERK-3040), which its instants cannot carry: `{tod, len}` ms, from the
+  // sent strings' own fields, else the hint it had. Hub-internal: never served.
+  if (out.recurrence) {
+    const wall = recurrence.wallHint(startMs, endMs, out.timeZone, calLocalWall(start), calLocalWall(end), v.wall);
+    if (wall) out.wall = wall;
+  }
   // Every series a chain of "following" splits made this one from, nearest first
   // (XERK-3014): an unsettled sent copy of any still covers these occurrences, and all
   // are kept so deleting a middle one cannot cut the chain. Hub-internal: never
@@ -6756,7 +6765,7 @@ function turmaEventWire(p, rec, served = rec.orgs, occKey = "") {
   // A series' exceptions ride its occurrences, never the wire; nor do its copies' hosts and ids.
   // Nor does `createdBy`: it names the creator's hub user id, which no client reads (`editable`
   // says who may change it), and a private event must not tell every org viewer who made it (XERK-2953).
-  const { exceptions, outlook, createdBy, splitFrom, ...fields } = rec;
+  const { exceptions, outlook, createdBy, splitFrom, wall, ...fields } = rec;
   const out = { source: "turma", host: "", ...fields, orgs: served, org: served[0] || "",
     outlook: calOutlookWire(outlook, served),
     seriesId: rec.recurrence ? rec.id : "", recurring: !!rec.recurrence,
@@ -7159,8 +7168,11 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   const fields = calPick(body);
   if (sc.scope === "series" && shown) {
     // Moving one occurrence "for the series" moves the series by the same amount.
-    if ("start" in body && calIso(body.start)) fields.start = calIsoZ(f.rec.startMs + Date.parse(body.start) - shown.startMs);
-    if ("end" in body && calIso(body.end)) fields.end = calIsoZ(f.rec.endMs + Date.parse(body.end) - shown.endMs);
+    // The sent string itself when it names the moved instant (the first occurrence): its
+    // wall fields are the time picked, which a DST-gap anchor needs (XERK-3040).
+    const moved = (sent, ms) => (Date.parse(sent) === ms ? sent : calIsoZ(ms));
+    if ("start" in body && calIso(body.start)) fields.start = moved(body.start, f.rec.startMs + Date.parse(body.start) - shown.startMs);
+    if ("end" in body && calIso(body.end)) fields.end = moved(body.end, f.rec.endMs + Date.parse(body.end) - shown.endMs);
     // Moving a later occurrence back by its delta can take the FIRST one before 1970.
     if (!(Date.parse(fields.start || f.rec.start) > 0)) {
       return { status: 400, body: { error: "this would move the series' first occurrence before 1970-01-01T00:00:00Z" } };
@@ -7466,6 +7478,7 @@ function calWriteEvent(rec, org) {
     exceptions[k] = !x.deleted && hide(x.sensitivity ?? rec.sensitivity) ? { ...x, ...CAL_WRITE_WITHHELD } : x;
   }
   const ev = { subject: rec.subject, start: rec.start, end: rec.end, timeZone: rec.timeZone, allDay: rec.allDay,
+    ...(rec.recurrence && rec.wall ? { wall: rec.wall } : {}),
     location: rec.location, body: rec.body, attendees: rec.attendees, joinUrl: rec.joinUrl, busy: rec.busy,
     categories: rec.categories, sensitivity: rec.sensitivity, recurrence: rec.recurrence, exceptions,
     sendInvites: calTurmaSends(rec, org),

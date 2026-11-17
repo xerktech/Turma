@@ -1511,6 +1511,40 @@ class CalendarRecurrenceWriteTest(unittest.TestCase):
                          (self.key(moved_from), "Moved", self.key(moved_to)))
         self.assertIsNone(occ["location"])       # only the overridden fields are set
 
+    def test_xerk3040_a_gap_anchor_writes_the_wall_time_recurrence_js_repeats(self):
+        """A series anchored on the spring-forward gap: the hub's `wall` hint sets the
+        pattern's time and length, so Outlook repeats what recurrence.js expands."""
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        ny = "America/New_York"
+        cases = [  # (start UTC ms, end UTC ms, wall, rule, want time, want minutes)
+            (self.utc("2027-03-14T01:00", ny), self.utc("2027-03-14T01:00", ny) + 90 * 60000,
+             {"tod": 3600000, "len": 5400000}, {"freq": "weekly", "interval": 1, "count": 4}, "01:00:00", 90),
+            (self.utc("2027-03-14T03:30", ny), self.utc("2027-03-14T04:00", ny),
+             {"tod": 9000000, "len": 1800000}, {"freq": "daily", "interval": 1, "count": 5}, "02:30:00", 30)]
+        cmds = []
+        for i, (s, e, wall, rule, _, _) in enumerate(cases):
+            ev = {"subject": f"G{i}", "start": self.key(s), "end": self.key(e), "timeZone": ny,
+                  "allDay": False, "recurrence": rule, "exceptions": {}, "wall": wall}
+            cmds.append({"op": "upsert", "turmaId": f"turma:{i:016x}", "outlookId": "", "event": ev})
+        got, err = self.run_write(cmds)
+        self.assertEqual([r["ok"] for r in got], [True, True], got)
+        patterns = [json.loads(l[8:]) for l in err if l.startswith("PATTERN ")]
+        want = self.node_keys([{"series": {"startMs": s, "endMs": e, "timeZone": ny, "rule": rule, "wall": wall},
+                                "lo": s, "hi": s + 60 * 86400000} for s, e, wall, rule, _, _ in cases])
+        zone = ZoneInfo(ny)
+        for (s, _, _, _, time, minutes), p, w in zip(cases, patterns, want):
+            self.assertEqual((p["time"], p["duration"]), (time, minutes))
+            hm = dt.time.fromisoformat(p["time"])
+            keys = [self.key(int(dt.datetime.combine(d, hm, zone).timestamp() * 1000))
+                    for d in _outlook_dates(p, dt.date(2027, 6, 1))]
+            self.assertEqual(keys, w)
+        # An older hub sends no hint: the anchor's instants, as before.
+        del cmds[1]["event"]["wall"]
+        _, err = self.run_write([cmds[1]])
+        (p,) = [json.loads(l[8:]) for l in err if l.startswith("PATTERN ")]
+        self.assertEqual((p["time"], p["duration"]), ("03:30:00", 30))
+
     def test_a_rewrite_clears_the_old_series_first(self):
         c = self.cmd(1, *self.CASES[0])
         got, err = self.run_write([c, dict(c, outlookId="E1")])

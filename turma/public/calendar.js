@@ -1393,8 +1393,10 @@ function addYmd(ymd, n) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
 }
 // A wall date + time in `tz` as the ISO-with-offset the hub requires, or null.
-// A time a DST gap skips lands on the instant the old offset names; the ISO is
-// always that instant's own wall time + offset, so it parses back to itself.
+// A time a DST gap skips lands on the instant the old offset names, and its ISO is
+// the time as picked + that old offset (02:30-05:00, the same instant as 03:30-04:00):
+// the hub keeps it as the wall time a series repeats (XERK-3040). Every ISO parses
+// back to its instant.
 function wallToIso(date, time, tz) {
   const d = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date || ""));
   const t = /^(\d{2}):(\d{2})$/.exec(String(time || ""));
@@ -1411,7 +1413,8 @@ function wallToIso(date, time, tz) {
     const names = (off) => { const q = zoneParts(guess - off * 60000, tz); return Date.UTC(q.y, q.mo - 1, q.d, q.h, q.mi) === guess; };
     const fits = [...new Set([before, after])].filter(names).map((off) => guess - off * 60000);
     const ms = fits.length ? Math.min(...fits) : guess - before * 60000;
-    const p = zoneParts(ms, tz), off = zoneOffsetMin(ms, tz);
+    const p = fits.length ? zoneParts(ms, tz) : { y, mo, d: dd, h: +t[1], mi: +t[2] };
+    const off = fits.length ? zoneOffsetMin(ms, tz) : before;
     const sign = off < 0 ? "-" : "+", a = Math.abs(off);
     return { ms, iso: `${ymdOf(p)}T${pad(p.h)}:${pad(p.mi)}:00${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}` };
   } catch { return null; }

@@ -164,7 +164,10 @@ client write state XERK-2987, reminders XERK-2988, invitations XERK-2989.
   day (Outlook's weeks start on the mailbox's first day, which no pattern property sets; Turma's on
   Sunday); yearly past every 8 years (Outlook's 99-month Interval cap).
 - Pattern times are WALL times in the event's zone (`StartTimeZone` set first): DST keeps 9:00 as
-  `recurrence.js` does. A start in a spring-forward gap is host-unverified.
+  `recurrence.js` does. A gap anchor's command carries the record's `wall` (XERK-3040), which the
+  agent sets as the pattern's `StartTime`/`Duration` (`wallTod`/`wallLen`); without it (an older
+  hub) the anchor's instants. Outlook taking a gap `StartTime` is host-unverified; an older agent
+  ignores `wall`, so its copy reads drifted and is re-written at most every 10 min until it updates.
 - **An upsert rewrites the whole series**: an existing copy is `ClearRecurrencePattern()`ed first
   (drops every old exception), then the pattern, `Save()`, then each exception by
   `GetOccurrence(<original start>)` (local time; an all-day one by its date in the event's zone):
