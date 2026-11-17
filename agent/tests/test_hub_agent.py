@@ -15514,7 +15514,11 @@ class TestMigrationCarriesTicketUpdates(ManagerMixin, unittest.TestCase):
     def test_an_implausible_record_is_not_carried(self):
         t = self._ticket()
         enc = lambda d: json.dumps(d).encode()
-        far = int(time.time() * 1000) + 10 * 86_400_000
+        far = int(time.time() * 1000) + 2 * 3_600_000
+        for bad in (0, -5, far, True, 1.5):
+            out = ha._carried_ticket_state(enc({"key": self.KEY, "ticketUpdateBase": {
+                "key": self.KEY, "seen": [], "mark": bad}}), t)
+            self.assertNotIn("mark", out["ticketUpdateBase"], bad)
         out = ha._carried_ticket_state(enc({
             "key": self.KEY, "ticketUpdateBase": {"key": self.KEY, "seen": [], "mark": far},
             "ticketUpdateSince": "9999-01-01T00:00:00Z"}), t)
@@ -15555,6 +15559,13 @@ class TestMigrationCarriesTicketUpdates(ManagerMixin, unittest.TestCase):
         self.assertNotIn("ticketUpdateSince", out)
         self.assertNotIn("ticketUpdateHeld", out)
         self.assertEqual(out["ticketWrites"], [{"u": "ok", "t": 1}])
+
+    def test_a_failing_record_never_costs_the_move(self):
+        with mock.patch.object(ha, "_migration_ticket_state", side_effect=RuntimeError("x")):
+            dst, sess = self._move({"createdAt": "2019-01-01T00:00:00Z",
+                                    "ticketUpdateBase": {"key": self.KEY, "seen": ["c:1"]}})
+        self.assertEqual(sess["status"], "running")
+        self.assertIsNone(sess.get("ticketUpdateBase"))
 
     def test_an_older_target_never_unpacks_the_record(self):
         # The member rides under `.worktree/`, which no agent extracts.

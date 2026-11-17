@@ -12933,7 +12933,7 @@ def _carried_ticket_state(raw, ticket):
                 f"over {SESSION_STATE_MAX}; not carrying it")
             return {}
         key = ticket.get("key") if isinstance(ticket, dict) else None
-        latest = int(time.time() * 1000) + 86_400_000   # a day of clock skew
+        latest = int(time.time() * 1000) + 3_600_000   # an hour of clock skew
         data = json.loads(raw.decode()) if isinstance(raw, bytes) else None
         if not isinstance(key, str) or not key or not isinstance(data, dict) \
                 or data.get("key") != key:
@@ -12949,7 +12949,8 @@ def _carried_ticket_state(raw, ticket):
                 nbase["mark"] = mark
             out["ticketUpdateBase"] = nbase
         since = data.get("ticketUpdateSince")
-        if isinstance(since, str) and (_ts_ms(since) or latest + 1) <= latest:
+        since_ms = _ts_ms(since)
+        if since_ms is not None and since_ms <= latest:
             out["ticketUpdateSince"] = since
         held = data.get("ticketUpdateHeld")
         if isinstance(held, dict) and held.get("key") == key \

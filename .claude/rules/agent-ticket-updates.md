@@ -28,10 +28,12 @@ New comments and edits on a running session's ticket reach that session via `not
     that tail (QA). `ticketUpdateSince` is carried too, so a run killed before its first read
     keeps its own anchor; only a record predating both keys anchors at its `closedAt`.
   - Migration carries the base, anchor (`since`, else the source's `createdAt`), held updates and
-    `ticketWrites` in the bundle as `.worktree/session.json` (XERK-3055; never extracted, so a
-    target since #1213 ignores it; an older one drops a stray copy in the project-slug dir). The target re-validates it against the command's ticket key
-    (`_carried_ticket_state`); absent or mismatched = first sight at its own `createdAt`.
-    - Over `SESSION_STATE_MAX`, or a `mark`/`since` over a day ahead, is dropped: a future
+    `ticketWrites` in the bundle as `.worktree/session.json` (XERK-3055).
+    - It is never extracted: a target since #1213 ignores it; an older one leaves a stray copy
+      in the project-slug dir.
+    - The target re-validates it against the command's ticket key (`_carried_ticket_state`);
+      absent or mismatched = first sight at its own `createdAt`.
+    - Over `SESSION_STATE_MAX`, or a `mark`/`since` over an hour ahead, is dropped: a future
       `mark` would mute the session's updates for good.
     - It is a snapshot at export: what the source delivers before its kill is redelivered on
       the target, a duplicate rather than a loss. Tests: `TestMigrationCarriesTicketUpdates`.
