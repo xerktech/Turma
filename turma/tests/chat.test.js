@@ -2015,16 +2015,19 @@ test("renderProse: emphasis and markers stay linear on pathological input", () =
     "**".repeat(100000),
     "-".repeat(100000),
   ];
+  // CPU time, not wall time: a loaded host (the full suite runs files in parallel) stretched one
+  // case past the budget on the wall clock while the scan itself stayed in milliseconds.
+  const cpuMs = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
   for (const src of cases) {
-    const t0 = Date.now();
+    const t0 = cpuMs();
     renderProse(src);
-    const ms = Date.now() - t0;
+    const ms = Math.round(cpuMs() - t0);
     assert.ok(ms < 2000, "renderProse took " + ms + "ms on a " + src.length + "-char input");
   }
   // The same for the degraded-entry marker peel (it was unanchored on the left).
-  const t0 = Date.now();
+  const t0 = cpuMs();
   buildItems([{ id: "a", role: "assistant", text: "x" + "[Bash]".repeat(40000) + "tail" }]);
-  assert.ok(Date.now() - t0 < 2000, "degraded marker scan is not linear");
+  assert.ok(cpuMs() - t0 < 2000, "degraded marker scan is not linear");
 });
 
 test("renderInline: GFM flanking kills arithmetic, spaced stars and globs", () => {

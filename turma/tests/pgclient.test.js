@@ -729,8 +729,12 @@ test("live: an IDLE connection death logs one line per connection; a busy one do
   try {
     await Promise.all([pool.query("SELECT $1", ["a"]), pool.query("SELECT $1", ["b"])]);
     fake.dropAll();
+    // Wait for both closes rather than a fixed 50 ms: on a loaded host the second socket's close
+    // landed later and the count read 1. A third line still fails (the wait stops at 2, then 50 ms more).
+    const idleLines = () => warn.lines.filter((l) => /idle connection .* died/.test(l));
+    for (let t = Date.now(); idleLines().length < 2 && Date.now() - t < 2000;) await new Promise((r) => setTimeout(r, 10));
     await new Promise((r) => setTimeout(r, 50));
-    const idle = warn.lines.filter((l) => /idle connection .* died/.test(l));
+    const idle = idleLines();
     assert.equal(idle.length, 2, warn.lines.join("\n"));
   } finally {
     warn.restore();
