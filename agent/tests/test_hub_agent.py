@@ -60529,3 +60529,248 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
     def test_a_huge_command_is_not_parsed(self):
         cmd = 'jira comment X-1 "' + "a" * ha.TICKET_WRITE_CMD_MAX + '"'
         self.assertEqual(ha.ticket_writes_from_bash(cmd), [])
+
+
+class TestTicketUpdates(ManagerMixin, unittest.TestCase):
+    """New comments and edits on a session's ticket are delivered into that
+    session (XERK-3035): baseline on first sight, then only new, wanted,
+    not-self-authored events, via notify_session; fetched off the beat."""
+
+    SITE = "x.atlassian.net"
+    KEY = "XERK-1"
+    NOW = "2026-11-16T12:00:00.000+0000"
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("board_configured", True),
+                            ("board_site_key", self.SITE)):
+            p = mock.patch.object(ha, name, return_value=value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _mgr(self, *sessions):
+        sm = self.make_manager()
+        sm.registry = list(sessions)
+        sm.notify_session = mock.Mock(return_value=True)
+        return sm
+
+    def _sess(self, sid="s1", base=None, **kw):
+        s = {"id": sid, "status": "running", "tmuxName": f"agent-{sid}",
+             "ticket": {"key": self.KEY, "siteKey": self.SITE, "summary": "Fix it"}}
+        if base is not None:
+            s["ticketUpdateBase"] = {"key": self.KEY, "seen": list(base)}
+        s.update(kw)
+        return s
+
+    def _comment(self, cid, body="please also cover the edge case", at=None, author="Ann"):
+        return {"key": f"c:{cid}", "kind": "comment", "author": author, "authorId": "a1",
+                "body": body, "field": None, "rawField": None, "fromText": None,
+                "toText": None, "created": at or self.NOW}
+
+    def _field(self, hid, field, frm=None, to=None, at=None, **kw):
+        e = {"key": f"h:{hid}:{field}", "kind": "field", "author": "Ann",
+             "authorId": "a1", "body": None, "field": field, "rawField": field,
+             "fromText": frm, "toText": to, "created": at or self.NOW}
+        e.update(kw)
+        return e
+
+    def _status(self, hid, frm_col, to_col, to="In Progress"):
+        return self._field(hid, "status", frm="x", to=to, fromColumn=frm_col,
+                           toColumn=to_col, toCategory="done" if to_col == "done" else "inprogress")
+
+    def _run(self, sm, events):
+        """Stage, fetch (worker body, inline) and deliver one round."""
+        with mock.patch.object(ha, "ticket_update_events", return_value=events) as fe, \
+                mock.patch.object(ha, "tickets_changed_since",
+                                  side_effect=lambda keys, since: set(keys)):
+            with mock.patch.object(ha.threading, "Thread"):   # no real worker
+                sm._stage_ticket_update_fetch()
+            sm._fetch_ticket_updates()
+            sm._deliver_ticket_updates()
+        return fe
+
+    def _delivered(self, sm):
+        return [c.args[1] for c in sm.notify_session.call_args_list]
+
+    def test_first_sight_baselines_silently(self):
+        sess = self._sess()
+        sm = self._mgr(sess)
+        self._run(sm, [self._comment("1"), self._field("2", "description", "a", "b")])
+        sm.notify_session.assert_not_called()
+        self.assertEqual(sess["ticketUpdateBase"], {"key": self.KEY, "seen": ["c:1", "h:2:description"]})
+
+    def test_a_new_comment_is_delivered_once(self):
+        sess = self._sess(base=["c:1"])
+        sm = self._mgr(sess)
+        events = [self._comment("1"), self._comment("2", body="also handle\nnulls")]
+        self._run(sm, events)
+        self._run(sm, events)
+        msgs = self._delivered(sm)
+        self.assertEqual(len(msgs), 1)
+        self.assertIn("XERK-1", msgs[0])
+        self.assertIn("[@Ann — comment] also handle nulls", msgs[0])
+        self.assertIn("continue in this session", msgs[0])
+
+    def test_a_ticket_key_change_rebaselines(self):
+        # A base for another ticket (the session adopted a new one) is no base.
+        sess = self._sess()
+        sess["ticketUpdateBase"] = {"key": "XERK-9", "seen": []}
+        sm = self._mgr(sess)
+        self._run(sm, [self._comment("1")])
+        sm.notify_session.assert_not_called()
+        self.assertEqual(sess["ticketUpdateBase"]["key"], self.KEY)
+
+    def test_self_authored_comment_by_id_is_suppressed(self):
+        # The manager's close-ticket comment, recorded by tracker id.
+        sess = self._sess(base=[], ticketWrites=[
+            {"u": "mgr:1", "t": 1, "kind": "comment", "key": self.KEY, "id": "7"}])
+        sm = self._mgr(sess)
+        self._run(sm, [self._comment("7")])
+        sm.notify_session.assert_not_called()
+        self.assertIn("c:7", sess["ticketUpdateBase"]["seen"])
+
+    def test_self_authored_comment_by_body_is_suppressed(self):
+        # The session's own CLI comment, recorded from the transcript by body.
+        at = ha._ts_ms(ha._iso_z(self.NOW))
+        sess = self._sess(base=[], ticketWrites=[
+            {"u": "tu1", "t": at, "kind": "comment", "key": self.KEY,
+             "fp": ha.ticket_body_fingerprint("Fixed in PR #3")}])
+        sm = self._mgr(sess)
+        self._run(sm, [self._comment("8", body="Fixed in **PR #3**")])
+        sm.notify_session.assert_not_called()
+
+    def test_self_authored_edit_is_suppressed(self):
+        at = ha._ts_ms(ha._iso_z(self.NOW))
+        sess = self._sess(base=[], ticketWrites=[
+            {"u": "tu2", "t": at, "kind": "edit", "key": self.KEY, "fields": ["description"]}])
+        sm = self._mgr(sess)
+        self._run(sm, [self._field("3", "description", "old", "new")])
+        sm.notify_session.assert_not_called()
+
+    def test_a_description_edit_carries_before_and_after(self):
+        sm = self._mgr(self._sess(base=[]))
+        self._run(sm, [self._field("3", "description", "old text", "new text")])
+        msg = self._delivered(sm)[0]
+        self.assertIn('[description edited by @Ann] before: "old text"', msg)
+        self.assertIn('after: "new text"', msg)
+
+    def test_status_moves(self):
+        sm = self._mgr(self._sess(base=[]))
+        self._run(sm, [self._status("4", "todo", "inprogress"),
+                       self._status("5", "review", "done", to="Done")])
+        sm.notify_session.assert_not_called()      # forward and Done: never
+        self._run(sm, [self._status("6", "review", "inprogress")])
+        self.assertIn("[moved back to In Progress by @Ann]", self._delivered(sm)[0])
+
+    def test_unlisted_fields_and_removed_attachments_are_dropped(self):
+        sm = self._mgr(self._sess(base=[]))
+        self._run(sm, [self._field("7", "assignee", "a", "b"),
+                       self._field("8", "labels", "", "x"),
+                       self._field("9", "attachment", "shot.png", None)])
+        sm.notify_session.assert_not_called()
+        self._run(sm, [self._field("10", "attachment", None, "trace.log")])
+        self.assertIn("[attachment added by @Ann] trace.log", self._delivered(sm)[0])
+
+    def test_two_sessions_on_one_ticket_cost_one_fetch(self):
+        a, b = self._sess("s1", base=[]), self._sess("s2", base=[])
+        sm = self._mgr(a, b)
+        fe = self._run(sm, [self._comment("1")])
+        self.assertEqual(fe.call_count, 1)
+        self.assertEqual(sorted(c.args[0] for c in sm.notify_session.call_args_list),
+                         ["s1", "s2"])
+
+    def test_a_fetch_failure_keeps_the_baseline(self):
+        sess = self._sess(base=["c:1"])
+        sm = self._mgr(sess)
+        self._run(sm, None)
+        sm.notify_session.assert_not_called()
+        self.assertEqual(sess["ticketUpdateBase"]["seen"], ["c:1"])
+        fresh = self._sess("s2")                     # no base: stays without one
+        sm.registry = [fresh]
+        self._run(sm, None)
+        self.assertNotIn("ticketUpdateBase", fresh)
+
+    def test_updates_are_capped_per_message(self):
+        sm = self._mgr(self._sess(base=[]))
+        events = [self._comment(str(i), body=f"note {i}") for i in range(ha.TICKET_UPDATES_MAX + 3)]
+        self._run(sm, events)
+        msg = self._delivered(sm)[0]
+        self.assertNotIn("note 0", msg)
+        self.assertIn(f"note {ha.TICKET_UPDATES_MAX + 2}", msg)
+        self.assertIn("+3 older updates", msg)
+
+    def test_toggle_off(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        with mock.patch.object(ha, "TICKET_UPDATES_DELIVER", False):
+            fe = self._run(sm, [self._comment("1")])
+            self.assertNotIn("delivered into this session", sm._session_directive(sess))
+        fe.assert_not_called()
+        sm.notify_session.assert_not_called()
+
+    def test_dsh_and_qwen_sessions_route_through_notify_session(self):
+        for rt in ("dsh", "qwen"):
+            sm = self._mgr(self._sess(base=[], agentType=rt))
+            self._run(sm, [self._comment("1")])
+            self.assertEqual(sm.notify_session.call_count, 1, rt)
+
+    def test_a_restart_does_not_redeliver(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        events = [self._comment("1")]
+        self._run(sm, events)
+        self.assertEqual(sm.notify_session.call_count, 1)
+        sm2 = self._mgr(json.loads(json.dumps(sess)))   # the persisted record
+        self._run(sm2, events)
+        sm2.notify_session.assert_not_called()
+
+    def test_other_boards_stopped_sessions_and_shadows_are_skipped(self):
+        other = self._sess("s2", base=[])
+        other["ticket"]["siteKey"] = "other.atlassian.net"
+        sm = self._mgr(other, self._sess("s3", base=[], status="stopped"),
+                       self._sess("s4", base=[], shadow={"id": "sh-1"}))
+        fe = self._run(sm, [self._comment("1")])
+        fe.assert_not_called()
+        sm.notify_session.assert_not_called()
+
+    def test_a_baselined_ticket_is_prechecked_and_skipped_when_unchanged(self):
+        sm = self._mgr(self._sess(base=[]))
+        self._run(sm, [])                            # first read sets _ticket_upd_last
+        with mock.patch.object(ha, "ticket_update_events") as fe, \
+                mock.patch.object(ha, "tickets_changed_since", return_value=set()) as pc, \
+                mock.patch.object(ha.threading, "Thread"):
+            sm._stage_ticket_update_fetch()
+            sm._fetch_ticket_updates()
+        pc.assert_called_once()
+        fe.assert_not_called()
+
+    def test_the_beat_stages_and_delivers_but_never_fetches(self):
+        sm = self.make_manager()
+        sm._stage_ticket_update_fetch = mock.Mock()
+        sm._deliver_ticket_updates = mock.Mock()
+        sm._fetch_ticket_updates = mock.Mock()
+        sm.build_payload(0)
+        sm._stage_ticket_update_fetch.assert_called_once_with()
+        sm._deliver_ticket_updates.assert_called_once_with()
+        sm._fetch_ticket_updates.assert_not_called()
+        sm._deliver_ticket_updates.side_effect = RuntimeError("boom")
+        sm.build_payload(0)                          # never raises onto the beat
+
+    def test_staging_never_raises(self):
+        sm = self._mgr(self._sess(base=[]))
+        with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("no threads")):
+            sm._stage_ticket_update_fetch()
+
+    def test_the_worker_runs_the_staged_fetch(self):
+        sm = self._mgr(self._sess(base=[]))
+        ran = threading.Event()
+        sm._fetch_ticket_updates = lambda: ran.set()
+        sm._stage_ticket_update_fetch()
+        self.assertTrue(ran.wait(2))
+
+    def test_the_directive_says_not_to_poll(self):
+        sm = self._mgr()
+        self.assertIn("do not poll the ticket", sm._session_directive(self._sess()))
+        bare = self._sess()
+        bare.pop("ticket")
+        self.assertNotIn("do not poll the ticket", sm._session_directive(bare))
