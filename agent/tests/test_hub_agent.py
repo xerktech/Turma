@@ -21879,19 +21879,21 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "_pr_comment_events",
                                return_value=ha._PartialEvents(conv)):
             sm._poll_pr_comments()
+        conv.append(self._ev("crec", body="onrecovery"))
         with self._events(*conv, *inline):
-            sm._poll_pr_comments()
+            sm._poll_pr_comments()                  # recovery: conv still sent
         self.assertNotIn("prCommentInlinePending", sess)
         inline.append(self._ev("inew", kind="inline", body="later"))
         with self._events(*conv, *inline):
             sm._poll_pr_comments()
         typed = self._typed()
-        self.assertEqual(len(typed), 2)
+        self.assertEqual(len(typed), 3)
         self.assertIn("during", typed[0])
-        self.assertIn("later", typed[1])
+        self.assertIn("onrecovery", typed[1])
+        self.assertIn("later", typed[2])
         self.assertNotIn("old", "".join(typed))
 
-    def test_the_inline_pending_flag_is_per_session_and_dropped_with_its_pr(self):
+    def test_the_inline_pending_flag_is_per_session_and_outlives_a_dropped_pr(self):
         sm = self.make_manager()
         conv = [self._ev("c0")]
         sess = self._session(sm)
@@ -21903,9 +21905,16 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             sm._poll_pr_comments()
         self.assertEqual(sess["prCommentInlinePending"], [self.URL])
         self.assertNotIn("prCommentInlinePending", other)
+        # A flagged PR that leaves the session's url list (capped, newest
+        # kept) and comes back still folds its inline history in silently.
         sm.session_pr_urls["s1"] = ["https://github.com/o/r/pull/8"]
         with self._events(*conv):
             sm._poll_pr_comments()
+        self.assertEqual(sess["prCommentInlinePending"], [self.URL])
+        sm.session_pr_urls = {"s1": [self.URL]}     # s2 is not flagged
+        with self._events(*conv, self._ev("i0", kind="inline", body="old")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
         self.assertNotIn("prCommentInlinePending", sess)
 
     def test_an_inline_channel_that_always_fails_still_delivers(self):

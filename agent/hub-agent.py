@@ -36835,7 +36835,6 @@ class SessionManager:
             if isinstance(c, dict) and "paused" in c:
                 c.pop("paused", None)
                 c.pop("prCommentBase", None)
-                c.pop("prCommentInlinePending", None)
                 log(f"closed session {c.get('id')}: dropped its sleeper pause; "
                     f"it is an ordinary ended session now")
                 tmux = c.get("tmuxName")
@@ -48399,10 +48398,10 @@ class SessionManager:
                     continue
                 for msg in _pr_comment_messages(url, fresh):
                     self.notify_session(sess["id"], msg)
-            # Drop flags for PRs the session no longer has, so none outlives
-            # its PR.
-            live = set(self.session_pr_urls.get(sess["id"]) or [])
-            pending = [u for u in pending if u in live]
+            # Never prune a flag for a PR that left session_pr_urls: its
+            # prCommentBase entry stays, so a PR that comes back (the url list
+            # is capped, newest kept) would deliver its inline history. The flag
+            # lives exactly as long as that baseline.
             if pending != (sess.get("prCommentInlinePending") or []):
                 if pending:
                     sess["prCommentInlinePending"] = pending
