@@ -12015,9 +12015,534 @@ def _scan_context_entry(entry, report):
             report["lastTurnContextTokens"] = post
 
 
+# ---- what a session itself wrote to its own ticket (XERK-3034) --------------
+#
+# The ticket-update poller (XERK-3032) must not hand a session back the comment
+# or status change it just made. Author identity cannot tell: the host's tracker
+# creds, the session's tracker CLI/MCP and the operator are usually ONE account.
+# So each session keeps a PROVENANCE LEDGER on its record (`ticketWrites`):
+#
+#   * the manager's own writes (the close-ticket evidence comment, XERK-1569),
+#     with the comment id the tracker returned;
+#   * the session's writes, found in its OWN transcript by the one-parse
+#     `_scan_entry_line` path under `_scan_pr_line`'s discipline: a structured
+#     tool_use (Bash tracker CLI / curl, or an Atlassian / Azure DevOps MCP tool)
+#     PAIRED with its own successful tool_result. Quoted prose, tool OUTPUT that
+#     merely prints such a command and an assistant echo never count.
+#
+# An entry: {u, t, kind, key, id?, fp?, fields?}. `u` dedups a re-scan (the
+# tool_use id, or "mgr:<…>"); `t` epoch ms; kind comment|edit|transition; `id`
+# the tracker's comment id when the result carried one; `fp` the comment body's
+# fingerprint (`ticket_body_fingerprint`); `fields` the normalized field names
+# an edit/transition touched. Bounded (TICKET_WRITES_MAX, newest kept) and
+# persisted on the record, because a manager restart primes the scan to EOF.
+TICKET_WRITES_MAX = 50
+# How far apart a session's edit/transition and the tracker's change of the same
+# field may be and still be the same write (transcript and tracker clocks differ).
+TICKET_SELF_EDIT_WINDOW_MS = 120_000
+# Pending tool calls held across beats (a call and its result land apart).
+TICKET_WRITE_CALLS_MAX = 32
+# A command longer than this is not parsed (bounded work on the beat).
+TICKET_WRITE_CMD_MAX = 64 * 1024
+# A tool_result longer than this is not searched for a comment id.
+TICKET_WRITE_RESULT_MAX = 256 * 1024
+_TICKET_WRITE_KEY_RE = re.compile(r"\A(?:[A-Za-z][A-Za-z0-9_]{0,31}-[0-9]{1,12}|[0-9]{1,12})\Z")
+_TW_HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]{0,31})\1[^\n]*\n")
+_TW_JIRA_URL_RE = re.compile(
+    r"/rest/api/[23]/issue/([A-Za-z][A-Za-z0-9_]{0,31}-[0-9]{1,12})(?:/(comment|transitions))?/?(?:[?#]|\Z)")
+_TW_AZDO_URL_RE = re.compile(r"/_apis/wit/work[iI]tems/([0-9]{1,12})(?:/(comments))?/?(?:[?#]|\Z)")
+_TW_TAG_RE = re.compile(r"<[^<>\n]{0,200}>")
+_TW_MD_LINK_RE = re.compile(r"\]\([^()\s]{0,500}\)")
+# Tracker field names, normalized to one vocabulary the poller compares with.
+_TW_FIELD_ALIASES = {
+    "system.state": "status", "state": "status", "status": "status",
+    "system.title": "summary", "title": "summary", "summary": "summary",
+    "system.description": "description", "description": "description",
+    "microsoft.vsts.tcm.reprosteps": "description",
+    "system.assignedto": "assignee", "assigned-to": "assignee", "assignee": "assignee",
+    "system.tags": "labels", "tags": "labels", "labels": "labels",
+    "priority": "priority", "microsoft.vsts.common.priority": "priority",
+}
+
+
+def _tw_field(name):
+    n = str(name or "").strip().lower().lstrip("-")
+    if n.startswith("/fields/"):
+        n = n[len("/fields/"):]
+    return _TW_FIELD_ALIASES.get(n, n[:64]) if n else None
+
+
+def _tw_key(key):
+    k = str(key if key is not None else "").strip()
+    if not _TICKET_WRITE_KEY_RE.match(k):
+        return None
+    return k.upper()
+
+
+def _tw_text(value, depth=0):
+    """The human text inside a comment payload: a plain string, an ADF document
+    (every `text` leaf), or a JSON body naming one ({"body": …} / {"text": …} /
+    {"comment": …}). A string that parses as such JSON is read as it."""
+    if depth > 40:
+        return ""
+    if isinstance(value, str):
+        s = value.strip()
+        if s[:1] in ("{", "[") and len(s) <= TICKET_WRITE_CMD_MAX:
+            try:
+                return _tw_text(json.loads(s), depth + 1)
+            except (ValueError, RecursionError):
+                pass
+        return value
+    if isinstance(value, list):
+        return " ".join(_tw_text(v, depth + 1) for v in value)
+    if isinstance(value, dict):
+        if value.get("type") == "text" and isinstance(value.get("text"), str):
+            return value["text"]
+        for k in ("body", "commentBody", "comment", "text", "content"):
+            if k in value:
+                return _tw_text(value[k], depth + 1)
+    return ""
+
+
+def ticket_body_fingerprint(value):
+    """A whitespace/markup-insensitive hash of a comment's text, so the same
+    words read back as ADF, Markdown or ADO HTML hash alike: tags and a Markdown
+    link's target are dropped, then everything but letters and digits, case
+    folded. None for a body with no words."""
+    text = _tw_text(value)
+    if not isinstance(text, str):
+        return None
+    text = html.unescape(_TW_MD_LINK_RE.sub("]", _TW_TAG_RE.sub(" ", text[:TICKET_WRITE_CMD_MAX])))
+    norm = "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold() if ch.isalnum())
+    if not norm:
+        return None
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:24]
+
+
+def _tw_write(kind, key, body=None, fields=None):
+    k = _tw_key(key)
+    if not k:
+        return None
+    w = {"kind": kind, "key": k}
+    if kind == "comment" and body is not None:
+        fp = ticket_body_fingerprint(body)
+        if fp:
+            w["fp"] = fp
+    if fields:
+        names = []
+        for f in fields:
+            n = _tw_field(f)
+            if n and n not in names:
+                names.append(n)
+        if names:
+            w["fields"] = names[:16]
+    if kind == "transition" and "status" not in w.get("fields", []):
+        w.setdefault("fields", []).insert(0, "status")
+    return w
+
+
+def _tw_heredocs(cmd):
+    """(command with heredoc bodies cut out, [bodies]) — bodies are what a
+    `-`/stdin argument reads. An unterminated heredoc leaves the rest as body."""
+    bodies, out, pos = [], [], 0
+    while True:
+        m = _TW_HEREDOC_RE.search(cmd, pos)
+        if not m:
+            out.append(cmd[pos:])
+            break
+        out.append(cmd[pos:m.end()])
+        delim = m.group(2)
+        end = re.compile(r"^[ \t]*" + re.escape(delim) + r"[ \t]*$", re.M).search(cmd, m.end())
+        if not end:
+            bodies.append(cmd[m.end():])
+            break
+        bodies.append(cmd[m.end():end.start()])
+        out.append("\n")
+        pos = end.end()
+    return "".join(out), bodies
+
+
+def _tw_segments(cmd):
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|")
+        lex.whitespace_split = True
+        lex.commenters = ""
+        toks = list(lex)
+    except ValueError:
+        return []
+    segs, cur = [], []
+    for t in toks:
+        if t and set(t) <= set(";&|"):
+            if cur:
+                segs.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def _tw_opts(args, value_flags):
+    """(positional args, {flag: value}) — `--f=v`, `--f v`, `-f v`."""
+    pos, opts, i = [], {}, 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and a != "-" and len(a) > 1:
+            name, eq, val = a.partition("=")
+            if eq:
+                opts[name] = val
+            elif name in value_flags and i + 1 < len(args):
+                opts[name] = args[i + 1]
+                i += 1
+            else:
+                opts[name] = True
+        else:
+            pos.append(a)
+        i += 1
+    return pos, opts
+
+
+def _tw_stdin(arg, heredocs):
+    return heredocs[0] if arg == "-" and heredocs else (None if arg == "-" else arg)
+
+
+def _tw_jira_cli(args, heredocs):
+    if len(args) < 2:
+        return []
+    verb, rest = args[0], args[1:]
+    pos, opts = _tw_opts(rest, {"-s", "-d", "-F", "--add-label", "--remove-label",
+                                "-p", "-t", "-l", "--priority"})
+    if not pos:
+        return []
+    key = pos[0]
+    if verb == "comment":
+        body = None if "-F" in opts else _tw_stdin(pos[1] if len(pos) > 1 else None, heredocs)
+        w = _tw_write("comment", key, body)
+    elif verb == "edit":
+        fields = []
+        if "-s" in opts:
+            fields.append("summary")
+        if "-d" in opts or "-F" in opts or "-" in pos[1:]:
+            fields.append("description")
+        if "--add-label" in opts or "--remove-label" in opts:
+            fields.append("labels")
+        w = _tw_write("edit", key, fields=fields)
+    elif verb == "transition" and len(pos) > 1:
+        w = _tw_write("transition", key)
+    elif verb == "assign":
+        w = _tw_write("edit", key, fields=["assignee"])
+    else:
+        w = None
+    return [w] if w else []
+
+
+def _tw_acli(args, heredocs):
+    words = [a for a in args if not a.startswith("-")][:4]
+    if "jira" not in words[:1] or len(words) < 3 or words[1] not in ("workitem", "issue"):
+        return []
+    verb = words[2]
+    sub = words[3] if len(words) > 3 else ""
+    _, opts = _tw_opts(args, {"--key", "-k", "--body", "-b", "--summary", "--description",
+                              "--status", "-s", "--assignee", "-a", "--labels", "--type",
+                              "--body-file", "--from-file", "--jql", "--project"})
+    key = opts.get("--key") or opts.get("-k")
+    if not isinstance(key, str):
+        return []
+    if verb == "comment" and sub in ("create", "add", ""):
+        body = opts.get("--body", opts.get("-b"))
+        w = _tw_write("comment", key, _tw_stdin(body, heredocs) if isinstance(body, str) else None)
+    elif verb == "transition":
+        w = _tw_write("transition", key)
+    elif verb == "assign":
+        w = _tw_write("edit", key, fields=["assignee"])
+    elif verb == "edit":
+        w = _tw_write("edit", key, fields=[o for o in opts if o in (
+            "--summary", "--description", "--assignee", "--labels", "--type")])
+    else:
+        w = None
+    return [w] if w else []
+
+
+def _tw_az(args, heredocs):
+    words = [a for a in args if not a.startswith("-")][:3]
+    if words[:3] != ["boards", "work-item", "update"]:
+        return []
+    _, opts = _tw_opts(args, {"--id", "--discussion", "--state", "--title", "--description",
+                              "--assigned-to", "--fields", "-f", "--area", "--iteration",
+                              "--reason", "--org", "--organization", "--project", "-p"})
+    key = opts.get("--id")
+    if not isinstance(key, str):
+        return []
+    out = []
+    disc = opts.get("--discussion")
+    if isinstance(disc, str):
+        out.append(_tw_write("comment", key, _tw_stdin(disc, heredocs)))
+    fields = [f for f in ("--title", "--description", "--assigned-to") if f in opts]
+    fv = opts.get("--fields", opts.get("-f"))
+    if isinstance(fv, str):
+        fields += [p.split("=", 1)[0] for p in fv.split() if "=" in p]
+    if fields:
+        out.append(_tw_write("edit", key, fields=fields))
+    if "--state" in opts:
+        out.append(_tw_write("transition", key))
+    return [w for w in out if w]
+
+
+def _tw_curl(args, heredocs):
+    _, opts = _tw_opts(args, {"-X", "--request", "-d", "--data", "--data-raw",
+                              "--data-binary", "--json", "-H", "--header", "-u",
+                              "--user", "-o", "--output", "-w", "--url"})
+    method = str(opts.get("-X") or opts.get("--request") or "").upper()
+    data = next((opts[f] for f in ("--json", "-d", "--data", "--data-raw", "--data-binary")
+                 if isinstance(opts.get(f), str)), None)
+    if not method:
+        method = "POST" if data is not None else "GET"
+    if method == "GET":
+        return []
+    body = None
+    if isinstance(data, str):
+        body = None if data.startswith("@") and data != "@-" else (
+            heredocs[0] if data in ("@-", "-") and heredocs else data)
+    urls = [a for a in args if "/_apis/" in a or "/rest/api/" in a]
+    if isinstance(opts.get("--url"), str):
+        urls.insert(0, opts["--url"])
+    for url in urls:
+        m = _TW_JIRA_URL_RE.search(url)
+        if m:
+            key, tail = m.group(1), m.group(2)
+            if tail == "comment" and method == "POST":
+                w = _tw_write("comment", key, body)
+            elif tail == "transitions" and method == "POST":
+                w = _tw_write("transition", key)
+            elif tail is None and method == "PUT":
+                w = _tw_write("edit", key, fields=_tw_payload_fields(body))
+            else:
+                w = None
+            return [w] if w else []
+        m = _TW_AZDO_URL_RE.search(url)
+        if m:
+            key, tail = m.group(1), m.group(2)
+            if tail == "comments" and method == "POST":
+                w = _tw_write("comment", key, body)
+            elif tail is None and method == "PATCH":
+                fields = _tw_payload_fields(body)
+                w = _tw_write("transition" if fields == ["status"] else "edit", key, fields=fields)
+            else:
+                w = None
+            return [w] if w else []
+    return []
+
+
+def _tw_payload_fields(body):
+    """Field names a REST edit payload touches: Jira {"fields"|"update": {…}},
+    an ADO JSON-Patch list of {"path": "/fields/X"}."""
+    try:
+        data = json.loads(body) if isinstance(body, str) else body
+    except (ValueError, RecursionError):
+        return []
+    if isinstance(data, dict):
+        names = []
+        for k in ("fields", "update"):
+            if isinstance(data.get(k), dict):
+                names += list(data[k])[:32]
+        return names
+    if isinstance(data, list):
+        return [d.get("path") for d in data[:32] if isinstance(d, dict) and isinstance(d.get("path"), str)]
+    return []
+
+
+_TW_PROGRAMS = {"jira": _tw_jira_cli, "acli": _tw_acli, "az": _tw_az, "curl": _tw_curl}
+
+
+def ticket_writes_from_bash(cmd):
+    """Tracker writes a Bash command makes: the host's `jira` helper
+    (comment/edit/transition/assign), `acli jira workitem …`, `az boards
+    work-item update` (--discussion is a comment), curl/REST to a Jira issue's
+    comment/transitions/PUT or an ADO work item's comments/PATCH. Read off the
+    COMMAND words (shlex), never its output. [] for anything else."""
+    if not isinstance(cmd, str) or not cmd or len(cmd) > TICKET_WRITE_CMD_MAX:
+        return []
+    stripped, heredocs = _tw_heredocs(cmd)
+    out = []
+    for seg in _tw_segments(stripped)[:64]:
+        i = 0
+        while i < len(seg) and (re.match(r"\A[A-Za-z_][A-Za-z0-9_]*=", seg[i])
+                                or seg[i] in ("env", "command", "exec", "sudo", "time")):
+            i += 1
+        if i >= len(seg):
+            continue
+        fn = _TW_PROGRAMS.get(os.path.basename(seg[i]))
+        if fn:
+            out += fn(seg[i + 1:], heredocs)
+    return out[:8]
+
+
+def ticket_writes_from_mcp(name, inp):
+    """Tracker writes an MCP tool call makes: Atlassian `addCommentToJiraIssue`,
+    `editJiraIssue`, `transitionJiraIssue`; Azure DevOps `wit_add_work_item_comment`,
+    `wit_update_work_item`. Matched on the tool's own name (after the last
+    `__`), whatever server prefix carries it."""
+    if not isinstance(name, str) or not isinstance(inp, dict):
+        return []
+    tool = name.rsplit("__", 1)[-1]
+    if tool == "addCommentToJiraIssue":
+        w = _tw_write("comment", inp.get("issueIdOrKey"), inp.get("commentBody"))
+    elif tool == "editJiraIssue":
+        f = inp.get("fields")
+        w = _tw_write("edit", inp.get("issueIdOrKey"),
+                      fields=list(f)[:32] if isinstance(f, dict) else None)
+    elif tool == "transitionJiraIssue":
+        w = _tw_write("transition", inp.get("issueIdOrKey"))
+    elif tool == "wit_add_work_item_comment":
+        w = _tw_write("comment", inp.get("workItemId"), inp.get("comment"))
+    elif tool == "wit_update_work_item":
+        ups = inp.get("updates")
+        fields = [u.get("path") for u in ups[:32] if isinstance(u, dict)] \
+            if isinstance(ups, list) else []
+        names = [_tw_field(f) for f in fields]
+        w = _tw_write("transition" if names == ["status"] else "edit",
+                      inp.get("id"), fields=fields)
+    else:
+        w = None
+    return [w] if w else []
+
+
+def _tw_result_id(text):
+    """The created comment's id when the tool's own result is that comment as
+    JSON (a top-level "id"; a nested author id never counts). Else None."""
+    if not isinstance(text, str) or len(text) > TICKET_WRITE_RESULT_MAX:
+        return None
+    s = text.strip()
+    cands = [s] + [ln.strip() for ln in s.splitlines()[-20:] if ln.strip().startswith("{")]
+    for c in cands:
+        if not c.startswith("{"):
+            continue
+        try:
+            data = json.loads(c)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(data, dict):
+            v = data.get("id")
+            if isinstance(v, bool):
+                return None
+            if isinstance(v, int) or (isinstance(v, str) and re.fullmatch(r"[0-9A-Za-z_-]{1,64}", v)):
+                return str(v)
+    return None
+
+
+def _scan_ticket_write_entry(entry, state, report):
+    """Fold one transcript entry into the session's own-ticket-write scan
+    (XERK-3034). A tool_use is held only when it names a tracker write; it is
+    recorded only from ITS OWN tool_result, and only when that result is not an
+    error. An assistant entry's tool_result, or a user entry's tool_use, is
+    never read (the role a real call/result rides). Appends to
+    `report["ticketWrites"]`."""
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return
+    etype = entry.get("type")
+    calls = state.setdefault("twCalls", {})
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_use" and etype == "assistant":
+            bid, name, inp = block.get("id"), block.get("name"), block.get("input")
+            if not isinstance(bid, str) or not isinstance(inp, dict):
+                continue
+            if name == "Bash":
+                writes = ticket_writes_from_bash(inp.get("command"))
+            else:
+                writes = ticket_writes_from_mcp(name, inp)
+            if writes:
+                calls[bid] = writes
+                while len(calls) > TICKET_WRITE_CALLS_MAX:
+                    calls.pop(next(iter(calls)))
+        elif block.get("type") == "tool_result" and etype == "user" \
+                and block.get("tool_use_id") in calls:
+            bid = block["tool_use_id"]
+            writes = calls.pop(bid)
+            if block.get("is_error") is True:
+                continue  # refused, denied or failed: nothing was written
+            tur = entry.get("toolUseResult")
+            if isinstance(tur, dict) and tur.get("backgroundTaskId"):
+                continue  # still running: its outcome is not known here
+            t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
+            cid = _tw_result_id(_tool_result_text(block.get("content")))
+            out = report.setdefault("ticketWrites", [])
+            for n, w in enumerate(writes):
+                rec = {"u": f"{bid}:{n}", "t": t, **w}
+                if cid and w["kind"] == "comment" and len(writes) == 1:
+                    rec["id"] = cid
+                out.append(rec)
+
+
+def merge_ticket_writes(writes, new):
+    """Fold new ledger entries onto a record's (deduped by `u`, oldest first,
+    the newest TICKET_WRITES_MAX kept). Returns (writes, changed)."""
+    cur = [dict(w) for w in writes if isinstance(w, dict) and isinstance(w.get("u"), str)] \
+        if isinstance(writes, list) else []
+    seen = {w["u"] for w in cur}
+    changed = False
+    for w in new or []:
+        if isinstance(w, dict) and isinstance(w.get("u"), str) and w["u"] not in seen:
+            seen.add(w["u"])
+            cur.append(dict(w))
+            changed = True
+    if changed:
+        cur.sort(key=lambda w: w.get("t") if isinstance(w.get("t"), int) else 0)
+        del cur[:-TICKET_WRITES_MAX]
+    return cur, changed
+
+
+def _ticket_self_authored(sess, event):
+    """Did this session (or its manager on its behalf) make this ticket change?
+    `event` = {kind: comment|edit|transition, key, id?, body?, fields?, at?}
+    (`at` epoch ms; `fields` in the `_tw_field` vocabulary: status, summary,
+    description, assignee, labels, priority, …). Matched against the record's
+    `ticketWrites`: the comment id first, then the body fingerprint, then an
+    edit/transition of an overlapping field within TICKET_SELF_EDIT_WINDOW_MS.
+    False when nothing matches — a miss delivers the update, never hides one."""
+    if not isinstance(sess, dict) or not isinstance(event, dict):
+        return False
+    writes = sess.get("ticketWrites")
+    if not isinstance(writes, list) or not writes:
+        return False
+    key = _tw_key(event.get("key")) if event.get("key") is not None else None
+    writes = [w for w in writes if isinstance(w, dict)
+              and (key is None or w.get("key") == key)]
+    kind = event.get("kind")
+    if kind == "comment":
+        eid = event.get("id")
+        if eid is not None and any(w.get("kind") == "comment" and w.get("id") == str(eid)
+                                   for w in writes):
+            return True
+        fp = ticket_body_fingerprint(event.get("body")) if event.get("body") is not None else None
+        return bool(fp) and any(w.get("kind") == "comment" and w.get("fp") == fp for w in writes)
+    if kind in ("edit", "transition"):
+        at = event.get("at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            return False
+        efields = {_tw_field(f) for f in (event.get("fields") or [])} - {None}
+        if kind == "transition":
+            efields.add("status")
+        for w in writes:
+            if w.get("kind") not in ("edit", "transition"):
+                continue
+            t = w.get("t")
+            if not isinstance(t, int) or abs(at - t) > TICKET_SELF_EDIT_WINDOW_MS:
+                continue
+            wfields = set(w.get("fields") or [])
+            if not efields or not wfields or efields & wfields:
+                return True
+    return False
+
+
 def _scan_entry_line(raw, state, report):
     """Fold one appended transcript line into every incremental per-beat scan
-    (PR attribution + actual model + context occupancy) with a single JSON parse."""
+    (PR attribution + actual model + context occupancy + QA runs + the session's
+    own ticket writes) with a single JSON parse."""
     try:
         entry = json.loads(raw)
     except (ValueError, RecursionError):
@@ -12030,6 +12555,7 @@ def _scan_entry_line(raw, state, report):
     _scan_agent_entry(entry, state)
     _scan_loop_entry(entry, state)
     _scan_qa_entry(entry, state, report)
+    _scan_ticket_write_entry(entry, state, report)
 
 
 # ---- live background agents, off the transcript (XERK-245) -------------------
@@ -27035,20 +27561,25 @@ def add_board_comment(key, text):
     text as ADF (`_text_to_adf`, like the create path). Azure: POST the work
     item's comments endpoint (project-scoped, the same preview api-version the
     detail read uses), the text HTML-escaped with its line breaks kept.
-    Exceptions propagate to the caller, which stages them."""
+    Returns the created comment's id as a string (XERK-3034: the provenance
+    ledger matches the poller's read-back by it), or None when the tracker's
+    answer names none. Exceptions propagate to the caller, which stages them."""
     if azure_configured():
         wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
                        {"fields": "System.TeamProject"})
         project = (wi.get("fields") or {}).get("System.TeamProject")
         if not project:
             raise RuntimeError("the work item names no project")
-        azure_req(f"/{urllib.parse.quote(project)}/_apis/wit/workItems/"
-                  f"{urllib.parse.quote(key)}/comments",
-                  {"api-version": f"{AZDO_API_VERSION}-preview.3"},
-                  body={"text": html.escape(str(text)).replace("\n", "<br>")})
+        made = azure_req(f"/{urllib.parse.quote(project)}/_apis/wit/workItems/"
+                         f"{urllib.parse.quote(key)}/comments",
+                         {"api-version": f"{AZDO_API_VERSION}-preview.3"},
+                         body={"text": html.escape(str(text)).replace("\n", "<br>")})
     else:
-        jira_req(f"/rest/api/3/issue/{urllib.parse.quote(key)}/comment", {},
-                 body={"body": _text_to_adf(text)})
+        made = jira_req(f"/rest/api/3/issue/{urllib.parse.quote(key)}/comment", {},
+                        body={"body": _text_to_adf(text)})
+    cid = made.get("id") if isinstance(made, dict) else None
+    return str(cid) if isinstance(cid, (int, str)) and not isinstance(cid, bool) and cid != "" \
+        else None
 
 
 # A Done-category status a board names for "could not reproduce" (Jira's
@@ -31349,6 +31880,37 @@ class SessionManager:
             return None
         return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
+    def _seed_ticket_writes(self, sess):
+        """Re-derive a resumed/migrated session's own-ticket-write ledger
+        (XERK-3034) from its whole transcript, once at launch — the per-beat
+        scan primes past the history, exactly as `_seed_prs` explains. Merges
+        (deduped by tool_use id) into what the record carried. Never raises."""
+        try:
+            path = _session_transcript_path(sess)
+            if not path or not os.path.isfile(path):
+                return
+            report, state = {}, {}
+            with open(path, "rb") as f:
+                raw = f.read()
+            end = raw.rfind(b"\n") + 1
+            for line in raw[:end].split(b"\n"):
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(entry, dict):
+                    _scan_ticket_write_entry(entry, state, report)
+            writes, grew = merge_ticket_writes(sess.get("ticketWrites"),
+                                               report.get("ticketWrites"))
+            if grew:
+                sess["ticketWrites"] = writes
+                self.save()
+        except Exception as e:
+            log(f"session {sess.get('id')}: could not re-read its ticket writes: "
+                f"{type(e).__name__}: {e}")
+
     def _seed_prs(self, sess):
         """Re-derive a resumed/migrated session's PR chips from its transcript.
 
@@ -35603,6 +36165,9 @@ class SessionManager:
             # outcome ledger credits a session it first sees already closed by
             # these, so a kill must not forget them.
             "modelActual", "qaRuns", "qaPartial",
+            # What the session wrote to its own ticket (XERK-3034), so a resumed
+            # session is never handed its own comment back as news.
+            "ticketWrites",
             # Which model this session was running against (XERK-246). Without
             # it a resume silently returns a failed-over session to the
             # exhausted subscription — and restores its --model alias, which the
@@ -35847,6 +36412,7 @@ class SessionManager:
                 self._seed_prs(sess)
             except Exception as e:
                 log(f"resume {sid}: could not re-read its PR links: {type(e).__name__}: {e}")
+            self._seed_ticket_writes(sess)
             log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
         except Exception as e:
             self._set_error(sess, e)
@@ -36208,6 +36774,7 @@ class SessionManager:
             # PR it opened before the resume. The per-beat scan primes past that,
             # so re-derive the chips once here (covers migration and resume-any).
             self._seed_prs(sess)
+            self._seed_ticket_writes(sess)
             log(f"resumed transcript {transcript_id} for {repo} in {cwd} "
                 f"on :{sess['ttydPort']}")
             return sess
@@ -40444,7 +41011,10 @@ class SessionManager:
                     "final": final, "status": status, "at": int(now * 1000),
                     # The evidence, for the board's "Closed by" row; the beat
                     # stamps it on the ticket, never on the hub's result list.
-                    "note": req.get("note") or ""})
+                    "note": req.get("note") or "",
+                    # The evidence comment as a provenance-ledger entry
+                    # (XERK-3034), once it landed; the beat files it on the record.
+                    "selfWrite": st.pop("selfWrite", None)})
 
         refusal = "this session has no ticket" if not key else req.get("error")
         if refusal is None and not valid_issue_key(key):
@@ -40496,8 +41066,15 @@ class SessionManager:
                                 f"its current status, only {option['name']}; finished "
                                 f"work is never closed as {option['name']}")
             if not st["commented"]:
-                add_board_comment(key, _close_ticket_comment(req))
+                text = _close_ticket_comment(req)
+                cid = add_board_comment(key, text)
                 st["commented"] = True
+                # Our own comment: the ticket-update poller must not hand it back
+                # to the session (XERK-3034). Staged for the beat to record.
+                w = _tw_write("comment", key, text)
+                if w:
+                    st["selfWrite"] = {**w, "u": f"mgr:{cid or w.get('fp') or int(now)}",
+                                       "t": int(now * 1000), **({"id": cid} if cid else {})}
             if option is None:
                 log(f"close-ticket: {key} already in {current} ({req['kind']})")
                 return land(status=current)
@@ -40555,6 +41132,17 @@ class SessionManager:
         changed = False
         for r in landed:
             note = r.pop("note", "")
+            self_write = r.pop("selfWrite", None)
+            if self_write:
+                # The manager's evidence comment, recorded whatever the close's
+                # outcome (it landed even when the status move failed).
+                owner = self._find(r["sessionId"]) or next(
+                    (c for c in reversed(self.closed) if c.get("id") == r["sessionId"]), None)
+                if owner is not None:
+                    writes, grew = merge_ticket_writes(owner.get("ticketWrites"), [self_write])
+                    if grew:
+                        owner["ticketWrites"] = writes
+                        changed = True
             self.ticket_outcome_results.append(r)
             if not r["ok"]:
                 if r.get("final"):
@@ -50542,6 +51130,15 @@ class SessionManager:
                     runs, grew = merge_qa_runs(sess.get("qaRuns"), qa_reports)
                     if grew:
                         sess["qaRuns"] = runs
+                        self.save()
+                # Tracker writes the session made itself (XERK-3034), kept on the
+                # record: a restart primes the scan to EOF, so the ledger is not
+                # re-derivable from the per-beat scan.
+                tw_reports = signals.pop("ticketWrites", None)
+                if tw_reports:
+                    writes, grew = merge_ticket_writes(sess.get("ticketWrites"), tw_reports)
+                    if grew:
+                        sess["ticketWrites"] = writes
                         self.save()
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))

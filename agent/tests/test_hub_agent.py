@@ -26440,6 +26440,38 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
     def _transitions(self):
         return [b for p, b in self.calls if p.endswith("/transitions")]
 
+    def test_xerk3034_the_evidence_comment_is_recorded_as_the_sessions_own_write(self):
+        """The manager's close-ticket comment goes on the session's provenance
+        ledger with the id the tracker returned, so the ticket-update poller never
+        hands the session its own evidence back."""
+        inner = ha.jira_req
+
+        def with_id(path, params, body=None):
+            out = inner(path, params, body)
+            return {"id": "10077"} if path.endswith("/comment") else out
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        with mock.patch.object(ha, "jira_req", with_id):
+            sm._process_close_ticket_requests(now=1000.0)
+        self.assertNotIn("ticketWrites", sess)      # the worker writes no record
+        sm._apply_closed_tickets()
+        [w] = sess["ticketWrites"]
+        self.assertEqual((w["kind"], w["key"], w["id"], w["t"]),
+                         ("comment", self.KEY, "10077", 1_000_000))
+        text = ha._close_ticket_comment({"kind": "not-reproducible",
+                                         "note": "ran repro.sh on main: passes"})
+        self.assertTrue(ha._ticket_self_authored(
+            sess, {"kind": "comment", "key": self.KEY, "id": "10077"}))
+        # The read-back as ADF, no id: the fingerprint still matches.
+        self.assertTrue(ha._ticket_self_authored(
+            sess, {"kind": "comment", "key": self.KEY, "body": ha._text_to_adf(text)}))
+        self.assertFalse(ha._ticket_self_authored(
+            sess, {"kind": "comment", "key": self.KEY, "id": "1", "body": "a human reply"}))
+        # An outcome-less retry pass records it once, never twice.
+        sm._apply_closed_tickets()
+        self.assertEqual(len(sess["ticketWrites"]), 1)
+
     def test_the_file_becomes_a_comment_and_done_then_the_beat_stamps_the_outcome(self):
         sm = self.make_manager()
         sess = self._sess(sm)
@@ -59620,3 +59652,248 @@ class TestFetchSendFile(ManagerMixin, unittest.TestCase):
             sm._fetch_send_file_async("nope", "a" * 32)
             # An unknown session is reported, on a worker.
             self.assertEqual(T.call_args.kwargs["target"], sm._send_file_report_error)
+
+
+def _tw_call(tid, name, inp):
+    return {"type": "assistant", "timestamp": "2026-11-16T10:00:00Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": tid, "name": name, "input": inp}]}}
+
+
+def _tw_result(tid, text="", is_error=False, ts="2026-11-16T10:00:05Z"):
+    block = {"type": "tool_result", "tool_use_id": tid, "content": text}
+    if is_error:
+        block["is_error"] = True
+    return {"type": "user", "timestamp": ts,
+            "message": {"role": "user", "content": [block]}}
+
+
+class TestTicketWrites(ManagerMixin, unittest.TestCase):
+    """XERK-3034: what a session itself wrote to its own ticket — the self-filter
+    the ticket-update poller uses, since author identity cannot tell."""
+
+    CID = "33333333-3333-4333-8333-333333333333"
+
+    def _scan(self, entries, state=None):
+        state = {} if state is None else state
+        writes = []
+        for e in entries:
+            report = {"prUrls": [], "modelActual": None}
+            ha._scan_entry_line(json.dumps(e), state, report)
+            writes, _ = ha.merge_ticket_writes(writes, report.get("ticketWrites"))
+        return writes
+
+    def _one(self, name, inp, result="", **kw):
+        return self._scan([_tw_call("t1", name, inp), _tw_result("t1", result, **kw)])
+
+    # --- each write shape ---------------------------------------------------
+
+    def test_the_jira_helper_comment_edit_transition_and_assign(self):
+        cases = [
+            ('~/.claude/bin/jira comment XERK-1 "Fixed in PR #5"', "comment", None),
+            ("jira comment XERK-1 - <<'EOF'\nmulti\nline\nEOF", "comment", None),
+            ('jira edit XERK-1 -s "New title" --add-label x', "edit", ["summary", "labels"]),
+            ('cd /w && jira transition xerk-1 "In Review"', "transition", ["status"]),
+            ("jira assign XERK-1 me", "edit", ["assignee"]),
+        ]
+        for cmd, kind, fields in cases:
+            with self.subTest(cmd=cmd):
+                [w] = self._one("Bash", {"command": cmd})
+                self.assertEqual((w["kind"], w["key"]), (kind, "XERK-1"))
+                if fields:
+                    self.assertEqual(w["fields"], fields)
+                if kind == "comment":
+                    self.assertTrue(w["fp"])
+
+    def test_acli_and_az_boards(self):
+        [w] = self._one("Bash", {"command":
+                                 'acli jira workitem comment create --key XERK-2 --body "hi there"'})
+        self.assertEqual((w["kind"], w["key"]), ("comment", "XERK-2"))
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("Hi there!"))
+        ws = self._one("Bash", {"command":
+                                'az boards work-item update --id 42 --discussion "done" --state Closed'})
+        self.assertEqual([(w["kind"], w["key"]) for w in ws],
+                         [("comment", "42"), ("transition", "42")])
+
+    def test_rest_writes_record_and_reads_do_not(self):
+        adf = json.dumps({"body": {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Fixed in PR"}]}]}})
+        cmd = ("curl -s -X POST -H 'Content-Type: application/json' "
+               f"https://x.atlassian.net/rest/api/3/issue/XERK-4/comment -d '{adf}'")
+        [w] = self._one("Bash", {"command": cmd}, result=json.dumps(
+            {"self": "https://x/comment/10010", "id": "10010",
+             "author": {"accountId": "abc"}}))
+        self.assertEqual((w["kind"], w["key"], w["id"]), ("comment", "XERK-4", "10010"))
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("fixed in pr"))
+        [w] = self._one("Bash", {"command":
+                                 "curl -X PUT https://x.atlassian.net/rest/api/3/issue/XERK-4 "
+                                 "-d '{\"fields\": {\"summary\": \"x\"}}'"})
+        self.assertEqual((w["kind"], w["fields"]), ("edit", ["summary"]))
+        [w] = self._one("Bash", {"command":
+                                 "curl -X POST https://dev.azure.com/o/p/_apis/wit/workItems/7/"
+                                 "comments?api-version=7.1-preview.4 -d '{\"text\": \"ok\"}'"},
+                        result='{"workItemId": 7, "id": 3, "createdBy": {"id": "g"}}')
+        self.assertEqual((w["kind"], w["key"], w["id"]), ("comment", "7", "3"))
+        # A GET of the same endpoints writes nothing.
+        self.assertEqual(self._one("Bash", {"command":
+                                            "curl https://x.atlassian.net/rest/api/3/issue/XERK-4/comment"}),
+                         [])
+
+    def test_mcp_tools(self):
+        prefix = "mcp__claude_ai_Atlassian_Rovo__"
+        [w] = self._one(prefix + "addCommentToJiraIssue",
+                        {"cloudId": "c", "issueIdOrKey": "XERK-5", "commentBody": "**Done**"},
+                        result='{"id": "555", "body": "x"}')
+        self.assertEqual((w["kind"], w["key"], w["id"]), ("comment", "XERK-5", "555"))
+        [w] = self._one(prefix + "editJiraIssue",
+                        {"issueIdOrKey": "XERK-5", "fields": {"summary": "s", "labels": ["a"]}})
+        self.assertEqual(w["fields"], ["summary", "labels"])
+        [w] = self._one(prefix + "transitionJiraIssue",
+                        {"issueIdOrKey": "XERK-5", "transition": {"id": "31"}})
+        self.assertEqual((w["kind"], w["fields"]), ("transition", ["status"]))
+        [w] = self._one("mcp__ado__wit_add_work_item_comment",
+                        {"project": "p", "workItemId": 9, "comment": "hi"})
+        self.assertEqual((w["kind"], w["key"]), ("comment", "9"))
+        [w] = self._one("mcp__ado__wit_update_work_item",
+                        {"id": 9, "updates": [{"op": "add", "path": "/fields/System.State",
+                                               "value": "Done"}]})
+        self.assertEqual((w["kind"], w["fields"]), ("transition", ["status"]))
+
+    # --- what never counts --------------------------------------------------
+
+    def test_quoted_echoed_failed_or_output_shapes_are_not_writes(self):
+        cmd = 'jira comment XERK-1 "hi"'
+        # Prose quoting the command: no tool_use at all.
+        prose = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "I'll run `" + cmd + "`"}]}}
+        # A command that only PRINTS one, or searches for one.
+        printed = [_tw_call("p1", "Bash", {"command": "echo '" + cmd + "'"}), _tw_result("p1", cmd)]
+        grep = [_tw_call("g1", "Bash", {"command": 'grep -rn "jira comment XERK-1" .'}),
+                _tw_result("g1", cmd)]
+        # Tool OUTPUT naming a write (another command's result) is never read.
+        other = [_tw_call("o1", "Read", {"file_path": "/x"}), _tw_result("o1", cmd)]
+        # A real write call whose result is an error wrote nothing.
+        failed = [_tw_call("f1", "Bash", {"command": cmd}), _tw_result("f1", "401", True)]
+        # An ASSISTANT entry echoing a tool_result for a pending call is ignored.
+        echo = [_tw_call("e1", "Bash", {"command": cmd}),
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_result", "tool_use_id": "e1", "content": "ok"}]}}]
+        self.assertEqual(self._scan([prose, *printed, *grep, *other, *failed, *echo]), [])
+
+    def test_a_backgrounded_write_is_not_recorded_from_its_launch(self):
+        res = _tw_result("b1", "Command running in background")
+        res["toolUseResult"] = {"backgroundTaskId": "bt1"}
+        self.assertEqual(self._scan([_tw_call("b1", "Bash", {"command": 'jira comment X-1 "a"'}),
+                                     res]), [])
+
+    def test_a_call_and_its_result_in_different_beats(self):
+        state = {}
+        self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command":
+                                                             'jira comment X-1 "a b"'})], state), [])
+        [w] = self._scan([_tw_result("t1")], state)
+        self.assertEqual(w["u"], "t1:0")
+
+    # --- the fingerprint ----------------------------------------------------
+
+    def test_fingerprint_survives_adf_markdown_and_html_reformatting(self):
+        md = "Fixed in **[PR #12](https://github.com/o/r/pull/12)** — see `app.py`.\n\nThanks!"
+        adf = {"type": "doc", "version": 1, "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "Fixed in "},
+                {"type": "text", "text": "PR #12", "marks": [
+                    {"type": "strong"},
+                    {"type": "link", "attrs": {"href": "https://github.com/o/r/pull/12"}}]},
+                {"type": "text", "text": " — see "},
+                {"type": "text", "text": "app.py", "marks": [{"type": "code"}]},
+                {"type": "text", "text": "."}]},
+            {"type": "paragraph", "content": [{"type": "text", "text": "Thanks!"}]}]}
+        html_body = "<p>Fixed in <b>PR #12</b> &mdash; see <code>app.py</code>.</p><p>Thanks!</p>"
+        fp = ha.ticket_body_fingerprint(md)
+        self.assertEqual(ha.ticket_body_fingerprint(adf), fp)
+        self.assertEqual(ha.ticket_body_fingerprint(html_body), fp)
+        self.assertEqual(ha.ticket_body_fingerprint(json.dumps({"body": adf})), fp)
+        self.assertNotEqual(ha.ticket_body_fingerprint("Fixed in PR #13. Thanks!"), fp)
+        self.assertIsNone(ha.ticket_body_fingerprint("  \n **  "))
+
+    # --- _ticket_self_authored ------------------------------------------------
+
+    def test_self_authored_matches_id_then_fingerprint_then_field_window(self):
+        sess = {"ticketWrites": [
+            {"u": "a", "t": 1_000_000, "kind": "comment", "key": "XERK-1", "id": "9",
+             "fp": ha.ticket_body_fingerprint("hello world")},
+            {"u": "b", "t": 2_000_000, "kind": "transition", "key": "XERK-1",
+             "fields": ["status"]}]}
+        sa = ha._ticket_self_authored
+        self.assertTrue(sa(sess, {"kind": "comment", "key": "XERK-1", "id": 9}))
+        self.assertTrue(sa(sess, {"kind": "comment", "key": "XERK-1", "body": "<p>Hello, world</p>"}))
+        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-2", "id": "9"}))
+        self.assertFalse(sa(sess, {"kind": "comment", "key": "XERK-1", "body": "hello there"}))
+        self.assertTrue(sa(sess, {"kind": "transition", "key": "XERK-1", "at": 2_060_000}))
+        self.assertTrue(sa(sess, {"kind": "edit", "key": "XERK-1", "at": 1_950_000,
+                                  "fields": ["System.State"]}))
+        self.assertFalse(sa(sess, {"kind": "edit", "key": "XERK-1", "at": 2_000_000,
+                                   "fields": ["summary"]}))
+        self.assertFalse(sa(sess, {"kind": "transition", "key": "XERK-1",
+                                   "at": 2_000_000 + ha.TICKET_SELF_EDIT_WINDOW_MS + 1}))
+        self.assertFalse(sa(sess, {"kind": "transition", "key": "XERK-1"}))  # no time
+        self.assertFalse(sa({}, {"kind": "comment", "id": "9"}))
+
+    # --- persistence ----------------------------------------------------------
+
+    def _sess(self):
+        return {"id": "abcde", "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": os.path.join(self.tmp, "wt"),
+                "branch": None, "rcName": "rc", "tmuxName": "agent-abcde",
+                "claudeSessionId": self.CID}
+
+    def test_the_beat_folds_writes_onto_the_record_and_a_restart_keeps_them(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sm.registry = [sess]
+        w = {"u": "t1:0", "t": 5, "kind": "comment", "key": "XERK-1", "fp": "f"}
+        signals = {"prUrls": [], "modelActual": None, "tail": [], "ticketWrites": [w]}
+        with mock.patch.object(ha, "session_report", return_value=signals), \
+             mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm._session_payload(sess, refresh=False)
+        self.assertEqual(sess["ticketWrites"], [w])
+        self.assertNotIn("ticketWrites", payload)    # never on the wire
+        sm2 = self.make_manager()                    # a manager restart
+        again = next(s for s in sm2.registry if s.get("id") == "abcde")
+        self.assertEqual(again["ticketWrites"], [w])
+
+    def test_the_ledger_is_bounded_newest_kept(self):
+        new = [{"u": f"u{i}", "t": i, "kind": "comment", "key": "X-1"}
+               for i in range(ha.TICKET_WRITES_MAX + 7)]
+        writes, grew = ha.merge_ticket_writes(None, new)
+        self.assertTrue(grew)
+        self.assertEqual(len(writes), ha.TICKET_WRITES_MAX)
+        self.assertEqual(writes[0]["u"], "u7")
+        self.assertEqual(ha.merge_ticket_writes(writes, new[-3:]), (writes, False))
+
+    def test_resume_reseeds_from_the_whole_transcript(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        sess["ticketWrites"] = [{"u": "mgr:1", "t": 1, "kind": "comment", "key": "X-1", "id": "1"}]
+        sm.registry = [sess]
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(sess["worktreePath"]))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, self.CID + ".jsonl"), "w") as f:
+            for e in [_tw_call("t1", "Bash", {"command": 'jira comment X-1 "earlier"'}),
+                      _tw_result("t1", '{"id": "77"}')]:
+                f.write(json.dumps(e) + "\n")
+        sm._seed_ticket_writes(sess)
+        self.assertEqual([w["u"] for w in sess["ticketWrites"]], ["mgr:1", "t1:0"])
+        self.assertEqual(sess["ticketWrites"][1]["id"], "77")
+        sm._seed_ticket_writes(sess)                 # idempotent
+        self.assertEqual(len(sess["ticketWrites"]), 2)
+
+    def test_resume_seed_never_raises(self):
+        sm = self.make_manager()
+        sess = self._sess()
+        with mock.patch.object(ha, "_session_transcript_path", side_effect=RuntimeError("x")):
+            sm._seed_ticket_writes(sess)
+        self.assertNotIn("ticketWrites", sess)
+
+    def test_a_huge_command_is_not_parsed(self):
+        cmd = 'jira comment X-1 "' + "a" * ha.TICKET_WRITE_CMD_MAX + '"'
+        self.assertEqual(ha.ticket_writes_from_bash(cmd), [])
