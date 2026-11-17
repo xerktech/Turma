@@ -246,7 +246,6 @@ internal fun CalendarView(
     modifier: Modifier,
     wide: Boolean,
     fleet: FleetState,
-    scoped: Set<String>,
     names: Map<String, String>,
     colors: Map<String, Int>,
     cvm: CalendarViewModel,
@@ -261,7 +260,7 @@ internal fun CalendarView(
         CalendarBody(
             Modifier.fillMaxSize(), weekly = wide || maxWidth >= CAL_WEEK_MIN_WIDTH,
             side = wide || maxWidth >= CAL_SIDE_MIN_WIDTH,
-            fleet, scoped, names, colors, cvm, bvm, mvm, reveal, onRevealed, onOpenNotes, dailyFor,
+            fleet, names, colors, cvm, bvm, mvm, reveal, onRevealed, onOpenNotes, dailyFor,
         )
     }
 }
@@ -273,7 +272,6 @@ private fun CalendarBody(
     weekly: Boolean,
     side: Boolean,
     fleet: FleetState,
-    scoped: Set<String>,
     names: Map<String, String>,
     colors: Map<String, Int>,
     cvm: CalendarViewModel,
@@ -305,7 +303,8 @@ private fun CalendarBody(
     val picked = modes[weekly] ?: CalMode.of(null, weekly)
     val mode = if (weekly && revealWeek) CalMode.WEEK else picked
     val days = calVisibleDays(anchor, mode)
-    val keys = remember(scoped) { scoped.sorted() }
+    // Every org, whatever the header's site-wide pick (XERK-3031): the read sends no org filter.
+    val keys = emptyList<String>()
     LaunchedEffect(days, keys) { cvm.show(days, keys) }
     val range = calCollect(days, zone) { weeks[cvm.weekKey(it, keys)] }
     // The days a swipe slides in, drawn off-screen either side (XERK-2980); they are in the
@@ -763,7 +762,7 @@ private fun WeekGrid(
                     }
                     if (off.isNotEmpty()) {
                         Text(
-                            "Day off" + if (keys.size == 1) "" else " · " + off.joinToString(", ") { orgLabel(it) },
+                            "Day off" + if (names.size == 1) "" else " · " + off.joinToString(", ") { orgLabel(it) },
                             fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

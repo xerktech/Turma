@@ -192,11 +192,12 @@ fun BriefScreen(
     }
     // The notes review lists each org's upcoming calendar meetings (XERK-2899): the
     // calendar keeps reading those weeks whichever view shows.
-    LaunchedEffect(scoped) { calendarVm.wantUpcoming(scoped) }
-    val upcomingEvents = remember(calWeeks, scoped, now) {
-        val keys = scoped.sorted()
+    // The calendar reads every org whatever the header's pick (XERK-3031); calUpcoming
+    // picks each org's own meetings out of those weeks.
+    LaunchedEffect(Unit) { calendarVm.wantUpcoming(emptySet()) }
+    val upcomingEvents = remember(calWeeks, now) {
         calUpcomingWeeks(now, ZoneId.systemDefault())
-            .flatMap { calWeeks[calendarVm.weekKey(it, keys)]?.cal?.events.orEmpty() }
+            .flatMap { calWeeks[calendarVm.weekKey(it, emptyList())]?.cal?.events.orEmpty() }
     }
     val entries = remember(fleet, orgs, now, upcomingEvents) {
         orgs.associateWith { s ->
@@ -335,7 +336,7 @@ fun BriefScreen(
         ViewSwitch(view) { calendarVm.setView(it) }
         when {
             view == CalendarViewModel.VIEW_CALENDAR -> CalendarView(
-                Modifier.weight(1f), wide, fleet, scoped, names, colors, calendarVm, vm, meetingsVm,
+                Modifier.weight(1f), wide, fleet, names, colors, calendarVm, vm, meetingsVm,
                 reveal = reveal, onRevealed = { reveal = null },
                 onOpenNotes = { t -> notesTarget = t; calendarVm.setView(CalendarViewModel.VIEW_NOTES) },
                 dailyFor = { s, at -> dailyEntryNear(entries[s].orEmpty(), at) },
