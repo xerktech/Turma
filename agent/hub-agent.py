@@ -12727,6 +12727,49 @@ def _tw_result_failed(text):
     return False
 
 
+def _tw_timed_out(tur):
+    """A Bash result Claude Code moved to the background on its timeout
+    (`timedOutAfterMs`), as opposed to an explicit run_in_background launch."""
+    v = tur.get("timedOutAfterMs")
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+
+
+def _tw_success_re(w):
+    """The `jira` helper's own success line for this write, or None for a
+    write no helper line can vouch for (curl, acli, az, MCP)."""
+    key = re.escape(w["key"])
+    if w["kind"] == "comment":
+        return re.compile(rf"^commented on {key}$", re.I)
+    if w["kind"] == "transition":
+        return re.compile(rf"^{key} -> \S", re.I)
+    if w["kind"] == "edit":
+        if w.get("fields") == ["assignee"]:
+            return re.compile(rf"^assigned {key} to ", re.I)
+        return re.compile(rf"^updated {key}(?:\s|$)", re.I)
+    return None
+
+
+def _tw_landed(writes, text):
+    """The writes of a still-running command that have already happened:
+    each one claims, in command order, a later `jira` helper success line
+    for its kind and key. A write with no such line (not run yet, or a
+    program that prints none) is left out — that errs toward delivering."""
+    if not isinstance(text, str) or len(text) > TICKET_WRITE_RESULT_MAX:
+        return []
+    lines = [ln.strip() for ln in text.splitlines()]
+    pos, out = 0, []
+    for n, w in enumerate(writes):
+        rx = _tw_success_re(w)
+        if rx is None:
+            continue
+        for i in range(pos, len(lines)):
+            if rx.match(lines[i]):
+                out.append((n, w))
+                pos = i + 1
+                break
+    return out
+
+
 def _scan_ticket_write_entry(entry, state, report):
     """Fold one transcript entry into the session's own-ticket-write scan
     (XERK-3034). A tool_use is held only when it names a tracker write; it is
@@ -12765,16 +12808,29 @@ def _scan_ticket_write_entry(entry, state, report):
             if block.get("is_error") is True:
                 continue  # refused, denied or failed: nothing was written
             tur = entry.get("toolUseResult")
-            if isinstance(tur, dict) and tur.get("backgroundTaskId"):
-                continue  # still running: its outcome is not known here
             text = _tool_result_text(block.get("content"))
+            landed = list(enumerate(writes))
+            timed_out = False
+            if isinstance(tur, dict) and tur.get("backgroundTaskId"):
+                if not _tw_timed_out(tur):
+                    continue  # run_in_background: nothing has run yet
+                # Moved to the background on its timeout (XERK-3052): the
+                # command is still running, so only a write whose success
+                # line is already in the output has happened.
+                timed_out = True
+                stdout = tur.get("stdout")
+                if isinstance(stdout, str):
+                    text = f"{text}\n{stdout}"
+                landed = _tw_landed(writes, text)
+                if not landed:
+                    continue
             if _tw_result_failed(text):
                 continue  # curl exits 0 on an HTTP 4xx: the tracker refused it
-            resolve_ticket_write_files(writes)  # the command has run: read its body file
+            resolve_ticket_write_files([w for _, w in landed])  # it has run: read its body file
             t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
-            cid = _tw_result_id(text)
+            cid = None if timed_out else _tw_result_id(text)
             out = report.setdefault("ticketWrites", [])
-            for n, w in enumerate(writes):
+            for n, w in landed:
                 rec = {"u": f"{bid}:{n}", "t": t, **w}
                 if cid and w["kind"] == "comment" and len(writes) == 1:
                     rec["id"] = cid

@@ -60535,6 +60535,57 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._scan([_tw_call("b1", "Bash", {"command": 'jira comment X-1 "a"'}),
                                      res]), [])
 
+    def _timed_out(self, tid, stdout, content="Command running in background with ID: bt1."):
+        res = _tw_result(tid, content)
+        res["toolUseResult"] = {"stdout": stdout, "stderr": "", "interrupted": False,
+                                "backgroundTaskId": "bt1", "timedOutAfterMs": 600000}
+        return res
+
+    def test_xerk3052_a_write_that_ran_before_the_timeout_is_recorded(self):
+        # The real shape (k8x-02): a long command moved to the background on
+        # its 600 s timeout after the helper already printed its success line.
+        cmd = 'jira comment XERK-2597 "Fixed in PR #5" && sleep 900'
+        [w] = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                          self._timed_out("t1", "commented on XERK-2597\n")])
+        self.assertEqual((w["kind"], w["key"], w["u"]), ("comment", "XERK-2597", "t1:0"))
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("Fixed in PR #5"))
+        self.assertNotIn("id", w)
+
+    def test_xerk3052_a_write_not_yet_run_is_not_recorded(self):
+        cmd = 'sleep 900; jira comment XERK-1 "later"'
+        self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                                     self._timed_out("t1", "")]), [])
+
+    def test_xerk3052_only_the_writes_whose_line_printed_count(self):
+        cmd = ('jira transition XERK-1 "In Review" && jira comment XERK-1 "a" && '
+               'make long && jira comment XERK-1 "b" && jira edit XERK-1 -s t')
+        ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                         self._timed_out("t1", "XERK-1 -> In Review\ncommented on XERK-1\n"
+                                               "building...\n")])
+        self.assertEqual([(w["u"], w["kind"]) for w in ws],
+                         [("t1:0", "transition"), ("t1:1", "comment")])
+
+    def test_xerk3052_a_success_line_for_another_key_or_kind_does_not_count(self):
+        cmd = 'jira comment XERK-1 "a"; jira edit XERK-2 -s t'
+        out = "commented on XERK-9\nXERK-1 -> Done\nupdated XERK-2  https://x/browse/XERK-2\n"
+        ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}), self._timed_out("t1", out)])
+        self.assertEqual([(w["u"], w["key"]) for w in ws], [("t1:1", "XERK-2")])
+
+    def test_xerk3052_a_timed_out_curl_write_is_not_vouched_for(self):
+        cmd = ("curl -s -X POST https://x.atlassian.net/rest/api/3/issue/XERK-4/comment "
+               "-d '{\"body\": \"hi\"}'; sleep 900")
+        self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                                     self._timed_out("t1", '{"id": "10010"}')]), [])
+
+    def test_xerk3052_an_explicit_background_launch_still_records_nothing(self):
+        res = self._timed_out("b1", "commented on X-1\n")
+        del res["toolUseResult"]["timedOutAfterMs"]
+        self.assertEqual(self._scan([_tw_call("b1", "Bash", {"command": 'jira comment X-1 "a"'}),
+                                     res]), [])
+        res["toolUseResult"]["timedOutAfterMs"] = True  # a bool is no timeout
+        self.assertEqual(self._scan([_tw_call("b1", "Bash", {"command": 'jira comment X-1 "a"'}),
+                                     res]), [])
+
     def test_a_call_and_its_result_in_different_beats(self):
         state = {}
         self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command":
