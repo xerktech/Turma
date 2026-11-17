@@ -2887,6 +2887,7 @@ WORKTREE_STATE_MEMBERS = ("state.json", "commits.bundle", "changes.patch")
 # the member instead of unpacking it into the project-slug tree. Rides a
 # repos-root move too, with no `state.json` beside it.
 SESSION_STATE_MEMBER = "session.json"
+SESSION_STATE_MAX = 512 * 1024
 # qwen persists its per-server MCP connection-trust decisions here, keyed by the
 # workdir's realpath (XERK-507 D1). We PRE-AUTHORIZE our own registered servers
 # in it at launch so a session never wedges at the trust dialog. Same resolution
@@ -12921,10 +12922,18 @@ def _carried_ticket_state(raw, ticket):
     importSession command's ticket (XERK-3055): the record fields to resume
     with, or {} (first sight at the target's createdAt, as before) when absent,
     unreadable or for another ticket. The bundle crossed a host boundary, so
-    each field is rebuilt from checked parts and capped like the live record.
-    Never raises."""
+    each field is rebuilt from checked parts and capped like the live record,
+    the whole member is bounded (SESSION_STATE_MAX: a real record is far
+    smaller, and the target would re-save any bloat on every beat) and a time
+    must be plausible (a `mark` far in the future would mute every later
+    update). Never raises."""
     try:
+        if isinstance(raw, bytes) and len(raw) > SESSION_STATE_MAX:
+            log(f"migration: the carried ticket-update record is {len(raw)} bytes, "
+                f"over {SESSION_STATE_MAX}; not carrying it")
+            return {}
         key = ticket.get("key") if isinstance(ticket, dict) else None
+        latest = int(time.time() * 1000) + 86_400_000   # a day of clock skew
         data = json.loads(raw.decode()) if isinstance(raw, bytes) else None
         if not isinstance(key, str) or not key or not isinstance(data, dict) \
                 or data.get("key") != key:
@@ -12936,11 +12945,11 @@ def _carried_ticket_state(raw, ticket):
             nbase = {"key": key, "seen": [k for k in base["seen"]
                                           if isinstance(k, str)][-TICKET_UPDATES_SEEN_MAX:]}
             mark = base.get("mark")
-            if isinstance(mark, int) and not isinstance(mark, bool):
+            if isinstance(mark, int) and not isinstance(mark, bool) and 0 < mark <= latest:
                 nbase["mark"] = mark
             out["ticketUpdateBase"] = nbase
         since = data.get("ticketUpdateSince")
-        if isinstance(since, str) and _ts_ms(since) is not None:
+        if isinstance(since, str) and (_ts_ms(since) or latest + 1) <= latest:
             out["ticketUpdateSince"] = since
         held = data.get("ticketUpdateHeld")
         if isinstance(held, dict) and held.get("key") == key \
@@ -12949,7 +12958,7 @@ def _carried_ticket_state(raw, ticket):
                       if isinstance(e, dict) and isinstance(e.get("key"), str)]
             if events:
                 out["ticketUpdateHeld"] = {"key": key,
-                                           "events": events[-TICKET_UPDATES_MAX * 4:]}
+                                           "events": events[-TICKET_UPDATES_HELD_MAX:]}
         writes, _ = merge_ticket_writes([], data.get("ticketWrites"))
         if writes:
             out["ticketWrites"] = writes
@@ -38145,7 +38154,11 @@ class SessionManager:
         # target baselines at its own createdAt and an update that landed before
         # the move, unread, is history there.
         members = dict(worktree or {})
-        ticket_state = _migration_ticket_state(sess)
+        try:
+            ticket_state = _migration_ticket_state(sess)
+        except Exception as e:   # never costs the move: the target anchors as before
+            log(f"exportSession: not carrying the ticket-update record: {e}")
+            ticket_state = None
         if ticket_state:
             members[SESSION_STATE_MEMBER] = ticket_state
         try:

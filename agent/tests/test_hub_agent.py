@@ -15502,6 +15502,31 @@ class TestMigrationCarriesTicketUpdates(ManagerMixin, unittest.TestCase):
                                  "ticketUpdateBase": {"key": self.KEY, "seen": ["c:9"]},
                                  "ticketUpdateHeld": held})
         self.assertEqual(sess["ticketUpdateHeld"], held)
+        # No call is pending on the target, so the next beat delivers it, once.
+        _dst.notify_session = mock.Mock(return_value=True)
+        _dst._release_held_ticket_updates()
+        msgs = [c.args[1] for c in _dst.notify_session.call_args_list]
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("also handle the edge case", msgs[0])
+        self.assertIsNone(sess.get("ticketUpdateHeld"))
+        self.assertEqual(self._round(_dst, [self._comment("9")]), msgs)
+
+    def test_an_implausible_record_is_not_carried(self):
+        t = self._ticket()
+        enc = lambda d: json.dumps(d).encode()
+        far = int(time.time() * 1000) + 10 * 86_400_000
+        out = ha._carried_ticket_state(enc({
+            "key": self.KEY, "ticketUpdateBase": {"key": self.KEY, "seen": [], "mark": far},
+            "ticketUpdateSince": "9999-01-01T00:00:00Z"}), t)
+        self.assertNotIn("mark", out["ticketUpdateBase"])   # would mute every update
+        self.assertNotIn("ticketUpdateSince", out)
+        huge = enc({"key": self.KEY, "ticketUpdateBase": {
+            "key": self.KEY, "seen": ["x" * ha.SESSION_STATE_MAX]}})
+        self.assertEqual(ha._carried_ticket_state(huge, t), {})
+        held = enc({"key": self.KEY, "ticketUpdateHeld": {"key": self.KEY, "events": [
+            {"key": f"c:{i}"} for i in range(ha.TICKET_UPDATES_HELD_MAX + 5)]}})
+        self.assertEqual(len(ha._carried_ticket_state(held, t)["ticketUpdateHeld"]["events"]),
+                         ha.TICKET_UPDATES_HELD_MAX)
 
     def test_a_record_for_another_ticket_is_dropped(self):
         dst, sess = self._move({"createdAt": "2019-01-01T00:00:00Z",
