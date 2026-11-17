@@ -60458,6 +60458,54 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
             "body": {"type": "doc", "content": [{"type": "paragraph", "content": [
                 {"type": "text", "text": "From a file"}]}]}}))
 
+    def test_xerk3042_the_file_is_read_when_the_command_has_run(self):
+        # The session writes the file and posts it in one command, so the
+        # tool_use is scanned before the file holds this comment's words.
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        path = os.path.join(d, "note.md")
+        with open(path, "w") as f:
+            f.write("the previous comment")
+        call = _tw_call("f2", "Bash", {"command": "jira comment X-1 - < note.md"})
+        call["cwd"] = d
+        state, report = {}, {"prUrls": [], "modelActual": None}
+        ha._scan_entry_line(json.dumps(call), state, report)
+        with open(path, "w") as f:
+            f.write("this comment")
+        ha._scan_entry_line(json.dumps(_tw_result("f2", "commented on X-1")), state, report)
+        [w] = report["ticketWrites"]
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("this comment"))
+        self.assertNotIn("_file", w)
+
+    def test_xerk3042_a_directory_change_or_here_string_is_never_misread(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        os.mkdir(os.path.join(d, "sub"))
+        for name, text in (("note.md", "top"), ("sub/note.md", "sub")):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+        for cmd in ("{ cd sub; jira comment X-1 -F note.md; }",
+                    "builtin cd sub && jira comment X-1 -F note.md",
+                    "command cd sub && jira comment X-1 -F note.md",
+                    "CDPATH= cd sub && jira comment X-1 -F note.md",
+                    "! cd sub || jira comment X-1 -F note.md",
+                    "time cd sub; jira comment X-1 -F note.md"):
+            [w] = ha.ticket_writes_from_bash(cmd, d)
+            self.assertNotIn("fp", w, cmd)
+        for cmd in ("cat note.md | jira comment X-1 - <<< 'words'",
+                    "jira comment X-1 - < note.md <<< 'words'"):
+            [w] = ha.ticket_writes_from_bash(cmd, d)
+            self.assertEqual(w["fp"], ha.ticket_body_fingerprint("words"), cmd)
+        # Only fd 0 is stdin; a `$` path is never expanded or guessed.
+        for literal in ("$XERK3042_NOTE", "${XERK3042_NOTE}"):  # shlex leaves it unexpanded
+            with open(os.path.join(d, literal), "w") as f:
+                f.write("not what bash reads")
+        for cmd in ("jira comment X-1 - 3< note.md",
+                    "jira comment X-1 -F $XERK3042_NOTE",
+                    "jira comment X-1 -F ${XERK3042_NOTE}"):
+            [w] = ha.ticket_writes_from_bash(cmd, d)
+            self.assertNotIn("fp", w, cmd)
+
     def test_redirections_are_not_arguments(self):
         for cmd in ('jira comment X-1 "text" 2>&1 | tail -3',
                     'jira comment X-1 "text" >/dev/null 2>&1',

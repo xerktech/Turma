@@ -12153,6 +12153,10 @@ def _tw_file_fingerprint(path, cwd):
             return None
         path = os.path.join(cwd, path)
     try:
+        # stat before open: opening a FIFO, even O_NONBLOCK, releases a writer
+        # blocked on it, and a device open can have side effects of its own.
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None
         data = _read_regular_file_bounded(path, TICKET_WRITE_CMD_MAX)
     except (OSError, ValueError):
         return None
@@ -12275,6 +12279,8 @@ def _tw_segments(cmd, heredocs=()):
                 if t == "<" and fd in (None, "0") and has_target \
                         and not _TW_HEREDOC_MARK_RE.match(toks[i + 1]):
                     docs = [_TwFile(toks[i + 1])]
+                elif t == "<<<" and fd in (None, "0"):
+                    docs = [toks[i + 1]] if has_target else []
                 i += 2 if has_target else 1
                 continue
             nxt = []
@@ -12510,7 +12516,7 @@ _TW_PROGRAMS = {"jira": _tw_jira_cli, "acli": _tw_acli, "az": _tw_az, "curl": _t
 _TW_PROGRAM_HINT_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:jira|acli|az|curl)(?![A-Za-z0-9_.-])")
 
 
-def ticket_writes_from_bash(cmd, cwd=None):
+def ticket_writes_from_bash(cmd, cwd=None, defer_files=False):
     """Tracker writes a Bash command makes: the host's `jira` helper
     (comment/edit/transition/assign), `acli jira workitem …`, `az boards
     work-item update` (--discussion is a comment), curl/REST to a Jira issue's
@@ -12518,7 +12524,9 @@ def ticket_writes_from_bash(cmd, cwd=None):
     COMMAND words (shlex), never its output. [] for anything else. A body the
     command reads from a file is fingerprinted from that file as it is NOW
     (`_tw_file_fingerprint`; a relative path against `cwd`, the call's own
-    working dir, unless an earlier segment changed directory)."""
+    working dir, unless the command changes directory anywhere before it). With
+    `defer_files` the file is NOT read: the write keeps `_file` = (path, base
+    dir) for `resolve_ticket_write_files` to read once the command has run."""
     if not isinstance(cmd, str) or not cmd or len(cmd) > TICKET_WRITE_CMD_MAX:
         return []
     if not _TW_PROGRAM_HINT_RE.search(cmd):
@@ -12526,8 +12534,10 @@ def ticket_writes_from_bash(cmd, cwd=None):
     stripped, heredocs = _tw_heredocs(cmd)
     out, moved = [], False
     for seg, docs in _tw_segments(stripped, heredocs)[:64]:
-        if seg[0] in ("cd", "pushd", "popd"):
-            moved = True  # a relative path no longer resolves against `cwd`
+        if any(wd in _TW_CD_WORDS for wd in seg):
+            # A relative path may no longer resolve against `cwd` (`{ cd x;`,
+            # `builtin cd`, `CDPATH= cd`…): any such word, anywhere, counts.
+            moved = True
         i, other_board = 0, False
         while i < len(seg) and (re.match(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}=", seg[i])
                                 or seg[i] in ("env", "command", "exec", "sudo", "time")):
@@ -12541,11 +12551,28 @@ def ticket_writes_from_bash(cmd, cwd=None):
         if fn:
             for w in fn(seg[i + 1:], docs):
                 if "_file" in w:
-                    fp = _tw_file_fingerprint(w.pop("_file"), None if moved else cwd)
-                    if fp:
-                        w["fp"] = fp
+                    w["_file"] = (w["_file"], None if moved else cwd)
+                    if not defer_files:
+                        resolve_ticket_write_files([w])
                 out.append(w)
     return out[:8]
+
+
+_TW_CD_WORDS = frozenset(("cd", "pushd", "popd"))
+
+
+def resolve_ticket_write_files(writes):
+    """Fingerprint each write's deferred body file (`_file`) as it is NOW and
+    drop the internal key. Called once the command has RUN (its tool_result):
+    a session writes the file and posts it in one command, so read at the
+    tool_use the file may not exist yet, or still hold the last comment."""
+    for w in writes:
+        f = w.pop("_file", None)
+        if isinstance(f, tuple) and len(f) == 2:
+            fp = _tw_file_fingerprint(f[0], f[1])
+            if fp:
+                w["fp"] = fp
+    return writes
 
 
 def ticket_writes_from_mcp(name, inp):
@@ -12648,7 +12675,8 @@ def _scan_ticket_write_entry(entry, state, report):
             if name == "Bash":
                 cwd = entry.get("cwd")
                 writes = ticket_writes_from_bash(inp.get("command"),
-                                                 cwd if isinstance(cwd, str) else None)
+                                                 cwd if isinstance(cwd, str) else None,
+                                                 defer_files=True)
             else:
                 writes = ticket_writes_from_mcp(name, inp)
             if writes:
@@ -12667,6 +12695,7 @@ def _scan_ticket_write_entry(entry, state, report):
             text = _tool_result_text(block.get("content"))
             if _tw_result_failed(text):
                 continue  # curl exits 0 on an HTTP 4xx: the tracker refused it
+            resolve_ticket_write_files(writes)  # the command has run: read its body file
             t = _ts_ms(entry.get("timestamp")) or int(time.time() * 1000)
             cid = _tw_result_id(text)
             out = report.setdefault("ticketWrites", [])
