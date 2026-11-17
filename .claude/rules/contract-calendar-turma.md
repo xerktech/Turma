@@ -142,6 +142,8 @@ Events made IN Turma, owned by the hub. Every child of the epic
 - **Expanded at SERVE time, over the requested range only, in the event's IANA `timeZone`** (Intl,
   no dependency): every occurrence keeps the anchor's WALL start and length, so DST never moves a
   9:00. A time a spring-forward skips reads an hour later (old offset), a repeated one is its first.
+  - **Except the anchor itself** (XERK-3041): the first occurrence is the stored start/end, so a
+    series started at the SECOND 1:30 of a fall-back day keeps that instant and its own key resolves.
   - Unbounded rules are fine: a call skips straight to the range and never walks more than
     `PERIODS_MAX` periods; the served range is already ≤100 days.
   - **A `count` series skips ahead too** (its occurrences before a period are counted in O(1)):

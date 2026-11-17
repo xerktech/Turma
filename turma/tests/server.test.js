@@ -36410,3 +36410,19 @@ test("sendfile: a multi-range request is answered whole", async () => {
   assert.equal(r.headers["content-type"], "video/webm");
   sendFiles.clear();
 });
+
+test("XERK-3041: an exception stored under the old first-instance key of a second-1:30 anchor moves to the anchor's key", () => {
+  const base = { id: "turma:3041000000000000", orgs: [S2968A], subject: "Late", start: "2027-11-07T01:30:00-05:00",
+    end: "2027-11-07T02:30:00-05:00", timeZone: "America/New_York", recurrence: { freq: "daily", interval: 1 },
+    createdBy: "breakglass", createdAt: 1, updatedAt: 1, version: 1 };
+  const moved = hub.sanitizeTurmaEvent({ ...base, exceptions: {
+    "2027-11-07T05:30:00Z": { subject: "Moved" }, "2027-11-08T06:30:00Z": { deleted: true } } }, "");
+  assert.deepEqual(Object.keys(moved.exceptions), ["2027-11-07T06:30:00Z", "2027-11-08T06:30:00Z"]);
+  assert.equal(moved.exceptions["2027-11-07T06:30:00Z"].subject, "Moved");
+  assert.deepEqual(hub.sanitizeTurmaEvent(moved, ""), moved, "a coerce fixed point");
+  // An exception already at the anchor's own key wins; the stale one is dropped.
+  const both = hub.sanitizeTurmaEvent({ ...base, exceptions: {
+    "2027-11-07T05:30:00Z": { subject: "Old" }, "2027-11-07T06:30:00Z": { subject: "New" } } }, "");
+  assert.deepEqual(Object.keys(both.exceptions), ["2027-11-07T06:30:00Z"]);
+  assert.equal(both.exceptions["2027-11-07T06:30:00Z"].subject, "New");
+});
