@@ -141,6 +141,9 @@ DevOps, and what gets typed back because of it.
 - **The seen-cap never trims a key the PR still has** (`prCommentBase`): a trimmed current key reads
   as new every poll. Current keys go last; vanished ones age out first.
   Tests: `test_a_pr_past_the_seen_cap_does_not_resend_old_comments`.
+- **A partial fetch never shrinks the seen set**: a failed GitHub inline channel returns
+  `_PartialEvents`, not None, and the keys it lacks are still on the PR.
+  Tests: `test_a_partial_fetch_past_the_seen_cap_does_not_resend_later`.
 - `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a rebase/force-
   push**) off the just-cached `mergeable`. `prConflicts` bounds nudging per PR; MERGEABLE/closed
   re-arms it, **UNKNOWN does neither** — that's what a just-pushed fix looks like, and clearing on it

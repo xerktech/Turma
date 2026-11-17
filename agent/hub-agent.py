@@ -10148,6 +10148,12 @@ def _pr_ref(url):
     return "PR", ""
 
 
+class _PartialEvents(list):
+    """A comment-event list missing a channel whose fetch failed (XERK-3047):
+    the keys it lacks are not evidence those comments vanished, so the seen-set
+    trim in _deliver_pr_comments must not drop them."""
+
+
 def _pr_comment_events(url, self_login):
     """Every human-visible comment on a PR, normalized to the fields the
     delivery poller needs (XERK-49). Three channels, because "reply in a PR"
@@ -10166,8 +10172,9 @@ def _pr_comment_events(url, self_login):
     `viewerDidAuthor` where present, else a login compare), so the poller can
     baseline it as seen yet never react to the session's own words.
 
-    Returns the event list (possibly empty — a real PR with no comments), or
-    None on a hard fetch failure so the caller leaves the baseline untouched
+    Returns the event list (possibly empty — a real PR with no comments), a
+    _PartialEvents when the inline channel failed, or None on a hard fetch
+    failure so the caller leaves the baseline untouched
     rather than treating "gh errored" as "every prior comment vanished".
 
     A GitLab merge-request URL dispatches to _mr_comment_events (XERK-162) and
@@ -10224,16 +10231,20 @@ def _pr_comment_events(url, self_login):
     # from the API. Best-effort — a failure just leaves inline notes uncovered
     # this beat rather than losing the conversation ones already gathered.
     m = PR_URL_PARTS_RE.search(url or "")
+    partial = False
     if m:
         owner, repo, num = m.group(1), m.group(2), m.group(3)
         raw2 = run(["gh", "api", f"repos/{owner}/{repo}/pulls/{num}/comments",
                     "--paginate"])
+        inline = None
         if raw2:
             try:
                 inline = json.loads(raw2)
             except ValueError:
                 inline = None
-            for c in inline or []:
+        partial = not isinstance(inline, list)
+        if not partial:
+            for c in inline:
                 if not isinstance(c, dict):
                     continue
                 body = str(c.get("body") or "").strip()
@@ -10248,7 +10259,8 @@ def _pr_comment_events(url, self_login):
                     "author": login, "body": body, "kind": "inline", "loc": loc,
                     "is_self": bool(self_login) and login == self_login,
                 })
-    return [e for e in events if e["key"]]
+    events = [e for e in events if e["key"]]
+    return _PartialEvents(events) if partial else events
 
 
 def _mr_comment_events(url):
@@ -48345,12 +48357,19 @@ class SessionManager:
                 # one: a key trimmed while the PR still has that comment reads
                 # as new on every later beat (a PR past the cap re-sent its
                 # oldest comments each poll). Keys no longer fetched age out
-                # first, in the order they were recorded.
+                # first, in the order they were recorded — except on a PARTIAL
+                # fetch (an inline channel failed): its missing keys are still
+                # on the PR, and trimming them would re-send them on the next
+                # full fetch, so that beat never shrinks the set.
                 keys = [e["key"] for e in events]
                 current = set(keys)
-                prior = [k for k in (base.get(url) or []) if k not in current]
+                old = base.get(url) or []
+                prior = [k for k in old if k not in current]
                 merged = prior + list(dict.fromkeys(keys))
-                base[url] = merged[-max(PR_COMMENTS_SEEN_MAX, len(current)):]
+                keep = max(PR_COMMENTS_SEEN_MAX, len(current))
+                if isinstance(events, _PartialEvents):
+                    keep = max(keep, len(old))
+                base[url] = merged[-keep:]
                 changed = True
                 if first or not fresh:
                     continue
