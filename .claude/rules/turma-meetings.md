@@ -149,8 +149,9 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   viewer in `localStorage` (`turma-meetings-view`, guarded), Calendar by default. A `?site=` link
   (the proposals push) opens Notes review. The hidden view's keys are inert (`offsetParent`).
 - **`calendar.js` reads its own routes** (`/api/calendar` per Sunday–Saturday week, prefetching the
-  weeks either side; `/api/holidays` for the same days). The org pick is part of the cache key
-  (`<orgs>|<week>`); a read keeps the pick it started with.
+  weeks either side; `/api/holidays` for the same days), keyed by week alone.
+- **The calendar always shows every org** (XERK-3031): the header's site-wide org pick never
+  filters it (no `org=` on the read), on web and Android. Don't re-scope it to the pick.
 - **What re-reads it** (each a QA finding): `calendar`, `holidaySettings` AND `meetingProposals`
   frames (a Tenir-only capture is announced only by the last), coalesced 1s (`calendarSoon`); a
   stream reconnect; a 60s poll while the stream is down.
@@ -198,7 +199,7 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
     strikethrough (kept, as Teams keeps them); past = dimmed; Tenir-only (`source:"tenir"`) = a
     caption glyph. All-day and ≥24h events ride the all-day band, one chip per day (Teams draws a
     spanning bar; not worth the layout here).
-  - Holidays sit in the all-day band; a day off for an org in view (`offFor` ∩ header pick) is
+  - Holidays sit in the all-day band; a day off for any org (`offFor`) is
     hatched grey with "Day off · <org>".
 - **Outlook events are read-only; Turma events are made here** (XERK-2971). A click on an event
   opens the detail panel (XERK-2898); nothing drags an event.
@@ -275,8 +276,8 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
 
 - Wire: `contract-calendar-turma.md`. The web half is all in `calendar.js`.
 - **Create**: "+ New event" in the bar, or a click/drag on an empty grid slot (30-min rows,
-  `slotMinAt`); a TOUCH that moved >10px is a swipe, never a create. The header's org pick
-  (∩ pickable orgs) pre-fills the orgs; a lone org is picked for you.
+  `slotMinAt`); a TOUCH that moved >10px is a swipe, never a create. A lone pickable org is
+  pre-filled; otherwise the orgs start empty.
 - **The editor is a `.td-backdrop` modal** (`role=dialog aria-modal`, so `trapModalTab` traps
   Tab and the calendar's own Esc yields): Esc / ✕ / Cancel / backdrop close it, full screen under
   760px. Field values live in `ed.f` (read on input), so a repaint never loses a draft; repaints go

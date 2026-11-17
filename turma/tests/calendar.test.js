@@ -215,7 +215,7 @@ test("XERK-2937: grid geometry is in --slot rows, so a tall pane stretches the d
   assert.ok(!/top:\d+px/.test(html), "no fixed-px row geometry left");
 });
 
-test("XERK-2897: holidays fill the all-day band; a day off shades only for the orgs in view", async () => {
+test("XERK-2897: holidays fill the all-day band; a day off shades for every org, whatever the header pick (XERK-3031)", async () => {
   replies = {
     "/api/holidays": () => [{ id: "us-veterans-day", date: "2026-11-11", name: "Veterans Day", country: "US", offFor: ["acme"] }],
     "/api/calendar": () => ({ events: [], hosts: [] }),
@@ -228,22 +228,19 @@ test("XERK-2897: holidays fill the all-day band; a day off shades only for the o
   assert.match(html, /Day off · acme/);
   orgKeys = ["other.atlassian.net"];
   html = await show(at(2026, 11, 11));
-  assert.match(html, />Veterans Day</);                // still a holiday
-  assert.doesNotMatch(html, /cal-col today off/);      // but not a day off for the org in view
-  orgKeys = ["acme"];
-  html = await show(at(2026, 11, 11));
-  assert.match(html, /cal-col today off/);
+  assert.match(html, />Veterans Day</);
+  assert.match(html, /cal-col today off/, "the header's org pick never hides a day off");
   orgKeys = [];
 });
 
-test("XERK-2897: the org pick rides the calendar read, and a week the hub has not synced says so", async () => {
+test("XERK-3031: the header's org pick never rides the calendar read; a week the hub has not synced says so", async () => {
   const asked = [];
   replies = {
     "/api/calendar": (url) => { asked.push(url); return { events: [], hosts: [{ host: "h1", device: "laptop", online: true, pending: true, ranges: [] }] }; },
   };
   orgKeys = ["a.atlassian.net", "b.atlassian.net"];
   const html = await show(at(2027, 6, 2));
-  assert.ok(asked.some((u) => u.includes("&org=a.atlassian.net%2Cb.atlassian.net")));
+  assert.ok(asked.length && !asked.some((u) => u.includes("org=")), "every org is read");
   assert.ok(asked.some((u) => u.includes(`from=${cal.weekStart(at(2027, 6, 2))}`)));
   assert.ok(asked.some((u) => u.includes(`from=${cal.addDays(cal.weekStart(at(2027, 6, 2)), 7)}`)), "next week prefetched");
   assert.match(html, /Syncing laptop&#39;s Outlook for this week…/);
@@ -267,17 +264,20 @@ test("XERK-2897: host notices — Outlook unreachable and a covered online host"
   assert.equal(cal.safeHttps('https://x.test/"onmouseover'), "");
 });
 
-test("XERK-2897: the org pick is the cache key — another pick's events never show", async () => {
+test("XERK-3031: the calendar shows every org's events whatever the header's org pick", async () => {
   const ws = cal.weekStart(at(2027, 2, 3));
   replies = {
-    "/api/calendar": (url) => ({ hosts: [], events: url.includes("org=a.atlassian.net") && url.includes(`from=${ws}`)
-      ? [{ host: "h1", id: "A1", org: "a.atlassian.net", subject: "Only for A", startMs: at(2027, 2, 3, 9), endMs: at(2027, 2, 3, 10) }]
+    "/api/calendar": (url) => ({ hosts: [], events: !url.includes("org=") && url.includes(`from=${ws}`)
+      ? [{ host: "h1", id: "A1", org: "a.atlassian.net", subject: "Org A's meeting", startMs: at(2027, 2, 3, 9), endMs: at(2027, 2, 3, 10) }]
       : [] }),
   };
-  orgKeys = ["a.atlassian.net"];
-  assert.match(await show(at(2027, 2, 3)), /Only for A/);
-  orgKeys = ["b.atlassian.net"];
-  assert.doesNotMatch(await show(at(2027, 2, 3)), /Only for A/);
+  cal.refetch();
+  try {
+    orgKeys = ["a.atlassian.net"];
+    assert.match(await show(at(2027, 2, 3)), /Org A&#39;s meeting|Org A's meeting/);
+    orgKeys = ["b.atlassian.net"];
+    assert.match(await show(at(2027, 2, 3)), /Org A&#39;s meeting|Org A's meeting/, "another org's pick still shows it");
+  } finally { orgKeys = []; }
   orgKeys = [];
 });
 
@@ -1161,8 +1161,10 @@ test("XERK-2954: brief.html sizes the rows from --hours over the pane's height",
 
 test("XERK-2954 QA: the grid opens with 8:00 at the top and keeps it while the pane changes height", async () => {
   NOW = at(2026, 11, 12, 10, 30);
-  let hold;
-  replies = { "/api/calendar": () => new Promise((r) => { hold = r; }) };
+  // Every held read is released together, so none is left loading for later tests.
+  const held = [];
+  const hold = (v) => { for (const r of held.splice(0)) r(v); };
+  replies = { "/api/calendar": () => new Promise((r) => { held.push(r); }) };
   const [grid] = root.children;
   // The loading notice takes 26px off the pane until the week lands (QA: 597 -> 623px).
   const pane = { h: 597 };
@@ -1439,7 +1441,7 @@ test("XERK-2989: invitations — the form round-trips them, the editor offers th
   assert.match(cal.detailHtml(ev), /Invitations/);
 });
 
-test("XERK-2971: a multi-org event renders once, with every org's color, and shows under an org filter", () => withOrgs(async () => {
+test("XERK-2971: a multi-org event renders once, with every org's color, and shows under any header pick", () => withOrgs(async () => {
   const asked = [];
   replies = { "/api/calendar": (url) => { asked.push(url); return { hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [tev()] : [] }; } };
   cal.refetch();
@@ -1448,12 +1450,12 @@ test("XERK-2971: a multi-org event renders once, with every org's color, and sho
   assert.match(html, /class="cal-ev turma multi"/);
   assert.match(html, /class="cal-orgbar"[^>]*linear-gradient\(to bottom,var\(--s3\) 0\.00% 50\.00%,var\(--s5\) 50\.00% 100\.00%\)/);
   assert.match(html, /aria-label="Joint planning,[^"]*orgs acme, globex[^"]*Turma event"/);
-  // Under a filter on its SECOND org the hub serves it (any of its orgs) and it still shows once.
+  // A header pick (XERK-3031) is never sent, and the event still shows once.
   orgKeys = ["globex"];
   try {
     cal.refetch();
     html = await show(at(2027, 5, 4));
-    assert.ok(asked.some((u) => u.includes("&org=globex")));
+    assert.ok(!asked.some((u) => u.includes("org=")));
     assert.equal((html.match(/aria-label="Joint planning,/g) || []).length, 1);
   } finally { orgKeys = []; }
   // A single-org Turma event keeps a plain org bar; an Outlook event is never "turma".
@@ -1476,7 +1478,7 @@ test("XERK-2971: Edit and Delete only on an editable Turma event; Outlook keeps 
   assert.match(h, /data-ev-delete/);
 });
 
-test("XERK-2971: create — New event opens the editor pre-filled with the filtered org; Save posts the payload", () => withOrgs(async () => {
+test("XERK-2971: create — New event ignores the header's org pick (XERK-3031); Save posts the payload", () => withOrgs(async () => {
   orgKeys = ["globex"];
   replies = { "/api/calendar/events": () => ({ ok: true, event: tev({ id: "turma:aaaaaaaaaaaaaaaa", orgs: ["globex"] }) }) };
   try {
@@ -1484,13 +1486,13 @@ test("XERK-2971: create — New event opens the editor pre-filled with the filte
     click({ calNew: "" });
     const e = cal._ed();
     assert.equal(e.mode, "new");
-    assert.deepEqual(e.f.orgs, ["globex"], "the header's org pick pre-fills");
+    assert.deepEqual(e.f.orgs, [], "two pickable orgs: none pre-filled, the header's pick ignored");
     assert.equal(cal._edEls().back.hidden, false);
     const html = cal._edEls().panel.innerHTML;
     assert.match(html, /data-ed-org="acme"/);
-    assert.match(html, /data-ed-org="globex" checked/);
+    assert.match(html, /data-ed-org="globex"(?! checked)/);
     assert.match(html, /Does not repeat/);
-    editorFill({ subject: "Plan <b>", startDate: "2027-05-05", startTime: "13:00", endDate: "2027-05-05", endTime: "14:00", reqDraft: "Ann <ann@acme.com>" });
+    editorFill({ orgs: ["globex"], subject: "Plan <b>", startDate: "2027-05-05", startTime: "13:00", endDate: "2027-05-05", endTime: "14:00", reqDraft: "Ann <ann@acme.com>" });
     posts.length = 0;
     await cal.saveEditor();
     assert.equal(posts.length, 1);
