@@ -20151,6 +20151,26 @@ class TestPendingScan(ProjectDirMixin, unittest.TestCase):
         delivered, _queued, _c = ha._pending_scan(path)
         self.assertEqual(delivered, ["real one"])
 
+    def test_a_bracketed_paste_is_delivered_as_what_was_pasted(self):
+        # XERK-3043: a message past PASTE_SLICED_MAX_CHARS is pasted, and
+        # Claude Code records it framed in <pasted_content> lines. Compared
+        # raw it never matched the outbox record, so a compaction re-typed it.
+        body = ha.INBOX_PREFIX + "\n\nline one\nline two"
+        framed = ('<pasted_content id="ab12">\n' + body
+                  + '\n</pasted_content id="ab12">')
+        path = self._write([
+            {"type": "user", "message": {"role": "user", "content": framed}},
+        ])
+        delivered, _q, _c = ha._pending_scan(path)
+        self.assertEqual(delivered, [body])
+
+    def test_only_a_whole_matching_paste_frame_is_unwrapped(self):
+        for text in (
+                '<pasted_content id="a">\nx\n</pasted_content id="b">',
+                'note\n<pasted_content id="a">\nx\n</pasted_content id="a">',
+                '<pasted_content id="a">\n</pasted_content id="a">'):
+            self.assertEqual(ha._unwrap_paste(text), text)
+
     def test_dequeue_empties_the_queue(self):
         path = self._write([
             {"type": "queue-operation", "operation": "enqueue", "content": "q"},
@@ -20925,6 +20945,8 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
     fall back to the pane whenever that would not actually deliver (XERK-340)."""
 
     SID = "11111111-1111-4111-8111-111111111111"
+    # The pane fallback carries the inbox's attribution frame (XERK-3043).
+    PANE_TEXT = f"{ha.INBOX_PREFIX}\n\nresolve the conflicts"
 
     def make_manager(self):
         sm = super().make_manager()
@@ -20977,8 +20999,8 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         # Staged for the input worker: nothing types on the beat.
         self.assertEqual(self.run_stdin_calls, [])
         self._deliver(sm)
-        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
-        self.assertEqual(sess["pendingInputs"][0]["text"], "resolve the conflicts")
+        self.assertEqual(self.run_stdin_calls[0][1], self.PANE_TEXT)
+        self.assertEqual(sess["pendingInputs"][0]["text"], self.PANE_TEXT)
 
     def test_a_failed_post_falls_back_to_the_pane(self):
         sm = self.make_manager()
@@ -20989,7 +21011,7 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         # Staged for the input worker: nothing types on the beat.
         self.assertEqual(self.run_stdin_calls, [])
         self._deliver(sm)
-        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(self.run_stdin_calls[0][1], self.PANE_TEXT)
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
     def test_a_session_that_refuses_peer_messages_stays_on_the_pane(self):
@@ -21008,7 +21030,7 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         # Staged for the input worker: nothing types on the beat.
         self.assertEqual(self.run_stdin_calls, [])
         self._deliver(sm)
-        self.assertEqual(self.run_stdin_calls[0][1], "resolve the conflicts")
+        self.assertEqual(self.run_stdin_calls[0][1], self.PANE_TEXT)
         self.assertEqual(len(sess["pendingInputs"]), 1)
 
     def test_oversize_is_refused_once_by_send_input(self):
