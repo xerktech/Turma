@@ -60395,6 +60395,69 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual([w["fp"] for w in ha.ticket_writes_from_bash(two)],
                          [ha.ticket_body_fingerprint("first"), ha.ticket_body_fingerprint("second")])
 
+    # --- XERK-3042: a body read from a file --------------------------------
+
+    def test_xerk3042_a_file_bodied_comment_is_fingerprinted_from_the_file(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "note.md"), "w") as f:
+            f.write("Verified on **main**: the fix holds.\n")
+        want = ha.ticket_body_fingerprint("Verified on main: the fix holds.")
+        absn = os.path.join(d, "note.md")
+        for cmd in ("jira comment XERK-1 -F note.md",
+                    "jira comment XERK-1 --file note.md",
+                    "jira comment XERK-1 - < note.md",
+                    "jira comment XERK-1 - 0< note.md 2>&1",
+                    "cat note.md | jira comment XERK-1 -",
+                    f"jira comment XERK-1 -F {absn}",
+                    "acli jira workitem comment create --key XERK-1 --body-file note.md",
+                    "az boards work-item update --id 7 --discussion @note.md",
+                    "curl -X POST https://x/_apis/wit/workItems/7/comments --data-binary @note.md"):
+            [w] = ha.ticket_writes_from_bash(cmd, d)
+            self.assertEqual(w.get("fp"), want, cmd)
+            self.assertNotIn("_file", w, cmd)
+        # A curl JSON body file is read the way the inline JSON body is.
+        with open(os.path.join(d, "c.json"), "w") as f:
+            json.dump({"body": "json words"}, f)
+        [w] = ha.ticket_writes_from_bash(
+            "curl -X POST https://x/rest/api/3/issue/X-1/comment -d @c.json", d)
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("json words"))
+        # Bash's rule: the LAST stdin redirect is what the command reads.
+        [w] = ha.ticket_writes_from_bash("jira comment X-1 - < note.md <<'E'\nhd\nE", d)
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("hd"))
+
+    def test_xerk3042_an_unresolvable_file_gives_no_fingerprint(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "note.md"), "w") as f:
+            f.write("words")
+        fifo = os.path.join(d, "pipe.md")
+        os.mkfifo(fifo)
+        for cmd, cwd in (("jira comment X-1 -F note.md", None),        # no cwd
+                         ("jira comment X-1 -F note.md", "rel/dir"),   # not absolute
+                         ("jira comment X-1 -F gone.md", d),           # missing
+                         ("jira comment X-1 -F pipe.md", d),           # FIFO: never blocks
+                         ("jira comment X-1 -F $NOTE", d),             # expansion
+                         ("cd sub && jira comment X-1 -F note.md", d),  # cwd moved
+                         ("jira comment X-1 -F", d)):
+            [w] = ha.ticket_writes_from_bash(cmd, cwd)
+            self.assertEqual(set(w), {"kind", "key"}, cmd)
+
+    def test_xerk3042_the_scan_reads_the_file_against_the_calls_cwd(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(os.path.join(d, "note.md"), "w") as f:
+            f.write("from a file")
+        call = _tw_call("f1", "Bash", {"command": "jira comment XERK-1 -F note.md"})
+        call["cwd"] = d
+        [w] = self._scan([call, _tw_result("f1", "commented on XERK-1")])
+        self.assertEqual(w["fp"], ha.ticket_body_fingerprint("from a file"))
+        sess = {"ticketWrites": [w]}
+        self.assertTrue(ha._ticket_self_authored(sess, {
+            "kind": "comment", "key": "XERK-1", "at": w["t"] + 1000,
+            "body": {"type": "doc", "content": [{"type": "paragraph", "content": [
+                {"type": "text", "text": "From a file"}]}]}}))
+
     def test_redirections_are_not_arguments(self):
         for cmd in ('jira comment X-1 "text" 2>&1 | tail -3',
                     'jira comment X-1 "text" >/dev/null 2>&1',

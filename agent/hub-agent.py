@@ -12125,6 +12125,42 @@ def _tw_status(name):
     return n[:64] or None
 
 
+class _TwFile:
+    """A comment body the command reads from a FILE (`-F f`, `- < f`,
+    `cat f | …`, curl `-d @f`, acli `--body-file f`, az `--discussion @f`).
+    The command text never holds the file's words, so `ticket_writes_from_bash`
+    reads the file itself (`_tw_file_fingerprint`, XERK-3042)."""
+    __slots__ = ("path",)
+
+    def __init__(self, path):
+        self.path = path
+
+
+def _tw_file_fingerprint(path, cwd):
+    """The body fingerprint of a comment file, read NOW, or None. The file is
+    session-written, so it is read only as a REGULAR file (O_NONBLOCK + fstat:
+    a FIFO can't block the beat), bounded at TICKET_WRITE_CMD_MAX. A relative
+    path needs the call's own absolute `cwd`; a path holding an expansion is
+    not guessed at. A changed or missing file just yields no match — the
+    update is then delivered, the safe direction."""
+    if not isinstance(path, str) or not path or len(path) > 4096 \
+            or any(c in path for c in "\0$`"):
+        return None
+    if path.startswith("~/"):
+        path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        if not isinstance(cwd, str) or not os.path.isabs(cwd):
+            return None
+        path = os.path.join(cwd, path)
+    try:
+        data = _read_regular_file_bounded(path, TICKET_WRITE_CMD_MAX)
+    except (OSError, ValueError):
+        return None
+    if data is None:
+        return None
+    return ticket_body_fingerprint(data[:TICKET_WRITE_CMD_MAX].decode("utf-8", "replace"))
+
+
 def _tw_write(kind, key, body=None, fields=None, to=None):
     k = _tw_key(key)
     if not k:
@@ -12132,7 +12168,9 @@ def _tw_write(kind, key, body=None, fields=None, to=None):
     w = {"kind": kind, "key": k}
     if kind == "transition" and _tw_status(to):
         w["to"] = _tw_status(to)
-    if kind == "comment" and body is not None:
+    if kind == "comment" and isinstance(body, _TwFile):
+        w["_file"] = body.path
+    elif kind == "comment" and body is not None:
         fp = ticket_body_fingerprint(body)
         if fp:
             w["fp"] = fp
@@ -12210,9 +12248,10 @@ def _tw_heredocs(cmd):
 
 
 def _tw_segments(cmd, heredocs=()):
-    """[(words, own heredoc bodies)] per simple command. Redirections (`2>&1`,
+    """[(words, [stdin source])] per simple command. Redirections (`2>&1`,
     `> f`, `&>f`, `<f`) are dropped with their target, so they never pose as an
-    argument; the heredoc marker words are moved to the segment's own list."""
+    argument. A segment's stdin is its LAST heredoc or `< file` (bash's rule),
+    else the file a `cat FILE |` right before it prints (`_TwFile`)."""
     try:
         # A newline ends a command like `;` does (outside quotes).
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|<>\n")
@@ -12229,20 +12268,28 @@ def _tw_segments(cmd, heredocs=()):
             if "<" in t or ">" in t:
                 # A redirection: a lone fd number right before it is part of it,
                 # and its target (or the `&N` fd) is the next word.
+                fd = None
                 if cur and cur[-1].isdigit() and len(cur[-1]) <= 2:
-                    cur.pop()
-                i += 2 if i + 1 < len(toks) and not set(toks[i + 1]) <= set(";&|<>\n") else 1
+                    fd = cur.pop()
+                has_target = i + 1 < len(toks) and not set(toks[i + 1]) <= set(";&|<>\n")
+                if t == "<" and fd in (None, "0") and has_target \
+                        and not _TW_HEREDOC_MARK_RE.match(toks[i + 1]):
+                    docs = [_TwFile(toks[i + 1])]
+                i += 2 if has_target else 1
                 continue
+            nxt = []
+            if t == "|" and len(cur) == 2 and cur[0] == "cat" and not cur[1].startswith("-"):
+                nxt = [_TwFile(cur[1])]
             if cur:
                 segs.append((cur, docs))
-            cur, docs = [], []
+            cur, docs = [], nxt
             i += 1
             continue
         m = _TW_HEREDOC_MARK_RE.match(t)
         if m:
             n = int(m.group(1))
             if n < len(heredocs):
-                docs.append(heredocs[n])
+                docs = [heredocs[n]]
         else:
             cur.append(t)
         i += 1
@@ -12286,8 +12333,13 @@ def _tw_jira_cli(args, heredocs):
         return []
     key = pos[0]
     if verb == "comment":
-        body = None if ("-F" in opts or "--file" in opts) \
-            else _tw_stdin(pos[1] if len(pos) > 1 else None, heredocs)
+        f = opts.get("-F", opts.get("--file"))
+        if isinstance(f, str):
+            body = _tw_stdin(f, heredocs) if f == "-" else _TwFile(f)
+        elif f is not None:
+            body = None
+        else:
+            body = _tw_stdin(pos[1] if len(pos) > 1 else None, heredocs)
         w = _tw_write("comment", key, body)
     elif verb == "edit":
         fields = []
@@ -12322,7 +12374,14 @@ def _tw_acli(args, heredocs):
         return []
     if verb == "comment" and sub in ("create", "add", ""):
         body = opts.get("--body", opts.get("-b"))
-        w = _tw_write("comment", key, _tw_stdin(body, heredocs) if isinstance(body, str) else None)
+        bf = opts.get("--body-file", opts.get("--from-file"))
+        if isinstance(body, str):
+            body = _tw_stdin(body, heredocs)
+        elif isinstance(bf, str):
+            body = _tw_stdin(bf, heredocs) if bf == "-" else _TwFile(bf)
+        else:
+            body = None
+        w = _tw_write("comment", key, body)
     elif verb == "transition":
         to = opts.get("--status", opts.get("-s"))
         w = _tw_write("transition", key, to=to if isinstance(to, str) else None)
@@ -12349,7 +12408,8 @@ def _tw_az(args, heredocs):
     out = []
     disc = opts.get("--discussion")
     if isinstance(disc, str):
-        out.append(_tw_write("comment", key, _tw_stdin(disc, heredocs)))
+        out.append(_tw_write("comment", key, _TwFile(disc[1:]) if disc.startswith("@")
+                             and len(disc) > 1 else _tw_stdin(disc, heredocs)))
     fields = [f for f in ("--title", "--description", "--assigned-to") if f in opts]
     fv = opts.get("--fields", opts.get("-f"))
     if isinstance(fv, str):
@@ -12376,7 +12436,7 @@ def _tw_curl(args, heredocs):
         return []
     body = None
     if isinstance(data, str):
-        body = None if data.startswith("@") and data != "@-" else (
+        body = _TwFile(data[1:]) if data.startswith("@") and data != "@-" else (
             heredocs[0] if data in ("@-", "-") and heredocs else data)
     urls = [a for a in args if "/_apis/" in a or "/rest/api/" in a]
     if isinstance(opts.get("--url"), str):
@@ -12450,19 +12510,24 @@ _TW_PROGRAMS = {"jira": _tw_jira_cli, "acli": _tw_acli, "az": _tw_az, "curl": _t
 _TW_PROGRAM_HINT_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:jira|acli|az|curl)(?![A-Za-z0-9_.-])")
 
 
-def ticket_writes_from_bash(cmd):
+def ticket_writes_from_bash(cmd, cwd=None):
     """Tracker writes a Bash command makes: the host's `jira` helper
     (comment/edit/transition/assign), `acli jira workitem …`, `az boards
     work-item update` (--discussion is a comment), curl/REST to a Jira issue's
     comment/transitions/PUT or an ADO work item's comments/PATCH. Read off the
-    COMMAND words (shlex), never its output. [] for anything else."""
+    COMMAND words (shlex), never its output. [] for anything else. A body the
+    command reads from a file is fingerprinted from that file as it is NOW
+    (`_tw_file_fingerprint`; a relative path against `cwd`, the call's own
+    working dir, unless an earlier segment changed directory)."""
     if not isinstance(cmd, str) or not cmd or len(cmd) > TICKET_WRITE_CMD_MAX:
         return []
     if not _TW_PROGRAM_HINT_RE.search(cmd):
         return []  # cheap prefilter: most commands name no tracker program
     stripped, heredocs = _tw_heredocs(cmd)
-    out = []
+    out, moved = [], False
     for seg, docs in _tw_segments(stripped, heredocs)[:64]:
+        if seg[0] in ("cd", "pushd", "popd"):
+            moved = True  # a relative path no longer resolves against `cwd`
         i, other_board = 0, False
         while i < len(seg) and (re.match(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}=", seg[i])
                                 or seg[i] in ("env", "command", "exec", "sudo", "time")):
@@ -12474,7 +12539,12 @@ def ticket_writes_from_bash(cmd):
             continue
         fn = _TW_PROGRAMS.get(os.path.basename(seg[i]))
         if fn:
-            out += fn(seg[i + 1:], docs)
+            for w in fn(seg[i + 1:], docs):
+                if "_file" in w:
+                    fp = _tw_file_fingerprint(w.pop("_file"), None if moved else cwd)
+                    if fp:
+                        w["fp"] = fp
+                out.append(w)
     return out[:8]
 
 
@@ -12576,7 +12646,9 @@ def _scan_ticket_write_entry(entry, state, report):
             if not isinstance(bid, str) or not isinstance(inp, dict):
                 continue
             if name == "Bash":
-                writes = ticket_writes_from_bash(inp.get("command"))
+                cwd = entry.get("cwd")
+                writes = ticket_writes_from_bash(inp.get("command"),
+                                                 cwd if isinstance(cwd, str) else None)
             else:
                 writes = ticket_writes_from_mcp(name, inp)
             if writes:
