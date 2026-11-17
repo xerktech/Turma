@@ -35147,6 +35147,106 @@ test("XERK-2987: an org with no Outlook writer is served noHost, until a writer 
   }
 });
 
+// ---- XERK-3057: an Outlook event blocks other orgs' calendars under an alias --------------
+const src3057 = (extra = {}) => ({ id: "SRC-3057", seriesId: "", subject: "Board review",
+  start: iso2968(T2968), end: iso2968(T2968 + 3.6e6), allDay: false, location: "HQ", organizer: "Ann", busy: "busy",
+  myResponse: "accepted", canceled: false, recurring: false, joinUrl: "", lastModified: "2026-11-15T10:00:00Z",
+  sensitivity: "normal", attendees: [{ name: "Bo", email: "bo@x.com", role: "required", response: "accepted" }], ...extra });
+const block3057 = (body, host = D2985A) => request("PUT", `/api/agents/${encodeURIComponent(host)}/calendar/blocks`,
+  { body, headers: { ...userHeaders, "content-type": "application/json" } });
+const blockRecs3057 = () => Object.values(hub.getCalendarTurmaEvents()[""] || {}).filter((r) => r.blockOf);
+
+test("XERK-3057: a block writes an Out-of-office alias copy with nobody invited, and follows its source", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    await beat2985(D2985A, S2985A, sync2985([src3057()]));
+    // Refusals in words, none storing a rule.
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: S2985B })).status, 400);
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: [S2985A] })).status, 400, "never its own org");
+    assert.equal((await block3057({ eventId: "NOPE", orgs: [S2985B] })).status, 404);
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: ["nobody.atlassian.net"] })).status, 404);
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: [S2985B] }, "no-such-host")).status, 404);
+    assert.deepEqual(blockRecs3057(), []);
+    const r = await block3057({ eventId: "SRC-3057", orgs: [S2985B], alias: "Focus" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual([r.body.blocks.orgs, r.body.blocks.alias, r.body.blocks.outlook[S2985B].state], [[S2985B], "Focus", "pending"]);
+    const [rec] = blockRecs3057();
+    assert.deepEqual([rec.orgs, rec.subject, rec.busy, rec.attendees, rec.sendInvites, rec.startMs, rec.endMs],
+      [[S2985B], "Focus", "outOfOffice", [], false, T2968, T2968 + 3.6e6]);
+    assert.equal(rec.id, hub.calBlockId(D2985A, "SRC-3057"));
+    // The copy is a plain appointment: no invitation, no recipient, no source text.
+    const [w] = writes2985(D2985B).filter((x) => x.turmaId === rec.id);
+    assert.deepEqual([w.op, w.event.subject, w.event.busy, w.event.sendInvites, w.event.attendees, w.event.location, w.event.body],
+      ["upsert", "Focus", "outOfOffice", false, [], "", ""]);
+    assert.ok(!("blockOf" in w.event));
+    assert.equal(writes2985(D2985A).length, 0, "nothing is written to the source's own org");
+    // Never served as an event of its own; the source carries it; the copy read back is hidden.
+    await later2985();
+    await beat2985(D2985B, S2985B, sync2985([copy2985(rec, { busy: "outOfOffice" })]));
+    const all = (await calGet2891(T2968 - 864e5, T2968 + 864e5)).body.events;
+    assert.deepEqual(all.map((e) => [e.source, e.id]), [["outlook", "SRC-3057"]]);
+    assert.equal(all[0].blocks.alias, "Focus");
+    const stored = hub.getCalendarTurmaEvents()[""];
+    assert.equal(JSON.stringify(hub.calendarTurmaEventsCoerce(JSON.parse(JSON.stringify({ "": stored })))[""]), JSON.stringify(stored));
+    // The Turma routes refuse it: it changes only with its source and rule.
+    assert.equal((await turma2968("DELETE", rec.id)).status, 404);
+    // The source moves: the copy follows (same record, next version).
+    await later2985();
+    await beat2985(D2985A, S2985A, sync2985([src3057({ start: iso2968(T2968 + 3.6e6), end: iso2968(T2968 + 7.2e6) })]));
+    const [moved] = blockRecs3057();
+    assert.deepEqual([moved.id, moved.version, moved.startMs], [rec.id, 2, T2968 + 3.6e6]);
+    // A re-sent identical sync changes nothing.
+    await beat2985(D2985A, S2985A, sync2985([src3057({ start: iso2968(T2968 + 3.6e6), end: iso2968(T2968 + 7.2e6) })]));
+    assert.equal(blockRecs3057()[0].version, 2);
+    // The alias changes: the copy is renamed.
+    await block3057({ eventId: "SRC-3057", orgs: [S2985B], alias: "" });
+    assert.equal(blockRecs3057()[0].subject, "Blocked", "an empty alias reads Blocked");
+    // The source is deleted in Outlook: the copy is deleted from org B's Outlook.
+    await beat2985(D2985B, S2985B, { calendarWriteResults: [ok2985(rec.id, S2985B, 3)] });
+    await beat2985(D2985A, S2985A, sync2985([]));
+    assert.deepEqual(blockRecs3057(), []);
+    assert.ok(writes2985(D2985B).some((x) => x.op === "delete" && x.turmaId === rec.id));
+    // It comes back, then the org is unchecked: the copy goes again.
+    await beat2985(D2985A, S2985A, sync2985([src3057()]));
+    assert.equal(blockRecs3057().length, 1);
+    assert.equal((await block3057({ eventId: "SRC-3057", orgs: [] })).status, 200);
+    assert.deepEqual(blockRecs3057(), []);
+    assert.ok(!hub.getCalendarHostSettings()[D2985A].blocks);
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
+test("XERK-3057: a recurring source blocks its whole series; an ended event gets no new block", async () => {
+  cleanup2985(D2985A, D2985B);
+  try {
+    await beat2985(D2985A, S2985A);
+    await beat2985(D2985B, S2985B);
+    const occ = (ms) => src3057({ id: `GID-1:${iso2968(ms)}`, seriesId: "GID-1", recurring: true,
+      start: iso2968(ms), end: iso2968(ms + 1.8e6) });
+    const past = src3057({ id: "PAST-1", start: iso2968(Date.now() - 7.2e6), end: iso2968(Date.now() - 3.6e6) });
+    await beat2985(D2985A, S2985A, { calendarSync: [{ windowFrom: Date.now() - 864e5, windowUntil: T2968 + 864e5,
+      syncedAt: Date.now(), events: [occ(T2968), occ(T2968 + 3 * 3.6e6), past] }] });
+    const r = await block3057({ eventId: `GID-1:${iso2968(T2968)}`, orgs: [S2985B], alias: "Standup elsewhere" });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.equal(r.body.blocks.series, true);
+    assert.deepEqual(blockRecs3057().map((x) => x.startMs).sort(), [T2968, T2968 + 3 * 3.6e6]);
+    assert.deepEqual(Object.keys(hub.getCalendarHostSettings()[D2985A].blocks), ["GID-1"]);
+    assert.equal((await block3057({ eventId: "PAST-1", orgs: [S2985B] })).status, 200);
+    assert.equal(blockRecs3057().length, 2, "an event that has ended gets no new block");
+    // An all-day source keeps its day in an Etc zone.
+    assert.equal(hub.calBlockZone({ allDay: true, start: "2026-11-16T00:00:00-05:00" }), "Etc/GMT+5");
+    assert.equal(hub.calBlockZone({ allDay: true, start: "2026-11-16T00:00:00+05:30" }), "UTC");
+    assert.equal(hub.calBlockZone({ allDay: false, start: "2026-11-16T09:00:00-05:00" }), "UTC");
+  } finally {
+    cleanup2985(D2985A, D2985B);
+    forget2533(D2985A, D2985B);
+  }
+});
+
 test("XERK-2985: removing an org deletes that org's copy; deleting the event deletes every copy", async () => {
   cleanup2985(D2985A, D2985B);
   try {

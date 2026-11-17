@@ -101,6 +101,7 @@ const ROUTES = [
   ["POST", "/api/agents/:host/restart", "host"],
   ["POST", "/api/agents/:host/roll-token", "host"],
   ["POST", "/api/agents/:host/calendar/settings", "host"],
+  ["PUT", "/api/agents/:host/calendar/blocks", "host"],
   ["POST", "/api/agents/:host/revoke-name-token", "host"],
   ["POST", "/api/agents/:host/transcripts/:tid/resume", "host"],
   ["POST", "/api/agents/:host/uploads", "host"],

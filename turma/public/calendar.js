@@ -721,6 +721,8 @@ function ariaOf(ev, day) {
   const olk = outlookMark(ev);
   if (olk) bits.push(olk === "failed" ? "an Outlook copy failed" : "writing to Outlook");
   if (ev.recurring === true) bits.push("repeats");
+  const blk = blockOrgsOf(ev);
+  if (blk.length) bits.push(`blocks ${blk.map(orgLabel).join(", ")}`);
   return bits.join(", ");
 }
 // A capture's review state on its event block (XERK-2898): proposals still
@@ -769,6 +771,17 @@ function orgBarHtml(ev, colors) {
   const stops = cs.map((c, i) => `${c} ${((i / cs.length) * 100).toFixed(2)}% ${(((i + 1) / cs.length) * 100).toFixed(2)}%`).join(",");
   return `<span class="cal-orgbar" aria-hidden="true" style="background:linear-gradient(to bottom,${stops})"></span>`;
 }
+// An Outlook event that blocks other orgs' calendars (XERK-3057) keeps its own tint; a bar
+// on its RIGHT edge shows the orgs it pushes an alias to, stacked top to bottom.
+const blockOrgsOf = (ev) => (ev && ev.blocks && Array.isArray(ev.blocks.orgs)
+  ? [...new Set(ev.blocks.orgs.filter((o) => typeof o === "string" && o))] : []);
+function blockBarHtml(ev, colors) {
+  const orgs = blockOrgsOf(ev);
+  if (!orgs.length) return "";
+  const cs = orgs.map((o) => safeColor(colors.get(o)) || "var(--muted)");
+  const stops = cs.map((c, i) => `${c} ${((i / cs.length) * 100).toFixed(2)}% ${(((i + 1) / cs.length) * 100).toFixed(2)}%`).join(",");
+  return `<span class="cal-blkbar" aria-hidden="true" style="background:linear-gradient(to bottom,${stops})"></span>`;
+}
 function timedHtml(seg, day, colors, now) {
   const ev = seg.ev;
   const left = (seg.col / seg.cols) * 100, width = (seg.span / seg.cols) * 100;
@@ -780,7 +793,7 @@ function timedHtml(seg, day, colors, now) {
   return `<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="${seg.top}"`
     + ` style="${evStyle(ev, colors)}top:${slots(seg.top / 30)};height:${slots((seg.bottom - seg.top) / 30, 2)};left:calc(${left}% + 1px);width:calc(${width}% - 4px)"`
     + ` aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-    + orgBarHtml(ev, colors) + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${outlookMarkHtml(ev)}${badgeHtml(b)}</span>`
+    + orgBarHtml(ev, colors) + blockBarHtml(ev, colors) + `<span class="cal-evb"><span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${outlookMarkHtml(ev)}${badgeHtml(b)}</span>`
     + `<span class="m">${esc(meta)}</span></span></button>`;
 }
 function bandHtml(day, events, holidays, colors, now) {
@@ -796,7 +809,7 @@ function bandHtml(day, events, holidays, colors, now) {
     const b = badgeOf(ev);
     bits.push(`<button type="button" class="${cls}" data-ev="${evIndex(ev)}" data-day="${day}" data-top="-1"`
       + ` style="${evStyle(ev, colors)}" aria-label="${esc([ariaOf(ev, day), badgeAria(b)].filter(Boolean).join(", "))}">`
-      + orgBarHtml(ev, colors) + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${outlookMarkHtml(ev)}${badgeHtml(b)}</span></button>`);
+      + orgBarHtml(ev, colors) + blockBarHtml(ev, colors) + `<span class="t">${ev.source === "tenir" ? TENIR_SVG : ""}<span class="tx">${esc(titleOf(ev))}</span>${recurHtml(ev)}${outlookMarkHtml(ev)}${badgeHtml(b)}</span></button>`);
   }
   return bits.join("");
 }
@@ -1042,7 +1055,65 @@ function detailHtml(ev, now, hasPanel = false) {
     + capture
     + (caps.length ? caps.map((c) => captureLinkHtml(ev, c)).join("") : "")
     + (!tenir && !turma && !caps.length && ev.startMs < now ? `<p class="cal-dnote">Tenir captured nothing for this event.</p>` : "")
-    + (turma ? turmaActionsHtml(ev) : "");
+    + (turma ? turmaActionsHtml(ev) : "")
+    + blocksHtml(ev);
+}
+// "Block other calendars" (XERK-3057): an Outlook event pushes an Out of office alias,
+// nobody invited, to each checked org's Outlook. The draft (`blk`) is this panel's; a
+// checkbox repaints, the alias is read on input (never a repaint, the change-on-blur rule).
+let blk = null;   // {key, orgs: Set, alias, busy, err}
+function blockDraft(ev) {
+  if (!blk || blk.key !== evKey(ev)) {
+    blk = { key: evKey(ev), orgs: new Set(blockOrgsOf(ev)), alias: ev.blocks && typeof ev.blocks.alias === "string" ? ev.blocks.alias : "",
+      busy: false, err: "" };
+  }
+  return blk;
+}
+function blockStateText(o) {
+  if (!o || typeof o !== "object") return "";
+  if (o.state === "written") return "In Outlook";
+  if (o.state === "failed") return `Failed: ${(typeof o.error === "string" && o.error.trim()) || "Outlook gave no reason"}`;
+  return o.noHost === true ? "No Outlook host for this org" : "Writing…";
+}
+function blocksHtml(ev) {
+  if (!ev || ev.source !== "outlook" || !ev.host || !ev.org || ev.private === true) return "";
+  const others = pickableOrgs(blockOrgsOf(ev)).filter((o) => o !== ev.org);
+  if (!others.length) return "";
+  const d = blockDraft(ev);
+  const colors = colorMap();
+  const ol = ev.blocks && ev.blocks.outlook && typeof ev.blocks.outlook === "object" ? ev.blocks.outlook : {};
+  const dis = d.busy ? ' aria-disabled="true"' : "";
+  const rows = others.map((o) => {
+    const c = safeColor(colors.get(o));
+    const st = blockOrgsOf(ev).includes(o) ? blockStateText(own(ol, o)) : "";
+    return `<label class="cal-blk-org"><input type="checkbox" data-blk-org="${esc(o)}"${d.orgs.has(o) ? " checked" : ""}${dis}>`
+      + `<span class="cal-orgdot"${c ? ` style="--org:${c}"` : ""} aria-hidden="true"></span>${esc(orgLabel(o))}`
+      + (st ? `<span class="cal-blk-st">${esc(st)}</span>` : "") + `</label>`;
+  }).join("");
+  return `<div class="cal-dsec cal-blk"><div class="cal-blk-h">Block other calendars</div>`
+    + `<p class="cal-dnote">Adds an Out of office event to each org you check, with nobody invited — no invitations are sent. `
+    + `It moves and goes with this event${ev.seriesId ? ", for every occurrence in its series" : ""}.</p>`
+    + `<div class="cal-blk-orgs">${rows}</div>`
+    + `<label class="cal-blk-alias"><span class="k">Meeting alias</span><input type="text" maxlength="300" data-blk-alias placeholder="Blocked" value="${esc(d.alias)}"${dis}></label>`
+    + `<div class="cal-dact"><button type="button" class="btn-sm" data-blk-save${dis}>${d.busy ? "Saving…" : "Save"}</button></div>`
+    + (d.err ? `<div class="mt-err">${esc(d.err)}</div>` : "")
+    + `</div>`;
+}
+async function saveBlocks() {
+  const ev = detail;
+  if (!ev || !blk || blk.key !== evKey(ev) || blk.busy) return;
+  const d = blk;
+  d.busy = true; d.err = "";
+  paintDetail(true);
+  const body = { eventId: String(ev.id), orgs: [...d.orgs], alias: d.alias.trim() };
+  const r = await writeJson("PUT", `/api/agents/${encodeURIComponent(ev.host)}/calendar/blocks`, body, "Blocking other calendars");
+  d.busy = false;
+  if (r.signedOut) return;
+  if (r.text) d.err = r.text;
+  else if (detail && evKey(detail) === d.key) detail = { ...detail, blocks: r.out.blocks || undefined };
+  paintDetail(true);
+  focusInfo("[data-blk-save]");
+  if (!r.text) refetch();
 }
 // Each host's calendar settings (XERK-2929): whether its private events are shown.
 // Its org is shown, never set: every event takes its host's org (XERK-2964).
@@ -1395,10 +1466,10 @@ function paintDetail(force = false) {
   lastDetail = html;
   const a = typeof document !== "undefined" ? document.activeElement : null;
   const ds = a && $info.contains && $info.contains(a) && a.dataset ? a.dataset : null;
-  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail", "evEdit", "evDelete", "evDeleteYes", "evDeleteNo", "evScope", "evScopeNo"].find((x) => ds[x] !== undefined);
+  const k = ds && ["linkPick", "linkGo", "linkUnlink", "linkAuto", "bodyToggle", "attToggle", "closeDetail", "evEdit", "evDelete", "evDeleteYes", "evDeleteNo", "evScope", "evScopeNo", "blkOrg", "blkSave"].find((x) => ds[x] !== undefined);
   $info.innerHTML = html;
   if (k && $info.querySelectorAll) {
-    const el = [...$info.querySelectorAll("button,select")].find((x) => x.dataset && x.dataset[k] === ds[k]);
+    const el = [...$info.querySelectorAll("button,select,input")].find((x) => x.dataset && x.dataset[k] === ds[k]);
     if (el && el.focus) el.focus({ preventScroll: true });
   }
 }
@@ -1469,7 +1540,7 @@ function closeDetail() {
 }
 function openDetail(e, from) {
   detailFrom = from;
-  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; attOpen = false; linkPick.clear(); linkErr.clear(); delConfirm = false; scopeAsk = null; evErr = ""; }
+  if (!detail || evKey(detail) !== evKey(e)) { descOpen = false; attOpen = false; linkPick.clear(); linkErr.clear(); delConfirm = false; scopeAsk = null; evErr = ""; blk = null; }
   detail = e;
   picker = null;
   paint(true);
@@ -2413,6 +2484,11 @@ function mount(el, opts = {}) {
     for (const n of ["pointerup", "pointercancel", "contextmenu"]) addEventListener(n, release, true);
     addEventListener("blur", (e) => { if (typeof window !== "undefined" && e.target === window) release(); });
   }
+  // The block alias is a typed draft: read on input, never a repaint (XERK-3057).
+  $root.addEventListener("input", (ev) => {
+    const t = ev.target, d = t && t.dataset;
+    if (d && d.blkAlias !== undefined && blk && detail && blk.key === evKey(detail)) blk.alias = String(t.value || "");
+  });
   $root.addEventListener("change", (ev) => {
     const t = ev.target, d = t && t.dataset;
     if (!d) return;
@@ -2422,6 +2498,11 @@ function mount(el, opts = {}) {
       return void (paint(true), paintDetail(true));
     }
     if (d.hostPrivate !== undefined) return void saveHost(d.hostPrivate, { showPrivate: !!t.checked });
+    if (d.blkOrg !== undefined) {
+      if (!blk || blk.busy || !detail || blk.key !== evKey(detail)) return void paintDetail(true);
+      if (t.checked) blk.orgs.add(d.blkOrg); else blk.orgs.delete(d.blkOrg);
+      return void paintDetail(true);
+    }
     if (d.linkPick === undefined) return;
     if (t.value) linkPick.set(d.linkPick, t.value); else linkPick.delete(d.linkPick);
     paintDetail(true);
@@ -2434,7 +2515,7 @@ function mount(el, opts = {}) {
     const b = ev.target && ev.target.closest
       ? ev.target.closest("[data-ev],[data-step],[data-mode],[data-cal-today],[data-open-picker],[data-pick],[data-pmonth],[data-close-detail],"
         + "[data-open-notes],[data-body-toggle],[data-att-toggle],[data-link-go],[data-link-unlink],[data-link-auto],[data-host-settings],[data-zoom],[data-feed-new],[data-feed-off],[data-feed-copy],"
-        + "[data-cal-new],[data-ev-edit],[data-ev-delete],[data-ev-delete-yes],[data-ev-delete-no],[data-ev-scope],[data-ev-scope-no]") : null;
+        + "[data-cal-new],[data-ev-edit],[data-ev-delete],[data-ev-delete-yes],[data-ev-delete-no],[data-ev-scope],[data-ev-scope-no],[data-blk-save]") : null;
     if (!b) {
       if (picker !== null && !(ev.target && ev.target.closest && ev.target.closest(".cal-picker"))) { picker = null; paint(true); }
       return;
@@ -2446,6 +2527,10 @@ function mount(el, opts = {}) {
       return;
     }
     if (d.closeDetail !== undefined) return void closeDetail();
+    if (d.blkSave !== undefined) {
+      if (b.getAttribute && b.getAttribute("aria-disabled") === "true") return;
+      return void saveBlocks();
+    }
     if (d.calNew !== undefined) return void openEditor();
     if (d.evEdit !== undefined || d.evDelete !== undefined || d.evDeleteYes !== undefined || d.evDeleteNo !== undefined
         || d.evScope !== undefined || d.evScopeNo !== undefined) {
@@ -2602,7 +2687,7 @@ const api = {
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
   wallMinutes, gridAxis, gridMin, gridMs, gridRemap, gridGaps, gridHours, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
-  detailHtml, invitesText, invitesRowHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
+  detailHtml, blocksHtml, blockBarHtml, invitesText, invitesRowHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
   _zoom: zoom, ZOOMS, ZOOM_DEFAULT,
   _reopen: () => { scrolled = false; topMin = -1; paneSig = ""; wroteTop = -1; },

@@ -451,6 +451,18 @@
   .cal-ev.turma.canceled { background: var(--turma-grad); opacity: 0.6; }
   .cal-ev.multi { border-left: 0; padding-left: 12px; }
   .cal-orgbar { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; }
+  /* A blocking Outlook event (XERK-3057): the orgs it pushes an alias to, on its right edge. */
+  .cal-blkbar { position: absolute; right: 0; top: 0; bottom: 0; width: 5px; }
+  .cal-ev.allday:has(.cal-blkbar) { position: relative; padding-right: 9px; }
+  .cal-ev:has(.cal-blkbar) .cal-evb { padding-right: 6px; }
+  .cal-blk-h { font-weight: 600; font-size: 13px; margin: 2px 0 4px; }
+  .cal-blk-orgs { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+  .cal-blk-org { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .cal-blk-st { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .cal-blk-alias { display: flex; align-items: center; gap: 10px; font-size: 13px; margin: 4px 0; }
+  .cal-blk-alias .k { flex: none; color: var(--muted); }
+  .cal-blk-alias input { flex: 1 1 auto; min-width: 0; box-sizing: border-box; background: var(--page); color: var(--ink);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: inherit; font-size: 13px; padding: 5px 8px; }
   .cal-ev.allday.multi { position: relative; }
   button.cal-new { white-space: nowrap; }
   .cal-orgchip { display: inline-flex; align-items: center; gap: 5px; margin: 0 10px 2px 0; }

@@ -316,6 +316,10 @@ those are marked `[MODEL]`.
 
 - **Calendar feed link (XERK-2992) is web-only for now**: the calendar ⚙'s "Subscribe in Google
   Calendar" mints the link (`/api/calendar/feed`). Android has no control; the link works anywhere.
+- **Calendar blocks (XERK-3057) are web-only for now**: an Outlook event's panel has "Block other
+  calendars" (orgs + Meeting alias, `PUT /api/agents/<host>/calendar/blocks`) and the block's right
+  bar of those orgs' colors. Android ignores the served `blocks` (untyped); the hub writes the copies
+  either way. Port: the section in `CalendarScreen`'s detail, the bar in its block.
 
 ### Nav / Login
 - **Native Authentik SSO is IMPLEMENTED on Android (XERK-591).** `LoginScreen.kt` shows a "Sign in
