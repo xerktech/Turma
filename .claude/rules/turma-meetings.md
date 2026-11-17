@@ -306,6 +306,10 @@ The web surface of the Meetings epic (XERK-2503). The wire, the review/archive r
   repaint. Unit tests can't see this ordering: drive a real mouse (`fill()` hides it).
 - A skipped DST time takes the offset BEFORE the switch, a repeated one its first pass, east of UTC
   too (`wallToIso` tries the offsets a day either side).
+- **The form keeps the offset its times were opened at** (`startOff`/`endOff`, XERK-3039): a
+  repeated wall time saves in THAT pass, else the first. A press on the second "1 AM" row, or an
+  edit of a second-pass event, otherwise saved an hour earlier. A zone change drops them.
+  Android: `TurmaEventDraft.startOffset`/`endOffset` via `ZonedDateTime.ofLocal`.
 - **Repeat (XERK-2973)**: a Teams-style preset menu named for the start day, Custom (interval +
   unit + days / month mode), Ends never / on date / after N, and a one-line summary.
   - Rule ⇄ control is calendar.js's repeat block; Android's `core/CalendarRepeat.kt` is its port.

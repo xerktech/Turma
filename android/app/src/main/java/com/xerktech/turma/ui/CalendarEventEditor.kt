@@ -184,7 +184,7 @@ internal fun CalendarEventEditor(
             WhenRow("Starts", d.startDate, d.startTime, d.allDay, locale, "start", { picker = it })
             WhenRow("Ends", d.endDate, d.endTime, d.allDay, locale, "end", { picker = it })
             OutlinedTextField(
-                d.timeZone, { set(d.copy(timeZone = it)) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
+                d.timeZone, { set(d.copy(timeZone = it, startOffset = null, endOffset = null)) }, Modifier.fillMaxWidth().testTag("cal-ed-tz"),
                 label = { Text("Time zone") }, singleLine = true, enabled = !d.oneOccurrence,
             )
             RepeatSection(d, ::set, { picker = it }, locale)

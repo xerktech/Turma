@@ -1650,6 +1650,24 @@ test("XERK-2971 QA: join link case and DST edges match the hub", () => {
   assert.equal(cal.wallToIso("0050-06-01", "09:00", "UTC"), null, "no 19xx for a year under 100");
 });
 
+test("XERK-3039: the editor keeps the pass of a repeated hour it opened on", () => withOrgs(async () => {
+  const est = Date.parse("2026-11-01T01:30:00-05:00"), edt = Date.parse("2026-11-01T01:30:00-04:00");
+  // A press on the second "1 AM" row opens at 1:30 and saves at 1:30 EST, not an hour earlier.
+  const f = { ...cal.blankForm(est, est + 30 * 60000), orgs: ["acme"], subject: "x" };
+  assert.deepEqual([f.startTime, f.endTime], ["01:30", "02:00"]);
+  assert.deepEqual([cal.formPayload(f).start, cal.formPayload(f).end], ["2026-11-01T01:30:00-05:00", "2026-11-01T02:00:00-05:00"]);
+  // The first pass stays the first pass.
+  assert.equal(cal.formPayload({ ...cal.blankForm(edt, edt + 30 * 60000), orgs: ["acme"] }).start, "2026-11-01T01:30:00-04:00");
+  // An event served in the second pass saves where it is (an edit of its title must not move it).
+  const back = cal.formFromEvent(tev({ start: "2026-11-01T01:30:00-05:00", end: "2026-11-01T01:45:00-05:00", startMs: est, endMs: est + 15 * 60000 }));
+  assert.equal(cal.formPayload({ ...back, orgs: ["acme"] }).start, "2026-11-01T01:30:00-05:00");
+  // A wall time typed outside the repeated hour ignores the kept offset.
+  assert.equal(cal.formPayload({ ...f, startTime: "03:00", endTime: "03:30" }).start, "2026-11-01T03:00:00-05:00");
+  assert.equal(cal.wallToIso("2026-11-01", "01:30", "America/New_York", -300).iso, "2026-11-01T01:30:00-05:00");
+  assert.equal(cal.wallToIso("2026-11-01", "01:30", "America/New_York", 60).iso, "2026-11-01T01:30:00-04:00", "an offset the time cannot have is ignored");
+  cal.closeEditor();
+}));
+
 test("XERK-2971 QA: a half-typed start keeps the length; the shifted end is written into the inputs; a fixed field's error clears", () => withOrgs(async () => {
   cal.openEditor({ startMs: at(2027, 5, 5, 9), endMs: at(2027, 5, 5, 9, 30) });
   const panel = cal._edEls().panel;

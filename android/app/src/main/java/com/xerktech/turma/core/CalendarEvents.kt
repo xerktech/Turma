@@ -119,6 +119,10 @@ data class TurmaEventDraft(
     val startTime: LocalTime,
     val endDate: LocalDate,
     val endTime: LocalTime,
+    // The offsets the start and end were read at (the tapped slot's, the served event's): a
+    // repeated fall-back wall time keeps that pass on save, not its first (XERK-3039).
+    val startOffset: ZoneOffset? = null,
+    val endOffset: ZoneOffset? = null,
     val allDay: Boolean = false,
     val timeZone: String,
     val location: String = "",
@@ -175,10 +179,15 @@ const val CAL_NEW_EVENT_MIN = 30
  * A new event starting at [start] on [day], [CAL_NEW_EVENT_MIN] long, in the
  * phone's [zone], for [orgs] (the header pick, or the only org there is).
  */
-fun calNewEventDraft(day: LocalDate, start: LocalTime, zone: ZoneId, orgs: Set<String>): TurmaEventDraft {
-    val end = day.atTime(start).plusMinutes(CAL_NEW_EVENT_MIN.toLong())
+fun calNewEventDraft(
+    day: LocalDate, start: LocalTime, zone: ZoneId, orgs: Set<String>, startOffset: ZoneOffset? = null,
+): TurmaEventDraft {
+    // [startOffset] names the pass of a repeated wall time (the second "1 AM" row's EST).
+    val s = java.time.ZonedDateTime.ofLocal(day.atTime(start), zone, startOffset)
+    val end = s.plusMinutes(CAL_NEW_EVENT_MIN.toLong())
     return TurmaEventDraft(
         startDate = day, startTime = start, endDate = end.toLocalDate(), endTime = end.toLocalTime(),
+        startOffset = s.offset, endOffset = end.offset,
         timeZone = zone.id, orgs = orgs, reminder = CAL_REMINDER_DEFAULT,
     )
 }
@@ -217,6 +226,7 @@ fun calDraftOf(ev: CalendarEvent, fallback: ZoneId): TurmaEventDraft {
         required = names("required"), optional = names("optional"),
         startDate = s.toLocalDate(), startTime = s.toLocalTime().withSecond(0).withNano(0),
         endDate = e.toLocalDate(), endTime = e.toLocalTime().withSecond(0).withNano(0),
+        startOffset = s.offset, endOffset = e.offset,
         allDay = ev.allDay, timeZone = zone.id, location = ev.location,
         online = ev.isOnlineMeeting, joinUrl = ev.joinUrl, body = ev.body,
         busy = ev.busy.takeIf { b -> CAL_SHOW_AS.any { it.first == b } } ?: "busy",
@@ -431,8 +441,9 @@ private fun calCleanSubject(s: String): String = jsTrim(com.xerktech.turma.model
 /** The draft's start and end instants, all-day ending at the midnight after its last day. */
 fun calDraftSpan(d: TurmaEventDraft): Pair<OffsetDateTime, OffsetDateTime>? {
     val zone = calZoneOrNull(d.timeZone) ?: return null
-    val s = if (d.allDay) d.startDate.atStartOfDay(zone) else d.startDate.atTime(d.startTime).atZone(zone)
-    val e = if (d.allDay) d.endDate.plusDays(1).atStartOfDay(zone) else d.endDate.atTime(d.endTime).atZone(zone)
+    // ofLocal keeps a repeated wall time's pass when the offset is one it can have, else its first.
+    val s = if (d.allDay) d.startDate.atStartOfDay(zone) else java.time.ZonedDateTime.ofLocal(d.startDate.atTime(d.startTime), zone, d.startOffset)
+    val e = if (d.allDay) d.endDate.plusDays(1).atStartOfDay(zone) else java.time.ZonedDateTime.ofLocal(d.endDate.atTime(d.endTime), zone, d.endOffset)
     return s.toOffsetDateTime() to e.toOffsetDateTime()
 }
 

@@ -179,6 +179,29 @@ class CalendarEventsTest {
         assertEquals(LocalTime.of(9, 0), calDefaultStart(day.plusDays(3), 0, ny))
     }
 
+    @Test fun `XERK-3039 a repeated hour's second pass is kept from the slot or event it opened on`() {
+        val fb = LocalDate.of(2026, 11, 1)
+        val est = java.time.ZoneOffset.ofHours(-5)
+        // A tap on the second "1 AM" row (EST) saves at 1:30 EST, not an hour earlier.
+        val d = calNewEventDraft(fb, LocalTime.of(1, 30), ny, setOf("o"), startOffset = est).copy(subject = "x")
+        val p = calDraftPayload(d)
+        assertEquals("2026-11-01T01:30:00-05:00", p["start"]!!.jsonPrimitive.content)
+        assertEquals("2026-11-01T02:00:00-05:00", p["end"]!!.jsonPrimitive.content)
+        // With no pass named, the first one, as before.
+        assertEquals("2026-11-01T01:30:00-04:00",
+            calDraftPayload(calNewEventDraft(fb, LocalTime.of(1, 30), ny, setOf("o")))["start"]!!.jsonPrimitive.content)
+        // An event served in the second pass saves where it is (a title edit must not move it).
+        val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:a", "orgs": ["o"], "org": "o", "editable": true, "version": 1,
+            "start": "2026-11-01T01:30:00-05:00", "end": "2026-11-01T01:45:00-05:00", "startMs": 1, "endMs": 2,
+            "timeZone": "America/New_York" } ]""").single()
+        val back = calDraftPayload(calDraftOf(ev, ny))
+        assertEquals("2026-11-01T01:30:00-05:00", back["start"]!!.jsonPrimitive.content)
+        assertEquals("2026-11-01T01:45:00-05:00", back["end"]!!.jsonPrimitive.content)
+        // A time moved out of the repeated hour ignores the kept offset.
+        assertEquals("2026-11-01T03:00:00-05:00",
+            calDraftPayload(d.copy(startTime = LocalTime.of(3, 0), endTime = LocalTime.of(3, 30)))["start"]!!.jsonPrimitive.content)
+    }
+
     @Test fun `XERK-2972 QA a name with a comma survives an unchanged save, and quoted names parse`() {
         val ev = decode("""[ { "source": "turma", "host": "", "id": "turma:a", "orgs": ["o"], "org": "o", "editable": true, "version": 1,
             "start": "2026-11-16T14:00:00Z", "end": "2026-11-16T15:00:00Z", "startMs": 1, "endMs": 2, "timeZone": "UTC",
