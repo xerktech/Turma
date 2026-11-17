@@ -10148,6 +10148,12 @@ def _pr_ref(url):
     return "PR", ""
 
 
+class _PartialEvents(list):
+    """A comment-event list missing a channel whose fetch failed (XERK-3047):
+    the keys it lacks are not evidence those comments vanished, so the seen-set
+    trim in _deliver_pr_comments must not drop them."""
+
+
 def _pr_comment_events(url, self_login):
     """Every human-visible comment on a PR, normalized to the fields the
     delivery poller needs (XERK-49). Three channels, because "reply in a PR"
@@ -10166,8 +10172,9 @@ def _pr_comment_events(url, self_login):
     `viewerDidAuthor` where present, else a login compare), so the poller can
     baseline it as seen yet never react to the session's own words.
 
-    Returns the event list (possibly empty — a real PR with no comments), or
-    None on a hard fetch failure so the caller leaves the baseline untouched
+    Returns the event list (possibly empty — a real PR with no comments), a
+    _PartialEvents when the inline channel failed, or None on a hard fetch
+    failure so the caller leaves the baseline untouched
     rather than treating "gh errored" as "every prior comment vanished".
 
     A GitLab merge-request URL dispatches to _mr_comment_events (XERK-162) and
@@ -10224,16 +10231,20 @@ def _pr_comment_events(url, self_login):
     # from the API. Best-effort — a failure just leaves inline notes uncovered
     # this beat rather than losing the conversation ones already gathered.
     m = PR_URL_PARTS_RE.search(url or "")
+    partial = False
     if m:
         owner, repo, num = m.group(1), m.group(2), m.group(3)
         raw2 = run(["gh", "api", f"repos/{owner}/{repo}/pulls/{num}/comments",
                     "--paginate"])
+        inline = None
         if raw2:
             try:
                 inline = json.loads(raw2)
             except ValueError:
                 inline = None
-            for c in inline or []:
+        partial = not isinstance(inline, list)
+        if not partial:
+            for c in inline:
                 if not isinstance(c, dict):
                     continue
                 body = str(c.get("body") or "").strip()
@@ -10248,7 +10259,8 @@ def _pr_comment_events(url, self_login):
                     "author": login, "body": body, "kind": "inline", "loc": loc,
                     "is_self": bool(self_login) and login == self_login,
                 })
-    return [e for e in events if e["key"]]
+    events = [e for e in events if e["key"]]
+    return _PartialEvents(events) if partial else events
 
 
 def _mr_comment_events(url):
@@ -10360,25 +10372,75 @@ def _azdo_pr_comment_events(url):
     return events
 
 
-def _pr_comment_message(url, events):
+PR_COMMENTS_TAG_CAP = 200          # per-comment author / loc chars in the message
+
+
+def _pr_comment_header(url, part=None):
+    what, num = _pr_ref(url)
+    of = f" (part {part[0]} of {part[1]})" if part else ""
+    return (f"New review activity on the {what} {num} you opened ({url}){of}. "
+            f"Address it and update the {what} — continue in this session:")
+
+
+def _pr_comment_line(e):
+    cap = PR_COMMENTS_TAG_CAP
+    who = f"@{str(e['author'])[:cap]}" if e.get("author") else "someone"
+    tag = e.get("kind") or "comment"
+    if e.get("loc"):
+        tag = f"{tag} on {str(e['loc'])[:cap]}"
+    body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
+    return f"[{who} — {tag}] {body}"
+
+
+def _pr_comment_message(url, events, part=None):
     """Fold new PR comments into the single free-text message typed into the
     session (XERK-49). One flat paragraph — a header naming the PR and telling
     the agent to act on it in THIS session, then each comment as
-    `@author (kind, loc): body`, each body collapsed to one line and capped so
-    one long comment can't crowd out the rest before INPUT_MAX_CHARS truncates."""
+    `@author (kind, loc): body`, each body collapsed to one line and capped (as
+    are author and loc) so one long comment can't crowd out the rest. Callers
+    delivering a batch use _pr_comment_messages, which splits it to fit
+    INPUT_MAX_CHARS; `part` = (i, n) labels one of those parts."""
     if not events:
         return ""
-    what, num = _pr_ref(url)
-    parts = [f"New review activity on the {what} {num} you opened ({url}). "
-             f"Address it and update the {what} — continue in this session:"]
-    for e in events:
-        who = f"@{e['author']}" if e.get("author") else "someone"
-        tag = e.get("kind") or "comment"
-        if e.get("loc"):
-            tag = f"{tag} on {e['loc']}"
-        body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
-        parts.append(f"[{who} — {tag}] {body}")
-    return "  ".join(parts)
+    return "  ".join([_pr_comment_header(url, part)]
+                     + [_pr_comment_line(e) for e in events])
+
+
+def _pr_comment_messages(url, events, limit=None):
+    """_pr_comment_message split into as many messages as it takes for each to
+    fit `limit` (XERK-3047). Default limit: INPUT_MAX_CHARS less the
+    INBOX_PREFIX framing notify_session adds on the inbox and pane paths alike.
+
+    One message past INPUT_MAX_CHARS is REFUSED whole by send_input and skipped
+    by the inbox, while _deliver_pr_comments has already marked every key seen —
+    so an oversized batch was lost for good. Splitting keeps every comment.
+
+    Greedy and in order, linear in the batch (a running length, never a
+    rebuild per comment: this runs on the beat). Parts of a split batch are
+    labelled "part i of n", so a session that reads one first (an inbox post
+    can fail over to the later pane) knows more is coming. A single comment
+    cannot overflow: author, loc and body are each capped."""
+    if not events:
+        return []
+    if limit is None:
+        limit = INPUT_MAX_CHARS - len(INBOX_PREFIX) - 2
+    lines = [_pr_comment_line(e) for e in events]
+    # Room for the longest header any part could get ("part 9999 of 9999").
+    room = limit - len(_pr_comment_header(url, (9999, 9999)))
+    chunks, cur, size = [], [], 0
+    for e, line in zip(events, lines):
+        add = len(line) + 2                  # "  " joins each line on
+        if cur and size + add > room:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(e)
+        size += add
+    chunks.append(cur)
+    if len(chunks) == 1:
+        return [_pr_comment_message(url, events)]
+    n = len(chunks)
+    return [_pr_comment_message(url, c, (i, n))
+            for i, c in enumerate(chunks, 1)]
 
 
 def _pr_conflict_message(url, base, again=False):
@@ -48576,6 +48638,11 @@ class SessionManager:
             base = sess.get("prCommentBase")
             if not isinstance(base, dict):
                 base = {}
+            # PRs first baselined from a PARTIAL fetch (inline channel failed):
+            # their inline history is not in `base` yet (XERK-3047).
+            pending = sess.get("prCommentInlinePending")
+            pending = [u for u in pending if isinstance(u, str)] \
+                if isinstance(pending, list) else []
             changed = False
             # Iterate the session's CURRENT urls so a PR dropped between fetch
             # and deliver is not delivered for; look each up in the staging.
@@ -48585,23 +48652,63 @@ class SessionManager:
                 events = staged[url]
                 if events is None:
                     continue                       # fetch failed — keep baseline
-                seen = set(base.get(url) or [])
                 first = url not in base
+                partial = isinstance(events, _PartialEvents)
+                # A first sighting from a partial fetch baselines what it has,
+                # so conversation comments flow at once, and flags the PR: the
+                # first FULL fetch then folds the inline history in silently
+                # rather than delivering it as new. (Inline comments posted
+                # while the channel was failing are folded in too: they cannot
+                # be told from history.)
+                quiet_inline = False
+                if first and partial:
+                    pending.append(url)
+                    log(f"PR comments: {url} for session {sess['id']}: inline "
+                        f"fetch failed on first sighting; baselining without "
+                        f"it until a full fetch")
+                elif url in pending and not partial:
+                    pending = [u for u in pending if u != url]
+                    quiet_inline = True
+                seen = set(base.get(url) or [])
                 fresh = [e for e in events
-                         if e["key"] not in seen and not e["is_self"]]
+                         if e["key"] not in seen and not e["is_self"]
+                         and not (quiet_inline and e.get("kind") == "inline")]
                 # Fold EVERY current key (self-authored included) into the seen
                 # set — a first sighting baselines them all; later beats only add
-                # the newcomers. Cap newest-kept so a chatty PR can't grow it
-                # without bound.
+                # the newcomers, capped so a chatty PR can't grow it without bound.
+                # Current keys go LAST, in fetch order, and the cap never cuts
+                # one: a key trimmed while the PR still has that comment reads
+                # as new on every later beat (a PR past the cap re-sent its
+                # oldest comments each poll). Keys no longer fetched age out
+                # first, in the order they were recorded — except on a PARTIAL
+                # fetch (an inline channel failed): its missing keys are still
+                # on the PR, and trimming them would re-send them on the next
+                # full fetch, so that beat trims nothing. It grows only by keys
+                # the PR really has; the next full fetch trims as usual.
                 keys = [e["key"] for e in events]
-                merged = list(seen) + [k for k in keys if k not in seen]
-                base[url] = merged[-PR_COMMENTS_SEEN_MAX:]
+                current = set(keys)
+                old = base.get(url) or []
+                prior = [k for k in old if k not in current]
+                merged = prior + list(dict.fromkeys(keys))
+                keep = max(PR_COMMENTS_SEEN_MAX, len(current))
+                if partial:
+                    keep = len(merged)
+                base[url] = merged[-keep:]
                 changed = True
                 if first or not fresh:
                     continue
-                msg = _pr_comment_message(url, fresh)
-                if msg:
+                for msg in _pr_comment_messages(url, fresh):
                     self.notify_session(sess["id"], msg)
+            # Never prune a flag for a PR that left session_pr_urls: its
+            # prCommentBase entry stays, so a PR that comes back (the url list
+            # is capped, newest kept) would deliver its inline history. The flag
+            # lives exactly as long as that baseline.
+            if pending != (sess.get("prCommentInlinePending") or []):
+                if pending:
+                    sess["prCommentInlinePending"] = pending
+                else:
+                    sess.pop("prCommentInlinePending", None)
+                changed = True
             if changed:
                 sess["prCommentBase"] = base
                 self.save()

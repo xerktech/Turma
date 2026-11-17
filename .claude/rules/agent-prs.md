@@ -134,6 +134,22 @@ DevOps, and what gets typed back because of it.
   silently the first beat a PR is seen (`prCommentBase`, capped `PR_COMMENTS_SEEN_MAX`), after that
   only NEW keys not the agent's own are typed in. Bounded `PR_COMMENTS_MAX` per beat; **a fetch
   failure leaves the baseline UNTOUCHED.**
+- **A batch is split, never sent past `INPUT_MAX_CHARS`** (`_pr_comment_messages`, XERK-3047): keys
+  are marked seen before delivery, and an oversized message is refused whole, so one big batch was
+  lost. Each part leaves room for `INBOX_PREFIX` and says `part i of n`; author/loc are capped too.
+  Tests: `TestPrCommentMessages`, `test_a_batch_past_input_max_chars_is_split_not_lost`.
+- **The seen-cap never trims a key the PR still has** (`prCommentBase`): a trimmed current key reads
+  as new every poll. Current keys go last; vanished ones age out first.
+  Tests: `test_a_pr_past_the_seen_cap_does_not_resend_old_comments`.
+- **A partial fetch trims nothing from the seen set**: a failed GitHub inline channel returns
+  `_PartialEvents`, not None, and the keys it lacks are still on the PR.
+  Tests: `test_a_partial_fetch_past_the_seen_cap_does_not_resend_later`.
+- **A partial first sighting baselines at once and flags the PR** (`prCommentInlinePending`): the
+  first full fetch folds the inline history in silently. Never prune the flag apart from its
+  baseline (a PR evicted from `session_pr_urls` can return). Never wait for a full fetch instead:
+  an inline channel that always fails (too many pages for `run()`'s timeout) would deliver nothing.
+  Tests: `test_a_partial_first_sighting_*`, `test_the_inline_pending_flag_*`,
+  `test_an_inline_channel_that_always_fails_*`.
 - `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a rebase/force-
   push**) off the just-cached `mergeable`. `prConflicts` bounds nudging per PR; MERGEABLE/closed
   re-arms it, **UNKNOWN does neither** — that's what a just-pushed fix looks like, and clearing on it

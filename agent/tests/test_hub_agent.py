@@ -21071,6 +21071,20 @@ class TestPrCommentEvents(unittest.TestCase):
             return ""
         return run
 
+    def test_a_failed_inline_channel_marks_the_list_partial(self):
+        view = {"comments": [{"id": "c1", "author": {"login": "a"},
+                              "body": "hi"}], "reviews": []}
+
+        def run(cmd, cwd=None):
+            return json.dumps(view) if cmd[:3] == ["gh", "pr", "view"] else ""
+        with mock.patch.object(ha, "run", run):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        self.assertIsInstance(events, ha._PartialEvents)
+        self.assertEqual([e["key"] for e in events], ["c1"])
+        with mock.patch.object(ha, "run", self._fake_run(view, [])):
+            events = ha._pr_comment_events(self.URL, "botlogin")
+        self.assertNotIsInstance(events, ha._PartialEvents)
+
     def test_gathers_all_three_channels(self):
         view = {
             "comments": [
@@ -21171,6 +21185,74 @@ class TestPrCommentMessage(unittest.TestCase):
         self.assertIn("!12", msg)
         self.assertIn("the PR", msg)
         self.assertNotIn("MR", msg)
+
+
+class TestPrCommentMessages(unittest.TestCase):
+    """_pr_comment_messages splits a batch so each message fits (XERK-3047)."""
+
+    URL = "https://github.com/o/r/pull/7"
+
+    def _evs(self, n, size=ha.PR_COMMENTS_BODY_CAP):
+        return [{"author": "a", "body": f"b{i:03d} " + "x" * size,
+                 "kind": "comment", "loc": None} for i in range(n)]
+
+    def test_a_small_batch_is_one_message(self):
+        evs = self._evs(3, 10)
+        self.assertEqual(ha._pr_comment_messages(self.URL, evs),
+                         [ha._pr_comment_message(self.URL, evs)])
+
+    def test_no_events_is_no_messages(self):
+        self.assertEqual(ha._pr_comment_messages(self.URL, []), [])
+
+    def test_each_part_fits_beside_the_inbox_prefix_and_keeps_every_comment(self):
+        evs = self._evs(200)
+        msgs = ha._pr_comment_messages(self.URL, evs)
+        self.assertGreater(len(msgs), 1)
+        for m in msgs:
+            self.assertLessEqual(len(f"{ha.INBOX_PREFIX}\n\n{m}"),
+                                 ha.INPUT_MAX_CHARS)
+            self.assertIn("this session", m)
+        joined = "".join(msgs)
+        order = [joined.index(f"b{i:03d} ") for i in range(200)]
+        self.assertEqual(order, sorted(order))
+
+    def test_a_tight_limit_still_sends_each_comment_alone(self):
+        msgs = ha._pr_comment_messages(self.URL, self._evs(3, 50), limit=1)
+        self.assertEqual(len(msgs), 3)
+
+    def test_every_framed_part_fits_across_body_sizes(self):
+        # Guards the header reserve and the "  " join room: without either a
+        # part lands a few chars past INPUT_MAX_CHARS and is refused whole.
+        # The grid must land a part within the ~20-char label slack, so sweep
+        # sizes densely (e.g. 239 x 400 overflowed without the reserve).
+        grid = [(size, n) for size in range(200, 340) for n in (300, 400)]
+        grid += [(size, n) for size in (1, 20, 777, ha.PR_COMMENTS_BODY_CAP)
+                 for n in (1, 59, 60, 61, 90)]
+        for size, n in grid:
+            for m in ha._pr_comment_messages(self.URL, self._evs(n, size)):
+                self.assertLessEqual(
+                    len(f"{ha.INBOX_PREFIX}\n\n{m}"), ha.INPUT_MAX_CHARS,
+                    (size, n))
+
+    def test_parts_of_a_split_batch_are_labelled(self):
+        msgs = ha._pr_comment_messages(self.URL, self._evs(200))
+        n = len(msgs)
+        for i, m in enumerate(msgs, 1):
+            self.assertIn(f"(part {i} of {n})", m)
+
+    def test_a_lone_comment_with_huge_author_and_loc_still_fits(self):
+        evs = [{"author": "a" * 100000, "body": "x" * 100000,
+                "kind": "inline", "loc": "p" * 100000}]
+        msgs = ha._pr_comment_messages(self.URL, evs)
+        self.assertEqual(len(msgs), 1)
+        self.assertLessEqual(len(f"{ha.INBOX_PREFIX}\n\n{msgs[0]}"),
+                             ha.INPUT_MAX_CHARS)
+
+    def test_many_short_comments_split_in_linear_time(self):
+        t = time.monotonic()
+        msgs = ha._pr_comment_messages(self.URL, self._evs(20000, 20))
+        self.assertLess(time.monotonic() - t, 2.0)
+        self.assertGreater(len(msgs), 1)
 
 
 class TestMrCommentEvents(unittest.TestCase):
@@ -21762,6 +21844,134 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.assertLessEqual(len(sess["prCommentBase"][self.URL]),
                              ha.PR_COMMENTS_SEEN_MAX)
         self.assertIn("knew", sess["prCommentBase"][self.URL])
+
+    def test_a_pr_past_the_seen_cap_does_not_resend_old_comments(self):
+        # A PR with more comments than PR_COMMENTS_SEEN_MAX once trimmed keys it
+        # still had, and re-sent those as new on every poll (XERK-3047 QA).
+        sm = self.make_manager()
+        n = ha.PR_COMMENTS_SEEN_MAX + 100
+        evs = [self._ev(f"c{i}") for i in range(n)]
+        sess = self._session(sm)
+        with self._events(*evs):
+            sm._poll_pr_comments()                  # baseline
+        with self._events(*evs, self._ev("cnew", body="only me")):
+            sm._poll_pr_comments()
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("only me", typed[0])
+        self.assertNotIn("[@alice — comment] fix", typed[0])
+        self.assertEqual(len(sess["prCommentBase"][self.URL]), n + 1)
+
+    def test_a_partial_fetch_past_the_seen_cap_does_not_resend_later(self):
+        # A failed inline channel returns the other comments only; trimming the
+        # missing keys re-sent them on the next full fetch (XERK-3047 QA).
+        sm = self.make_manager()
+        conv = [self._ev(f"c{i}") for i in range(400)]
+        inline = [self._ev(f"i{i}", kind="inline") for i in range(300)]
+        self._session(sm)
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()                  # baseline
+        for beat in range(2):                       # inline fetch fails twice
+            conv += [self._ev(f"n{beat}{i}", body=f"new{beat}{i}")
+                     for i in range(10)]            # while new comments land
+            with mock.patch.object(ha, "_pr_comment_events",
+                                   return_value=ha._PartialEvents(conv)):
+                sm._poll_pr_comments()
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()
+        joined = "".join(self._typed())
+        self.assertIn("new19", joined)
+        self.assertNotIn("inline", joined)          # no old inline re-sent
+
+    def test_a_partial_first_sighting_does_not_deliver_inline_history(self):
+        # Baselined from a partial fetch, the first full fetch folds the inline
+        # history in silently (XERK-3047 QA); comments posted meanwhile on the
+        # conversation are delivered as usual.
+        sm = self.make_manager()
+        conv = [self._ev(f"c{i}") for i in range(5)]
+        inline = [self._ev(f"i{i}", kind="inline", body=f"old{i}")
+                  for i in range(5)]
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()
+        self.assertEqual(sess["prCommentInlinePending"], [self.URL])
+        conv.append(self._ev("cnew", body="during"))
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()
+        conv.append(self._ev("crec", body="onrecovery"))
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()                  # recovery: conv still sent
+        self.assertNotIn("prCommentInlinePending", sess)
+        inline.append(self._ev("inew", kind="inline", body="later"))
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 3)
+        self.assertIn("during", typed[0])
+        self.assertIn("onrecovery", typed[1])
+        self.assertIn("later", typed[2])
+        self.assertNotIn("old", "".join(typed))
+
+    def test_the_inline_pending_flag_is_per_session_and_outlives_a_dropped_pr(self):
+        sm = self.make_manager()
+        conv = [self._ev("c0")]
+        sess = self._session(sm)
+        other = dict(sess, id="s2", prCommentBase={self.URL: ["c0"]})
+        sm.registry.append(other)
+        sm.session_pr_urls["s2"] = [self.URL]
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()
+        self.assertEqual(sess["prCommentInlinePending"], [self.URL])
+        self.assertNotIn("prCommentInlinePending", other)
+        # A flagged PR that leaves the session's url list (capped, newest
+        # kept) and comes back still folds its inline history in silently.
+        sm.session_pr_urls["s1"] = ["https://github.com/o/r/pull/8"]
+        with self._events(*conv):
+            sm._poll_pr_comments()
+        self.assertEqual(sess["prCommentInlinePending"], [self.URL])
+        sm.session_pr_urls = {"s1": [self.URL]}     # s2 is not flagged
+        with self._events(*conv, self._ev("i0", kind="inline", body="old")):
+            sm._poll_pr_comments()
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prCommentInlinePending", sess)
+
+    def test_an_inline_channel_that_always_fails_still_delivers(self):
+        sm = self.make_manager()
+        conv = [self._ev(f"c{i}") for i in range(3)]
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()                  # baseline, at once
+        self.assertEqual(len(sess["prCommentBase"][self.URL]), 3)
+        conv.append(self._ev("cnew", body="reply"))
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("reply", typed[0])
+
+    def test_a_batch_past_input_max_chars_is_split_not_lost(self):
+        # XERK-3047: ~90 near-cap comments compose past INPUT_MAX_CHARS; one
+        # message that size is refused whole while every key is already seen.
+        sm = self.make_manager()
+        sess = self._session(sm, base={self.URL: ["c0"]})
+        evs = [self._ev(f"c{i}", body=f"n{i:03d} " + "x" * 1300)
+               for i in range(1, 91)]
+        self.assertGreater(len(ha._pr_comment_message(self.URL, evs)),
+                           ha.INPUT_MAX_CHARS)
+        with self._events(self._ev("c0"), *evs):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertGreater(len(typed), 1)
+        joined = "".join(typed)
+        for i in range(1, 91):
+            self.assertIn(f"n{i:03d} ", joined)
+        self.assertEqual(len(sess["prCommentBase"][self.URL]), 91)
 
 
 class TestPrConflictMessage(unittest.TestCase):
