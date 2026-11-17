@@ -21,6 +21,10 @@ composed.**
     sent (`compactBase` rose) AND it's neither delivered nor in the folded live queue AND the pane
     has settled idle (`_pane_busy` False, not None). `delivered` matches by text, biased AGAINST
     resend. Bounded by `PENDING_INPUT_MAX_ATTEMPTS`/`PENDING_INPUT_TTL_SEC`, one per beat.
+  - **A bracketed paste is matched UNWRAPPED** (`_unwrap_paste`, XERK-3043): the transcript keeps
+    it as `<pasted_content id=X>` lines around the text, which never equals the outbox record, so
+    every pasted message (>4000 chars or emoji) was re-typed by the next compaction. Only a whole
+    turn framed by one matching id is unwrapped. Tests: the paste cases in `TestPendingScan`.
   - **The beat only STAGES a resend** (`_stage_resend`); the input worker types it
     (`_deliver_staged_resends`), skipping one the session no longer holds on its outbox (delivered,
     or cleared by a clear-context restart) so a new conversation never gets the old one's text.

@@ -20151,6 +20151,26 @@ class TestPendingScan(ProjectDirMixin, unittest.TestCase):
         delivered, _queued, _c = ha._pending_scan(path)
         self.assertEqual(delivered, ["real one"])
 
+    def test_a_bracketed_paste_is_delivered_as_what_was_pasted(self):
+        # XERK-3043: a message past PASTE_SLICED_MAX_CHARS is pasted, and
+        # Claude Code records it framed in <pasted_content> lines. Compared
+        # raw it never matched the outbox record, so a compaction re-typed it.
+        body = ha.INBOX_PREFIX + "\n\nline one\nline two"
+        framed = ('<pasted_content id="ab12">\n' + body
+                  + '\n</pasted_content id="ab12">')
+        path = self._write([
+            {"type": "user", "message": {"role": "user", "content": framed}},
+        ])
+        delivered, _q, _c = ha._pending_scan(path)
+        self.assertEqual(delivered, [body])
+
+    def test_only_a_whole_matching_paste_frame_is_unwrapped(self):
+        for text in (
+                '<pasted_content id="a">\nx\n</pasted_content id="b">',
+                'note\n<pasted_content id="a">\nx\n</pasted_content id="a">',
+                '<pasted_content id="a">\n</pasted_content id="a">'):
+            self.assertEqual(ha._unwrap_paste(text), text)
+
     def test_dequeue_empties_the_queue(self):
         path = self._write([
             {"type": "queue-operation", "operation": "enqueue", "content": "q"},

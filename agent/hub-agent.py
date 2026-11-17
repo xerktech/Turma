@@ -14729,6 +14729,30 @@ PENDING_INPUT_MAX_ATTEMPTS = _env_int("SESSION_INPUT_RESEND_MAX", 3)
 PENDING_INPUT_TTL_SEC = _env_float("SESSION_INPUT_PENDING_TTL_SEC", 900.0)
 
 
+_PASTE_OPEN_RE = re.compile(r'<pasted_content id="([^"\n]*)">[ \t]*\Z')
+_PASTE_CLOSE_RE = re.compile(r'</pasted_content id="([^"\n]*)">[ \t]*\Z')
+
+
+def _unwrap_paste(text):
+    """A bracketed paste as Claude Code records it, back to what was pasted.
+
+    A message past PASTE_SLICED_MAX_CHARS (or carrying _SLICE_UNSAFE_RE chars)
+    goes in as one bracketed paste, which the transcript keeps as
+    `<pasted_content id="X">` / the text / `</pasted_content id="X">`, each tag
+    on a line of its own. Compared raw, it never equals the outbox record, so
+    the message was never reaped and every later compaction typed it again.
+    Only a WHOLE turn framed by one matching id is unwrapped; anything else is
+    returned as it was."""
+    lines = text.split("\n")
+    if len(lines) < 3:
+        return text
+    head = _PASTE_OPEN_RE.match(lines[0].strip(" \t\r"))
+    tail = _PASTE_CLOSE_RE.match(lines[-1].strip(" \t\r"))
+    if not head or not tail or head.group(1) != tail.group(1):
+        return text
+    return "\n".join(lines[1:-1]).strip()
+
+
 def _pending_scan(path):
     """Read a session's transcript tail for the three facts the resend-across-
     compaction guarantee needs (XERK-47), in one pass:
@@ -14766,7 +14790,7 @@ def _pending_scan(path):
               and entry.get("promptSource") != "system"):
             text = _entry_text(entry)
             if text:
-                delivered.append(text.strip())
+                delivered.append(_unwrap_paste(text.strip()))
     return delivered, _queued_display(queued), compactions
 
 
