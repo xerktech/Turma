@@ -203,14 +203,28 @@ fun calGridMin(ms: Long, day: LocalDate, zone: ZoneId, axis: CalAxis, end: Boole
     val ds = calDayStartMs(day, zone)
     val len = (calDayStartMs(day.plusDays(1), zone) - ds) / 60000.0
     val e = (ms - ds) / 60000.0
-    if (e <= 0 && !(end && e == 0.0)) return 0.0
-    if (e >= len) return axis.total.toDouble()
     val ps = calDayPieces(day, zone)
+    // Before the day: its first minute, which is not row 0 on a day whose midnight the clocks skip.
+    if (e <= 0 && !(end && e == 0.0)) return maxOf(0.0, calAxisAt(axis, ps[0].w0.toDouble(), ps[0].pass))
+    if (e >= len) return axis.total.toDouble()
     val p = ps.firstOrNull { if (end) e > it.e0 && e <= it.e1 else e >= it.e0 && e < it.e1 } ?: ps.last()
     val w = p.w0 + (e - p.e0)
     // A neighbour day drawn on another day's axis (the swipe) may repeat an hour the axis lacks.
     val m = calAxisAt(axis, w, p.pass, end).takeIf { it >= 0 } ?: calAxisAt(axis, w, 0, end)
     return maxOf(0.0, m)
+}
+
+/**
+ * Grid minute [m] of axis [from] moved onto [to] at the same wall time (the web's gridRemap), so a
+ * held scroll stays on 9:00 when a step brings a 25- or 23-row day into view or takes it away.
+ */
+fun calAxisRemap(from: CalAxis, to: CalAxis, m: Double): Double {
+    val s = from.segs.firstOrNull { m >= it.top && m < it.top + it.to - it.from } ?: from.segs.last()
+    val w = s.from + minOf(m - s.top, (s.to - s.from).toDouble())
+    var r = calAxisAt(to, w, s.pass)
+    if (r < 0 && s.pass == 1) r = calAxisAt(to, w, 0)
+    if (r < 0) r = to.segs.firstOrNull { it.pass == 0 && it.from > w }?.top?.toDouble() ?: to.total.toDouble()
+    return r
 }
 
 /** The instant grid minute [m] of [day]'s column stands for; a minute the day lacks is the next one it has. */

@@ -302,6 +302,11 @@
   /* the two passes of a repeated hour name their zone under the hour (XERK-2932) */
   .cal-hr.z { line-height: 1.05; text-align: right; transform: translateY(-6px); }
   .cal-hr.z span { display: block; font-size: 9px; }
+  .cal-hr.top { transform: none; }
+  /* Hours off the 60-minute rhythm (XERK-2932): lines from the labels, the working-hours shade kept. */
+  .cal-odd .cal-col { background-image: linear-gradient(to bottom, var(--page) 0 calc(var(--slot) * var(--wa, 18)), transparent calc(var(--slot) * var(--wa, 18)) calc(var(--slot) * var(--wb, 34)), var(--page) calc(var(--slot) * var(--wb, 34))); }
+  .cal-odd .cal-col.off { background-image: repeating-linear-gradient(135deg, color-mix(in srgb, var(--muted) 9%, transparent) 0 6px, transparent 6px 12px); }
+  .cal-hl { position: absolute; left: 0; right: 0; height: 0; border-top: 1px solid var(--hairline); pointer-events: none; }
   .cal-col { position: relative; border-left: 1px solid var(--hairline);
     /* hour lines solid, half-hour dashed-light; non-working hours shaded (Teams) */
     background:

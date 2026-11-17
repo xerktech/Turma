@@ -172,6 +172,7 @@ import com.xerktech.turma.core.calVisibleDays
 import androidx.compose.ui.graphics.drawscope.clipRect
 import com.xerktech.turma.core.CalAxis
 import com.xerktech.turma.core.calAxisAt
+import com.xerktech.turma.core.calAxisRemap
 import com.xerktech.turma.core.calGridAxis
 import com.xerktech.turma.core.calGridGaps
 import com.xerktech.turma.core.calGridHours
@@ -871,6 +872,18 @@ private fun WeekGrid(
                 // clearing it here dropped to the top-hold fallback (rollup XERK-2953, measured).
                 if (hold === held) hold = null
             }
+            // A step that brings a 25- or 23-row day into view (or takes it away) keeps the same wall
+            // time at the top (the web's gridRemap): the scroll is in grid minutes of the old axis.
+            var lastAxis by remember { mutableStateOf(axis) }
+            LaunchedEffect(axis) {
+                val was = lastAxis
+                if (was == axis) return@LaunchedEffect
+                lastAxis = axis
+                val px = with(density) { slot.toPx() }
+                val to = calAxisRemap(was, axis, scroll.value / px * 30.0)
+                withFrameNanos { }
+                scroll.dispatchRawDelta(((px * to / 30).roundToInt().coerceAtLeast(0) - scroll.value).toFloat())
+            }
             val hours by rememberUpdatedState(zoomHours)
             fun zoomTo(h: Float, y: Float, end: Boolean) {
                 val next = calZoomClamp(h)
@@ -919,8 +932,9 @@ private fun WeekGrid(
                     // The hour labels follow the axis: a repeated hour is labelled twice, each with its zone.
                     Box(Modifier.width(gutter).fillMaxHeight()) {
                         for (r in hourRows) {
-                            if (r.top == 0) continue
-                            Column(Modifier.offset(y = slot * (r.top / 30f) - 7.dp).padding(start = 4.dp)) {
+                            // The top row is labelled only when it is not midnight (a day whose midnight is skipped).
+                            if (r.top == 0 && r.h == 0) continue
+                            Column(Modifier.offset(y = if (r.top == 0) 0.dp else slot * (r.top / 30f) - 7.dp).padding(start = 4.dp)) {
                                 Text(
                                     DateTimeFormatter.ofPattern("h a", locale).format(java.time.LocalTime.of(r.h, 0)),
                                     fontSize = 10.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,

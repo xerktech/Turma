@@ -254,6 +254,46 @@ test("XERK-2937: grid geometry is in --slot rows, so a tall pane stretches the d
   assert.ok(!/top:\d+px/.test(html), "no fixed-px row geometry left");
 });
 
+test("XERK-2932: a fall-back week paints 25 rows: labels, shading, now-line, gaps and slot presses follow the axis", async () => {
+  const was = NOW;
+  NOW = Date.parse("2026-11-01T08:00:00Z");             // 3:00 EST on the 25-hour Sunday
+  try {
+    replies = {
+      "/api/calendar": () => ({ hosts: [{ host: "h1", device: "box", online: true, syncedAt: NOW, ranges: [[0, 4e12]] }],
+        events: [{ host: "h1", id: "b1", org: "", subject: "Late", startMs: Date.parse("2026-11-01T07:00:00Z"), endMs: Date.parse("2026-11-01T07:30:00Z") }] }),
+    };
+    cal.refetch();
+    cal.setMode("week");
+    const html = await show(at(2026, 11, 1));
+    const slot = (n) => `calc(var(--slot, 24px) * ${n})`;
+    assert.ok(html.includes(`;height:${slot(50)}">`), "the week is 50 rows tall");
+    assert.match(html, /--wa:20;--wb:36;/, "working hours 9–17 in this axis' rows");
+    assert.ok(html.includes(`class="cal-hr z" style="top:${slot(2)}">1 AM<span>EDT</span>`));
+    assert.ok(html.includes(`class="cal-hr z" style="top:${slot(4)}">1 AM<span>EST</span>`));
+    assert.ok(html.includes(`class="cal-now" style="top:${slot(8)}"`), "now-line at 3:00 EST = grid 240");
+    assert.ok(html.includes(`top:${slot(6)};height:calc(var(--slot, 24px) * 1 - 2px);`), "2:00 EST at grid 180");
+    assert.equal((html.match(/class="cal-gap"/g) || []).length, 6, "the six other days hatch the repeat");
+    assert.doesNotMatch(html, /cal-odd|cal-hl/, "whole-hour axis keeps the column's own lines");
+    // A press on Sunday's second 1 AM row is that hour's second pass; on Monday's hatch, 2:00.
+    const col = (d) => ({ dataset: { col: String(d) }, getBoundingClientRect: () => ({ top: 0, height: 1500 }) });
+    assert.equal(cal.slotMinAt(col(at(2026, 11, 1)), 1499), 1470);
+    assert.equal(cal.slotMs(at(2026, 11, 1), cal.slotMinAt(col(at(2026, 11, 1)), 150)), Date.parse("2026-11-01T06:30:00Z"));
+    assert.equal(cal.slotMs(at(2026, 11, 2), cal.slotMinAt(col(at(2026, 11, 2)), 130)), at(2026, 11, 2, 2));
+  } finally { NOW = was; cal.setMode("work"); }
+});
+
+test("XERK-2932: a held scroll keeps its wall time across a 24 ⇄ 25 row step", () => {
+  const plain = cal.gridAxis(cal.visibleDays(at(2026, 10, 28), "week"));
+  const fall = cal.gridAxis(cal.visibleDays(at(2026, 11, 4), "week"));
+  assert.equal(cal.gridRemap(plain, fall, 540), 600);      // 9:00 stays 9:00
+  assert.equal(cal.gridRemap(fall, plain, 600), 540);
+  assert.equal(cal.gridRemap(fall, plain, 150), 90);       // the repeat's 1:30 EST reads 1:30
+  assert.equal(cal.gridRemap(plain, fall, 30), 30);        // before the repeat, unmoved
+  const spring = cal.gridAxis([at(2026, 3, 8)]);           // 23 rows, no 2:00–3:00
+  assert.equal(cal.gridRemap(cal.gridAxis([at(2026, 3, 7)]), spring, 150), 120, "a skipped time is the next one");
+  assert.equal(cal.gridRemap(cal.gridAxis([at(2026, 3, 7)]), spring, 540), 480);
+});
+
 test("XERK-2897: holidays fill the all-day band; a day off shades for every org, whatever the header pick (XERK-3031)", async () => {
   replies = {
     "/api/holidays": () => [{ id: "us-veterans-day", date: "2026-11-11", name: "Veterans Day", country: "US", offFor: ["acme"] }],

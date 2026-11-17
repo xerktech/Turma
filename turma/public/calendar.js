@@ -203,9 +203,10 @@ function axisAt(axis, w, pass, end = false) {
 function gridMin(ms, day, axis, end = false) {
   const len = (addDays(day, 1) - day) / 60000;
   const e = (ms - day) / 60000;
-  if (e <= 0 && !(end && e === 0)) return 0;
-  if (e >= len) return axis.total;
   const ps = dayPieces(day);
+  // Before the day: its first minute, which is not row 0 on a day whose midnight the clocks skip.
+  if (e <= 0 && !(end && e === 0)) return Math.max(0, axisAt(axis, ps[0].w0, ps[0].pass));
+  if (e >= len) return axis.total;
   const p = ps.find((x) => (end ? e > x.e0 && e <= x.e1 : e >= x.e0 && e < x.e1)) || ps[ps.length - 1];
   const w = p.w0 + (e - p.e0);
   // A day drawn on an axis that lacks its repeated hour reads that hour's first-pass rows.
@@ -213,6 +214,21 @@ function gridMin(ms, day, axis, end = false) {
   if (m < 0 && p.pass) m = axisAt(axis, w, 0, end);
   return m < 0 ? 0 : m;
 }
+// Grid minute `m` of axis `from` moved onto axis `to` at the same wall time, so a held scroll
+// stays on 9:00 when a step brings a 25- or 23-row day into view or takes it away (QA).
+function gridRemap(from, to, m) {
+  const s = from.segs.find((x) => m >= x.top && m < x.top + x.to - x.from) || from.segs[from.segs.length - 1];
+  const w = s.from + Math.min(m - s.top, s.to - s.from);
+  let r = axisAt(to, w, s.pass);
+  if (r < 0 && s.pass) r = axisAt(to, w, 0);
+  if (r < 0) {   // a wall time the new axis skips: the next one it has
+    const next = to.segs.find((x) => x.pass === 0 && x.from > w);
+    r = next ? next.top : to.total;
+  }
+  return r;
+}
+const sameAxis = (a, b) => a.total === b.total && a.segs.length === b.segs.length
+  && a.segs.every((x, i) => x.from === b.segs[i].from && x.pass === b.segs[i].pass && x.top === b.segs[i].top);
 // The instant at grid minute `m` of `day`'s column; a minute the day does not have
 // (a shaded stretch) is the next one it does.
 function gridMs(m, day, axis) {
@@ -1185,7 +1201,11 @@ function headerHtml(days) {
 function calendarHtml() {
   const now = nowFn();
   const days = visibleDays(anchor, mode());
-  const axis = curAxis = gridAxis(days);
+  const axis = gridAxis(days);
+  if (!sameAxis(axis, curAxis)) {
+    if (topMin >= 0) { topMin = gridRemap(curAxis, axis, topMin); paneSig = ""; }
+    curAxis = axis;
+  }
   ensureLoaded(days);
   const got = collect(days);
   if (revealing) {
@@ -1236,8 +1256,14 @@ function calendarHtml() {
   }).join("");
   const band = days.map((d) => `<div class="cal-band-day${offOrgs(d, got.holidays).length ? " off" : ""}">${bandHtml(d, got.events, got.holidays, colors, now)}</div>`).join("");
   // The hour labels follow the axis: a repeated hour is labelled twice, each with its zone.
-  const hours = gridHours(axis).map((r) => `<div class="cal-hr${r.zone ? " z" : ""}" style="top:${slots(r.top / 30)}">${r.top
+  // The top row's label shows only when it is not midnight (a day starting at 1:00, its midnight skipped).
+  const hourRows = gridHours(axis);
+  const hours = hourRows.map((r) => `<div class="cal-hr${r.zone ? " z" : ""}${r.top ? "" : " top"}" style="top:${slots(r.top / 30)}">${r.top || r.h
     ? esc(new Date(2000, 0, 1, r.h).toLocaleTimeString([], { hour: "numeric" })) + (r.zone ? `<span>${esc(r.zone)}</span>` : "") : ""}</div>`).join("");
+  // An axis whose hours sit off the 60-minute rhythm (a 30-minute DST shift, Lord Howe) draws
+  // its hour lines from the labels; the column's repeating lines would cut through the hours.
+  const offRhythm = axis.segs.some((x) => ((x.top - x.from) % 60 + 60) % 60 !== 0);
+  const hourLines = offRhythm ? hourRows.map((r) => `<div class="cal-hl" style="top:${slots(r.top / 30)}" aria-hidden="true"></div>`).join("") : "";
   const body = days.map((d) => {
     const isToday = dayKey(d) === today;
     const segs = daySegments(got.events, d, axis);
@@ -1247,7 +1273,7 @@ function calendarHtml() {
     const gaps = gridGaps(d, axis).map((g) => `<div class="cal-gap" style="top:${slots(g.top / 30)};height:${slots(g.len / 30)}"`
       + ` title="${g.pass ? "This hour repeats on another day" : "The clocks skip this time on this day"}" aria-hidden="true"></div>`).join("");
     return `<div class="cal-col${isToday ? " today" : ""}${offOrgs(d, got.holidays).length ? " off" : ""}" data-col="${d}">`
-      + gaps + segs.map((s) => timedHtml(s, d, colors, now)).join("") + nowLine + `</div>`;
+      + hourLines + gaps + segs.map((s) => timedHtml(s, d, colors, now)).join("") + nowLine + `</div>`;
   }).join("");
   const label = `Calendar, ${rangeLabel(days)}`;
   // The shaded working hours (9–17) in rows of this axis (brief.html .cal-col).
@@ -1258,7 +1284,7 @@ function calendarHtml() {
     + `<div class="cal-grid" role="region" aria-label="${esc(label)}">`
     + `<div class="cal-row cal-heads" style="${cols}"><div></div>${heads}</div>`
     + `<div class="cal-row cal-band" style="${cols}"><div class="cal-band-lbl">All day</div>${band}</div>`
-    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body" style="${cols};--hours:${zoomHours};--wa:${work(9)};--wb:${work(17)};height:${slots(axis.total / 30)}">`
+    + `<div class="cal-scroll" id="calScroll"><div class="cal-row cal-body${offRhythm ? " cal-odd" : ""}" style="${cols};--hours:${zoomHours};--wa:${work(9)};--wb:${work(17)};height:${slots(axis.total / 30)}">`
     + `<div class="cal-gutter">${hours}</div>${body}</div></div></div>`;
 }
 
@@ -2562,7 +2588,7 @@ const api = {
   mount, update, setActive, refetch, upcoming, reveal,
   // pure helpers, for tests
   dayStart, addDays, weekStart, dayKey, parseDayKey, visibleDays, stepAnchor, weeksOf, rangeLabel,
-  wallMinutes, gridAxis, gridMin, gridMs, gridGaps, gridHours, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
+  wallMinutes, gridAxis, gridMin, gridMs, gridRemap, gridGaps, gridHours, fmtSpan, layoutDay, daySegments, styleOf, titleOf, inBand, onDay, offOrgs, hostNotices, noticeText,
   calendarHtml, safeHttps, isUpcomingMeeting, notesTarget, UPCOMING_MS,
   detailHtml, invitesText, invitesRowHtml, panelSpec, badgeOf, outlookStates, outlookMark, fmtLongSpan, originalStart, relink, evDomKey, hostSettingsHtml, saveHost, feedSettingsHtml, feedAction, loadFeed, feed,
   _state: () => ({ anchor, mode: mode(), weeks, detail, picker, zoomHours }),
@@ -2572,7 +2598,7 @@ const api = {
   _go: go,
   scopedBody, blankRepeat, repeatFromRule, ruleFromRepeat, repeatSummary, repeatError, repeatPresets, repeatPick, repeatPresetOf,
   validateForm, formPayload, formFromEvent, blankForm, wallToIso, parseAttendee, normEmail, evOrgs, openEditor, closeEditor,
-  saveEditor, slotMinAt,
+  saveEditor, slotMinAt, slotMs, setMode,
   _ed: () => ed, _edEls: () => ({ back: $edBack, panel: $edPanel }),
   _setHooks: (o) => { if (o.onData) onData = o.onData; if (o.openNotes) openNotes = o.openNotes; },
 };

@@ -292,7 +292,31 @@ class CalendarTest {
         val seg = calDaySegments(listOf(ev("x", iso("2026-04-05T02:30:00Z"), iso("2026-04-05T03:45:00Z"))), sat, scl, axis = axis).single()
         assertEquals(1410.0 to 1485.0, seg.top to seg.end)
         // The spring day starts at 1:00 (midnight is skipped): 23 rows.
-        assertEquals(1380, calGridAxis(listOf(LocalDate.of(2026, 9, 6)), scl).total)
+        val sun = LocalDate.of(2026, 9, 6)
+        assertEquals(1380, calGridAxis(listOf(sun), scl).total)
+        // In its week the skipped midnight hour is hatched, and an event at the day's first minute
+        // (or crossing in from Saturday) sits on the 1:00 row below it, not on row 0.
+        val wa = calGridAxis((0L..6L).map { sun.plusDays(it) }, scl)
+        assertEquals(listOf(CalGap(0, 60, 0)), calGridGaps(sun, scl, wa))
+        val first = calDaySegments(listOf(ev("f", calDayStartMs(sun, scl), calDayStartMs(sun, scl) + 3_600_000)), sun, scl, axis = wa).single()
+        assertEquals(60.0 to 120.0, first.top to first.end)
+        val over = calDaySegments(listOf(ev("o", iso("2026-09-06T02:00:00Z"), iso("2026-09-06T04:30:00Z"))), sun, scl, axis = wa).single()
+        assertEquals(60.0 to 90.0, over.top to over.end)
+        // Shown alone, its first row is labelled 1 AM.
+        assertEquals(0 to 1, calGridHours(calGridAxis(listOf(sun), scl), scl, Locale.US).first().let { it.top to it.h })
+    }
+
+    @Test fun `XERK-2932 a held scroll keeps its wall time across a 24 to 25 row step`() {
+        val plain = calGridAxis((0L..6L).map { LocalDate.of(2026, 10, 25).plusDays(it) }, ny)
+        val fall = calGridAxis((0L..6L).map { LocalDate.of(2026, 11, 1).plusDays(it) }, ny)
+        assertEquals(600.0, calAxisRemap(plain, fall, 540.0), 0.0)
+        assertEquals(540.0, calAxisRemap(fall, plain, 600.0), 0.0)
+        assertEquals(90.0, calAxisRemap(fall, plain, 150.0), 0.0)
+        assertEquals(30.0, calAxisRemap(plain, fall, 30.0), 0.0)
+        val spring = calGridAxis(listOf(LocalDate.of(2026, 3, 8)), ny)
+        val before = calGridAxis(listOf(LocalDate.of(2026, 3, 7)), ny)
+        assertEquals(120.0, calAxisRemap(before, spring, 150.0), 0.0)
+        assertEquals(480.0, calAxisRemap(before, spring, 540.0), 0.0)
     }
 
     @Test fun `Teams styles follow busy and my response`() {
