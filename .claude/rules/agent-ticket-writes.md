@@ -21,6 +21,17 @@ The ticket-update poller must not hand a session back its own comment or status 
   - Bash shapes are read off shlex'd COMMAND words (`ticket_writes_from_bash`): the `jira` helper,
     `acli jira workitem`, `az boards work-item update`, curl to Jira/ADO comment/edit endpoints.
     A `bash -c '…'`-wrapped write is missed — that errs toward delivering the update, never hiding one.
+- **A Bash call moved to the background on its 600 s timeout counts the COMMENTS already made**
+  (XERK-3052): its result carries `backgroundTaskId` AND `timedOutAfterMs` (an explicit
+  `run_in_background` has no `timedOutAfterMs` and still records nothing). The command still runs,
+  so a comment counts only when the `jira` helper's `commented on K` line is a whole line of the
+  output, each line claimed once, in command order (`_tw_landed`).
+  - Read ONE source: `toolUseResult.stdout`, else the content. The content already repeats the
+    stdout, so joining both let one line vouch for a later, not-yet-run write of the same key.
+  - **Never edits, transitions or assigns**: a timed-out call's span is the full
+    `TICKET_SELF_SPAN_MAX_MS`, so a field match there hides ANY human change to that field across
+    the whole 10-minute run (QA, XERK-3052). Comments match by body, which a human's text lacks.
+  - curl/acli/az/MCP print no such line, so a timed-out one stays unrecorded (delivered).
 - **Matching errs toward DELIVERING** (a false match hides a human's update from the session):
   - key must be valid and equal, `at` finite — else False; never raises (`_ticket_self_authored`);
   - a comment: id when BOTH sides carry one (different ids = different comments), else the body
