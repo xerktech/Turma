@@ -10360,26 +10360,38 @@ def _azdo_pr_comment_events(url):
     return events
 
 
-def _pr_comment_message(url, events):
+PR_COMMENTS_TAG_CAP = 200          # per-comment author / loc chars in the message
+
+
+def _pr_comment_header(url, part=None):
+    what, num = _pr_ref(url)
+    of = f" (part {part[0]} of {part[1]})" if part else ""
+    return (f"New review activity on the {what} {num} you opened ({url}){of}. "
+            f"Address it and update the {what} — continue in this session:")
+
+
+def _pr_comment_line(e):
+    cap = PR_COMMENTS_TAG_CAP
+    who = f"@{str(e['author'])[:cap]}" if e.get("author") else "someone"
+    tag = e.get("kind") or "comment"
+    if e.get("loc"):
+        tag = f"{tag} on {str(e['loc'])[:cap]}"
+    body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
+    return f"[{who} — {tag}] {body}"
+
+
+def _pr_comment_message(url, events, part=None):
     """Fold new PR comments into the single free-text message typed into the
     session (XERK-49). One flat paragraph — a header naming the PR and telling
     the agent to act on it in THIS session, then each comment as
-    `@author (kind, loc): body`, each body collapsed to one line and capped so
-    one long comment can't crowd out the rest. Callers delivering a batch use
-    _pr_comment_messages, which splits it to fit INPUT_MAX_CHARS."""
+    `@author (kind, loc): body`, each body collapsed to one line and capped (as
+    are author and loc) so one long comment can't crowd out the rest. Callers
+    delivering a batch use _pr_comment_messages, which splits it to fit
+    INPUT_MAX_CHARS; `part` = (i, n) labels one of those parts."""
     if not events:
         return ""
-    what, num = _pr_ref(url)
-    parts = [f"New review activity on the {what} {num} you opened ({url}). "
-             f"Address it and update the {what} — continue in this session:"]
-    for e in events:
-        who = f"@{e['author']}" if e.get("author") else "someone"
-        tag = e.get("kind") or "comment"
-        if e.get("loc"):
-            tag = f"{tag} on {e['loc']}"
-        body = " ".join(str(e.get("body") or "").split())[:PR_COMMENTS_BODY_CAP]
-        parts.append(f"[{who} — {tag}] {body}")
-    return "  ".join(parts)
+    return "  ".join([_pr_comment_header(url, part)]
+                     + [_pr_comment_line(e) for e in events])
 
 
 def _pr_comment_messages(url, events, limit=None):
@@ -10390,19 +10402,33 @@ def _pr_comment_messages(url, events, limit=None):
     One message past INPUT_MAX_CHARS is REFUSED whole by send_input and skipped
     by the inbox, while _deliver_pr_comments has already marked every key seen —
     so an oversized batch was lost for good. Splitting keeps every comment.
-    Greedy, in order; a lone comment always fits (its body is capped at
-    PR_COMMENTS_BODY_CAP, far under the limit)."""
+
+    Greedy and in order, linear in the batch (a running length, never a
+    rebuild per comment: this runs on the beat). Parts of a split batch are
+    labelled "part i of n", so a session that reads one first (an inbox post
+    can fail over to the later pane) knows more is coming. A single comment
+    cannot overflow: author, loc and body are each capped."""
+    if not events:
+        return []
     if limit is None:
         limit = INPUT_MAX_CHARS - len(INBOX_PREFIX) - 2
-    out, chunk = [], []
-    for e in events:
-        if chunk and len(_pr_comment_message(url, chunk + [e])) > limit:
-            out.append(_pr_comment_message(url, chunk))
-            chunk = []
-        chunk.append(e)
-    if chunk:
-        out.append(_pr_comment_message(url, chunk))
-    return out
+    lines = [_pr_comment_line(e) for e in events]
+    # Room for the longest header any part could get ("part 9999 of 9999").
+    room = limit - len(_pr_comment_header(url, (9999, 9999)))
+    chunks, cur, size = [], [], 0
+    for e, line in zip(events, lines):
+        add = len(line) + 2                  # "  " joins each line on
+        if cur and size + add > room:
+            chunks.append(cur)
+            cur, size = [], 0
+        cur.append(e)
+        size += add
+    chunks.append(cur)
+    if len(chunks) == 1:
+        return [_pr_comment_message(url, events)]
+    n = len(chunks)
+    return [_pr_comment_message(url, c, (i, n))
+            for i, c in enumerate(chunks, 1)]
 
 
 def _pr_conflict_message(url, base, again=False):
@@ -48314,11 +48340,17 @@ class SessionManager:
                          if e["key"] not in seen and not e["is_self"]]
                 # Fold EVERY current key (self-authored included) into the seen
                 # set — a first sighting baselines them all; later beats only add
-                # the newcomers. Cap newest-kept so a chatty PR can't grow it
-                # without bound.
+                # the newcomers, capped so a chatty PR can't grow it without bound.
+                # Current keys go LAST, in fetch order, and the cap never cuts
+                # one: a key trimmed while the PR still has that comment reads
+                # as new on every later beat (a PR past the cap re-sent its
+                # oldest comments each poll). Keys no longer fetched age out
+                # first, in the order they were recorded.
                 keys = [e["key"] for e in events]
-                merged = list(seen) + [k for k in keys if k not in seen]
-                base[url] = merged[-PR_COMMENTS_SEEN_MAX:]
+                current = set(keys)
+                prior = [k for k in (base.get(url) or []) if k not in current]
+                merged = prior + list(dict.fromkeys(keys))
+                base[url] = merged[-max(PR_COMMENTS_SEEN_MAX, len(current)):]
                 changed = True
                 if first or not fresh:
                     continue

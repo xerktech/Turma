@@ -21184,6 +21184,26 @@ class TestPrCommentMessages(unittest.TestCase):
         msgs = ha._pr_comment_messages(self.URL, self._evs(3, 50), limit=1)
         self.assertEqual(len(msgs), 3)
 
+    def test_parts_of_a_split_batch_are_labelled(self):
+        msgs = ha._pr_comment_messages(self.URL, self._evs(200))
+        n = len(msgs)
+        for i, m in enumerate(msgs, 1):
+            self.assertIn(f"(part {i} of {n})", m)
+
+    def test_a_lone_comment_with_huge_author_and_loc_still_fits(self):
+        evs = [{"author": "a" * 100000, "body": "x" * 100000,
+                "kind": "inline", "loc": "p" * 100000}]
+        msgs = ha._pr_comment_messages(self.URL, evs)
+        self.assertEqual(len(msgs), 1)
+        self.assertLessEqual(len(f"{ha.INBOX_PREFIX}\n\n{msgs[0]}"),
+                             ha.INPUT_MAX_CHARS)
+
+    def test_many_short_comments_split_in_linear_time(self):
+        t = time.monotonic()
+        msgs = ha._pr_comment_messages(self.URL, self._evs(20000, 20))
+        self.assertLess(time.monotonic() - t, 2.0)
+        self.assertGreater(len(msgs), 1)
+
 
 class TestMrCommentEvents(unittest.TestCase):
     """XERK-162: _mr_comment_events answers _pr_comment_events' exact contract
@@ -21774,6 +21794,24 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.assertLessEqual(len(sess["prCommentBase"][self.URL]),
                              ha.PR_COMMENTS_SEEN_MAX)
         self.assertIn("knew", sess["prCommentBase"][self.URL])
+
+    def test_a_pr_past_the_seen_cap_does_not_resend_old_comments(self):
+        # A PR with more comments than PR_COMMENTS_SEEN_MAX once trimmed keys it
+        # still had, and re-sent those as new on every poll (XERK-3047 QA).
+        sm = self.make_manager()
+        n = ha.PR_COMMENTS_SEEN_MAX + 100
+        evs = [self._ev(f"c{i}") for i in range(n)]
+        sess = self._session(sm)
+        with self._events(*evs):
+            sm._poll_pr_comments()                  # baseline
+        with self._events(*evs, self._ev("cnew", body="only me")):
+            sm._poll_pr_comments()
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("only me", typed[0])
+        self.assertNotIn("[@alice — comment] fix", typed[0])
+        self.assertEqual(len(sess["prCommentBase"][self.URL]), n + 1)
 
     def test_a_batch_past_input_max_chars_is_split_not_lost(self):
         # XERK-3047: ~90 near-cap comments compose past INPUT_MAX_CHARS; one

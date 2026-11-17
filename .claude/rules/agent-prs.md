@@ -136,8 +136,11 @@ DevOps, and what gets typed back because of it.
   failure leaves the baseline UNTOUCHED.**
 - **A batch is split, never sent past `INPUT_MAX_CHARS`** (`_pr_comment_messages`, XERK-3047): keys
   are marked seen before delivery, and an oversized message is refused whole, so one big batch was
-  lost. Each part leaves room for `INBOX_PREFIX`. Tests: `TestPrCommentMessages`,
-  `test_a_batch_past_input_max_chars_is_split_not_lost`.
+  lost. Each part leaves room for `INBOX_PREFIX` and says `part i of n`; author/loc are capped too.
+  Tests: `TestPrCommentMessages`, `test_a_batch_past_input_max_chars_is_split_not_lost`.
+- **The seen-cap never trims a key the PR still has** (`prCommentBase`): a trimmed current key reads
+  as new every poll. Current keys go last; vanished ones age out first.
+  Tests: `test_a_pr_past_the_seen_cap_does_not_resend_old_comments`.
 - `_poll_pr_conflicts` types `_pr_conflict_message` (**MERGE `origin/<base>`, never a rebase/force-
   push**) off the just-cached `mergeable`. `prConflicts` bounds nudging per PR; MERGEABLE/closed
   re-arms it, **UNKNOWN does neither** — that's what a just-pushed fix looks like, and clearing on it
