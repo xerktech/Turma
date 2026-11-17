@@ -60538,7 +60538,10 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         [w] = ha.ticket_writes_from_bash("jira comment X-1 - 3<<< words", d)
         self.assertNotIn("fp", w)
         for cmd in ("eval 'cd sub'; jira comment X-1 -F note.md",
-                    'sh -c "cd sub"; jira comment X-1 -F note.md'):
+                    'sh -c "cd sub"; jira comment X-1 -F note.md',
+                    "eval 'true; pushd sub'; jira comment X-1 -F note.md",
+                    "eval 'cd;'; jira comment X-1 -F note.md",
+                    "eval $'cd sub'; jira comment X-1 -F note.md"):
             [w] = ha.ticket_writes_from_bash(cmd, d)
             self.assertNotIn("fp", w, cmd)
 

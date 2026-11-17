@@ -12560,7 +12560,7 @@ def ticket_writes_from_bash(cmd, cwd=None, defer_files=False):
 
 _TW_CD_WORDS = frozenset(("cd", "pushd", "popd"))
 # A quoted script that changes directory (`eval 'cd x'`, `sh -c "cd x; …"`).
-_TW_CD_IN_WORD_RE = re.compile(r"(?:\A|[\s;&|({])(?:cd|pushd|popd)(?:\s|\Z)")
+_TW_CD_IN_WORD_RE = re.compile(r"(?<![\w.-])(?:cd|pushd|popd)(?![\w.-])")
 
 
 def resolve_ticket_write_files(writes):
