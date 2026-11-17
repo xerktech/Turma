@@ -12214,7 +12214,9 @@ def _tw_segments(cmd, heredocs=()):
     `> f`, `&>f`, `<f`) are dropped with their target, so they never pose as an
     argument; the heredoc marker words are moved to the segment's own list."""
     try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|<>")
+        # A newline ends a command like `;` does (outside quotes).
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|<>\n")
+        lex.whitespace = " \t\r"
         lex.whitespace_split = True
         lex.commenters = ""
         toks = list(lex)
@@ -12223,13 +12225,13 @@ def _tw_segments(cmd, heredocs=()):
     segs, cur, docs, i = [], [], [], 0
     while i < len(toks):
         t = toks[i]
-        if t and set(t) <= set(";&|<>"):
+        if t and set(t) <= set(";&|<>\n"):
             if "<" in t or ">" in t:
                 # A redirection: a lone fd number right before it is part of it,
                 # and its target (or the `&N` fd) is the next word.
                 if cur and cur[-1].isdigit() and len(cur[-1]) <= 2:
                     cur.pop()
-                i += 2 if i + 1 < len(toks) and not set(toks[i + 1]) <= set(";&|<>") else 1
+                i += 2 if i + 1 < len(toks) and not set(toks[i + 1]) <= set(";&|<>\n") else 1
                 continue
             if cur:
                 segs.append((cur, docs))
@@ -12415,8 +12417,8 @@ def _tw_board_host(url, kind):
     unset board, or a URL with no host, says nothing)."""
     try:
         host = (urllib.parse.urlsplit(url).hostname or "").lower()
-        if not host:
-            return True
+        if not host or "$" in url.split("/rest/", 1)[0].split("/_apis/", 1)[0]:
+            return True  # no host, or an unexpanded `$JIRA_SITE`: unknown, so ours
         if kind == "jira":
             site = normalize_jira_site(JIRA_SITE) if JIRA_SITE else ""
             return not site or host == site.split("/")[0].split(":")[0].lower()

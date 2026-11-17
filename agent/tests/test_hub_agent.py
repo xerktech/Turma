@@ -59909,6 +59909,18 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
                         '{"$id": "1", "message": "VS402", "typeKey": "WorkItemUpdateException"}'):
             self.assertEqual(self._one("Bash", {"command": put}, result=refused), [], refused)
 
+    def test_a_write_on_a_later_line_or_via_the_site_variable(self):
+        for cmd in ("echo hi\njira comment X-1 hi",
+                    "cat > a <<'A'\nbody\nA\njira comment X-1 hi"):
+            [w] = ha.ticket_writes_from_bash(cmd)
+            self.assertEqual(w["fp"], ha.ticket_body_fingerprint("hi"), cmd)
+        with mock.patch.object(ha, "JIRA_SITE", "mine.atlassian.net"):
+            for url in ('"https://$JIRA_SITE/rest/api/3/issue/X-1/comment"',
+                        '"https://${JIRA_SITE#https://}/rest/api/3/issue/X-1/comment"'):
+                [w] = ha.ticket_writes_from_bash(
+                    f"curl -X POST {url} -d '{{\"body\": \"a\"}}'")
+                self.assertEqual(w["key"], "X-1")
+
     def test_a_tool_use_on_a_user_entry_is_never_a_call(self):
         call = _tw_call("u1", "Bash", {"command": 'jira comment X-1 "a"'})
         call["type"] = "user"
