@@ -48346,8 +48346,12 @@ class SessionManager:
                 events = staged[url]
                 if events is None:
                     continue                       # fetch failed — keep baseline
-                seen = set(base.get(url) or [])
                 first = url not in base
+                if first and isinstance(events, _PartialEvents):
+                    # A baseline missing a channel would deliver that channel's
+                    # whole history on the next full fetch: wait for a full one.
+                    continue
+                seen = set(base.get(url) or [])
                 fresh = [e for e in events
                          if e["key"] not in seen and not e["is_self"]]
                 # Fold EVERY current key (self-authored included) into the seen
@@ -48360,7 +48364,8 @@ class SessionManager:
                 # first, in the order they were recorded — except on a PARTIAL
                 # fetch (an inline channel failed): its missing keys are still
                 # on the PR, and trimming them would re-send them on the next
-                # full fetch, so that beat never shrinks the set.
+                # full fetch, so that beat trims nothing. It grows only by keys
+                # the PR really has; the next full fetch trims as usual.
                 keys = [e["key"] for e in events]
                 current = set(keys)
                 old = base.get(url) or []
@@ -48368,7 +48373,7 @@ class SessionManager:
                 merged = prior + list(dict.fromkeys(keys))
                 keep = max(PR_COMMENTS_SEEN_MAX, len(current))
                 if isinstance(events, _PartialEvents):
-                    keep = max(keep, len(old))
+                    keep = len(merged)
                 base[url] = merged[-keep:]
                 changed = True
                 if first or not fresh:

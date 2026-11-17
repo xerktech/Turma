@@ -21201,12 +21201,16 @@ class TestPrCommentMessages(unittest.TestCase):
     def test_every_framed_part_fits_across_body_sizes(self):
         # Guards the header reserve and the "  " join room: without either a
         # part lands a few chars past INPUT_MAX_CHARS and is refused whole.
-        for size in (1, 20, 100, 499, 777, 1000, ha.PR_COMMENTS_BODY_CAP):
-            for n in (1, 59, 60, 61, 90, 300):
-                for m in ha._pr_comment_messages(self.URL, self._evs(n, size)):
-                    self.assertLessEqual(
-                        len(f"{ha.INBOX_PREFIX}\n\n{m}"), ha.INPUT_MAX_CHARS,
-                        (size, n))
+        # The grid must land a part within the ~20-char label slack, so sweep
+        # sizes densely (e.g. 239 x 400 overflowed without the reserve).
+        grid = [(size, n) for size in range(200, 340) for n in (300, 400)]
+        grid += [(size, n) for size in (1, 20, 777, ha.PR_COMMENTS_BODY_CAP)
+                 for n in (1, 59, 60, 61, 90)]
+        for size, n in grid:
+            for m in ha._pr_comment_messages(self.URL, self._evs(n, size)):
+                self.assertLessEqual(
+                    len(f"{ha.INBOX_PREFIX}\n\n{m}"), ha.INPUT_MAX_CHARS,
+                    (size, n))
 
     def test_parts_of_a_split_batch_are_labelled(self):
         msgs = ha._pr_comment_messages(self.URL, self._evs(200))
@@ -21846,10 +21850,29 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm)
         with self._events(*conv, *inline):
             sm._poll_pr_comments()                  # baseline
+        for beat in range(2):                       # inline fetch fails twice
+            conv += [self._ev(f"n{beat}{i}", body=f"new{beat}{i}")
+                     for i in range(10)]            # while new comments land
+            with mock.patch.object(ha, "_pr_comment_events",
+                                   return_value=ha._PartialEvents(conv)):
+                sm._poll_pr_comments()
+        with self._events(*conv, *inline):
+            sm._poll_pr_comments()
+        joined = "".join(self._typed())
+        self.assertIn("new19", joined)
+        self.assertNotIn("inline", joined)          # no old inline re-sent
+
+    def test_a_partial_first_sighting_waits_for_a_full_baseline(self):
+        sm = self.make_manager()
+        conv = [self._ev(f"c{i}") for i in range(5)]
+        inline = [self._ev(f"i{i}", kind="inline") for i in range(5)]
+        sess = self._session(sm)
         with mock.patch.object(ha, "_pr_comment_events",
                                return_value=ha._PartialEvents(conv)):
-            sm._poll_pr_comments()                  # inline fetch failed
+            sm._poll_pr_comments()
+        self.assertNotIn(self.URL, sess.get("prCommentBase") or {})
         with self._events(*conv, *inline):
+            sm._poll_pr_comments()                  # the real baseline
             sm._poll_pr_comments()
         self.assertEqual(self._typed(), [])
 
