@@ -15400,6 +15400,151 @@ class TestMigrateWorktreeState(ManagerMixin, unittest.TestCase):
         self.assertIn("capturing the worktree", sm.spawn_failures[-1]["error"])
 
 
+class TestMigrationCarriesTicketUpdates(ManagerMixin, unittest.TestCase):
+    """A migration carries what the session already saw of its ticket's updates
+    (XERK-3055): the target delivers the unread tail from before the move, not
+    only what lands after its own createdAt."""
+
+    SITE = "x.atlassian.net"
+    KEY = "XERK-1"
+    TID = "transT"
+    PAST = "2020-01-02T00:00:00.000+0000"   # before the target's createdAt
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (("REPOS_ROOT", os.path.join(self.tmp, "git")),):
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.repo = {"name": "Turma", "path": os.path.join(ha.REPOS_ROOT, "Turma")}
+        os.makedirs(self.repo["path"], exist_ok=True)
+        for name, value in (("scan_repos", lambda: [self.repo]),
+                            ("board_configured", lambda: True),
+                            ("board_site_key", lambda: self.SITE)):
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        # A repo-dir cwd: no worktree state rides along, so the record travels
+        # without a `state.json` beside it.
+        self.cwd = self.repo["path"]
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.cwd))
+        os.makedirs(proj, exist_ok=True)
+        with open(os.path.join(proj, self.TID + ".jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+
+    def _ticket(self, key=None):
+        return {"key": key or self.KEY, "siteKey": self.SITE, "summary": "Fix it"}
+
+    def _comment(self, cid, body="also handle the edge case"):
+        return {"key": f"c:{cid}", "kind": "comment", "author": "Ann", "authorId": "a1",
+                "body": body, "field": None, "rawField": None, "fromText": None,
+                "toText": None, "created": self.PAST}
+
+    def _move(self, src_sess, cmd_ticket=None):
+        src = self.make_manager()
+        src.registry = [dict(src_sess, id="s1", worktreePath=self.cwd, status="running",
+                             repo="Turma", claudeSessionId=self.TID,
+                             ticket=self._ticket())]
+        sent = {}
+        src._migration_upload = lambda mid, blob: sent.update(blob=blob) or True
+        src.export_session("s1", "mig1")
+        self.assertIn("blob", sent, src.spawn_failures)
+        dst = self.make_manager()
+        dst._launch_tmux = mock.Mock()
+        dst._launch_ttyd = mock.Mock()
+        dst.notify_session = mock.Mock(return_value=True)
+        dst._migration_download = lambda mid: sent["blob"]
+        _run_import(dst, {"type": "importSession", "cmdId": "c1", "migrationId": "mig1",
+                          "transcriptId": self.TID, "cwd": self.cwd, "repo": "Turma",
+                          "ticket": cmd_ticket or self._ticket()})
+        self.assertEqual(len(dst.registry), 1, dst.spawn_failures)
+        return dst, dst.registry[0]
+
+    def _round(self, sm, events):
+        with mock.patch.object(ha, "ticket_update_events", return_value=events), \
+                mock.patch.object(ha, "tickets_changed_since",
+                                  side_effect=lambda keys, since: set(keys)), \
+                mock.patch.object(ha.threading, "Thread"):
+            sm._stage_ticket_update_fetch()
+            sm._fetch_ticket_updates()
+            sm._deliver_ticket_updates()
+        return [c.args[1] for c in sm.notify_session.call_args_list]
+
+    def test_an_update_unread_before_the_move_is_delivered_on_the_target(self):
+        own = "Fixed in PR #3"
+        dst, sess = self._move({
+            "createdAt": "2019-01-01T00:00:00Z",
+            "ticketUpdateBase": {"key": self.KEY, "seen": ["c:1"]},
+            "ticketWrites": [{"u": "tu1", "t": ha._ts_ms(ha._iso_z(self.PAST)),
+                              "kind": "comment", "key": self.KEY,
+                              "fp": ha.ticket_body_fingerprint(own)}]})
+        self.assertEqual(sess["ticketUpdateBase"], {"key": self.KEY, "seen": ["c:1"]})
+        msgs = self._round(dst, [self._comment("1", "already seen"),
+                                 self._comment("2", "unread before the move"),
+                                 self._comment("3", own)])
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertIn("unread before the move", msgs[0])
+        self.assertNotIn("already seen", msgs[0])
+        self.assertNotIn(own, msgs[0])   # its own write, carried on the ledger
+
+    def test_a_move_before_the_first_read_keeps_the_source_anchor(self):
+        # No base yet: the source would have delivered what landed after its own
+        # createdAt, so the target does too.
+        dst, sess = self._move({"createdAt": "2019-01-01T00:00:00Z"})
+        self.assertIsNone(sess.get("ticketUpdateBase"))
+        self.assertEqual(sess["ticketUpdateSince"], "2019-01-01T00:00:00Z")
+        msgs = self._round(dst, [self._comment("2", "landed before the move")])
+        self.assertEqual(len(msgs), 1, msgs)
+
+    def test_held_updates_ride_along(self):
+        held = {"key": self.KEY, "events": [self._comment("9")]}
+        _dst, sess = self._move({"createdAt": "2019-01-01T00:00:00Z",
+                                 "ticketUpdateBase": {"key": self.KEY, "seen": ["c:9"]},
+                                 "ticketUpdateHeld": held})
+        self.assertEqual(sess["ticketUpdateHeld"], held)
+
+    def test_a_record_for_another_ticket_is_dropped(self):
+        dst, sess = self._move({"createdAt": "2019-01-01T00:00:00Z",
+                                "ticketUpdateBase": {"key": self.KEY, "seen": ["c:1"]}},
+                               cmd_ticket=self._ticket("XERK-2"))
+        self.assertIsNone(sess.get("ticketUpdateBase"))
+        self.assertIsNone(sess.get("ticketUpdateSince"))   # anchors at its createdAt
+        self.assertEqual(sess["ticketWrites"], [])
+        self.assertEqual(self._round(dst, [self._comment("2")]), [])
+
+    def test_the_carried_record_is_revalidated(self):
+        t = self._ticket()
+        enc = lambda d: json.dumps(d).encode()
+        for raw in (None, b"not json", b"[]", enc({"key": "XERK-2"})):
+            self.assertEqual(ha._carried_ticket_state(raw, t), {}, raw)
+        out = ha._carried_ticket_state(enc({
+            "key": self.KEY,
+            "ticketUpdateBase": {"key": self.KEY, "seen": ["c:1", 5, None] + [
+                f"c:x{i}" for i in range(ha.TICKET_UPDATES_SEEN_MAX)], "mark": True},
+            "ticketUpdateSince": "yesterday",
+            "ticketUpdateHeld": {"key": "XERK-2", "events": [{"key": "c:1"}]},
+            "ticketWrites": [{"u": 1}, "x", {"u": "ok", "t": 1}]}), t)
+        self.assertEqual(len(out["ticketUpdateBase"]["seen"]), ha.TICKET_UPDATES_SEEN_MAX)
+        self.assertTrue(all(isinstance(k, str) for k in out["ticketUpdateBase"]["seen"]))
+        self.assertNotIn("mark", out["ticketUpdateBase"])
+        self.assertNotIn("ticketUpdateSince", out)
+        self.assertNotIn("ticketUpdateHeld", out)
+        self.assertEqual(out["ticketWrites"], [{"u": "ok", "t": 1}])
+
+    def test_an_older_target_never_unpacks_the_record(self):
+        # The member rides under `.worktree/`, which no agent extracts.
+        sm = self.make_manager()
+        sess = {"ticket": self._ticket(), "createdAt": "2019-01-01T00:00:00Z"}
+        path = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.cwd),
+                            self.TID + ".jsonl")
+        blob = sm._pack_transcript(path, worktree={
+            ha.SESSION_STATE_MEMBER: ha._migration_ticket_state(sess)})
+        dest = os.path.join(self.tmp, "dest")
+        os.makedirs(dest)
+        sm._unpack_transcript(blob, dest)
+        self.assertEqual(sorted(os.listdir(dest)), [self.TID + ".jsonl"])
+
+
 class TestMigrateSession(ManagerMixin, unittest.TestCase):
     """Moving a session to another agent (XERK-101): the source packs its raw
     transcript and ships it through the hub; the target unpacks it under the
