@@ -274,6 +274,23 @@ ticket builds to this file; change it here first.
     an update on work the brief lists is not new unless it adds a commitment, blocker or decision;
     an item continuing a ticket the brief names mentions that key in its description.
     `duplicateKeys` stays search-filled. An older agent ignores `daily`: no version gate.
+- **What is already tracked** (XERK-3061): the pull always adds `work: {sessions}` — the org's
+  Turma sessions (`meetingWorkSessions`: every host DECIDED into the org, running then ended
+  newest-first, ≤40, queued/root left out) as `{ticket?, title, branch?, state:"running"|"ended"}`.
+  - The DECIDED org, never the claimed `jira.siteKey` (XERK-348): a host drifted in would read as
+    the org's. An `error` session counts as running (Start resumes it); a host unseen 7 days
+    (`MEETING_WORK_HOST_STALE_MS`) is skipped. Tests also in `tenancy.test.js` (tenant isolation).
+  - Deduped on ticket + title AFTER the sort, so a migrated item's running copy beats the
+    source host's ended record; deduping while walking hosts made it read "ended".
+  - The agent (`meeting_work_context`) adds its OWN board tickets (open, then ≤20 of the recent
+    Done window, capped apart so a busy open list never crowds Done out; epics out) and appends
+    both after the meeting data, JSON-encoded as context: an update on tracked work is not new
+    work; a new commitment on it names the key. An old hub (no `work`) gives tickets only.
+  - Why: a standup mention of a ticket already being worked became a proposal for a second ticket.
+  - An item whose text names a listed key gets that key first in `duplicateKeys`
+    (`meeting_link_known_keys`; project-style keys only, case-sensitive). Still never a model-guessed key: only a
+    key in the list counts. An older agent ignores `work`: no version gate.
+  - Tests: `XERK-3061:` in `server.test.js`, the `xerk3061` cases in `TestMeetingWorker`.
 - Host: the SAME pick as the Daily Brief (`pickCapabilityHost`): `jiraHostPool(siteKey, true)` ∩
   `meetings.available === true`, a host with `claudeAuth.needsLogin` last, runtime/models as
   `pickDailyBriefHost`.

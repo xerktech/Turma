@@ -24550,6 +24550,50 @@ function meetingDailyBrief(siteKey, m) {
   return { meetingAt: m.daily.meetingAt, day: b.day || "", week: b.week || "", next: b.next || "" };
 }
 
+// The org's Turma sessions, for the meeting reader's context (XERK-3061): a
+// standup mentions work already running in Turma, and without this list the
+// model proposed a new ticket for it. Every host DECIDED into the org (never the
+// claimed siteKey: XERK-348), live then ended, newest first, bounded.
+const MEETING_WORK_SESSIONS_MAX = 40;
+// A host unseen this long is gone; its last-reported sessions say nothing current.
+const MEETING_WORK_HOST_STALE_MS = 7 * 24 * 3600e3;
+function meetingWorkSessions(siteKey, now = Date.now()) {
+  const rows = [];
+  const seen = new Set();
+  for (const a of Object.values(agents)) {
+    if (!a || decidedOrgOf(a) !== siteKey) continue;
+    if (!(now - Number(a.lastSeen) < MEETING_WORK_HOST_STALE_MS)) continue;
+    const add = (s, running) => {
+      if (!s || typeof s !== "object" || s.root === true) return;
+      const t = s.ticket && typeof s.ticket === "object" ? s.ticket : null;
+      const ticket = t && typeof t.key === "string" && isIssueKey(t.key) ? t.key : "";
+      const title = meetingText(s.summary, 120) || meetingText(s.label, 120);
+      if (!ticket && !title) return;
+      const branch = meetingText(s.branch, 120);
+      const at = Number(running ? s.createdAt : s.closedAt || s.createdAt);
+      rows.push({ key: `${ticket}\x00${title}`, row: { ...(ticket ? { ticket } : {}), title, ...(branch ? { branch } : {}),
+        state: running ? "running" : "ended" }, at: Number.isFinite(at) ? at : 0 });
+    };
+    for (const s of Array.isArray(a.sessions) ? a.sessions : []) {
+      // An `error` session is a crashed one Start resumes: still the work in hand
+      // (the outcome ledger reads it the same way).
+      if (s && s.status !== "queued") add(s, s.status === "running" || s.status === "error");
+    }
+    for (const c of Array.isArray(a.closedSessions) ? a.closedSessions : []) add(c, false);
+  }
+  rows.sort((x, y) => (x.row.state === y.row.state ? y.at - x.at : x.row.state === "running" ? -1 : 1));
+  // Deduped AFTER the sort, so one work item's running copy (a migration leaves
+  // the source's ended record behind) wins over its ended copy on another host.
+  const out = [];
+  for (const r of rows) {
+    if (seen.has(r.key)) continue;
+    seen.add(r.key);
+    out.push(r.row);
+    if (out.length >= MEETING_WORK_SESSIONS_MAX) break;
+  }
+  return out;
+}
+
 const meetingPendingCount = (list) => (list || []).filter((m) => MEETING_PENDING.has(m.status)).length;
 
 // The answer to a valid POST: {status, body}. Idempotent on meetingId.
@@ -28981,9 +29025,13 @@ const server = http.createServer(async (req, res) => {
           // The agent is handed its org PLAIN (XERK-2551), as in its command.
           // A daily meeting carries the brief the reviewer read (XERK-2856).
           const daily = meetingDailyBrief(siteKey, m);
+          // The org's Turma sessions, so the reader knows what is already being
+          // worked (XERK-3061). The agent adds its own board tickets beside them.
+          const sessions = meetingWorkSessions(siteKey);
           return json(res, 200, { runId, siteKey: baseOfSite(siteKey), meetingId: m.meetingId, title: m.title,
             platform: m.platform, startedAt: m.startedAt, endedAt: m.endedAt,
-            participants: m.participants, segments: m.segments, ...(daily ? { daily } : {}) });
+            participants: m.participants, segments: m.segments, ...(daily ? { daily } : {}),
+            work: { sessions } });
         }
       }
       return json(res, 404, { error: "no such meeting run" });

@@ -1650,3 +1650,53 @@ test("XERK-2992: a feed link serves only its owner's tenant, and dies with a pas
     }
   }
 });
+
+// XERK-3061: the meeting reader's `work.sessions` is the pulling host's own
+// tenant + decided org only — never another tenant's host on the same plain
+// site, the untenanted fleet, or a host drifted into or out of the org.
+test("XERK-3061: a meeting pull lists only its own tenant's and decided org's sessions", async () => {
+  const { A, B, beatAs } = await isoFleet();
+  const live = { meetings: { available: true } };
+  const sess = (canary) => ({ sessions: [{ id: "s-same", status: "running", repo: "shared-repo",
+    label: `${canary} label` }] });
+  const jiraOf = (site) => ({ configured: true, available: true, siteKey: site, tickets: [] });
+  assert.equal((await A.beat(live)).status, 200);
+  assert.equal((await B.beat(live)).status, 200);
+  assert.equal((await beatAs("agenttok", "laptop",
+    { jira: jiraOf(SITE), ...sess(CANARY.U), ...live })).status, 200);
+  // Bound to SITE, now claiming another org; and bound elsewhere, now claiming SITE.
+  const D = `canaryD${rand()}`;
+  const O = `canaryO${rand()}`;
+  await beatAs("agenttok", "drift3061", { jira: jiraOf(SITE), ...sess(D) });
+  await beatAs("agenttok", "drift3061", { jira: jiraOf("other3061.atlassian.net"), ...sess(D) });
+  await beatAs("agenttok", "rev3061", { jira: jiraOf("other3061b.atlassian.net"), ...sess(O) });
+  await beatAs("agenttok", "rev3061", { jira: jiraOf(SITE), ...sess(O) });
+  // Earlier cases leave meetings running in these orgs (one run per org).
+  for (const org of [A.site, B.site, SITE]) delete hub.getMeetings()[org];
+  const tokens = {};
+  for (const w of [A, B]) {
+    const r = await request("POST", "/api/meetings-token", { headers: w.h, body: {} });
+    tokens[w.tag] = JSON.parse(r.raw).token;
+  }
+  const post = (tok, mid) => request("POST", `/api/orgs/${encodeURIComponent(SITE)}/meetings`, {
+    headers: { authorization: `Bearer ${tok}` },
+    body: { meetingId: mid, title: "standup", platform: "zoom", startedAt: Date.now() - 60_000,
+      endedAt: Date.now(), participants: ["x"], segments: [{ speaker: "x", text: "said", startMs: 0, endMs: 1 }] } });
+  for (const [tok, mid] of [[tokens.a, "m3061a"], [tokens.b, "m3061b"], ["meetingstok", "m3061u"]]) {
+    assert.equal((await post(tok, mid)).status, 200, mid);
+  }
+  const cmds = (k) => ((hub.agents[k] && hub.agents[k].commands) || []).filter((c) => c.type === "extractMeeting");
+  for (const [name, key, tok, own, others] of [
+    ["A", A.key, A.tok, CANARY.A, [CANARY.B, CANARY.U, D, O]],
+    ["B", B.key, B.tok, CANARY.B, [CANARY.A, CANARY.U, D, O]],
+    ["U", "laptop", "agenttok", CANARY.U, [CANARY.A, CANARY.B, D, O]]]) {
+    const c = cmds(key).find((x) => x.meetingId.startsWith("m3061"));
+    assert.ok(c, `${name} was asked to read its meeting`);
+    const r = await request("GET", `/api/agents/${encodeURIComponent(key)}/meetings/${c.runId}/transcript`,
+      { headers: { authorization: `Bearer ${tok}` } });
+    assert.equal(r.status, 200, name);
+    const work = JSON.stringify(JSON.parse(r.raw).work);
+    assert.ok(work.includes(own), `${name} sees its own session`);
+    for (const x of others) assert.ok(!work.includes(x), `${name} must not see ${x}`);
+  }
+});

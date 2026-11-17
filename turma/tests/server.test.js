@@ -29530,6 +29530,7 @@ test("XERK-2395 QA: a fire with no capable host retries on the same row while du
 });
 
 // ---- XERK-2508: Meetings — ingest route, proposal store, dispatch, results -------
+// (helpers below; XERK-3061's case follows them)
 
 const meetHeaders2508 = { authorization: "Bearer meetingstok", "content-type": "application/json" };
 const meetHost2508 = (device, site, extra = {}) =>
@@ -29550,6 +29551,63 @@ function cleanup2508(site, devices) {
   for (const d of devices) delete agents[d];
   delete hub.getMeetings()[site];
 }
+
+test("XERK-3061: the transcript pull lists the org's Turma sessions, never another org's", async () => {
+  const S = "wkA3061.atlassian.net";
+  const now = Date.now();
+  const sess = (id, extra) => ({ id, status: "running", repo: "Turma", createdAt: now - 1000, ...extra });
+  await meetHost2508("wkHost3061", S, {
+    sessions: [sess("s1", { summary: "Meeting\u202e recommendations", branch: "XERK-3061",
+      ticket: { key: "XERK-3061", siteKey: S } }), sess("q1", { status: "queued", summary: "Queued" }),
+      sess("r1", { root: true, summary: "Root work" })],
+    closedSessions: [{ id: "c1", repo: "Turma", summary: "Old spike", closedAt: now - 5000 },
+      { id: "c2", repo: "Turma", label: "Labelled", ticket: { key: "not a key" }, closedAt: now - 2000 }] });
+  await beat1574("wkPeer3061", S, { sessions: [sess("p1", { label: "Peer work",
+    ticket: { key: "XERK-9", siteKey: S } })],
+  // An ended copy of wkHost3061's running item (a migration's source): listed once, running.
+  closedSessions: [{ id: "c9", repo: "Turma", summary: "Meeting recommendations",
+    ticket: { key: "XERK-3061" }, closedAt: now }] });
+  await beat1574("wkOther3061", "wkB3061.atlassian.net", { sessions: [sess("o1", { summary: "Other org" })] });
+  // Bound to another org, now claiming this one: not this org's (the DECIDED org counts).
+  await beat1574("wkDrift3061", "wkC3061.atlassian.net");
+  await beat1574("wkDrift3061", S, { sessions: [sess("d1", { summary: "Drifted in" })] });
+  // A host gone for weeks: its last report says nothing current.
+  await beat1574("wkGone3061", S, { sessions: [sess("g1", { summary: "Long gone" })] });
+  agents.wkGone3061.lastSeen = now - 30 * 24 * 3600e3;
+  // A crashed session is still the work in hand.
+  await beat1574("wkErr3061", S, { sessions: [sess("e1", { status: "error", summary: "Crashed work" })] });
+  assert.equal((await postMeeting2508(S, meeting2508("w1"))).status, 200);
+  const [cmd] = meetCmds2508("wkHost3061");
+  const t = await request("GET", `/api/agents/wkHost3061/meetings/${cmd.runId}/transcript`,
+    { headers: asHost("wkHost3061") });
+  assert.equal(t.status, 200);
+  const rows = t.body.work.sessions;
+  // Running first, then ended newest-first; queued, root and other-org sessions left out.
+  assert.deepEqual(rows.filter((r) => r.state === "running").map((r) => r.title).sort(),
+    ["Crashed work", "Meeting recommendations", "Peer work"]);
+  assert.deepEqual(rows.filter((r) => r.state === "ended").map((r) => r.title), ["Labelled", "Old spike"]);
+  assert.equal(rows.length, 5);
+  const mine = rows.find((r) => r.title === "Meeting recommendations");
+  assert.deepEqual(mine, { ticket: "XERK-3061", title: "Meeting recommendations", branch: "XERK-3061",
+    state: "running" });
+  assert.equal("ticket" in rows.find((r) => r.title === "Labelled"), false, "a malformed key is dropped");
+  // One work item on two hosts: the running copy wins whichever host is listed first.
+  // And the list is capped at 40, newest running first.
+  await beat1574("wkMany3061", S, {
+    closedSessions: [{ id: "x1", summary: "Migrated work", ticket: { key: "XERK-77" }, closedAt: now }],
+    sessions: Array.from({ length: 45 }, (_, i) => sess(`m${i}`, { summary: `Bulk ${i}`, createdAt: now - i })) });
+  await beat1574("wkMoved3061", S, { sessions: [sess("y1", { summary: "Migrated work",
+    branch: "XERK-77-x", ticket: { key: "XERK-77" }, createdAt: now + 1 })] });
+  const t2 = await request("GET", `/api/agents/wkHost3061/meetings/${cmd.runId}/transcript`,
+    { headers: asHost("wkHost3061") });
+  const rows2 = t2.body.work.sessions;
+  assert.equal(rows2.length, 40);
+  assert.deepEqual(rows2.filter((r) => r.title === "Migrated work"),
+    [{ ticket: "XERK-77", title: "Migrated work", branch: "XERK-77-x", state: "running" }]);
+  assert.equal(rows2.some((r) => r.state === "ended"), false, "running rows fill the cap first");
+  cleanup2508(S, ["wkHost3061", "wkPeer3061", "wkOther3061", "wkDrift3061", "wkGone3061", "wkErr3061",
+    "wkMany3061", "wkMoved3061"]);
+});
 
 test("XERK-2508: POST /api/orgs/<site>/meetings is token-authed, org-checked, bounded and idempotent", async () => {
   const S = "mtA2508.atlassian.net";
