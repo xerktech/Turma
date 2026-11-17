@@ -1543,6 +1543,45 @@ test("XERK-2971: an edit that lost a race gets the 409 in the hub's words and re
   click({ closeDetail: "" });
 }));
 
+test("XERK-3031: saving an event outside the header's org pick keeps its panel open", () => withOrgs(async () => {
+  const saved = tev({ orgs: ["globex"], org: "globex", subject: "Moved to globex", version: 3 });
+  replies = {
+    "/api/calendar/events/": () => ({ ok: true, event: saved }),
+    "/api/calendar": (url) => ({ hosts: [], events: url.includes(`from=${cal.weekStart(at(2027, 5, 4))}`) ? [tev()] : [] }),
+  };
+  orgKeys = ["acme"];
+  try {
+    cal.refetch();
+    await openEvent(at(2027, 5, 4), "Joint planning");
+    click({ evEdit: "" });
+    editorFill({ orgs: ["globex"], subject: "Moved to globex" });
+    await cal.saveEditor();
+    assert.equal(cal._ed(), null, "saved");
+    assert.equal(cal._els().side.hidden, false, "the panel stays open: the calendar is not filtered by the pick");
+    assert.match(cal._els().info.innerHTML, /Moved to globex/);
+    click({ closeDetail: "" });
+  } finally { orgKeys = []; }
+}));
+
+test("XERK-3031: a one-org fleet's day off is a bare \"Day off\"; two orgs name it", async () => {
+  replies = {
+    "/api/holidays": () => [{ id: "us-veterans-day", date: "2026-11-11", name: "Veterans Day", country: "US", offFor: ["acme"] }],
+    "/api/calendar": () => ({ events: [], hosts: [] }),
+  };
+  const board = globalThis.TurmaBoard;
+  try {
+    for (const [sites, named] of [[[{ siteKey: "acme" }], false], [[{ siteKey: "acme" }, { siteKey: "globex" }], true]]) {
+      globalThis.TurmaBoard = { ...board, mergeSites: () => sites };
+      cal.update({ agents: [] });
+      cal.refetch();
+      const html = await show(at(2026, 11, 11));
+      assert.match(html, /class="cal-dh[^"]* off"/);
+      if (named) assert.match(html, /Day off · acme/);
+      else { assert.match(html, />Day off</); assert.doesNotMatch(html, /Day off · /); }
+    }
+  } finally { globalThis.TurmaBoard = board; cal.update(null); }
+});
+
 test("XERK-2971: delete asks first, sends DELETE, closes the panel; a refusal shows the hub's words", () => withOrgs(async () => {
   let refuse = true;
   replies = {
