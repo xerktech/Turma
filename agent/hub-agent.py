@@ -48903,12 +48903,15 @@ class SessionManager:
                     log(f"ticket update delivery to {sess.get('id')} failed: {e}")
             if new:
                 log(f"ticket updates for {sess.get('id')} on {key}: {len(new)} new, "
-                    f"{len(fresh) if msg and not undelivered else 0} delivered"
+                    f"{min(len(fresh), TICKET_UPDATES_MAX) if msg and not undelivered else 0} delivered"
                     + (" (baseline)" if first else ""))
             merged = old + [e["key"] for e in events
                             if e["key"] not in seen and e["key"] not in undelivered]
-            marks = [_ts_ms(_iso_z(e.get("created"))) for e in events
-                     if e["key"] not in undelivered]
+            # A pass that failed to deliver keeps its mark: advanced past the failed
+            # event by a newer one it did not deliver (self-authored, unwanted), the
+            # retry would read that event as history and drop it (QA).
+            marks = [] if undelivered else [
+                _ts_ms(_iso_z(e.get("created"))) for e in events]
             marks = [m for m in marks if m] + ([mark] if isinstance(mark, int) else [])
             nbase = {"key": key, "seen": merged[-TICKET_UPDATES_SEEN_MAX:]}
             if marks:

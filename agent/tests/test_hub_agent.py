@@ -61168,6 +61168,22 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         self._run(sm, [self._comment("6", at="2026-11-16T12:30:00.000+0000")])
         self.assertEqual(len(self._delivered(sm)), 1)
 
+    def test_a_failed_delivery_keeps_the_mark_for_its_retry(self):
+        # QA: a newer self-authored/unwanted event advanced the mark past the event
+        # whose delivery failed, so the retry dropped it as history.
+        sess = self._sess(base=[])
+        sess["ticketUpdateBase"]["mark"] = ha._ts_ms("2026-11-16T11:00:00Z")
+        sm = self._mgr(sess)
+        events = [self._comment("1", body="please add X", at="2026-11-16T11:05:00.000+0000"),
+                  self._field("2", "assignee", "a", "b", at="2026-11-16T11:09:00.000+0000")]
+        sm.notify_session.side_effect = RuntimeError("inbox down")
+        self._run(sm, events)
+        sm.notify_session.side_effect = None
+        sm.notify_session.reset_mock()
+        self._run(sm, events)
+        self.assertEqual(len(self._delivered(sm)), 1)
+        self.assertIn("please add X", self._delivered(sm)[0])
+
     def test_a_summary_change_renames_the_message_header(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)
