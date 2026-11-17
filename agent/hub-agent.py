@@ -12735,17 +12735,15 @@ def _tw_timed_out(tur):
 
 
 def _tw_success_re(w):
-    """The `jira` helper's own success line for this write, or None for a
-    write no helper line can vouch for (curl, acli, az, MCP)."""
-    key = re.escape(w["key"])
+    """The `jira` helper's own success line for this COMMENT, or None.
+
+    Only comments: a timed-out write is stamped at the timeout, not when it
+    ran, and an edit/transition matches by field within a symmetric
+    TICKET_SELF_EDIT_WINDOW_MS — so it would miss its own earlier write yet
+    hide a human's same-field change made near the timeout. A comment
+    matches on its body fingerprint, which a human's text does not share."""
     if w["kind"] == "comment":
-        return re.compile(rf"^commented on {key}$", re.I)
-    if w["kind"] == "transition":
-        return re.compile(rf"^{key} -> \S", re.I)
-    if w["kind"] == "edit":
-        if w.get("fields") == ["assignee"]:
-            return re.compile(rf"^assigned {key} to ", re.I)
-        return re.compile(rf"^updated {key}(?:\s|$)", re.I)
+        return re.compile(rf"^commented on {re.escape(w['key'])}$", re.I)
     return None
 
 

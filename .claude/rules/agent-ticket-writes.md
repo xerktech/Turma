@@ -21,17 +21,17 @@ The ticket-update poller must not hand a session back its own comment or status 
   - Bash shapes are read off shlex'd COMMAND words (`ticket_writes_from_bash`): the `jira` helper,
     `acli jira workitem`, `az boards work-item update`, curl to Jira/ADO comment/edit endpoints.
     A `bash -c '…'`-wrapped write is missed — that errs toward delivering the update, never hiding one.
-- **A Bash call moved to the background on its 600 s timeout counts what already ran** (XERK-3052):
-  its result carries `backgroundTaskId` AND `timedOutAfterMs` (an explicit `run_in_background` has
-  no `timedOutAfterMs` and still records nothing). The command is still running, so a write counts
-  only when its `jira` helper success line (`commented on K`, `K -> S`, `updated K`, `assigned K to`)
-  is in the result's content or `toolUseResult.stdout`, each line claimed once, in command order
-  (`_tw_landed`). curl/acli/az/MCP print no such line, so a timed-out one stays unrecorded.
+- **A Bash call moved to the background on its 600 s timeout counts the COMMENTS already made**
+  (XERK-3052): its result carries `backgroundTaskId` AND `timedOutAfterMs` (an explicit
+  `run_in_background` has no `timedOutAfterMs` and still records nothing). The command still runs,
+  so a comment counts only when the `jira` helper's `commented on K` line is a whole line of the
+  output, each line claimed once, in command order (`_tw_landed`).
   - Read ONE source: `toolUseResult.stdout`, else the content. The content already repeats the
     stdout, so joining both let one line vouch for a later, not-yet-run write of the same key.
-  - Accepted residual: `t` is the timeout moment, so an edit/transition that landed more than
-    `TICKET_SELF_EDIT_WINDOW_MS` earlier never self-matches (re-delivered, the harmless side).
-    Widening it to the call's span would hide a human's same-field edit made during the run.
+  - **Never edits, transitions or assigns**: the record is stamped at the timeout, not when the
+    write ran, and the field window is symmetric, so it missed the session's own earlier write and
+    only ever hid a human's same-field change near the timeout (QA). Comments match by body.
+  - curl/acli/az/MCP print no such line, so a timed-out one stays unrecorded (delivered).
 - **Matching errs toward DELIVERING** (a false match hides a human's update from the session):
   - key must be valid and equal, `at` finite — else False; never raises (`_ticket_self_authored`);
   - a comment: id when BOTH sides carry one (different ids = different comments), else the body

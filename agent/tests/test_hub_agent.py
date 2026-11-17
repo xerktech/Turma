@@ -60561,14 +60561,23 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command": cmd}),
                                      self._timed_out("t1", "")]), [])
 
-    def test_xerk3052_only_the_writes_whose_line_printed_count(self):
+    def test_xerk3052_only_the_comments_whose_line_printed_count(self):
         cmd = ('jira transition XERK-1 "In Review" && jira comment XERK-1 "a" && '
                'make long && jira comment XERK-1 "b" && jira edit XERK-1 -s t')
         ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
                          self._timed_out("t1", "XERK-1 -> In Review\ncommented on XERK-1\n"
                                                "building...\n")])
-        self.assertEqual([(w["u"], w["kind"]) for w in ws],
-                         [("t1:0", "transition"), ("t1:1", "comment")])
+        self.assertEqual([(w["u"], w["kind"]) for w in ws], [("t1:1", "comment")])
+
+    def test_xerk3052_a_timed_out_edit_or_transition_is_never_recorded(self):
+        # Stamped at the timeout, a field match would miss the session's own
+        # earlier write yet hide a human's same-field change near the timeout.
+        for cmd, out in [('jira transition X-1 "Done"; sleep 900', "X-1 -> Done\n"),
+                         ("jira edit X-1 -s a; sleep 900", "updated X-1  https://x/browse/X-1\n"),
+                         ("jira assign X-1 me; sleep 900", "assigned X-1 to me\n")]:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                                             self._timed_out("t1", out)]), [])
 
     def test_xerk3052_one_line_never_vouches_for_two_writes(self):
         # QA: content + stdout joined counted the one printed line twice, so
@@ -60576,10 +60585,8 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
         for cmd, out in [
                 ('jira comment X-1 "first" && make long && jira comment X-1 "second"',
                  "commented on X-1\n"),
-                ('jira transition X-1 "In Progress" && make long && jira transition X-1 "To Do"',
-                 "X-1 -> In Progress\n"),
-                ("jira edit X-1 -s a && make long && jira edit X-1 -s b",
-                 "updated X-1  https://x/browse/X-1\n")]:
+                ('jira comment X-1 - <<EOF\nfirst\nEOF\nmake long; jira comment X-1 "second"',
+                 "commented on X-1\n")]:
             with self.subTest(cmd=cmd):
                 ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
                                  self._timed_out("t1", out)])
@@ -60600,11 +60607,11 @@ class TestTicketWrites(ManagerMixin, unittest.TestCase):
                           self._timed_out("t1", 'commented on X-1\n{"id": "10010"}\n')])
         self.assertNotIn("id", w)
 
-    def test_xerk3052_a_success_line_for_another_key_or_kind_does_not_count(self):
-        cmd = 'jira comment XERK-1 "a"; jira edit XERK-2 -s t'
-        out = "commented on XERK-9\nXERK-1 -> Done\nupdated XERK-2  https://x/browse/XERK-2\n"
-        ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}), self._timed_out("t1", out)])
-        self.assertEqual([(w["u"], w["key"]) for w in ws], [("t1:1", "XERK-2")])
+    def test_xerk3052_a_success_line_for_another_key_does_not_count(self):
+        cmd = 'jira comment X-1 "a" && jira comment X-12 "b"; sleep 900'
+        ws = self._scan([_tw_call("t1", "Bash", {"command": cmd}),
+                         self._timed_out("t1", "commented on X-12\ncommented on X-9\n")])
+        self.assertEqual([(w["u"], w["key"]) for w in ws], [("t1:1", "X-12")])
 
     def test_xerk3052_a_timed_out_curl_write_is_not_vouched_for(self):
         cmd = ("curl -s -X POST https://x.atlassian.net/rest/api/3/issue/XERK-4/comment "
