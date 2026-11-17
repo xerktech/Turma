@@ -61172,73 +61172,108 @@ class TestTicketUpdates(ManagerMixin, unittest.TestCase):
         sess["ticketWrites"], _ = ha.merge_ticket_writes(sess.get("ticketWrites") or [],
                                                          report.get("ticketWrites"))
 
+    def _now_ev(self, cid, body, ago_ms=0):
+        return self._comment(cid, body=body, at=self._iso(int(time.time() * 1000) - ago_ms, False))
+
     def test_xerk3052_a_running_calls_own_comment_is_held_then_filtered(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)
         st = self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
-        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
-        self._run(sm, [ev])
+        self._run(sm, [self._now_ev("9", "Fixed in PR 5")])
         sm.notify_session.assert_not_called()
-        self.assertNotIn("c:9", sess["ticketUpdateBase"]["seen"])  # held, not seen
+        self.assertEqual([e["key"] for e in sess["ticketUpdateHeld"]["events"]], ["c:9"])
         self._land(sm, sess, st)
-        self._run(sm, [ev])
+        sm._deliver_ticket_updates()  # a full beat with nothing fetched releases it
         sm.notify_session.assert_not_called()
-        self.assertIn("c:9", sess["ticketUpdateBase"]["seen"])
+        self.assertNotIn("ticketUpdateHeld", sess)
 
     def test_xerk3052_a_humans_comment_during_the_call_is_delivered(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)
         self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
-        ev = self._comment("9", body="please also cover nulls",
-                           at=self._iso(int(time.time() * 1000), False))
-        self._run(sm, [ev])
+        self._run(sm, [self._now_ev("9", "please also cover nulls")])
         self.assertEqual(len(self._delivered(sm)), 1)
 
-    def test_xerk3052_a_failed_call_releases_the_held_comment(self):
+    def test_xerk3052_a_failed_call_releases_without_a_refetch(self):
+        # QA D2: the ticket is not read again (no change since), yet the held
+        # comment must still reach the session once the call fails.
         sess = self._sess(base=[])
         sm = self._mgr(sess)
         st = self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5"')
-        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
-        self._run(sm, [ev])
+        self._run(sm, [self._now_ev("9", "Fixed in PR 5")])
         sm.notify_session.assert_not_called()
         self._land(sm, sess, st, is_error=True)  # refused: nothing written by us
-        self._run(sm, [ev])
+        sm._deliver_ticket_updates()
         self.assertEqual(len(self._delivered(sm)), 1)
+        self.assertNotIn("ticketUpdateHeld", sess)
+
+    def test_xerk3052_a_held_update_survives_the_watermark(self):
+        # QA D1: a later event moving the mark must not turn the held one into
+        # history; held updates are judged off the record, not re-read.
+        sess = self._sess(base=["c:1"])
+        sm = self._mgr(sess)
+        st = self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        human = self._now_ev("9", "HUMAN: please", ago_ms=400_000)
+        edit = self._field("10", "description", "a", "b",
+                           at=self._iso(int(time.time() * 1000), False))
+        self._run(sm, [self._comment("1"), human, edit])
+        self.assertEqual(len(self._delivered(sm)), 1)  # the edit
+        self._land(sm, sess, st, is_error=True)
+        self._run(sm, [self._comment("1"), human, edit])
+        self.assertIn("HUMAN: please", self._delivered(sm)[-1])
 
     def test_xerk3052_a_lost_call_stops_holding(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)
         self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5"',
                       ago_ms=ha.TICKET_PENDING_HOLD_MAX_MS + 1_000)
-        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
-        self._run(sm, [ev])
+        self._run(sm, [self._now_ev("9", "Fixed in PR 5")])
         self.assertEqual(len(self._delivered(sm)), 1)
 
     def test_xerk3052_a_comment_body_from_a_file_holds_any_comment(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)
-        self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
-        ev = self._comment("9", body="anything", at=self._iso(int(time.time() * 1000), False))
-        self._run(sm, [ev])
+        st = self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        self._run(sm, [self._now_ev("9", "anything")])
         sm.notify_session.assert_not_called()
-
-    def test_xerk3052_a_held_event_does_not_move_the_watermark(self):
-        sess = self._sess(base=["c:1"])
-        sess["ticketUpdateBase"]["mark"] = int(time.time() * 1000) - 60_000
-        sm = self._mgr(sess)
-        self._pending(sm, "s1", 'jira comment XERK-1 "Fixed in PR 5" && sleep 900')
-        ev = self._comment("9", body="Fixed in PR 5", at=self._iso(int(time.time() * 1000), False))
-        mark = sess["ticketUpdateBase"]["mark"]
-        self._run(sm, [ev])
-        self.assertEqual(sess["ticketUpdateBase"]["mark"], mark)
+        self._land(sm, sess, st)  # its body file is gone: no fp, so no self-match
+        sm._deliver_ticket_updates()
+        self.assertIn("anything", self._delivered(sm)[0])
 
     def test_xerk3052_a_pending_write_on_another_ticket_holds_nothing(self):
         sess = self._sess(base=[])
         sm = self._mgr(sess)
         self._pending(sm, "s1", "jira comment XERK-2 -F /tmp/x.md && sleep 900")
-        ev = self._comment("9", body="anything", at=self._iso(int(time.time() * 1000), False))
-        self._run(sm, [ev])
+        self._run(sm, [self._now_ev("9", "anything")])
         self.assertEqual(len(self._delivered(sm)), 1)
+
+    def test_xerk3052_held_updates_wait_out_a_stop_and_survive_a_restart(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md && sleep 900")
+        self._run(sm, [self._now_ev("9", "a human note")])
+        sm.notify_session.assert_not_called()
+        sess["status"] = "stopped"
+        sm.sess_state.clear()   # the in-memory scan is gone with a manager restart
+        sm._deliver_ticket_updates()
+        sm.notify_session.assert_not_called()
+        self.assertIn("ticketUpdateHeld", sess)   # kept while not running
+        sess["status"] = "running"
+        sm._deliver_ticket_updates()
+        self.assertIn("a human note", self._delivered(sm)[0])
+
+    def test_xerk3052_a_failed_release_stays_held(self):
+        sess = self._sess(base=[])
+        sm = self._mgr(sess)
+        st = self._pending(sm, "s1", "jira comment XERK-1 -F /tmp/x.md")
+        self._run(sm, [self._now_ev("9", "a human note")])
+        self._land(sm, sess, st, is_error=True)
+        sm.notify_session.side_effect = OSError("down")
+        sm._deliver_ticket_updates()
+        self.assertIn("ticketUpdateHeld", sess)
+        sm.notify_session.side_effect = None
+        sm._deliver_ticket_updates()
+        self.assertNotIn("ticketUpdateHeld", sess)
 
     def test_a_ticket_key_change_rebaselines(self):
         # A base for another ticket (the session adopted a new one) is no base.

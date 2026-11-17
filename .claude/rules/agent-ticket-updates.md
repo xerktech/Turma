@@ -52,8 +52,13 @@ New comments and edits on a running session's ticket reach that session via `not
     ledger only with its tool_result, and a live check saw the poller hand a session its own
     comment 13s before its timed-out result landed. An event matching a pending call's write in
     the scan's `twCalls` (`_ticket_update_pending_match`; any comment while the pending body is a
-    file) is neither delivered nor marked seen, nor moves `mark`, until the call resolves.
-    A call older than `TICKET_PENDING_HOLD_MAX_MS` holds nothing (lost to a restart).
+    file) moves to the record's `ticketUpdateHeld` {key, events}, marked seen like the rest.
+    - **Every full beat re-judges it off the record** (`_release_held_ticket_updates`), never via
+      a re-read: the pre-check skips an unchanged ticket and `mark` would read it as history, so
+      leaving it unseen lost or stranded a human's update (QA). Still pending → kept; else
+      delivered unless the result put it on the ledger; a failed notify keeps it.
+    - Carried across kill/resume, kept while not running; a call older than
+      `TICKET_PENDING_HOLD_MAX_MS` holds nothing; past `TICKET_UPDATES_HELD_MAX` it delivers.
 - One message per session per round (`_ticket_update_message`), newest `TICKET_UPDATES_MAX`
   events, each a flattened capped line.
   - The header names the CURRENT summary: a delivered-pass summary edit rewrites

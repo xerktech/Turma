@@ -28567,6 +28567,8 @@ TICKET_UPDATES_SLACK_MS = 120_000      # pre-check window widened by this
 # the poller could hand the session its own change mid-command. Past a
 # foreground call's own timeout (+ slack) the call is presumed lost.
 TICKET_PENDING_HOLD_MAX_MS = 600_000 + 120_000
+# At most this many updates held per session; the overflow is delivered.
+TICKET_UPDATES_HELD_MAX = 20
 TICKET_UPDATE_LINE_MAX = 600           # chars of one delivered line
 TICKET_UPDATE_EXCERPT_MAX = 160        # chars of a before/after excerpt
 TICKET_UPDATE_MESSAGE_MAX = 8000       # chars of one delivered message
@@ -37291,6 +37293,9 @@ class SessionManager:
             # resume delivers exactly the rest: the unread tail before the kill
             # AND what landed while the session was down.
             "ticketUpdateBase", "ticketUpdateSince",
+            # Updates held for a call still running at the kill (XERK-3052):
+            # already marked seen, so dropping them would lose them.
+            "ticketUpdateHeld",
             # The model that actually answered and its QA runs (XERK-1845): the
             # outcome ledger credits a session it first sees already closed by
             # these, so a kill must not forget them.
@@ -37520,6 +37525,8 @@ class SessionManager:
             # (no key at all) anchors at the kill.
             "ticketUpdateBase": (rec.get("ticketUpdateBase")
                                  if isinstance(rec.get("ticketUpdateBase"), dict) else None),
+            "ticketUpdateHeld": (rec.get("ticketUpdateHeld")
+                                 if isinstance(rec.get("ticketUpdateHeld"), dict) else None),
             "ticketUpdateSince": (
                 (rec.get("ticketUpdateSince")
                  if _ts_ms(rec.get("ticketUpdateSince")) is not None else None)
@@ -48955,9 +48962,11 @@ class SessionManager:
         clear-context restart keeps the record, so it keeps the baseline."""
         with self._ticket_upd_lock:
             fetched, self._ticket_upd_fetched = self._ticket_upd_fetched, {}
+        changed = self._release_held_ticket_updates()
         if not fetched:
+            if changed:
+                self.save()
             return
-        changed = False
         for sess in self.registry:
             key = self._ticket_update_key(sess)
             if not key or key not in fetched:
@@ -48992,11 +49001,9 @@ class SessionManager:
                      and _ticket_update_wanted(e)]
             # A tracker write the session's still-running command names is not
             # on the ledger until that command's result lands: HOLD a change it
-            # may have made (not delivered, not marked seen) until it does
-            # (XERK-3052). Bounded by the call's age, so a lost call stops holding.
-            pending = self._ticket_pending_writes(sess, key)
-            held = {e["key"] for e in fresh if _ticket_update_pending_match(pending, key, e)}
-            fresh = [e for e in fresh if e["key"] not in held]
+            # may have made on the record (marked seen like the rest) and judge
+            # it again each beat until the call resolves (XERK-3052).
+            fresh = self._hold_pending_ticket_updates(sess, key, fresh)
             # The header names the ticket by its CURRENT summary, not the one
             # it had at spawn (XERK-3036); the card reads the same field.
             renamed = [e.get("toText") for e in new
@@ -49016,14 +49023,13 @@ class SessionManager:
                 log(f"ticket updates for {sess.get('id')} on {key}: {len(new)} new, "
                     f"{min(len(fresh), TICKET_UPDATES_MAX) if msg and not undelivered else 0} delivered"
                     + (" (baseline)" if first else ""))
-            undelivered |= held
             merged = old + [e["key"] for e in events
                             if e["key"] not in seen and e["key"] not in undelivered]
             # A pass that failed to deliver keeps its mark: advanced past the failed
             # event by a newer one it did not deliver (self-authored, unwanted), the
             # retry would read that event as history and drop it (QA).
-            marks = [] if undelivered - held else [
-                _ts_ms(_iso_z(e.get("created"))) for e in events if e["key"] not in held]
+            marks = [] if undelivered else [
+                _ts_ms(_iso_z(e.get("created"))) for e in events]
             marks = [m for m in marks if m] + ([mark] if isinstance(mark, int) else [])
             nbase = {"key": key, "seen": merged[-TICKET_UPDATES_SEEN_MAX:]}
             if marks:
@@ -49032,6 +49038,75 @@ class SessionManager:
             changed = True
         if changed:
             self.save()
+
+    def _hold_pending_ticket_updates(self, sess, key, fresh):
+        """Move the events of `fresh` a still-running call may have made onto
+        the record's `ticketUpdateHeld` {key, events}; return the rest. Past
+        TICKET_UPDATES_HELD_MAX held, the overflow is delivered (never lost)."""
+        pending = self._ticket_pending_writes(sess, key)
+        if not pending:
+            return fresh
+        held = sess.get("ticketUpdateHeld")
+        events = list(held["events"]) if isinstance(held, dict) and held.get("key") == key \
+            and isinstance(held.get("events"), list) else []
+        out = []
+        for e in fresh:
+            if len(events) < TICKET_UPDATES_HELD_MAX \
+                    and _ticket_update_pending_match(pending, key, e):
+                events.append(e)
+            else:
+                out.append(e)
+        if events:
+            sess["ticketUpdateHeld"] = {"key": key, "events": events}
+        return out
+
+    def _release_held_ticket_updates(self):
+        """Each full beat, judge every session's held ticket updates again
+        (XERK-3052): one its pending call still may have made stays held; the
+        rest are delivered unless the call's result put them on the ledger.
+        Held state lives on the record, so a re-fetch is never needed and a
+        restart keeps it. Returns True when a record changed. Never raises."""
+        changed = False
+        for sess in list(self.registry):
+            held = sess.get("ticketUpdateHeld") if isinstance(sess, dict) else None
+            if held is None:
+                continue
+            try:
+                key = self._ticket_update_key(sess, running=False)
+                events = held.get("events") if isinstance(held, dict) else None
+                if not key or held.get("key") != key or not isinstance(events, list):
+                    sess.pop("ticketUpdateHeld", None)  # its ticket is no longer this one
+                    changed = True
+                    continue
+                if not self._ticket_update_key(sess):
+                    continue  # not running: kept for a resume, judged then
+                pending = self._ticket_pending_writes(sess, key)
+                keep, due = [], []
+                for e in events:
+                    if not isinstance(e, dict) or not isinstance(e.get("key"), str):
+                        continue
+                    (keep if _ticket_update_pending_match(pending, key, e) else due).append(e)
+                if not due and len(keep) == len(events):
+                    continue
+                due = [e for e in due
+                       if not _ticket_self_authored(sess, _ticket_update_self_event(key, e))]
+                msg = _ticket_update_message(sess.get("ticket"), due)
+                if msg:
+                    try:
+                        self.notify_session(sess["id"], msg)
+                    except Exception as ex:
+                        log(f"held ticket update delivery to {sess.get('id')} failed: {ex}")
+                        continue  # stays held: the next beat tries again
+                    log(f"ticket updates for {sess.get('id')} on {key}: "
+                        f"{min(len(due), TICKET_UPDATES_MAX)} held delivered")
+                if keep:
+                    sess["ticketUpdateHeld"] = {"key": key, "events": keep}
+                else:
+                    sess.pop("ticketUpdateHeld", None)
+                changed = True
+            except Exception as ex:
+                log(f"held ticket updates for {sess.get('id')}: {ex}")
+        return changed
 
     def _ticket_pending_writes(self, sess, key):
         """The tracker writes on `key` that this session's still-running calls
