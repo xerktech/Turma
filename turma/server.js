@@ -27294,16 +27294,23 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
       // Reject unless the transaction is live AND the browser presented the same
-      // `state` in its bound cookie as came back in the query (login-CSRF). A
-      // mobile flow reaching here has no trusted redirect (tx is null/dead), so
-      // it deliberately falls to the JSON 400 rather than deep-linking.
+      // `state` in its bound cookie as came back in the query (login-CSRF). The
+      // usual cause is a sign-in left open past OIDC_TX_TTL_MS, so the browser is
+      // sent somewhere it can recover rather than stranded on a JSON error
+      // (XERK-3038): an already-signed-in browser (a stale tab, a replayed
+      // callback) goes to the app, anyone else to /login?error=expired, which
+      // offers a fresh SSO sign-in. Never straight back to the IdP: a browser
+      // that drops the state cookie would loop. No session is issued on either
+      // path, so the login-CSRF defence is unchanged. A mobile flow reaching here
+      // has no trusted tx, so it never deep-links (an untrusted redirect must not
+      // carry a token); the app times out and reports the failure.
       if (!state || !code || !tx || Date.now() - tx.at > OIDC_TX_TTL_MS || stateCookie !== state) {
-        res.writeHead(400, {
-          "Content-Type": "application/json",
+        res.writeHead(302, {
+          Location: userAuthorized(req) ? "/" : "/login?error=expired",
           "Cache-Control": "no-store",
           "Set-Cookie": clearState,
         });
-        return res.end(JSON.stringify({ error: "invalid or expired OIDC state" }));
+        return res.end();
       }
       try {
         const disco = await oidcDiscovery();

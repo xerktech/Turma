@@ -28,6 +28,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   raw terminal one toggle away; Android does the same, with the terminal as a separate screen.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
+- **Expired-SSO notice is web-only (XERK-3038).** The web login shows "timed out" + a Sign in with
+  SSO link on `/login?error=expired`; Android's own SSO button is always on its Login screen, and a
+  timed-out Custom Tab flow already reports a failed sign-in there, so it needs no counterpart.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
 - **Insights is WEB-ONLY (operator decision, XERK-2386).** The web's Insights page (`/insights`)
   holds the per-org decisions log, the permission-prompts ledger and model quality (shadow runs);
