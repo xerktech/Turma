@@ -9069,6 +9069,11 @@ PR_COMMENTS_DELIVER = os.environ.get("TURMA_PR_COMMENTS", "1") != "0"
 PR_COMMENTS_REFRESH_EVERY = _env_int("TURMA_PR_COMMENTS_EVERY", 3)
 PR_COMMENTS_MAX = 20               # PRs polled per beat, like PR_STATUS_MAX
 PR_COMMENTS_SEEN_MAX = 500         # per-PR seen-key ceiling (newest kept)
+# Beats a PR's FIRST sighting waits for a full fetch (XERK-3047) before it
+# baselines a partial one: a baseline missing the inline channel delivers that
+# channel's whole history later, but an inline fetch that always fails (a PR too
+# big to page inside run()'s timeout, a rate limit) must not mean no delivery.
+PR_COMMENTS_PARTIAL_WAIT = 3
 PR_COMMENTS_BODY_CAP = 1200        # per-comment body chars folded into the message
 
 # Merge-conflict auto-resolution (XERK-223): a PR whose branch conflicts with
@@ -30767,6 +30772,8 @@ class SessionManager:
         self._pr_comments_wake = threading.Event()
         self._pr_comments_worker = None
         self._pr_comments_fetched = {}
+        # (sid, url) -> partial first sightings skipped so far (XERK-3047).
+        self._pr_partial_waits = {}
         # The permission ledger (XERK-1563). The hook-log TAIL is a worker's
         # (`_permission_cursors` is its alone); it stages parsed hook rows in
         # `_permission_rows_fetched`, REBOUND under `_permission_lock` like the
@@ -48347,10 +48354,23 @@ class SessionManager:
                 if events is None:
                     continue                       # fetch failed — keep baseline
                 first = url not in base
+                wait_key = (sess["id"], url)
                 if first and isinstance(events, _PartialEvents):
                     # A baseline missing a channel would deliver that channel's
-                    # whole history on the next full fetch: wait for a full one.
-                    continue
+                    # whole history on the next full fetch: wait for a full one,
+                    # but only PR_COMMENTS_PARTIAL_WAIT beats.
+                    waited = self._pr_partial_waits.get(wait_key, 0) + 1
+                    if waited <= PR_COMMENTS_PARTIAL_WAIT:
+                        self._pr_partial_waits[wait_key] = waited
+                        log(f"PR comments: {url} for session {sess['id']}: "
+                            f"inline fetch failed on first sighting; waiting "
+                            f"for a full fetch ({waited}/"
+                            f"{PR_COMMENTS_PARTIAL_WAIT})")
+                        continue
+                    log(f"PR comments: {url} for session {sess['id']}: "
+                        f"baselining without inline comments after "
+                        f"{PR_COMMENTS_PARTIAL_WAIT} failed fetches")
+                self._pr_partial_waits.pop(wait_key, None)
                 seen = set(base.get(url) or [])
                 fresh = [e for e in events
                          if e["key"] not in seen and not e["is_self"]]

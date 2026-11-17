@@ -21876,6 +21876,26 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             sm._poll_pr_comments()
         self.assertEqual(self._typed(), [])
 
+    def test_an_inline_channel_that_always_fails_still_delivers(self):
+        # The wait for a full baseline is bounded: a PR whose inline fetch
+        # never succeeds still gets its conversation comments.
+        sm = self.make_manager()
+        conv = [self._ev(f"c{i}") for i in range(3)]
+        sess = self._session(sm)
+        for _ in range(ha.PR_COMMENTS_PARTIAL_WAIT + 1):
+            with mock.patch.object(ha, "_pr_comment_events",
+                                   return_value=ha._PartialEvents(conv)):
+                sm._poll_pr_comments()
+        self.assertEqual(len(sess["prCommentBase"][self.URL]), 3)
+        conv.append(self._ev("cnew", body="reply"))
+        with mock.patch.object(ha, "_pr_comment_events",
+                               return_value=ha._PartialEvents(conv)):
+            sm._poll_pr_comments()
+        typed = self._typed()
+        self.assertEqual(len(typed), 1)
+        self.assertIn("reply", typed[0])
+        self.assertEqual(sm._pr_partial_waits, {})
+
     def test_a_batch_past_input_max_chars_is_split_not_lost(self):
         # XERK-3047: ~90 near-cap comments compose past INPUT_MAX_CHARS; one
         # message that size is refused whole while every key is already seen.
