@@ -318,7 +318,40 @@ test("GET /auth/oidc/callback exchanges the code and issues the hub session", as
 test("GET /auth/oidc/callback rejects an unknown or reused state", async () => {
   hub.__setOidcCaches(DISCOVERY, jwksKeys);
   const res = await get("/auth/oidc/callback?state=never-issued&code=x");
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.location, "/login?error=expired");
+  assert.doesNotMatch(String(res.headers["set-cookie"] || ""), /hub_session=[^;]/);
+});
+
+test("XERK-3038: an expired sign-in sends the browser to a recoverable page, never stranded", async () => {
+  hub.__setOidcCaches(DISCOVERY, jwksKeys);
+  let tokenCalled = false;
+  const saved = global.fetch;
+  global.fetch = async () => { tokenCalled = true; return { ok: true, status: 200, text: async () => "{}" }; };
+  try {
+    // A tx older than the window, with the matching state cookie: the IdP took too long.
+    const state = "state-stale";
+    await txSet(state, { nonce: "n", verifier: "v-1234567890", next: "/board", at: Date.now() - hub.OIDC_TX_TTL_MS - 1000 });
+    let res = await get(`/auth/oidc/callback?state=${state}&code=c`, { cookie: `hub_oidc_state=${state}` });
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.location, "/login?error=expired");
+    const setCookie = (res.headers["set-cookie"] || []).join("\n");
+    assert.match(setCookie, /hub_oidc_state=;/, "the state cookie is cleared");
+    assert.doesNotMatch(setCookie, /hub_session=[^;]/, "no session is issued");
+    assert.equal(await txHas(state), false, "the stale tx is consumed");
+    // The landing page renders (no IdP bounce loop) with the expired message wired.
+    const page = await get("/login?error=expired", { accept: "text/html" });
+    assert.equal(page.status, 200);
+    assert.match(page.raw, /expired:/);
+    assert.match(page.raw, /id="ssoRetry" href="\/auth\/oidc\/login"/);
+    // An already-signed-in browser replaying a dead callback goes to the app.
+    res = await get("/auth/oidc/callback?state=gone&code=c", { authorization: basic("hubuser", "hubpass") });
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.location, "/");
+    assert.equal(tokenCalled, false, "the token endpoint is never contacted");
+  } finally {
+    global.fetch = saved;
+  }
 });
 
 test("GET /auth/oidc/callback is bound to the browser (login-CSRF)", async () => {
@@ -334,11 +367,13 @@ test("GET /auth/oidc/callback is bound to the browser (login-CSRF)", async () =>
   try {
     // No cookie at all.
     let res = await get(`/auth/oidc/callback?state=${state}&code=c`);
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 302);
+    assert.equal(res.headers.location, "/login?error=expired");
     // A DIFFERENT state cookie (attacker's own) — still rejected.
     await txSet(state, { nonce: "the-nonce", verifier: "v-1234567890", next: "/", at: Date.now() });
     res = await get(`/auth/oidc/callback?state=${state}&code=c`, { cookie: "hub_oidc_state=someone-else" });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 302);
+    assert.doesNotMatch(String(res.headers["set-cookie"] || ""), /hub_session=[^;]/);
     // The token endpoint was never even contacted.
     assert.equal(tokenCalled, false);
   } finally {

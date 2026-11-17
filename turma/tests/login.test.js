@@ -77,3 +77,30 @@ test("XERK-2576: login.html routes non-401 refusals through refusalMessage", () 
   // Only a 401 is a wrong password — a throttled 503/429 must not read as one.
   assert.match(html, /if \(res\.status === 401\) \{\n\s*showError\("Incorrect username or password\."\);/);
 });
+
+// XERK-3038: an OIDC outcome the callback bounced here picks the message and
+// whether a fresh SSO attempt is offered (never for a group refusal).
+function loadLoginNotice() {
+  const html = fs.readFileSync(path.join(__dirname, "..", "public", "login.html"), "utf8");
+  const src = html.match(/function loginNotice\(errParam\) \{[\s\S]*?\n  \}\n/);
+  assert.ok(src, "login.html defines loginNotice");
+  return new Function(`${src[0]}; return loginNotice;`)();
+}
+
+test("XERK-3038: an expired or failed SSO offers a retry; a group refusal does not", () => {
+  const notice = loadLoginNotice();
+  assert.deepEqual(notice("expired"), { message: "Your single sign-on attempt timed out. Sign in again to continue.", sso: true });
+  assert.equal(notice("oidc").sso, true);
+  assert.match(notice("oidc").message, /Single sign-on failed/);
+  assert.equal(notice("forbidden").sso, false);
+  assert.match(notice("forbidden").message, /isn’t in a group/);
+  for (const none of [null, "", "bogus", "__proto__", "toString", "hasOwnProperty"]) {
+    assert.equal(notice(none), null, JSON.stringify(none));
+  }
+});
+
+test("XERK-3038: the page applies the notice to the SSO link", () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "public", "login.html"), "utf8");
+  assert.match(html, /<a class="sso-retry" id="ssoRetry" href="\/auth\/oidc\/login" hidden>/);
+  assert.match(html, /getElementById\("ssoRetry"\)\.hidden = !notice\.sso/);
+});

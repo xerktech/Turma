@@ -42,6 +42,13 @@
   }
   .error.show { display: block; }
 
+  .sso-retry {
+    display: block; text-align: center; text-decoration: none; margin: 10px 0 18px;
+    padding: 9px 12px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 600;
+    background: var(--accent); border: 1px solid var(--accent); color: #fff;
+  }
+  .sso-retry:hover { filter: brightness(1.07); }
+  .sso-retry[hidden] { display: none; }
   .foot { margin-top: 20px; color: var(--muted); font-size: 11.5px; text-align: center; }
 
   /* Break-glass banner (XERK-595): the local login is the IdP-independent way in
@@ -71,6 +78,7 @@
     </div>
 
     <div class="error" id="error"></div>
+    <a class="sso-retry" id="ssoRetry" href="/auth/oidc/login" hidden>Sign in with SSO</a>
 
     <form id="form" autocomplete="on">
       <label>Username
@@ -143,15 +151,26 @@
   // `forbidden` = signed in, but not in a group with access; `oidc` = the SSO
   // flow itself failed. A denied SSO user can still use the break-glass local
   // credential below, so the message points them at it rather than dead-ending.
-  const OIDC_ERRORS = {
-    forbidden:
-      "You signed in, but your account isn’t in a group with access to this hub. " +
-      "Ask an administrator to be added, or use the local credential below.",
-    oidc: "Single sign-on failed. Please try again, or use the local credential below.",
-  };
-  const errParam = new URLSearchParams(location.search).get("error");
-  if (errParam && Object.prototype.hasOwnProperty.call(OIDC_ERRORS, errParam)) {
-    showError(OIDC_ERRORS[errParam]);
+  // XERK-3038: `expired` = the sign-in sat open past the hub's window (10 min)
+  // before the IdP sent the browser back, so the callback could not finish it.
+  // Only the callback sends these, so SSO is configured: every outcome but a
+  // group refusal also offers a fresh SSO attempt (`sso`), since retrying cannot
+  // change a refusal. An unknown or inherited key is ignored.
+  function loginNotice(errParam) {
+    const OIDC_ERRORS = {
+      forbidden:
+        "You signed in, but your account isn’t in a group with access to this hub. " +
+        "Ask an administrator to be added, or use the local credential below.",
+      oidc: "Single sign-on failed. Please try again, or use the local credential below.",
+      expired: "Your single sign-on attempt timed out. Sign in again to continue.",
+    };
+    if (!errParam || !Object.prototype.hasOwnProperty.call(OIDC_ERRORS, errParam)) return null;
+    return { message: OIDC_ERRORS[errParam], sso: errParam !== "forbidden" };
+  }
+  const notice = loginNotice(new URLSearchParams(location.search).get("error"));
+  if (notice) {
+    showError(notice.message);
+    document.getElementById("ssoRetry").hidden = !notice.sso;
   }
 
   // XERK-2630: after an administrator reset the password, /api/login answers 403
