@@ -74,11 +74,17 @@ Read `.claude/rules/turma.md` "Auth" for the auth model this plugs into.
   callbacks racing on one `state`/code can't both read it (a plain get-then-del yields the event loop
   between the two awaits and lets both through).
 - **The flow is BOUND to the browser (login-CSRF defence).** Login sets a `hub_oidc_state` cookie to
-  the `state`; the callback rejects (400) unless the cookie equals the returned `state`. Without it,
+  the `state`; the callback rejects unless the cookie equals the returned `state`. Without it,
   an attacker who finished their OWN IdP auth could deliver their `code`+`state` to a victim and plant
   a session in the victim's browser — harmless while the session is the generic single-user one, but
   a real hole once the epic adds identity-based authz, so it is closed at the foundation. The cookie
   is cleared on every callback outcome.
+- **A dead/expired/unbound callback REDIRECTS, never a JSON error page** (XERK-3038): a sign-in
+  left open past the tx TTL stranded the user on `{"error":"invalid or expired OIDC state"}`.
+  It 302s to `/` when the browser already has a session, else to `/login?error=expired`, whose
+  "Sign in with SSO" link starts a fresh flow. Never 302 straight to `/auth/oidc/login`: a browser
+  that drops the state cookie would loop. No session is issued on either path.
+  Tests: `XERK-3038:` and the login-CSRF case in `oidc.test.js`.
 - **The `next` param is open-redirect-guarded** (`oidcSafeNext`): only local same-origin paths
   (rejects `//`, `https://…`, `/\`); anything else → `/`.
 - **Logout keeps the ID token OFF the session cookie.** A separate small `hub_oidc` sid cookie names
@@ -131,7 +137,7 @@ by handing the token back over an app deep link, PKCE-protected. The hub stays t
 - **Both new routes are in `isLoginRoute`** (the app has no session yet): `/api/oidc/config` (public
   probe — `{enabled}` only, tells the app whether to offer the SSO button) and the exchange
   (self-authenticating on the code+verifier). Do NOT gate them behind `userAuthorized`.
-- **A dead/forged tx does NOT deep-link** — the state-CSRF 400 and the exchange 400 fall through, and
+- **A dead/forged tx does NOT deep-link** — the state-CSRF redirect and the exchange 400 fall through, and
   the app treats a non-deep-link outcome as a failed sign-in. Do not add a mobile deep-link to the
   invalid-state branch (an untrusted redirect must not carry a token).
 - Android side (Custom Tab, `Cookie` auth, 401-drop) is in `android/PARITY.md` + `android.md`; the

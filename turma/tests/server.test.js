@@ -34561,6 +34561,119 @@ test("XERK-2953: deleting a dead series' old half still respects an occurrence i
   }
 });
 
+test("XERK-2991: a 'following' edit resending a moved occurrence's own start keeps the series' cadence", async () => {
+  cleanup2968(D2968A);
+  try {
+    await beat1574(D2968A, S2968A);
+    const s = (await turma2968("POST", null, weekly2969())).body.event;
+    const back = (k, days) => iso2968(Date.parse(key2969(k)) - days * 864e5);
+    const endOf = (iso) => iso2968(Date.parse(iso) + 36e5);
+    // Occurrence 2 moved three days earlier on its own.
+    assert.equal((await turma2968("PATCH", `${s.id}:${key2969(2)}`, { version: 1,
+      start: back(2, 3), end: endOf(back(2, 3)) })).status, 200);
+    // The edit form resends that displayed start/end with a subject-only "this and following" edit.
+    const sp = await turma2968("PATCH", `${s.id}:${key2969(2)}`, { version: 2, scope: "following",
+      subject: "Planning v2", start: back(2, 3), end: endOf(back(2, 3)), timeZone: "UTC" });
+    assert.equal(sp.status, 200, JSON.stringify(sp.body));
+    assert.equal(sp.body.event.start, key2969(2), "the new series anchors on the original slot");
+    const occ = (await occ2969()).filter((e) => e.seriesId === sp.body.event.id);
+    assert.deepEqual(occ.map((e) => [e.start, e.subject]),
+      [[back(2, 3), "Planning v2"], [key2969(3), "Planning v2"], [key2969(4), "Planning v2"]],
+      "the moved occurrence stays moved; the rest keep the weekly slot");
+    // A start that DIFFERS from the displayed one still re-times the new series.
+    const t = (await turma2968("POST", null, weekly2969())).body.event;
+    assert.equal((await turma2968("PATCH", `${t.id}:${key2969(2)}`, { version: 1,
+      start: back(2, 3), end: endOf(back(2, 3)) })).status, 200);
+    const rt = await turma2968("PATCH", `${t.id}:${key2969(2)}`, { version: 2, scope: "following",
+      start: back(2, 2), end: endOf(back(2, 2)) });
+    assert.equal(rt.status, 200, JSON.stringify(rt.body));
+    assert.deepEqual([rt.body.event.start, rt.body.event.end], [back(2, 2), endOf(back(2, 2))]);
+    // ...even when the end is resent as displayed.
+    const t2 = (await turma2968("POST", null, weekly2969())).body.event;
+    await turma2968("PATCH", `${t2.id}:${key2969(2)}`, { version: 1, start: back(2, 3), end: endOf(back(2, 3)) });
+    const rt2 = await turma2968("PATCH", `${t2.id}:${key2969(2)}`, { version: 2, scope: "following",
+      start: back(2, 4), end: endOf(back(2, 3)) });
+    assert.equal(rt2.status, 200, JSON.stringify(rt2.body));
+    assert.deepEqual([rt2.body.event.start, rt2.body.event.end], [back(2, 4), endOf(back(2, 3))]);
+    // The displayed start with a LONGER end is a new length at the original slot, and the
+    // moved occurrence stays moved at that length (QA: the web editor sends exactly this).
+    for (const sent of [{ start: back(2, 3) }, {}]) {
+      const l = (await turma2968("POST", null, weekly2969())).body.event;
+      await turma2968("PATCH", `${l.id}:${key2969(2)}`, { version: 1, start: back(2, 3), end: endOf(back(2, 3)) });
+      const two = iso2968(Date.parse(back(2, 3)) + 72e5);
+      const lp = await turma2968("PATCH", `${l.id}:${key2969(2)}`, { version: 2, scope: "following", ...sent, end: two });
+      assert.equal(lp.status, 200, JSON.stringify(lp.body));
+      assert.deepEqual([lp.body.event.start, lp.body.event.end], [key2969(2), iso2968(Date.parse(key2969(2)) + 72e5)]);
+      assert.deepEqual((await occ2969()).filter((e) => e.seriesId === lp.body.event.id).map((e) => [e.start, e.end]),
+        [[back(2, 3), two], [key2969(3), iso2968(Date.parse(key2969(3)) + 72e5)],
+          [key2969(4), iso2968(Date.parse(key2969(4)) + 72e5)]]);
+    }
+    // An occurrence whose own override changed only its LENGTH keeps it to itself (QA).
+    const d = (await turma2968("POST", null, weekly2969())).body.event;
+    const long = iso2968(Date.parse(key2969(2)) + 72e5);
+    await turma2968("PATCH", `${d.id}:${key2969(2)}`, { version: 1, end: long });
+    const dp = await turma2968("PATCH", `${d.id}:${key2969(2)}`, { version: 2, scope: "following",
+      subject: "x", start: key2969(2), end: long });
+    assert.equal(dp.status, 200, JSON.stringify(dp.body));
+    assert.deepEqual((await occ2969()).filter((e) => e.seriesId === dp.body.event.id).map((e) => e.end),
+      [long, endOf(key2969(3)), endOf(key2969(4))]);
+    // All-day across a DST change: a length is counted in DAYS of the zone, so the series still
+    // ends at midnight — for "following" and for "series" (QA: both ended at 23:00).
+    const ad = () => turma2968("POST", null, ev2968([S2968A], { timeZone: "America/New_York", allDay: true,
+      start: "2027-03-01T05:00:00Z", end: "2027-03-02T05:00:00Z", recurrence: { freq: "weekly" } }));
+    for (const scope of ["following", "series"]) {
+      const a = (await ad()).body.event;
+      assert.equal((await turma2968("PATCH", `${a.id}:2027-03-15T04:00:00Z`, { version: 1,
+        start: "2027-03-13T05:00:00Z", end: "2027-03-14T05:00:00Z" })).status, 200);
+      const ap = await turma2968("PATCH", `${a.id}:2027-03-15T04:00:00Z`, { version: 2, scope, allDay: true,
+        start: "2027-03-13T05:00:00Z", end: "2027-03-15T04:00:00Z" });
+      assert.equal(ap.status, 200, JSON.stringify(ap.body));
+      assert.deepEqual([ap.body.event.start, ap.body.event.end], scope === "following"
+        ? ["2027-03-15T04:00:00Z", "2027-03-17T04:00:00Z"] : ["2027-03-01T05:00:00Z", "2027-03-03T05:00:00Z"], scope);
+    }
+    // A timed series moved through an occurrence across DST keeps its wall time (QA: main put a
+    // 9:00 EST series at 10:00); a move into the spring-forward gap keeps the length (QA: 0 min).
+    const nyc = async (start, end, freq) => (await turma2968("POST", null, ev2968([S2968A], {
+      timeZone: "America/New_York", start, end, recurrence: { freq } }))).body.event;
+    const nine = await nyc("2027-03-01T14:00:00Z", "2027-03-01T15:00:00Z", "weekly");
+    const nm = await turma2968("PATCH", `${nine.id}:2027-03-15T13:00:00Z`, { version: 1, scope: "series",
+      start: "2027-03-12T14:00:00Z", end: "2027-03-12T15:00:00Z" });
+    assert.equal(nm.status, 200, JSON.stringify(nm.body));
+    assert.deepEqual([nm.body.event.start, nm.body.event.end], ["2027-02-26T14:00:00Z", "2027-02-26T15:00:00Z"]);
+    const gap = await nyc("2027-03-13T07:30:00Z", "2027-03-13T08:30:00Z", "daily");
+    const gm = await turma2968("PATCH", `${gap.id}:2027-03-16T06:30:00Z`, { version: 1, scope: "series",
+      start: "2027-03-17T06:30:00Z", end: "2027-03-17T07:30:00Z" });
+    assert.equal(gm.status, 200, JSON.stringify(gm.body));
+    assert.equal(Date.parse(gm.body.event.end) - Date.parse(gm.body.event.start), 36e5);
+    // A start sent alone moves the series and keeps its length.
+    const lone = await nyc("2027-03-01T14:00:00Z", "2027-03-01T15:00:00Z", "weekly");
+    const lm = await turma2968("PATCH", `${lone.id}:2027-03-08T14:00:00Z`, { version: 1, scope: "series",
+      start: "2027-03-09T14:00:00Z" });
+    assert.equal(lm.status, 200, JSON.stringify(lm.body));
+    assert.deepEqual([lm.body.event.start, lm.body.event.end], ["2027-03-02T14:00:00Z", "2027-03-02T15:00:00Z"]);
+    // The fall-back fold: an anchor at the SECOND 01:30 keeps its instant on an end-only edit,
+    // an end inside the fold is kept when the times are resent as displayed, and a start-alone
+    // move keeps the WALL length (QA mutants).
+    const series = async (b, key, edit) => {
+      const e = (await turma2968("POST", null, ev2968([S2968A], { timeZone: "America/New_York",
+        recurrence: { freq: "daily" }, ...b }))).body.event;
+      const r = await turma2968("PATCH", `${e.id}:${key}`, { version: 1, scope: "series", ...edit });
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      return [r.body.event.start, r.body.event.end];
+    };
+    const second = { start: "2027-11-07T06:30:00Z", end: "2027-11-07T07:30:00Z" };
+    assert.deepEqual(await series(second, "2027-11-09T06:30:00Z", { end: "2027-11-09T08:00:00Z" }),
+      ["2027-11-07T06:30:00Z", "2027-11-07T08:00:00Z"]);
+    const fold = { start: "2027-11-07T04:30:00Z", end: "2027-11-07T06:30:00Z" };
+    assert.deepEqual(await series(fold, "2027-11-08T05:30:00Z", { start: "2027-11-08T05:30:00Z", end: "2027-11-08T06:30:00Z" }),
+      ["2027-11-07T04:30:00Z", "2027-11-07T06:30:00Z"]);
+    assert.deepEqual(await series(fold, "2027-11-08T05:30:00Z", { start: "2027-11-09T05:30:00Z" }),
+      ["2027-11-08T05:30:00Z", "2027-11-08T06:30:00Z"]);
+  } finally {
+    cleanup2968(D2968A);
+  }
+});
+
 test("XERK-2953: a 'following' edit moving the occurrence to another date moves an explicit day with it", async () => {
   cleanup2968(D2968A);
   try {

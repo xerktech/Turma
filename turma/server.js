@@ -7168,11 +7168,26 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   const fields = calPick(body);
   if (sc.scope === "series" && shown) {
     // Moving one occurrence "for the series" moves the series by the same amount.
-    // The sent string itself when it names the moved instant (the first occurrence): its
-    // wall fields are the time picked, which a DST-gap anchor needs (XERK-3040).
-    const moved = (sent, ms) => (Date.parse(sent) === ms ? sent : calIsoZ(ms));
-    if ("start" in body && calIso(body.start)) fields.start = moved(body.start, f.rec.startMs + Date.parse(body.start) - shown.startMs);
-    if ("end" in body && calIso(body.end)) fields.end = moved(body.end, f.rec.endMs + Date.parse(body.end) - shown.endMs);
+    // By WALL time in the event's zone (XERK-2991): a delta in ms read across a DST change
+    // left an all-day end at 23:00 and a moved 9:00 at 8:00.
+    // The end is built from the RESOLVED start + the wall length (a start in a spring-forward
+    // gap resolves an hour later, and a separately resolved end made the series 0 minutes);
+    // a start sent alone keeps the series' length.
+    const tz = f.rec.timeZone, W = (ms) => recurrence.wallOf(ms, tz);
+    const sD = "start" in body && calIso(body.start) ? W(Date.parse(body.start)) - W(shown.startMs) : null;
+    const eD = "end" in body && calIso(body.end) ? W(Date.parse(body.end)) - W(shown.endMs) : null;
+    // The sent string itself when it names the resolved instant (the first occurrence): its
+    // wall fields are the time picked, which a DST-gap anchor keeps (XERK-3040).
+    const iso = (k, ms) => (calIso(body[k]) && Date.parse(body[k]) === ms ? body[k] : calIsoZ(ms));
+    if (sD || eD) {
+      const sW = W(f.rec.startMs) + (sD || 0);
+      const st = sD ? recurrence.instantOf(sW, tz) : f.rec.startMs;
+      fields.start = iso("start", st);
+      fields.end = iso("end", recurrence.instantOf(W(st) + W(f.rec.endMs) + (eD ?? sD) - sW, tz));
+    } else {
+      if (sD === 0) fields.start = f.rec.start;
+      if (eD === 0) fields.end = f.rec.end;
+    }
     // Moving a later occurrence back by its delta can take the FIRST one before 1970.
     if (!(Date.parse(fields.start || f.rec.start) > 0)) {
       return { status: 400, body: { error: "this would move the series' first occurrence before 1970-01-01T00:00:00Z" } };
@@ -7213,6 +7228,28 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
   // it, carrying the edit and the exceptions from it on.
   const prev = calTurmaEndBefore(f.rec, f.occ, f.t, now);
   const { count } = f.rec.recurrence;
+  // A start resent as the occurrence DISPLAYS it (an edit form sends every field) is no
+  // re-time (XERK-2991): the new series keeps the cadence from the occurrence's ORIGINAL slot,
+  // and an occurrence moved on its own keeps that move as its exception. An end resent as
+  // displayed is unchanged too; a changed one (or one sent alone) is a new LENGTH, applied
+  // at the original slot. Only a start that differs from the displayed one re-times.
+  let ownEnd = null;
+  if (shown && ("start" in fields || "end" in fields) &&
+      (!("start" in fields) || Date.parse(fields.start) === shown.startMs)) {
+    const sentEnd = "end" in fields ? Date.parse(fields.end) : shown.endMs;
+    delete fields.start;
+    delete fields.end;
+    if (sentEnd !== shown.endMs) {
+      // A wall-clock length in the series' zone, as expansion keeps it: a ms length measured
+      // across a DST change ended an all-day series at 23:00.
+      const tz = f.rec.timeZone;
+      const endMs = recurrence.instantOf(recurrence.wallOf(f.occ.startMs, tz) +
+        recurrence.wallOf(sentEnd, tz) - recurrence.wallOf(shown.startMs, tz), tz);
+      // The sent string when it names that instant: a DST-gap end's wall time (XERK-3040).
+      fields.end = calIso(body.end) && Date.parse(body.end) === endMs ? body.end : calIsoZ(endMs);
+      ownEnd = calIsoZ(sentEnd);
+    }
+  }
   // The rule the new series runs: the one sent, else the series' own. Either way it is the
   // series' rule RE-ANCHORED at this occurrence (XERK-2973: a client editing "this and
   // following" sends the series' rule as the person changed it):
@@ -7252,6 +7289,8 @@ function patchTurmaEvent(p, id, body, now = Date.now()) {
     const own = { ...exceptions[f.key] };
     for (const k of Object.keys(fields)) delete own[k];
     if ("start" in fields || "end" in fields) { delete own.start; delete own.end; }
+    // A moved occurrence given a new length stays moved, at that length (XERK-2991).
+    if (ownEnd && exceptions[f.key].start) Object.assign(own, { start: exceptions[f.key].start, end: ownEnd });
     exceptions[f.key] = own;
   }
   const next = sanitizeTurmaEvent({ ...f.rec, start: calIsoZ(f.occ.startMs), end: calIsoZ(f.occ.endMs), ...fields,
@@ -27298,7 +27337,8 @@ const server = http.createServer(async (req, res) => {
       // never the hub's HTML /login page — the app is waiting on the deep link,
       // and dropping it into a web page strands the user in the Custom Tab. Only
       // a flow whose tx we recognise is trusted to deep-link; a dead/forged tx
-      // falls to the plain outcome (the app times out and reports failure).
+      // falls to the plain outcome (the Custom Tab shows the web page; the app
+      // itself has no timeout and stays on its Login screen).
       const mobile = tx && tx.mobile ? tx.mobile : "";
       const failLocation = (kind) => (mobile ? oidcMobileRedirect({ error: kind }) : `/login?error=${kind}`);
       if (idpError) {
@@ -27307,16 +27347,24 @@ const server = http.createServer(async (req, res) => {
         return res.end();
       }
       // Reject unless the transaction is live AND the browser presented the same
-      // `state` in its bound cookie as came back in the query (login-CSRF). A
-      // mobile flow reaching here has no trusted redirect (tx is null/dead), so
-      // it deliberately falls to the JSON 400 rather than deep-linking.
+      // `state` in its bound cookie as came back in the query (login-CSRF). The
+      // usual cause is a sign-in left open past OIDC_TX_TTL_MS, so the browser is
+      // sent somewhere it can recover rather than stranded on a JSON error
+      // (XERK-3038): an already-signed-in browser (a stale tab, a replayed
+      // callback) goes to the app, anyone else to /login?error=expired, which
+      // offers a fresh SSO sign-in. Never straight back to the IdP: a browser
+      // that drops the state cookie would loop. No session is issued on either
+      // path, so the login-CSRF defence is unchanged. A mobile flow reaching here
+      // has no trusted tx, so it never deep-links (an untrusted redirect must not
+      // carry a token): its Custom Tab lands on the same page, which the user
+      // closes to retry from the app's own SSO button.
       if (!state || !code || !tx || Date.now() - tx.at > OIDC_TX_TTL_MS || stateCookie !== state) {
-        res.writeHead(400, {
-          "Content-Type": "application/json",
+        res.writeHead(302, {
+          Location: userAuthorized(req) ? "/" : "/login?error=expired",
           "Cache-Control": "no-store",
           "Set-Cookie": clearState,
         });
-        return res.end(JSON.stringify({ error: "invalid or expired OIDC state" }));
+        return res.end();
       }
       try {
         const disco = await oidcDiscovery();
