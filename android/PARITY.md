@@ -29,7 +29,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Expired-SSO notice is web-only (XERK-3038).** The web login shows "timed out" + a Sign in with
-  SSO link on `/login?error=expired`. A timed-out app flow can't deep-link (its tx is gone), so its
+  SSO link on `/login?error=expired`. A timed-out app flow is never deep-linked (its tx is no longer trusted), so its
   Custom Tab shows that same web page; closing it returns to the app's Login screen, whose SSO button
   retries (`OidcController` clears `busy` before the tab opens, so nothing is left spinning). The
   page's link would sign in the Custom Tab's browser, not the app.
